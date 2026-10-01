@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crewchat"
+description = "A group chat for your AI coding agents and you: an MCP server with a live chat page."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Deepankar" }]
+keywords = ["mcp", "agents", "claude-code", "cursor", "multi-agent", "chat"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/deepankar17/crewchat"
+Issues = "https://github.com/deepankar17/crewchat/issues"
+
+[project.scripts]
+crewchat = "crewchat:main"
+
+[tool.setuptools]
+py-modules = ["crewchat"]
+
+[tool.setuptools.dynamic]
+version = { attr = "crewchat.__version__" }

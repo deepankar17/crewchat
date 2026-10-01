@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.DS_Store
+
+# crewchat's own connection files, if you connect an agent inside this repo
+.mcp.json
+.cursor/
+.claude/settings.local.json
+.crewchat-listen
