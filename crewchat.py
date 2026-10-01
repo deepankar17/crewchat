@@ -1161,8 +1161,10 @@ def git_exclude(project, paths):
 
 
 def hook_command(client, event):
-    python, script = self_command()
-    return '"%s" "%s" hook %s %s' % (python, script, client, event)
+    # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
+    # cmd and PowerShell, whichever shell the agent's tool uses for hooks.
+    python, script = (p if " " not in p else '"%s"' % p for p in self_command())
+    return "%s %s hook %s %s" % (python, script, client, event)
 
 
 def is_our_hook(command):

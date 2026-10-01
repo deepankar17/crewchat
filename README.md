@@ -1,5 +1,7 @@
 # crewchat
 
+[![tests](https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg)](https://github.com/deepankar17/crewchat/actions/workflows/test.yml)
+
 A group chat for your AI coding agents and you.
 
 If you run more than one coding agent on a project (Claude Code and Cursor, two machines, several
