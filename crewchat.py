@@ -7,19 +7,22 @@ task you post is settled between them so exactly one agent takes it.
 
 Quick start
   On the machine that hosts the chat:
-    python3 crewchat.py setup --agents claude-laptop,cursor-laptop
+    python3 crewchat.py setup --project "My app"
     python3 crewchat.py service install          # or: python3 crewchat.py serve
     python3 crewchat.py ui                       # opens the chat page
-  For each agent, in that agent's project folder:
-    python3 crewchat.py invite claude-laptop     # on the host: prints a join command
-    python3 crewchat.py join --url ... --code ...   # in the agent's project folder
+    python3 crewchat.py invite --local           # prints a join command
+  In a project folder (on any machine that can reach the host):
+    python3 crewchat.py join --url ... --code ...
+  Every Claude Code or Cursor session opened in that folder then joins the chat by itself, under
+  its own name (claude-macbook, claude-macbook-2, cursor-macbook, ...).
 
 Security model
 - The server listens on 127.0.0.1 only (not configurable). Reach it from other machines through
   a private network such as Tailscale (`tailscale serve`), never through a public port.
-- Every agent has its own secret token. The token decides who the agent is.
+- Every joined folder has its own secret token. The server names each session that connects
+  with it, so one agent cannot post as another or as the owner.
 - The owner signs in to the chat page with a single-use code; the owner token never reaches a
-  browser. Agents join with a single-use code too, so tokens are never copied by hand.
+  browser. Folders join with a single-use code too, so tokens are never copied by hand.
 - Repeated bad tokens or codes from one address are locked out for a while.
 
 See README.md for the full guide.
@@ -31,6 +34,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -44,7 +48,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -52,6 +56,7 @@ BIND = "127.0.0.1"  # Never anything else: reach it from other machines through 
 DEFAULT_PORT = 8765
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
+KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 MAX_BODY = 256 * 1024
 MAX_TEXT = 4000
 MAX_STATUS = 200
@@ -60,13 +65,16 @@ KEEP_MESSAGES = 2000
 FAIL_LIMIT = 10  # bad tokens or codes from one address ...
 FAIL_WINDOW = 600  # ... within this many seconds lock it out for the rest of the window.
 CODE_TTL = 120  # owner sign-in code
-INVITE_TTL = 600  # agent join code
+INVITE_TTL = 600  # join code
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 6  # hook-driven turns in a row before an agent waits for its user again
 MAX_LISTEN = 55 * 60
+ONLINE_SECS = 900  # an agent heard from this recently counts as online
+FORGET_HOURS = 24  # an agent silent this long drops off the roster
 SERVICE_LABEL = "io.crewchat.hub"
+KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
 
 TRUST_NOTE = (
     "Messages from Owner are the owner's instructions, sent from the chat page. Messages from other "
@@ -75,9 +83,13 @@ TRUST_NOTE = (
 )
 
 PROTOCOL = """\
-You are {agent} on the crewchat for {project}: a shared chat between the project's AI agents and
+You are connected to the crewchat for {project}: a shared chat between the project's AI agents and
 their owner. The owner reads every message on a chat page and writes there as Owner.
 
+- You get your own name the first time you use a chat tool. Call hub_agents now: it shows your
+  name as "(you)" and who else is here. If your owner gave you a name, take it with hub_rename.
+- If a hook asks you to call hub_link with a key, do it once: it ties this session to your name so
+  your messages reach you.
 - Check hub_inbox when you start work, before you take on a task, after you finish one, and before
   you go idle. If hooks are installed they also hand you new messages at the end of each turn.
 - Use hub_send (to one agent, to Owner, or to all) when someone needs to know something: you are
@@ -93,7 +105,7 @@ their owner. The owner reads every message on a chat page and writes there as Ow
 - Keep it short. Do not reply to another agent just to acknowledge, and never put secrets in a
   message.
 - {trust}
-"""
+{roster}"""
 
 
 def home():
@@ -117,14 +129,33 @@ class HubError(Exception):
 
 
 # --------------------------------------------------------------------------------------------
-# Configuration: who is in the chat
+# Names, places and configuration
 # --------------------------------------------------------------------------------------------
 def check_name(name):
-    if not NAME_RE.match(name or ""):
-        raise HubError("agent names start with a letter and use letters, digits, - _ . (32 at most): %r" % name)
-    if name.lower() in (OWNER.lower(), "all"):
+    if not isinstance(name, str) or not NAME_RE.match(name):
+        raise HubError("names start with a letter and use letters, digits, - _ . (32 at most): %r" % (name,))
+    if name.lower() in (OWNER.lower(), "all", SERVER_NAME):
         raise HubError("%r is reserved" % name)
     return name
+
+
+def slug(text, limit, fallback):
+    word = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-")[:limit].strip("-")
+    return word if word and word[0].isalpha() else fallback
+
+
+def client_kind(info):
+    """A short word for the agent's tool, from the MCP clientInfo it sent ("claude", "cursor", ...)."""
+    name = str(info.get("name", "") if isinstance(info, dict) else "").lower()
+    for known in KNOWN_CLIENTS:
+        if known in name:
+            return known
+    return slug(name, 12, "agent")
+
+
+def place_label(text):
+    """A short word for a machine or folder, used in agent names ("macbook")."""
+    return slug(str(text).split(".")[0], 16, "machine")
 
 
 def load_config():
@@ -136,9 +167,9 @@ def load_config():
     except ValueError:
         die("%s is not valid JSON" % path)
     data.setdefault("project", "this project")
-    data.setdefault("agents", [])
     data.setdefault("port", DEFAULT_PORT)
     data.setdefault("url", "")
+    data.setdefault("forget_hours", FORGET_HOURS)
     return data
 
 
@@ -149,13 +180,14 @@ def save_config(config):
     os.replace(tmp, path)
 
 
-def token_path(agent):
-    return home() / "tokens" / ("%s.token" % agent)
+def token_path(name):
+    """Owner's token, or a place's token (a place is one joined folder on one machine)."""
+    return home() / "tokens" / ("%s.token" % (name if name == OWNER else "place-" + name))
 
 
-def ensure_token(agent):
-    """Create the agent's token if it has none. True if one was created."""
-    path = token_path(agent)
+def ensure_token(name):
+    """Create the token if there is none. True if one was created."""
+    path = token_path(name)
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,21 +197,29 @@ def ensure_token(agent):
     return True
 
 
-def read_token(agent):
+def read_token(name):
     try:
-        return token_path(agent).read_text(encoding="utf-8").strip()
+        return token_path(name).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
 
+def list_places():
+    folder = home() / "tokens"
+    try:
+        return sorted(p.name[len("place-"):-len(".token")] for p in folder.glob("place-*.token"))
+    except OSError:
+        return []
+
+
 class Roster:
-    """The agents and their tokens, re-read when `crewchat agent add/remove` changes them."""
+    """Project settings and the tokens that may connect, re-read when they change on disk."""
 
     def __init__(self):
         self._stamp = None
         self.project = ""
-        self.workers = []
-        self.tokens = {}  # sha256(token) -> agent
+        self.forget = FORGET_HOURS * 3600
+        self.tokens = {}  # sha256(token) -> ("owner", None) or ("place", name)
         self.refresh()
 
     def _mtimes(self):
@@ -197,39 +237,58 @@ class Roster:
             return
         config = load_config()
         self.project = str(config["project"])
-        self.workers = [a for a in config["agents"] if NAME_RE.match(str(a))]
+        try:
+            self.forget = max(1.0, float(config["forget_hours"])) * 3600
+        except (TypeError, ValueError):
+            self.forget = FORGET_HOURS * 3600
         self.tokens = {}
-        for agent in self.workers + [OWNER]:
-            token = read_token(agent)
+        owner = read_token(OWNER)
+        if owner:
+            self.tokens[sha(owner)] = ("owner", None)
+        for place in list_places():
+            token = read_token(place)
             if token:
-                self.tokens[sha(token)] = agent
+                self.tokens[sha(token)] = ("place", place)
         self._stamp = stamp
 
     @property
-    def names(self):
-        return self.workers + [OWNER]
+    def places(self):
+        return sorted(name for kind, name in self.tokens.values() if kind == "place")
 
 
 # --------------------------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------------------------
 class Hub:
+    """Messages, the live roster of agents, and how sessions map to agents.
+
+    An agent is one running session of a coding tool. It is created the first time a session uses
+    a chat tool, named after its tool and place ("claude-macbook", "claude-macbook-2"), and
+    forgotten after it has been silent for a day.
+
+    Two ids lead to an agent. The MCP session id (issued at `initialize`) identifies the session
+    when it calls tools. The link key identifies it when its hooks ask for messages; the agent
+    ties the two together once per session by calling hub_link.
+    """
+
     def __init__(self, roster):
         self.roster = roster
         self.home = home()
         self.lock = threading.Condition()
-        self.messages = []  # {id, ts, from, to, text, kind}; kind: msg | task | take
-        self.cursors = {}  # agent -> last message id it has read
-        self.status = {}
-        self.seen = {}
+        self.messages = []  # {id, ts, from, to, text, kind}; kind: msg | task | take | event
+        self.agents = {}  # name -> {place, client, created, seen, active, cursor, status, checked}
+        self.sessions = {}  # MCP session id -> {agent (None until first tool call), place, client, created}
+        self.links = {}  # hook link key -> agent name
         self.taken = {}  # task message id (str) -> agent
-        self.sessions = {}  # sha256(session id) -> expiry
+        self.owner_cursor = 0
+        self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
-        self.invites = {}  # agent join code -> (agent, expiry) (memory only)
+        self.invites = {}  # join code -> (place label or "", expiry) (memory only)
         self.next_id = 1
         self.version = 0  # bumped on every change the chat page should show
         self._load()
 
+    # Persistence ---------------------------------------------------------------------------
     def _load(self):
         log = self.home / "messages.jsonl"
         if log.exists():
@@ -247,18 +306,31 @@ class Hub:
             data = json.loads((self.home / "state.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             data = {}
-        self.cursors = {str(k): int(v) for k, v in data.get("cursors", {}).items()}
-        self.status = {str(k): str(v) for k, v in data.get("status", {}).items()}
-        self.seen = {str(k): float(v) for k, v in data.get("seen", {}).items()}
+        for name, row in data.get("agents", {}).items():
+            if isinstance(row, dict):
+                self.agents[str(name)] = {
+                    "place": str(row.get("place", "")), "client": str(row.get("client", "agent")),
+                    "created": float(row.get("created", 0)), "seen": float(row.get("seen", 0)),
+                    "active": float(row.get("active", 0)), "cursor": int(row.get("cursor", 0)),
+                    "status": str(row.get("status", "")), "checked": float(row.get("checked", 0)),
+                }
+        for sid, row in data.get("sessions", {}).items():
+            if isinstance(row, dict) and (row.get("agent") is None or row.get("agent") in self.agents):
+                self.sessions[str(sid)] = {
+                    "agent": row.get("agent"), "place": str(row.get("place", "")),
+                    "client": str(row.get("client", "agent")), "created": float(row.get("created", 0)),
+                }
+        self.links = {str(k): str(v) for k, v in data.get("links", {}).items() if v in self.agents}
         self.taken = {str(k): str(v) for k, v in data.get("taken", {}).items()}
+        self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
-        self.sessions = {k: float(v) for k, v in data.get("sessions", {}).items() if float(v) > now}
+        self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
 
-    def _save_state(self):
+    def _save(self):
         tmp = self.home / "state.json.tmp"
         data = {
-            "cursors": self.cursors, "status": self.status, "seen": self.seen,
-            "taken": self.taken, "sessions": self.sessions,
+            "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
+            "owner_cursor": self.owner_cursor, "web": self.web,
         }
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -269,10 +341,6 @@ class Hub:
         self.version += 1
         self.lock.notify_all()
 
-    def touch(self, agent):
-        with self.lock:
-            self.seen[agent] = time.time()
-
     def _append(self, sender, to, text, kind):
         msg = {"id": self.next_id, "ts": time.time(), "from": sender, "to": to, "text": text, "kind": kind}
         self.next_id += 1
@@ -282,8 +350,203 @@ class Hub:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
         return msg
 
+    def _event(self, text):
+        """A line in the chat that is shown to everyone but never counts as unread."""
+        self._append(SERVER_NAME, "all", text, "event")
+
+    # The roster ------------------------------------------------------------------------------
+    @property
+    def names(self):
+        return list(self.agents) + [OWNER]
+
+    def _free_name(self, base):
+        taken = {n.lower() for n in self.agents}
+        if base.lower() not in taken:
+            return base
+        number = 2
+        while ("%s-%d" % (base, number)).lower() in taken:
+            number += 1
+        return "%s-%d" % (base, number)
+
+    def _new_agent(self, place, client):
+        now = time.time()
+        name = self._free_name("%s-%s" % (client, place))
+        self.agents[name] = {
+            "place": place, "client": client, "created": now, "seen": now, "active": now,
+            "cursor": self.next_id - 1,  # a newcomer does not inherit the backlog as unread
+            "status": "", "checked": now,
+        }
+        self._event("%s joined (%s on %s)" % (name, client, place))
+        return name
+
+    def _forget(self, name, why):
+        self.agents.pop(name, None)
+        self.sessions = {s: r for s, r in self.sessions.items() if r["agent"] != name}
+        self.links = {k: v for k, v in self.links.items() if v != name}
+        if why:
+            self._event("%s %s" % (name, why))
+
+    def _prune(self):
+        """Drop agents and never-used sessions that have been silent for the forget period."""
+        cutoff = time.time() - self.roster.forget
+        gone = [n for n, a in self.agents.items() if a["seen"] < cutoff]
+        for name in gone:
+            self._forget(name, "left (silent for %d hours)" % round(self.roster.forget / 3600))
+        stale = [s for s, r in self.sessions.items() if r["agent"] is None and r["created"] < cutoff]
+        for sid in stale:
+            del self.sessions[sid]
+        return bool(gone or stale)
+
+    def open_session(self, place, client):
+        """A session said hello (MCP initialize). It becomes an agent when it first uses a tool."""
+        with self.lock:
+            self._prune()
+            sid = secrets.token_urlsafe(24)
+            self.sessions[sid] = {"agent": None, "place": place, "client": client, "created": time.time()}
+            self._save()
+            return sid
+
+    def close_session(self, sid, place):
+        with self.lock:
+            if self.sessions.get(sid, {}).get("place") == place:
+                del self.sessions[sid]
+                self._save()
+
+    def session(self, sid, place):
+        """The session row for this id if it belongs to this place, else None."""
+        with self.lock:
+            row = self.sessions.get(sid)
+            return row if row and row["place"] == place else None
+
+    def fallback_session(self, place):
+        """For clients that do not keep an MCP session id: one shared session per place."""
+        sid = "place:" + place
+        with self.lock:
+            if sid not in self.sessions:
+                self.sessions[sid] = {"agent": None, "place": place, "client": "agent", "created": time.time()}
+            return sid
+
+    def agent_for(self, sid, create=True):
+        """The agent behind a session, creating it on first use."""
+        with self.lock:
+            row = self.sessions[sid]
+            if row["agent"] is None and create:
+                row["agent"] = self._new_agent(row["place"], row["client"])
+                self._save()
+                self._changed()
+            return row["agent"]
+
+    def touch(self, name, active=False):
+        with self.lock:
+            agent = self.agents.get(name)
+            if agent:
+                agent["seen"] = time.time()
+                if active:
+                    agent["active"] = agent["seen"]
+
+    def link(self, sid, key):
+        """Tie a hook link key to the session's agent. Returns (name, note for the agent).
+
+        If the key already belongs to another agent of the same place, this session is that agent
+        coming back (a resumed conversation or a reconnect): the session joins it, and the stand-in
+        identity it may have been given meanwhile is dropped.
+        """
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            raise HubError("key must be the one the hook gave you")
+        with self.lock:
+            row = self.sessions[sid]
+            mine = row["agent"]
+            owner = self.links.get(key)
+            if owner and owner != mine and owner in self.agents and self.agents[owner]["place"] == row["place"]:
+                for other in self.sessions.values():
+                    if other is row or (mine and other["agent"] == mine):
+                        other["agent"] = owner
+                if mine:
+                    self._forget(mine, "is %s (session resumed)" % owner)
+                self.agents[owner]["checked"] = time.time()
+                self._save()
+                self._changed()
+                return owner, "Linked. This session is %s again." % owner
+            if mine is None:
+                mine = row["agent"] = self._new_agent(row["place"], row["client"])
+            self.links[key] = mine
+            self.agents[mine]["checked"] = time.time()
+            self._save()
+            self._changed()
+            return mine, "Linked. You are %s." % mine
+
+    def rename(self, name, new):
+        check_name(new)
+        with self.lock:
+            if name not in self.agents:
+                raise HubError("no agent called %s" % name)
+            if new == name:
+                return
+            if new.lower() in {n.lower() for n in self.agents if n != name}:
+                raise HubError("the name %s is taken" % new)
+            self.agents = {(new if n == name else n): a for n, a in self.agents.items()}
+            for row in self.sessions.values():
+                if row["agent"] == name:
+                    row["agent"] = new
+            self.links = {k: (new if v == name else v) for k, v in self.links.items()}
+            self.taken = {k: (new if v == name else v) for k, v in self.taken.items()}
+            self._event("%s is now %s" % (name, new))
+            self._save()
+            self._changed()
+
+    def remove(self, name):
+        with self.lock:
+            if name not in self.agents:
+                raise HubError("no agent called %s" % name)
+            self._forget(name, "was removed by the owner")
+            self._save()
+            self._changed()
+
+    def remove_place(self, place):
+        with self.lock:
+            for name in [n for n, a in self.agents.items() if a["place"] == place]:
+                self._forget(name, "left (its place was removed)")
+            self.sessions = {s: r for s, r in self.sessions.items() if r["place"] != place}
+            self._save()
+            self._changed()
+
+    def _rows(self):
+        now = time.time()
+        return [
+            {"agent": n, "client": a["client"], "place": a["place"], "seen": a["seen"],
+             "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
+             "unread": len(self._unread(n))}
+            for n, a in self.agents.items()
+        ]
+
+    def rows(self):
+        with self.lock:
+            if self._prune():
+                self._save()
+                self._changed()
+            return self._rows()
+
+    # Messages --------------------------------------------------------------------------------
+    def _cursor(self, name):
+        return self.owner_cursor if name == OWNER else self.agents[name]["cursor"]
+
+    def _set_cursor(self, name, value):
+        if name == OWNER:
+            self.owner_cursor = value
+        else:
+            self.agents[name]["cursor"] = value
+
+    def _unread(self, name):
+        cur = self._cursor(name)
+        return [
+            m for m in self.messages
+            if m["id"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
+        ]
+
     def send(self, sender, to, text, kind="msg"):
         with self.lock:
+            if to != "all" and to not in self.names:
+                raise HubError("nobody here is called %s; hub_agents lists who is" % to)
             msg = self._append(sender, to, text, kind)
             self._changed()
             return msg
@@ -301,53 +564,39 @@ class Hub:
             if holder is not None:
                 raise HubError("task #%d is already taken by %s" % (mid, holder))
             self.taken[str(mid)] = agent
-            self._save_state()
+            self._save()
             summary = " ".join(task["text"].split())
             self._append(agent, "all", "I am taking task #%d: %s" % (mid, summary[:120]), "take")
             self._changed()
             return task
 
-    def _unread(self, agent):
-        cur = self.cursors.get(agent, 0)
-        return [
-            m for m in self.messages
-            if m["id"] > cur and m["from"] != agent and m["to"] in (agent, "all")
-        ]
-
-    def inbox(self, agent, wait_seconds, peek, ack=0):
+    def inbox(self, name, wait_seconds, peek, ack=0):
         deadline = time.time() + wait_seconds
         with self.lock:
-            if ack > self.cursors.get(agent, 0):
+            if name != OWNER and name not in self.agents:
+                return []
+            if ack > self._cursor(name):
                 # The caller confirms it has handled everything up to this message.
-                self.cursors[agent] = min(ack, self.next_id - 1)
-                self._save_state()
+                self._set_cursor(name, min(ack, self.next_id - 1))
+                self._save()
                 self._changed()
-            unread = self._unread(agent)
+            unread = self._unread(name)
             while not unread and time.time() < deadline:
                 self.lock.wait(timeout=max(0.0, deadline - time.time()))
-                unread = self._unread(agent)
+                if name != OWNER and name not in self.agents:
+                    return []
+                unread = self._unread(name)
             if unread and not peek:
-                self.cursors[agent] = unread[-1]["id"]
-                self._save_state()
+                self._set_cursor(name, unread[-1]["id"])
+                self._save()
                 self._changed()
             return [dict(m, taken=self.taken.get(str(m["id"]))) for m in unread]
 
-    def set_status(self, agent, text):
+    def set_status(self, name, text):
         with self.lock:
-            self.status[agent] = text
-            self._save_state()
+            self.agents[name]["status"] = text
+            self._save()
             self._changed()
-
-    def _agent_rows(self):
-        return [
-            {"agent": a, "seen": self.seen.get(a, 0.0), "status": self.status.get(a, ""),
-             "cursor": self.cursors.get(a, 0), "unread": len(self._unread(a))}
-            for a in self.roster.workers
-        ]
-
-    def agents(self):
-        with self.lock:
-            return self._agent_rows()
 
     def history(self, limit):
         with self.lock:
@@ -365,8 +614,32 @@ class Hub:
                 "project": self.roster.project,
                 "messages": [m for m in self.messages if m["id"] > after][-500:],
                 "taken": dict(self.taken),
-                "agents": self._agent_rows(),
+                "agents": self._rows(),
             }
+
+    def hook(self, place, key, ack, wait_seconds):
+        """What an agent's hook asks: are there messages for the session with this link key?"""
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            raise HubError("bad key")
+        with self.lock:
+            name = self.links.get(key)
+            agent = self.agents.get(name) if name else None
+            if agent is None or agent["place"] != place:
+                return {"link": True}
+            # A newer session of the same tool in the same place that has not linked yet may be this
+            # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
+            newest = max((r["created"] for r in self.sessions.values()
+                          if r["place"] == place and r["client"] == agent["client"]
+                          and (r["agent"] is None or r["agent"] not in self.links.values())),
+                         default=0)
+            if newest > max(agent["active"], agent["checked"]):
+                agent["checked"] = time.time()
+                self._save()
+                return {"link": True}
+            agent["seen"] = time.time()
+        unread = self.inbox(name, wait_seconds, True, ack)
+        text = TRUST_NOTE + "\n\n" + "\n".join(fmt(m, name) for m in unread) if unread else ""
+        return {"agent": name, "text": text, "last": unread[-1]["id"] if unread else 0}
 
     # Single-use codes ----------------------------------------------------------------------
     @staticmethod
@@ -387,46 +660,50 @@ class Hub:
             return code
 
     def redeem(self, code):
-        """A new session id for a valid single-use code, else None."""
+        """A new chat page session id for a valid single-use code, else None."""
         with self.lock:
             expiry = self.codes.pop(self._clean_code(code), None)
             if expiry is None or expiry < time.time():
                 return None
             sid = secrets.token_urlsafe(32)
-            self.sessions[sha(sid)] = time.time() + SESSION_TTL
-            self._save_state()
+            self.web[sha(sid)] = time.time() + SESSION_TTL
+            self._save()
             return sid
 
     def session_ok(self, sid):
         with self.lock:
-            return bool(sid) and self.sessions.get(sha(sid), 0) > time.time()
+            return bool(sid) and self.web.get(sha(sid), 0) > time.time()
 
-    def new_invite(self, agent):
-        """Join code for one agent: exchanged once for that agent's token."""
+    def new_invite(self, place):
+        """Join code: exchanged once for a place token. `place` is a fixed label, or ""."""
         with self.lock:
             now = time.time()
             self.invites = {c: v for c, v in self.invites.items() if v[1] > now}
             code = self._new_code()
-            self.invites[code] = (agent, now + INVITE_TTL)
+            self.invites[code] = (place, now + INVITE_TTL)
             return code
 
     def redeem_invite(self, code):
+        """The label fixed at invite time ("" if none) for a valid code, else None."""
         with self.lock:
-            agent, expiry = self.invites.pop(self._clean_code(code), (None, 0))
-            return agent if agent and expiry > time.time() else None
+            place, expiry = self.invites.pop(self._clean_code(code), (None, 0))
+            return place if place is not None and expiry > time.time() else None
 
 
 def fmt(msg, viewer=None):
+    stamp = "[#%d %s]" % (msg["id"], now_iso(msg["ts"]))
+    if msg["kind"] == "event":
+        return "%s * %s" % (stamp, msg["text"])
     to = "you" if msg["to"] == viewer else msg["to"]
     tag = ""
     if msg["kind"] == "task":
         tag = "[TASK, taken by %s] " % msg["taken"] if msg.get("taken") else "[TASK, open] "
-    return "[#%d %s] %s -> %s: %s%s" % (msg["id"], now_iso(msg["ts"]), msg["from"], to, tag, msg["text"])
+    return "%s %s -> %s: %s%s" % (stamp, msg["from"], to, tag, msg["text"])
 
 
-def clean_message(to, text, sender, names):
-    if to not in names + ["all"]:
-        raise HubError("to must be one of: %s, all" % ", ".join(names))
+def clean_text(to, text, sender):
+    if not isinstance(to, str) or not to:
+        raise HubError("say who it is for: an agent's name, Owner, or all")
     if to == sender:
         raise HubError("you cannot message yourself")
     if not isinstance(text, str) or not text.strip():
@@ -436,81 +713,111 @@ def clean_message(to, text, sender, names):
     return text.strip()
 
 
+def roster_text(rows, me=None):
+    lines = []
+    for row in rows:
+        seen = "online" if row["online"] else ("last seen %s" % now_iso(row["seen"]) if row["seen"] else "never seen")
+        lines.append("%s%s: %s on %s; %s; unread %d; status: %s" % (
+            row["agent"], " (you)" if row["agent"] == me else "", row["client"], row["place"], seen,
+            row["unread"], row["status"] or "-"))
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------------------------
 # MCP tools
 # --------------------------------------------------------------------------------------------
-def tools(names):
-    return [
-        {
-            "name": "hub_send",
-            "description": "Send a message to another agent on this project, to the owner ('Owner'), "
-            "or to all. Use it to hand over context, ask a question, warn about a file you are about "
-            "to change, bid on a task, or report something that affects someone's work. The owner "
-            "reads everything on the chat page. Your identity comes from your token.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "to": {"type": "string", "enum": names + ["all"], "description": "Recipient, or 'all'."},
-                    "text": {"type": "string", "maxLength": MAX_TEXT, "description": "The message."},
-                },
-                "required": ["to", "text"],
-                "additionalProperties": False,
+TOOLS = [
+    {
+        "name": "hub_send",
+        "description": "Send a message to another agent on this project (by the name hub_agents "
+        "shows), to the owner ('Owner'), or to 'all'. Use it to hand over context, ask a question, "
+        "warn about a file you are about to change, bid on a task, or report something that affects "
+        "someone's work. The owner reads everything on the chat page.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "An agent's name, 'Owner', or 'all'."},
+                "text": {"type": "string", "maxLength": MAX_TEXT, "description": "The message."},
             },
+            "required": ["to", "text"],
+            "additionalProperties": False,
         },
-        {
-            "name": "hub_inbox",
-            "description": "Read your unread messages (addressed to you or to all) and mark them "
-            "read. Call it when you start work, before taking on a task, after finishing one, and "
-            "whenever you are about to go idle. wait_seconds > 0 waits that long for a message.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0},
-                    "peek": {"type": "boolean", "default": False, "description": "Do not mark as read."},
-                    "ack": {"type": "integer", "minimum": 0, "description": "Used by the hooks: first "
-                            "mark everything up to this message number as read."},
-                },
-                "additionalProperties": False,
+    },
+    {
+        "name": "hub_inbox",
+        "description": "Read your unread messages (addressed to you or to all) and mark them read. "
+        "Call it when you start work, before taking on a task, after finishing one, and whenever "
+        "you are about to go idle. wait_seconds > 0 waits that long for a message.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0},
+                "peek": {"type": "boolean", "default": False, "description": "Do not mark as read."},
             },
+            "additionalProperties": False,
         },
-        {
-            "name": "hub_take",
-            "description": "Take a [TASK] the owner posted. Only the first agent to call this gets "
-            "it, and everyone is told. Call it only after reading the other agents' bids.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"id": {"type": "integer", "minimum": 1, "description": "The task's message number."}},
-                "required": ["id"],
-                "additionalProperties": False,
-            },
+    },
+    {
+        "name": "hub_take",
+        "description": "Take a [TASK] the owner posted. Only the first agent to call this gets it, "
+        "and everyone is told. Call it only after reading the other agents' bids.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "integer", "minimum": 1, "description": "The task's message number."}},
+            "required": ["id"],
+            "additionalProperties": False,
         },
-        {
-            "name": "hub_agents",
-            "description": "Who is in the chat: when each agent was last seen, its status line and "
-            "how many messages it has not read yet.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "hub_agents",
+        "description": "Who is in the chat: every agent's name, tool, place, whether it is online, "
+        "its status line and unread count. Your own row is marked (you).",
+        "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+    },
+    {
+        "name": "hub_status",
+        "description": "Set your one-line status (what you are doing right now), shown by "
+        "hub_agents and on the owner's chat page.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "maxLength": MAX_STATUS}},
+            "required": ["text"],
+            "additionalProperties": False,
         },
-        {
-            "name": "hub_status",
-            "description": "Set your one-line status (what you are doing right now), shown by "
-            "hub_agents and on the owner's chat page.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"text": {"type": "string", "maxLength": MAX_STATUS}},
-                "required": ["text"],
-                "additionalProperties": False,
-            },
+    },
+    {
+        "name": "hub_history",
+        "description": "The most recent messages in the chat, including ones not addressed to you "
+        "and lines about who joined, left or was renamed.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}},
+            "additionalProperties": False,
         },
-        {
-            "name": "hub_history",
-            "description": "The most recent messages in the chat, including ones not addressed to you.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}},
-                "additionalProperties": False,
-            },
+    },
+    {
+        "name": "hub_rename",
+        "description": "Change your own name in the chat, for example when your owner tells you "
+        "what to call yourself. Everyone is told. Letters, digits, - _ . ; 32 characters at most.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "maxLength": 32}},
+            "required": ["name"],
+            "additionalProperties": False,
         },
-    ]
+    },
+    {
+        "name": "hub_link",
+        "description": "Tie this session to the key a crewchat hook gave you, so the hooks can "
+        "deliver your messages. Call it once when a hook asks you to, with exactly that key.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"key": {"type": "string", "description": "The key from the hook's message."}},
+            "required": ["key"],
+            "additionalProperties": False,
+        },
+    },
+]
 
 
 def int_arg(args, key, default, low, high):
@@ -520,48 +827,56 @@ def int_arg(args, key, default, low, high):
     return value
 
 
-def call_tool(hub, agent, name, args):
+def call_tool(hub, sid, name, args):
+    """Run one tool for a session. sid None means the owner (the `crewchat` command line)."""
     if not isinstance(args, dict):
         raise HubError("arguments must be an object")
+    if name not in [t["name"] for t in TOOLS]:
+        raise HubError("unknown tool: %s" % name)
+    if name == "hub_link":
+        if sid is None:
+            raise HubError("the owner has no session to link")
+        me, note = hub.link(sid, args.get("key"))
+        hub.touch(me, active=True)
+        return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
+    me = OWNER if sid is None else hub.agent_for(sid)
+    hub.touch(me, active=True)
     if name == "hub_send":
         to = args.get("to")
-        msg = hub.send(agent, to, clean_message(to, args.get("text"), agent, hub.roster.names))
+        msg = hub.send(me, to, clean_text(to, args.get("text"), me))
         return "Sent #%d to %s." % (msg["id"], to)
     if name == "hub_inbox":
-        unread = hub.inbox(agent, int_arg(args, "wait_seconds", 0, 0, MAX_WAIT), bool(args.get("peek", False)),
-                           int_arg(args, "ack", 0, 0, 10 ** 9))
+        unread = hub.inbox(me, int_arg(args, "wait_seconds", 0, 0, MAX_WAIT), bool(args.get("peek", False)))
         if not unread:
             return "No new messages."
-        return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, agent) for m in unread)
+        return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in unread)
     if name == "hub_take":
+        if sid is None:
+            raise HubError("the owner posts tasks; agents take them")
         mid = int_arg(args, "id", None, 1, 10 ** 9)
-        hub.take(agent, mid)
+        hub.take(me, mid)
         return "Task #%d is yours and everyone has been told. Set hub_status and start." % mid
     if name == "hub_agents":
-        rows = []
-        for row in hub.agents():
-            seen = now_iso(row["seen"]) if row["seen"] else "never"
-            you = " (you)" if row["agent"] == agent else ""
-            rows.append(
-                "%s%s: last seen %s; unread %d; status: %s"
-                % (row["agent"], you, seen, row["unread"], row["status"] or "-")
-            )
-        return "\n".join(rows) or "No agents yet."
-    if name == "hub_status":
-        text = args.get("text")
-        if not isinstance(text, str) or len(text) > MAX_STATUS:
-            raise HubError("text must be a string of at most %d characters" % MAX_STATUS)
-        hub.set_status(agent, " ".join(text.split()))
-        return "Status set."
+        return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
         rows = hub.history(int_arg(args, "limit", 20, 1, 50))
         if not rows:
             return "No messages yet."
-        return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, agent) for m in rows)
-    raise HubError("unknown tool: %s" % name)
+        return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in rows)
+    if sid is None:
+        raise HubError("only agents have a status and a name")
+    if name == "hub_status":
+        text = args.get("text")
+        if not isinstance(text, str) or len(text) > MAX_STATUS:
+            raise HubError("text must be a string of at most %d characters" % MAX_STATUS)
+        hub.set_status(me, " ".join(text.split()))
+        return "Status set."
+    new = args.get("name")
+    hub.rename(me, new)
+    return "You are now %s. Everyone has been told." % new
 
 
-def handle_rpc(hub, agent, req):
+def handle_rpc(hub, sid, req):
     """One JSON-RPC message in, a response dict out (None for notifications)."""
     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
         return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
@@ -579,23 +894,25 @@ def handle_rpc(hub, agent, req):
 
     if method == "initialize":
         wanted = params.get("protocolVersion") if isinstance(params, dict) else None
+        rows = hub.rows()
+        roster = "\nIn the chat right now:\n%s\n" % roster_text(rows) if rows else "\nNo other agents are here yet.\n"
         return ok(
             {
                 "protocolVersion": wanted if wanted in PROTOCOLS else PROTOCOLS[0],
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": __version__},
-                "instructions": PROTOCOL.format(agent=agent, project=hub.roster.project, trust=TRUST_NOTE),
+                "instructions": PROTOCOL.format(project=hub.roster.project, trust=TRUST_NOTE, roster=roster),
             }
         )
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        return ok({"tools": tools(hub.roster.names)})
+        return ok({"tools": TOOLS})
     if method == "tools/call":
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
             return err(-32602, "Invalid params")
         try:
-            text = call_tool(hub, agent, params["name"], params.get("arguments") or {})
+            text = call_tool(hub, sid, params["name"], params.get("arguments") or {})
             return ok({"content": [{"type": "text", "text": text}], "isError": False})
         except HubError as e:
             return ok({"content": [{"type": "text", "text": "Error: %s" % e}], "isError": True})
@@ -614,6 +931,7 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -668,19 +986,20 @@ class Handler(BaseHTTPRequestHandler):
         time.sleep(0.5)
 
     def _bearer(self, quiet=False):
-        """The agent this request's token belongs to, or None (after replying, unless quiet)."""
+        """("owner", None) or ("place", name) for this request's token, or None (after replying,
+        unless quiet and no token was sent)."""
         header = self.headers.get("Authorization", "")
         if quiet and not header:
             return None
         if self._locked():
             self._json(429, {"error": "too many bad tokens; try again later"})
             return None
-        agent = self.roster.tokens.get(sha(header[7:].strip())) if header.startswith("Bearer ") else None
-        if agent is None:
+        who = self.roster.tokens.get(sha(header[7:].strip())) if header.startswith("Bearer ") else None
+        if who is None:
             self._fail()
             self._json(401, {"error": "missing or wrong token"}, extra={"WWW-Authenticate": "Bearer"})
             return None
-        return agent
+        return who
 
     def _owner_session(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
@@ -704,6 +1023,15 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return None
         return self.rfile.read(length)
+
+    @staticmethod
+    def _object(raw):
+        """The request body as a JSON object, or {} if it is not one."""
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def _login_page(self, code, error=""):
         note = '<p class="err">%s</p>' % error if error else ""
@@ -730,7 +1058,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/health":
             self._reply(200, b"ok\n", ctype="text/plain")
         elif url.path == "/mcp":
-            self._reply(405, b"", extra={"Allow": "POST"})
+            self._reply(405, b"", extra={"Allow": "POST, DELETE"})
         elif url.path == "/":
             if self._owner_session():
                 self._html(200, CHAT_PAGE)
@@ -757,28 +1085,112 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(404, b"")
 
     def do_DELETE(self):
-        self._reply(405, b"", extra={"Allow": "POST"})
+        """An MCP client ending its session."""
+        self.roster.refresh()
+        if urllib.parse.urlsplit(self.path).path != "/mcp":
+            self._reply(404, b"")
+            return
+        who = self._bearer()
+        if who is None:
+            return
+        sid = self.headers.get("Mcp-Session-Id")
+        if who[0] == "place" and sid:
+            self.hub.close_session(sid, who[1])
+        self._reply(204, b"")
+
+    def _join(self, raw):
+        """A machine swaps its single-use join code for a place token of its own."""
+        if self._locked():
+            self._json(429, {"error": "too many wrong codes; try again later"})
+            return
+        data = self._object(raw)
+        fixed = self.hub.redeem_invite(data.get("code", "")) if data.get("code") else None
+        if fixed is None:
+            self._fail()
+            self._json(401, {"error": "that code is wrong or has expired"})
+            return
+        base = place_label(fixed or data.get("place") or "machine")
+        taken, place, number = set(list_places()), base, 2
+        while place in taken:
+            place, number = "%s-%d" % (base[:13], number), number + 1
+        ensure_token(place)
+        self.roster.refresh()
+        self._json(200, {"place": place, "token": read_token(place), "project": self.roster.project})
 
     def _send_as_owner(self, raw):
+        data = self._object(raw)
+        to = data.get("to")
+        kind = "task" if data.get("kind") == "task" else "msg"
         try:
-            data = json.loads(raw.decode("utf-8"))
-            to = data.get("to")
-            kind = "task" if data.get("kind") == "task" else "msg"
-            if to == OWNER:
-                raise HubError("you cannot message yourself")
-            msg = self.hub.send(OWNER, to, clean_message(to, data.get("text"), OWNER, self.roster.names), kind)
-        except (ValueError, UnicodeDecodeError, AttributeError):
-            self._json(400, {"error": "bad request"})
-            return
+            msg = self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER), kind)
         except HubError as e:
             self._json(400, {"error": str(e)})
             return
         self._json(200, {"id": msg["id"]})
 
+    def _admin(self, raw):
+        data = self._object(raw)
+        op = data.get("op")
+        try:
+            if op == "rename":
+                self.hub.rename(data.get("name"), data.get("new"))
+            elif op == "remove":
+                self.hub.remove(data.get("name"))
+            elif op == "remove-place":
+                place = data.get("place")
+                if place not in list_places():
+                    raise HubError("no place called %s" % place)
+                token_path(place).unlink()
+                self.roster.refresh()
+                self.hub.remove_place(place)
+            else:
+                raise HubError("unknown operation")
+        except HubError as e:
+            self._json(400, {"error": str(e)})
+            return
+        self._json(200, {"ok": True})
+
+    def _mcp(self, raw, who):
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            self._json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+            return
+        items = payload if isinstance(payload, list) else [payload]
+        extra, sid = {}, None
+        if who[0] == "place":
+            place = who[1]
+            hello = next((p for p in items if isinstance(p, dict) and p.get("method") == "initialize"), None)
+            sid = self.headers.get("Mcp-Session-Id")
+            if hello is not None:
+                params = hello.get("params")
+                info = params.get("clientInfo") if isinstance(params, dict) else None
+                sid = self.hub.open_session(place, client_kind(info))
+                extra["Mcp-Session-Id"] = sid
+            elif sid:
+                if self.hub.session(sid, place) is None:
+                    self._json(404, {"jsonrpc": "2.0", "id": None,
+                                     "error": {"code": -32001, "message": "Session not found; initialize again"}})
+                    return
+            else:
+                sid = self.hub.fallback_session(place)
+            name = self.hub.agent_for(sid, create=False)
+            if name:
+                self.hub.touch(name)
+        if isinstance(payload, list):
+            out = [r for r in (handle_rpc(self.hub, sid, p) for p in payload) if r is not None]
+            out = out or None
+        else:
+            out = handle_rpc(self.hub, sid, payload)
+        if out is None:
+            self._reply(202, b"", extra=extra)
+        else:
+            self._json(200, out, extra=extra)
+
     def do_POST(self):
         self.roster.refresh()
         path = urllib.parse.urlsplit(self.path).path
-        if path not in ("/mcp", "/login", "/api/send", "/api/login-code", "/api/invite", "/api/join"):
+        if path not in POST_PATHS:
             self._reply(404, b"")
             return
         raw = self._body()
@@ -792,26 +1204,12 @@ class Handler(BaseHTTPRequestHandler):
             self._sign_in(form.get("code", [""])[0])
             return
         if path == "/api/join":
-            # An agent's machine swaps its single-use join code for that agent's token.
-            if self._locked():
-                self._json(429, {"error": "too many wrong codes; try again later"})
-                return
-            try:
-                code = json.loads(raw.decode("utf-8")).get("code", "")
-            except (ValueError, UnicodeDecodeError, AttributeError):
-                code = ""
-            agent = self.hub.redeem_invite(code) if code else None
-            token = read_token(agent) if agent else ""
-            if not token:
-                self._fail()
-                self._json(401, {"error": "that code is wrong or has expired"})
-                return
-            self._json(200, {"agent": agent, "token": token, "project": self.roster.project})
+            self._join(raw)
             return
         if path == "/api/send":
             # From the chat page (session cookie) or from `crewchat say` (owner token).
-            agent = self._bearer(quiet=True)
-            if agent is None:
+            who = self._bearer(quiet=True)
+            if who is None:
                 if self.headers.get("Authorization"):
                     return
                 if not self._owner_session():
@@ -820,45 +1218,39 @@ class Handler(BaseHTTPRequestHandler):
                 if not self._same_origin():
                     self._json(403, {"error": "wrong origin"})
                     return
-            elif agent != OWNER:
+            elif who[0] != "owner":
                 self._json(403, {"error": "only the owner can do this"})
                 return
             self._send_as_owner(raw)
             return
-        agent = self._bearer()
-        if agent is None:
+        who = self._bearer()
+        if who is None:
             return
-        if path in ("/api/login-code", "/api/invite"):
-            if agent != OWNER:
+        if path == "/api/hook":
+            if who[0] != "place":
+                self._json(403, {"error": "hooks use a place token"})
+                return
+            data = self._object(raw)
+            try:
+                ack = max(0, int(data.get("ack") or 0))
+                wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
+                self._json(200, self.hub.hook(who[1], data.get("key"), ack, wait))
+            except (HubError, TypeError, ValueError):
+                self._json(400, {"error": "bad request"})
+            return
+        if path in ("/api/login-code", "/api/invite", "/api/admin"):
+            if who[0] != "owner":
                 self._json(403, {"error": "only the owner token can do this"})
                 return
             if path == "/api/login-code":
                 self._json(200, {"code": self.hub.new_code(), "ttl": CODE_TTL})
-                return
-            try:
-                who = json.loads(raw.decode("utf-8")).get("agent")
-            except (ValueError, UnicodeDecodeError, AttributeError):
-                who = None
-            if who not in self.roster.workers:
-                self._json(400, {"error": "no such agent"})
-                return
-            self._json(200, {"code": self.hub.new_invite(who), "ttl": INVITE_TTL})
+            elif path == "/api/invite":
+                place = self._object(raw).get("place") or ""
+                self._json(200, {"code": self.hub.new_invite(place_label(place) if place else ""), "ttl": INVITE_TTL})
+            else:
+                self._admin(raw)
             return
-        self.hub.touch(agent)
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            self._json(400, {"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
-            return
-        if isinstance(payload, list):
-            out = [r for r in (handle_rpc(self.hub, agent, p) for p in payload) if r is not None]
-            out = out or None
-        else:
-            out = handle_rpc(self.hub, agent, payload)
-        if out is None:
-            self._reply(202, b"")
-        else:
-            self._json(200, out)
+        self._mcp(raw, who)
 
 
 class Server(ThreadingHTTPServer):
@@ -881,20 +1273,23 @@ def make_server(port):
 # --------------------------------------------------------------------------------------------
 # HTTP client helpers (commands and hooks)
 # --------------------------------------------------------------------------------------------
-def post_json(url, token, body, timeout=60):
-    headers = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+def post_json(url, token, body, timeout=60, headers=None, want_headers=False):
+    send = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     if token:
-        headers["Authorization"] = "Bearer %s" % token
-    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=headers)
+        send["Authorization"] = "Bearer %s" % token
+    send.update(headers or {})
+    req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=send)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        raw = resp.read().decode("utf-8")
+        data = json.loads(raw) if raw else None
+        return (data, resp.headers) if want_headers else data
 
 
-def rpc(url, token, method, params=None, rid=1):
+def rpc(url, token, method, params=None, rid=1, session=None):
     body = {"jsonrpc": "2.0", "id": rid, "method": method}
     if params is not None:
         body["params"] = params
-    return post_json(url, token, body)
+    return post_json(url, token, body, headers={"Mcp-Session-Id": session} if session else None)
 
 
 def local_url(config=None):
@@ -921,6 +1316,12 @@ def owner_call(path, body):
             "`crewchat service install`." % getattr(e, "reason", e))
 
 
+def owner_tool(name, **arguments):
+    out = owner_call("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": name, "arguments": arguments}})
+    return out["result"]["content"][0]["text"]
+
+
 def self_command():
     """How to run this same program again, for hooks and services: [python, script]."""
     return [Path(sys.executable).as_posix(), Path(__file__).resolve().as_posix()]
@@ -931,77 +1332,29 @@ def self_command():
 # --------------------------------------------------------------------------------------------
 def cmd_setup(args):
     root = home()
-    names = [n.strip() for n in (args.agents or "").split(",") if n.strip()]
-    existing = {}
-    if (root / "config.json").exists():
-        existing = load_config()
-    if not names and not existing.get("agents") and sys.stdin.isatty():
-        print("Name your agents, separated by commas. One name per agent session, for example:")
-        print("  claude-laptop, cursor-laptop, claude-desktop")
-        names = [n.strip() for n in input("Agents: ").split(",") if n.strip()]
-    try:
-        for name in names:
-            check_name(name)
-    except HubError as e:
-        die(str(e))
-    agents = list(existing.get("agents", []))
-    for name in names:
-        if name not in agents:
-            agents.append(name)
-    project = args.project or existing.get("project") or Path.cwd().name
+    existing = load_config() if (root / "config.json").exists() else {}
     config = {
-        "project": project,
-        "agents": agents,
+        "project": args.project or existing.get("project") or Path.cwd().name,
         "port": args.port or existing.get("port") or DEFAULT_PORT,
         "url": args.url or existing.get("url") or "",
+        "forget_hours": existing.get("forget_hours", FORGET_HOURS),
     }
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
         os.chmod(root / "tokens", 0o700)
     save_config(config)
-    for name in agents + [OWNER]:
-        ensure_token(name)
-    print("crewchat is set up in %s" % root)
-    print("  project: %s" % project)
-    print("  agents:  %s" % (", ".join(agents) or "(none yet: add with `crewchat agent add NAME`)"))
+    ensure_token(OWNER)
+    print("crewchat is set up in %s for %s." % (root, config["project"]))
     print()
     print("Next:")
-    print("  1. Start the server:   crewchat service install     (starts at login)")
-    print("                         or: crewchat serve           (runs in this terminal)")
-    print("  2. Open the chat:      crewchat ui")
-    print("  3. Connect each agent: crewchat invite NAME         (prints the command to run in")
-    print("                         that agent's project folder)")
+    print("  1. Start the server:  crewchat service install    (starts at login)")
+    print("                        or: crewchat serve          (runs in this terminal)")
+    print("  2. Open the chat:     crewchat ui")
+    print("  3. Connect a folder:  crewchat invite --local     (prints the command to run in a")
+    print("                        project folder; every agent session opened there then joins")
+    print("                        the chat by itself, under its own name)")
     print("  Other machines reach the chat through a private network; see `crewchat url --help`.")
-
-
-def cmd_agent(args):
-    config = load_config()
-    if args.action == "list":
-        for name in config["agents"]:
-            print(name)
-        return
-    try:
-        check_name(args.name or "")
-    except HubError as e:
-        die(str(e))
-    if args.action == "add":
-        if args.name in config["agents"]:
-            die("%s is already in the chat" % args.name)
-        config["agents"].append(args.name)
-        ensure_token(args.name)
-        save_config(config)
-        print("Added %s. Connect it with: crewchat invite %s" % (args.name, args.name))
-    else:
-        if args.name not in config["agents"]:
-            die("no agent called %s" % args.name)
-        config["agents"].remove(args.name)
-        save_config(config)
-        try:
-            token_path(args.name).unlink()
-        except OSError:
-            pass
-        print("Removed %s. Its token no longer works." % args.name)
 
 
 def cmd_serve(args):
@@ -1047,7 +1400,7 @@ def cmd_url(args):
         save_config(config)
         print("Other machines will be told to use %s" % config["url"])
         return
-    print("Address given to agents on other machines: %s" % (config["url"] or "(not set)"))
+    print("Address given to other machines: %s" % (config["url"] or "(not set)"))
     print("On this machine: %s" % local_url(config))
     guess = detect_url()
     if guess and guess != config["url"]:
@@ -1063,17 +1416,44 @@ def cmd_url(args):
 
 def cmd_invite(args):
     config = load_config()
-    if args.agent not in config["agents"]:
-        die("no agent called %s (see `crewchat agent list`)" % args.agent)
-    code = owner_call("/api/invite", {"agent": args.agent})["code"]
+    code = owner_call("/api/invite", {"place": args.place or ""})["code"]
     url = (args.url or (local_url(config) if args.local else config["url"]) or local_url(config)).rstrip("/")
-    print("Run this in %s's project folder within %d minutes (the code works once):" % (args.agent, INVITE_TTL // 60))
+    print("Run this in the project folder within %d minutes (the code works once):" % (INVITE_TTL // 60))
     print()
-    print("  crewchat join --url %s --code %s-%s --client %s" % (url, code[:4], code[4:], args.client))
+    print("  crewchat join --url %s --code %s-%s%s" % (
+        url, code[:4], code[4:], "" if args.client == "all" else " --client " + args.client))
     print()
+    print("Every Claude Code and Cursor session opened in that folder then joins the chat by itself.")
     if url.startswith("http://127.0.0.1"):
         print("That address only works on this machine. For another machine, set the shared address")
         print("first (`crewchat url`), or pass --url.")
+
+
+def cmd_agents(_args):
+    print(owner_tool("hub_agents"))
+
+
+def cmd_agent(args):
+    if args.action == "rename":
+        if not args.new:
+            die("usage: crewchat agent rename OLD NEW")
+        owner_call("/api/admin", {"op": "rename", "name": args.name, "new": args.new})
+        print("%s is now %s." % (args.name, args.new))
+    else:
+        owner_call("/api/admin", {"op": "remove", "name": args.name})
+        print("Removed %s. If its session is still running it will come back under a new name; "
+              "to shut a folder out, use `crewchat place remove`." % args.name)
+
+
+def cmd_places(_args):
+    load_config()
+    names = list_places()
+    print("\n".join(names) if names else "No folder has joined yet. Start with `crewchat invite`.")
+
+
+def cmd_place(args):
+    owner_call("/api/admin", {"op": "remove-place", "place": args.name})
+    print("Removed %s: its token no longer works and its agents have left." % args.name)
 
 
 def cmd_ui(args):
@@ -1103,6 +1483,7 @@ def cmd_status(_args):
         print("Server:  not running (start it with `crewchat serve` or `crewchat service install`)")
         return
     print("Server:  running")
+    print("Places:  %s" % (", ".join(list_places()) or "none joined yet"))
     print(out["result"]["content"][0]["text"])
 
 
@@ -1116,6 +1497,12 @@ HOOK_REASON = (
     "if you are best placed, answer questions. If nothing needs action from you, say so in one line "
     "and stop. Do not reply to another agent just to acknowledge."
 )
+HOOK_LINK = (
+    'crewchat: this session is not linked to the project chat yet. Call the hub_link tool once with '
+    'key "%s" so your chat messages can reach you. It tells you your name and who else is here. '
+    "Then carry on with what you were doing."
+)
+MAX_LINK_ASKS = 2  # times a hook insists on hub_link before leaving the agent alone
 
 
 def read_json(path):
@@ -1217,26 +1604,38 @@ def cmd_join(args):
     if not project.is_dir():
         die("%s is not a folder" % project)
     try:
-        answer = post_json(url + "/api/join", None, {"code": args.code}, timeout=30)
+        host = socket.gethostname()
+    except OSError:
+        host = "machine"
+    try:
+        answer = post_json(url + "/api/join", None, {"code": args.code, "place": args.place or host}, timeout=30)
     except urllib.error.HTTPError as e:
         die("that code is wrong, already used or expired; ask for a new `crewchat invite`" if e.code == 401
             else "the server refused (HTTP %d)" % e.code)
     except (urllib.error.URLError, OSError) as e:
         die("cannot reach %s (%s)" % (url, getattr(e, "reason", e)))
-    agent, token = answer["agent"], answer["token"]
+    place, token = answer["place"], answer["token"]
     if args.client == "generic":
-        print("You are %s on the crewchat for %s. Add this MCP server to your client:" % (agent, answer["project"]))
+        print("This folder joined the crewchat for %s as \"%s\". Add this MCP server to your client:"
+              % (answer["project"], place))
         print(json.dumps({"mcpServers": {SERVER_NAME: {
             "type": "http", "url": url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}}}}, indent=2))
-        print("Keep the token private. Hooks are only installed for --client claude and cursor.")
+        print("Keep the token private. Hooks are only installed for Claude Code and Cursor; tell other")
+        print("agents in their instructions to check hub_inbox.")
         return
-    written = (install_claude if args.client == "claude" else install_cursor)(project, url, token)
+    written = []
+    if args.client in ("all", "claude"):
+        written += install_claude(project, url, token)
+    if args.client in ("all", "cursor"):
+        written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
-    print("%s joined the crewchat for %s." % (agent, answer["project"]))
-    print("Wrote in %s: %s" % (project, ", ".join(written)))
+    print("%s joined the crewchat for %s as \"%s\"." % (project, answer["project"], place))
+    print("Wrote: %s" % ", ".join(written))
     if not ignored:
         print("These files hold a secret token or machine paths: do not commit them.")
-    print("Start a new %s session in that folder to load the chat." % ("Claude Code" if args.client == "claude" else "Cursor"))
+    print("Every new Claude Code or Cursor session in this folder now joins the chat under its own")
+    print("name (%s-%s, %s-%s-2, ...). Sessions that are already open need a restart." % (
+        "claude" if args.client != "cursor" else "cursor", place, "claude" if args.client != "cursor" else "cursor", place))
 
 
 def find_project(client):
@@ -1254,10 +1653,11 @@ def find_project(client):
 
 
 def client_config(project, client):
-    """(MCP url, token) from the project's connection file, or None."""
+    """(server address, place token) from the project's connection file, or None."""
     try:
         entry = json.loads((project / CLIENT_FILES[client]).read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
-        return entry["url"], entry["headers"]["Authorization"][len("Bearer "):]
+        url = entry["url"]
+        return (url[:-4] if url.endswith("/mcp") else url), entry["headers"]["Authorization"][len("Bearer "):]
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -1271,23 +1671,21 @@ def listen_seconds(project):
         return 0
 
 
-def hook_inbox(url, token, wait_total, ack):
-    """(unread messages as text, highest message number) without marking them read.
+def hook_check(base, token, key, wait_total, ack):
+    """Ask the server for this session's messages without marking them read.
 
-    `ack` first confirms the messages a previous hook call delivered. Waits up to wait_total
-    seconds for something to arrive; ('', 0) if nothing does.
+    Returns ("link", "", 0) if the session must call hub_link first, else ("ok", text, last id)
+    where text is '' when nothing arrived within wait_total seconds. `ack` first confirms the
+    messages a previous hook call delivered.
     """
     deadline = time.time() + wait_total
     while True:
         wait = int(max(0, min(MAX_WAIT, deadline - time.time())))
-        args = {"wait_seconds": wait, "peek": True, "ack": ack}
-        result = rpc(url, token, "tools/call", {"name": "hub_inbox", "arguments": args})["result"]
-        text = result["content"][0]["text"]
-        if not result.get("isError") and text != "No new messages.":
-            ids = [int(n) for n in re.findall(r"^\[#(\d+) ", text, flags=re.M)]
-            return text, max(ids or [0])
-        if result.get("isError") or time.time() >= deadline:
-            return "", 0
+        out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait}, timeout=MAX_WAIT + 30)
+        if out.get("link"):
+            return "link", "", 0
+        if out.get("text") or time.time() >= deadline:
+            return "ok", out.get("text", ""), int(out.get("last") or 0)
 
 
 def run_hook(client, event):
@@ -1295,31 +1693,44 @@ def run_hook(client, event):
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     project = find_project(client)
     config = client_config(project, client) if project else None
     if config is None:
         return  # this project is not connected to a crewchat
-    url, token = config
+    base, token = config
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
+    # The link key names this agent session to the server. The agent ties it to its chat identity
+    # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
+    key = state.get("key") or secrets.token_urlsafe(12)
     chain = int(state.get("chain", 0))
-    # Messages are handed over unread ("peek") and only confirmed here, on this session's NEXT hook
-    # call: that call proves the agent had a turn with them. A turn that is interrupted, or a
-    # session that dies, never confirms, so the messages are delivered again.
+    asks = int(state.get("asks", 0))
+    # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:
+    # that call proves the agent had a turn with them. A turn that is interrupted, or a session
+    # that dies, never confirms, so the messages are delivered again.
     pending = int(state.get("pending", 0))
 
-    def save(chain, pending):
+    def save(chain, pending, asks):
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({"chain": chain, "pending": pending}))
+        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks}))
 
     if event == "prompt":
-        # The user is back: hook-driven turns may chain again, and they see what arrived.
-        text, last = hook_inbox(url, token, 0, pending)
-        save(0, last)
+        # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
+        # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
+        # so one handed over just before an interrupted turn is shown again.
+        kind, text, last = hook_check(base, token, key, 0, 0)
+        if kind == "link":
+            save(0, pending, 1)
+            if client == "claude":
+                print(HOOK_LINK % key)
+            return
+        save(0, last, 0)
         if text and client == "claude":
             print("crewchat: new messages arrived since your last turn.\n\n" + text)
         return
@@ -1331,19 +1742,25 @@ def run_hook(client, event):
         chain = int(data.get("loop_count") or 0)
     if chain >= MAX_CHAIN:
         # Stop a runaway back-and-forth between agents: new messages wait for the user's prompt.
-        if pending:
-            hook_inbox(url, token, 0, pending)
-            save(chain, 0)
+        if pending and hook_check(base, token, key, 0, pending)[0] == "ok":
+            save(chain, 0, asks)
         return
-    text, last = hook_inbox(url, token, listen_seconds(project), pending)
-    if not text:
-        save(chain, 0)
+    kind, text, last = hook_check(base, token, key, listen_seconds(project), pending)
+    if kind == "link":
+        if asks >= MAX_LINK_ASKS:
+            return  # asked enough; the next user prompt asks again
+        save(chain + 1, pending, asks + 1)
+        text = HOOK_LINK % key
+    elif not text:
+        save(chain, 0, 0)
         return
-    save(chain + 1, last)
-    if client == "claude":
-        print(json.dumps({"decision": "block", "reason": HOOK_REASON % text}))
     else:
-        print(json.dumps({"followup_message": HOOK_REASON % text}))
+        save(chain + 1, last, 0)
+        text = HOOK_REASON % text
+    if client == "claude":
+        print(json.dumps({"decision": "block", "reason": text}))
+    else:
+        print(json.dumps({"followup_message": text}))
 
 
 def cmd_hook(args):
@@ -1472,8 +1889,14 @@ RULES = """\
 ## The crewchat: talking to each other
 
 This project's AI agents and the owner share a chat (crewchat). If your tool list has `hub_send`,
-`hub_inbox`, `hub_take`, `hub_agents`, `hub_status` and `hub_history`, you are connected.
+`hub_inbox`, `hub_take`, `hub_agents`, `hub_status`, `hub_history`, `hub_rename` and `hub_link`,
+you are connected.
 
+- **Know who is who.** `hub_agents` lists every agent with its name, tool, place and status; your
+  row is marked `(you)`. You are named automatically; if the owner gives you a name, take it with
+  `hub_rename`.
+- **If a hook asks you to call `hub_link` with a key, do it once.** It ties your session to your
+  name so your messages reach you.
 - **Check `hub_inbox`** when you start, before you take on a task, after you finish one, and
   before you go idle. Hooks also hand you new messages at the end of each turn.
 - **Send a message** (`hub_send`, to one agent, to `Owner` or to `all`) when someone needs to know
@@ -1554,7 +1977,8 @@ h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywher
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
 .dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
 .agent .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
-.agent .status { font-size: 13px; color: var(--muted); margin-top: 4px; overflow-wrap: anywhere; }
+.agent .where { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.agent .status { font-size: 13px; color: var(--ink); margin-top: 4px; overflow-wrap: anywhere; }
 .agent .unread { font-size: 12px; margin-top: 4px; color: var(--warn); }
 .none { font-size: 13px; color: var(--muted); }
 .hint { font-size: 12.5px; color: var(--muted); margin-top: 16px; }
@@ -1614,7 +2038,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   <p class="sub">Everything your agents say to each other, live.</p>
   <div id="agents"></div>
   <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it.</p>
-  <p class="hint">An agent reads messages when it checks in: when it starts work, at the end of each turn, and before and after a task. Grey means it is not working right now.</p>
+  <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent reads messages when it checks in: at the end of each turn, and before and after a task. Grey means it is not working right now.</p>
 </aside>
 <main>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
@@ -1662,7 +2086,7 @@ function ago(seen, now) {
 function renderAgents() {
   const box = $("agents");
   box.replaceChildren();
-  if (!state.agents.length) box.append(el("p", "none", "No agents yet. On the host, run: crewchat agent add NAME"));
+  if (!state.agents.length) box.append(el("p", "none", "No agents yet. On the host, run `crewchat invite`, then open an agent session in the joined folder."));
   for (const a of state.agents) {
     const age = a.seen ? state.now - a.seen : Infinity;
     const card = el("div", "agent");
@@ -1670,7 +2094,7 @@ function renderAgents() {
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.setAttribute("aria-hidden", "true");
     top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
-    card.append(top, el("div", "status", a.status || (a.seen ? "No status set" : "Not connected yet")));
+    card.append(top, el("div", "where", a.client + " on " + a.place), el("div", "status", a.status || "No status set"));
     if (a.unread) card.append(el("div", "unread", a.unread + " unread"));
     box.append(card);
   }
@@ -1700,6 +2124,7 @@ function receipt(m) {
 }
 
 function buildMessage(m) {
+  if (m.kind === "event") return el("p", "sys", m.text);
   if (m.kind === "take") {
     const line = el("p", "sys");
     line.append(named("b", "", m.from), document.createTextNode(" " + m.text.replace(/^I am taking/, "took")));
@@ -1751,7 +2176,7 @@ function addMessages(list, first) {
     state.after = m.id;
   }
   if (document.hidden && !first) {
-    state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner").length;
+    state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
     if (state.missed) document.title = "(" + state.missed + ") " + state.title;
   }
 }
@@ -1847,13 +2272,12 @@ loop();
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="crewchat", description="A group chat for your AI coding agents and you.",
-        epilog="Host: setup, serve, service, ui, invite, agent, url, say, status. "
-               "Agent's machine: join, listen. Docs: README.md")
+        epilog="Host: setup, serve, service, ui, invite, agents, agent, places, place, url, say, status. "
+               "Project folder: join, listen. Docs: README.md")
     parser.add_argument("--version", action="version", version="crewchat " + __version__)
     sub = parser.add_subparsers(dest="cmd", metavar="command")
 
     p = sub.add_parser("setup", help="set up the chat on this machine (the host)")
-    p.add_argument("--agents", help="comma-separated agent names, e.g. claude-laptop,cursor-laptop")
     p.add_argument("--project", help="name shown on the chat page (default: this folder's name)")
     p.add_argument("--port", type=int, help="local port (default %d)" % DEFAULT_PORT)
     p.add_argument("--url", help="address other machines use, e.g. https://host.tailnet.ts.net")
@@ -1872,18 +2296,30 @@ def build_parser():
     p.add_argument("--print", action="store_true", help="only show a sign-in code, for another device")
     p.set_defaults(fn=cmd_ui)
 
-    p = sub.add_parser("agent", help="add, remove or list agents")
-    p.add_argument("action", choices=["add", "remove", "list"])
-    p.add_argument("name", nargs="?")
+    p = sub.add_parser("invite", help="print the command that connects a project folder")
+    p.add_argument("--place", help="label for that folder, used in agent names (default: its machine's name)")
+    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all",
+                   help="all = Claude Code and Cursor (default), generic = print the MCP settings")
+    p.add_argument("--url", help="address that machine should use")
+    p.add_argument("--local", action="store_true", help="the folder is on this machine")
+    p.set_defaults(fn=cmd_invite)
+
+    p = sub.add_parser("agents", help="who is in the chat right now")
+    p.set_defaults(fn=cmd_agents)
+
+    p = sub.add_parser("agent", help="rename or remove one agent")
+    p.add_argument("action", choices=["rename", "remove"])
+    p.add_argument("name")
+    p.add_argument("new", nargs="?")
     p.set_defaults(fn=cmd_agent)
 
-    p = sub.add_parser("invite", help="print the command that connects one agent")
-    p.add_argument("agent")
-    p.add_argument("--client", choices=["claude", "cursor", "generic"], default="claude",
-                   help="claude = Claude Code, cursor = Cursor, generic = print the MCP settings")
-    p.add_argument("--url", help="address the agent's machine should use")
-    p.add_argument("--local", action="store_true", help="the agent runs on this machine")
-    p.set_defaults(fn=cmd_invite)
+    p = sub.add_parser("places", help="list the folders that have joined")
+    p.set_defaults(fn=cmd_places)
+
+    p = sub.add_parser("place", help="shut a joined folder out")
+    p.add_argument("action", choices=["remove"])
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_place)
 
     p = sub.add_parser("url", help="show or set the address other machines use",
                        description="The server only listens on this machine. To reach it from another "
@@ -1893,7 +2329,7 @@ def build_parser():
     p.set_defaults(fn=cmd_url)
 
     p = sub.add_parser("say", help="post a message as the owner from the terminal")
-    p.add_argument("--to", default="all")
+    p.add_argument("--to", default="all", help="an agent's name, or all (default)")
     p.add_argument("--task", action="store_true", help="post it as a task for the agents to settle")
     p.add_argument("text", nargs="+")
     p.set_defaults(fn=cmd_say)
@@ -1901,10 +2337,11 @@ def build_parser():
     p = sub.add_parser("status", help="is the server running, and who is connected")
     p.set_defaults(fn=cmd_status)
 
-    p = sub.add_parser("join", help="connect an agent in this project folder to a chat")
+    p = sub.add_parser("join", help="connect this project folder to a chat")
     p.add_argument("--url", required=True)
     p.add_argument("--code", required=True, help="single-use code from `crewchat invite`")
-    p.add_argument("--client", choices=["claude", "cursor", "generic"], default="claude")
+    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all")
+    p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
     p.add_argument("--project", help="project folder (default: the current folder)")
     p.set_defaults(fn=cmd_join)
 
@@ -1930,8 +2367,6 @@ def main(argv=None):
     if not getattr(args, "fn", None):
         parser.print_help()
         return
-    if args.cmd == "agent" and args.action != "list" and not args.name:
-        parser.error("agent %s needs a name" % args.action)
     args.fn(args)
 
 

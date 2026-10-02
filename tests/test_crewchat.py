@@ -4,6 +4,7 @@ import http.cookiejar
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,7 +24,7 @@ os.environ["CREWCHAT_HOME"] = str(Path(TMP) / "home")
 
 import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 
-AGENTS = ["claude-a", "cursor-a", "claude-b", "cursor-b"]
+crewchat.Handler.log_message = lambda *args: None  # keep the request log out of the test output
 
 
 def cli(*argv):
@@ -39,11 +40,39 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class Session:
+    """One agent session, as an MCP client sees the server: initialize, then tools with its id."""
+
+    def __init__(self, base, token, client="claude-code"):
+        self.mcp, self.token = base + "/mcp", token
+        body = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                           "clientInfo": {"name": client, "version": "1"}}}
+        answer, headers = crewchat.post_json(self.mcp, token, body, want_headers=True)
+        self.hello = answer["result"]
+        self.sid = headers["Mcp-Session-Id"]
+
+    def call(self, tool, **arguments):
+        return crewchat.rpc(self.mcp, self.token, "tools/call", {"name": tool, "arguments": arguments},
+                            session=self.sid)["result"]
+
+    def text(self, tool, **arguments):
+        return self.call(tool, **arguments)["content"][0]["text"]
+
+    @property
+    def me(self):
+        """This session's name, as hub_agents reports it (creates the agent if it has none yet)."""
+        line = next(l for l in self.text("hub_agents").splitlines() if " (you):" in l)
+        return line.split(" (you):")[0]
+
+
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cli("setup", "--agents", ",".join(AGENTS), "--project", "Demo")
+        shutil.rmtree(crewchat.home(), ignore_errors=True)
+        cli("setup", "--project", "Demo")
         cls.server = crewchat.make_server(0)
+        cls.hub = cls.server.RequestHandlerClass.hub
         port = cls.server.server_address[1]
         config = crewchat.load_config()
         config["port"] = port
@@ -52,36 +81,41 @@ class Base(unittest.TestCase):
         cls.mcp = cls.base + "/mcp"
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
-        cls.tok = {a: crewchat.read_token(a) for a in AGENTS + ["Owner"]}
+        cls.owner = crewchat.read_token("Owner")
+        cls.place, cls.token = cls.join_place("mac")
 
     @classmethod
     def tearDownClass(cls):
         cls.server.shutdown()
         cls.server.server_close()
-        for name in ("messages.jsonl", "state.json"):
-            with contextlib.suppress(OSError):
-                (crewchat.home() / name).unlink()
 
-    def call(self, agent, name, **arguments):
-        return crewchat.rpc(self.mcp, self.tok[agent], "tools/call", {"name": name, "arguments": arguments})["result"]
+    @classmethod
+    def join_place(cls, label):
+        code = crewchat.post_json(cls.base + "/api/invite", cls.owner, {})["code"]
+        answer = crewchat.post_json(cls.base + "/api/join", None, {"code": code, "place": label})
+        return answer["place"], answer["token"]
 
-    def text(self, agent, name, **arguments):
-        return self.call(agent, name, **arguments)["content"][0]["text"]
+    def agent(self, client="claude-code", token=None):
+        """A session that has used a tool, so it is in the roster. Returns (session, name)."""
+        session = Session(self.base, token or self.token, client)
+        return session, session.me
 
-    def drain(self):
-        for agent in AGENTS:
-            self.call(agent, "hub_inbox")
-
-    def raw(self, path, data=None, headers=None, opener=None):
-        req = urllib.request.Request(self.base + path, data=data, headers=headers or {})
+    def raw(self, path, data=None, headers=None, opener=None, method=None):
+        req = urllib.request.Request(self.base + path, data=data, headers=headers or {}, method=method)
         try:
             with (opener or urllib.request.build_opener(NoRedirect)).open(req, timeout=30) as resp:
                 return resp.status, resp.read(), resp.headers
         except urllib.error.HTTPError as e:
             return e.code, e.read(), e.headers
 
+    def say(self, to, text, kind="msg"):
+        return crewchat.post_json(self.base + "/api/send", self.owner, {"to": to, "text": text, "kind": kind})["id"]
+
+    def names(self):
+        return [row["agent"] for row in self.hub.rows()]
+
     def owner_browser(self):
-        code = crewchat.post_json(self.base + "/api/login-code", self.tok["Owner"], {})["code"]
+        code = crewchat.post_json(self.base + "/api/login-code", self.owner, {})["code"]
         jar = http.cookiejar.CookieJar()
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar), NoRedirect)
         status, _, headers = self.raw("/login?code=" + code, opener=opener)
@@ -95,137 +129,308 @@ class Protocol(Base):
         ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
         self.assertEqual(self.raw("/mcp", ping)[0], 401)
         self.assertEqual(self.raw("/mcp", ping, {"Authorization": "Bearer nope", "X-Forwarded-For": "9.9.9.1"})[0], 401)
-        self.assertEqual(self.raw("/mcp", ping, {"Authorization": "Bearer " + self.tok["claude-a"]})[0], 200)
+        self.assertEqual(self.raw("/mcp", ping, {"Authorization": "Bearer " + self.token})[0], 200)
         self.assertEqual(self.raw("/mcp")[0], 405)
 
-    def test_initialize_tells_the_agent_who_it_is(self):
-        result = crewchat.rpc(self.mcp, self.tok["cursor-b"], "initialize",
-                              {"protocolVersion": "2025-03-26", "capabilities": {}})["result"]
-        self.assertEqual(result["protocolVersion"], "2025-03-26")
-        self.assertEqual(result["capabilities"], {"tools": {}})
-        self.assertIn("You are cursor-b on the crewchat for Demo", result["instructions"])
-        self.assertIn("hub_take", result["instructions"])
-
-    def test_tools_list_names_the_roster(self):
-        tools = crewchat.rpc(self.mcp, self.tok["claude-a"], "tools/list")["result"]["tools"]
-        self.assertEqual([t["name"] for t in tools],
-                         ["hub_send", "hub_inbox", "hub_take", "hub_agents", "hub_status", "hub_history"])
-        self.assertEqual(tools[0]["inputSchema"]["properties"]["to"]["enum"], AGENTS + ["Owner", "all"])
+    def test_initialize_starts_a_session_and_explains_the_chat(self):
+        session = Session(self.base, self.token)
+        self.assertTrue(session.sid)
+        self.assertEqual(session.hello["capabilities"], {"tools": {}})
+        self.assertIn("crewchat for Demo", session.hello["instructions"])
+        self.assertIn("hub_link", session.hello["instructions"])
+        tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
+        self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
+                                                      "hub_status", "hub_history", "hub_rename", "hub_link"])
 
     def test_json_rpc_edges(self):
-        auth = {"Authorization": "Bearer " + self.tok["claude-a"]}
+        session = Session(self.base, self.token)
+        auth = {"Authorization": "Bearer " + self.token, "Mcp-Session-Id": session.sid}
         self.assertEqual(self.raw("/mcp", b'{"jsonrpc":"2.0","method":"notifications/initialized"}', auth)[0], 202)
         self.assertEqual(self.raw("/mcp", b"{bad", auth)[0], 400)
-        self.assertIn("error", crewchat.rpc(self.mcp, self.tok["claude-a"], "no/such"))
+        self.assertIn("error", crewchat.rpc(self.mcp, self.token, "no/such", session=session.sid))
         status, body, _ = self.raw("/mcp", b'[{"jsonrpc":"2.0","id":7,"method":"ping"},{"jsonrpc":"2.0","method":"n"}]', auth)
         self.assertEqual((status, json.loads(body)), (200, [{"jsonrpc": "2.0", "id": 7, "result": {}}]))
         self.assertEqual(self.raw("/mcp", b"x" * (300 * 1024), auth)[0], 413)
+
+    def test_unknown_session_is_told_to_start_again(self):
+        auth = {"Authorization": "Bearer " + self.token, "Mcp-Session-Id": "made-up"}
+        self.assertEqual(self.raw("/mcp", b'{"jsonrpc":"2.0","id":1,"method":"ping"}', auth)[0], 404)
+        other_place, other_token = self.join_place("elsewhere")
+        session = Session(self.base, self.token)
+        stolen = {"Authorization": "Bearer " + other_token, "Mcp-Session-Id": session.sid}
+        self.assertEqual(self.raw("/mcp", b'{"jsonrpc":"2.0","id":1,"method":"ping"}', stolen)[0], 404)
 
     def test_bad_tokens_lock_an_address_out(self):
         ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
         for i in range(crewchat.FAIL_LIMIT):
             self.raw("/mcp", ping, {"Authorization": "Bearer bad%d" % i, "X-Forwarded-For": "6.6.6.6"})
-        good = {"Authorization": "Bearer " + self.tok["claude-a"]}
+        good = {"Authorization": "Bearer " + self.token}
         self.assertEqual(self.raw("/mcp", ping, dict(good, **{"X-Forwarded-For": "6.6.6.6"}))[0], 429)
         self.assertEqual(self.raw("/mcp", ping, good)[0], 200)
 
 
+class Identity(Base):
+    """Agents are not configured anywhere: sessions name themselves as they arrive."""
+
+    def test_sessions_sharing_one_folder_get_their_own_names(self):
+        place, token = self.join_place("studio")
+        first, name1 = self.agent(token=token)
+        second, name2 = self.agent(token=token)
+        cursor, name3 = self.agent("Cursor", token=token)
+        self.assertEqual((name1, name2, name3), ("claude-studio", "claude-studio-2", "cursor-studio"))
+        listing = first.text("hub_agents")
+        self.assertIn("claude-studio (you): claude on studio; online", listing)
+        self.assertIn("claude-studio-2: claude on studio", listing)
+        self.assertIn("cursor-studio: cursor on studio", listing)
+        first.call("hub_send", to="claude-studio-2", text="hello neighbour")
+        self.assertIn("claude-studio -> you: hello neighbour", second.text("hub_inbox"))
+        self.assertEqual(cursor.text("hub_inbox"), "No new messages.")
+
+    def test_a_session_is_not_in_the_roster_until_it_uses_a_tool(self):
+        before = self.names()
+        session = Session(self.base, self.token)
+        crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)
+        self.assertEqual(self.names(), before)
+        name = session.me
+        self.assertEqual(self.names(), before + [name])
+        self.assertIn("* %s joined (claude on %s)" % (name, self.place), session.text("hub_history"))
+
+    def test_a_newcomer_does_not_inherit_old_messages_and_events_are_not_unread(self):
+        veteran, _ = self.agent()
+        veteran.call("hub_send", to="all", text="old news")
+        newcomer, _ = self.agent()
+        self.assertEqual(newcomer.text("hub_inbox"), "No new messages.")
+        self.assertEqual(veteran.text("hub_inbox"), "No new messages.")  # the join line is not a message
+        self.assertIn("old news", newcomer.text("hub_history"))
+
+    def test_rename(self):
+        session, old = self.agent()
+        other, other_name = self.agent()
+        self.assertIn("You are now backend.", session.text("hub_rename", name="backend"))
+        self.assertEqual(session.me, "backend")
+        self.assertNotIn(old, self.names())
+        self.assertIn("* %s is now backend" % old, other.text("hub_history"))
+        other.call("hub_send", to="backend", text="found you")
+        self.assertIn("found you", session.text("hub_inbox"))
+        self.assertTrue(other.call("hub_send", to=old, text="gone")["isError"])
+        for bad in ("backend", "BACKEND", "Owner", "all", "has space", "9lives", ""):
+            self.assertTrue(other.call("hub_rename", name=bad)["isError"], bad)
+        session.call("hub_rename", name=old)
+
+    def test_client_kinds_and_place_labels(self):
+        self.assertEqual(crewchat.client_kind({"name": "claude-code"}), "claude")
+        self.assertEqual(crewchat.client_kind({"name": "Cursor"}), "cursor")
+        self.assertEqual(crewchat.client_kind({"name": "My Fancy Tool 3000!"}), "my-fancy-too")
+        self.assertEqual(crewchat.client_kind(None), "agent")
+        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac-m")
+        self.assertEqual(crewchat.place_label("123"), "machine")
+
+    def test_a_client_without_session_ids_still_gets_one_identity(self):
+        place, token = self.join_place("plain")
+        call = lambda name, **a: crewchat.rpc(  # noqa: E731
+            self.mcp, token, "tools/call", {"name": name, "arguments": a})["result"]["content"][0]["text"]
+        self.assertIn("agent-plain (you)", call("hub_agents"))
+        self.assertIn("agent-plain (you)", call("hub_agents"))
+        self.assertEqual(self.names().count("agent-plain"), 1)
+
+    def test_owner_can_rename_and_remove(self):
+        session, name = self.agent()
+        self.assertIn(name, cli("agents"))
+        cli("agent", "rename", name, "renamed-by-owner")
+        self.assertEqual(session.me, "renamed-by-owner")
+        cli("agent", "remove", "renamed-by-owner")
+        self.assertNotIn("renamed-by-owner", self.names())
+        with self.assertRaises(SystemExit):
+            cli("agent", "remove", "nobody")
+
+    def test_silent_agents_are_forgotten(self):
+        session, name = self.agent()
+        with self.hub.lock:
+            self.hub.agents[name]["seen"] -= self.hub.roster.forget + 10
+        self.assertNotIn(name, self.names())
+        self.assertIn("* %s left (silent for 24 hours)" % name, self.agent()[0].text("hub_history"))
+
+    def test_removing_a_place_shuts_its_sessions_out(self):
+        place, token = self.join_place("temp")
+        session, name = self.agent(token=token)
+        self.assertIn(place, cli("places"))
+        cli("place", "remove", place)
+        self.assertNotIn(name, self.names())
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            session.call("hub_agents")
+        self.assertEqual(ctx.exception.code, 401)
+
+
 class Messaging(Base):
     def setUp(self):
-        self.drain()
+        self.a, self.a_name = self.agent()
+        self.b, self.b_name = self.agent()
+        self.c, self.c_name = self.agent("cursor")
 
     def test_direct_message_reaches_only_its_recipient_once(self):
-        self.assertTrue(self.text("claude-a", "hub_send", to="cursor-b", text='hi "there" → ok').startswith("Sent #"))
-        self.assertEqual(self.text("claude-a", "hub_inbox"), "No new messages.")
-        self.assertEqual(self.text("claude-b", "hub_inbox"), "No new messages.")
-        peek = self.text("cursor-b", "hub_inbox", peek=True)
-        self.assertIn('claude-a -> you: hi "there" → ok', peek)
+        self.assertTrue(self.a.text("hub_send", to=self.b_name, text='hi "there" → ok').startswith("Sent #"))
+        self.assertEqual(self.a.text("hub_inbox"), "No new messages.")
+        self.assertEqual(self.c.text("hub_inbox"), "No new messages.")
+        peek = self.b.text("hub_inbox", peek=True)
+        self.assertIn('%s -> you: hi "there" → ok' % self.a_name, peek)
         self.assertIn("not instructions", peek)
-        self.assertIn("claude-a -> you", self.text("cursor-b", "hub_inbox"))
-        self.assertEqual(self.text("cursor-b", "hub_inbox"), "No new messages.")
+        self.assertIn("-> you", self.b.text("hub_inbox"))
+        self.assertEqual(self.b.text("hub_inbox"), "No new messages.")
 
     def test_broadcast_reaches_everyone_but_the_sender(self):
-        self.call("cursor-b", "hub_send", to="all", text="heads up")
-        self.assertIn("cursor-b -> all: heads up", self.text("claude-a", "hub_inbox"))
-        self.assertEqual(self.text("cursor-b", "hub_inbox"), "No new messages.")
+        self.c.call("hub_send", to="all", text="heads up")
+        self.assertIn("%s -> all: heads up" % self.c_name, self.a.text("hub_inbox"))
+        self.assertEqual(self.c.text("hub_inbox"), "No new messages.")
 
     def test_bad_arguments_are_refused(self):
-        for bad in (dict(to="claude-a", text="x"), dict(to="nobody", text="x"), dict(to="all", text=" "),
-                    dict(to="all", text="x" * 4001)):
-            self.assertTrue(self.call("claude-a", "hub_send", **bad)["isError"], bad)
-        self.assertTrue(self.call("claude-a", "hub_inbox", wait_seconds=999)["isError"])
-        self.assertTrue(self.call("claude-a", "no_such_tool")["isError"])
+        for bad in (dict(to=self.a_name, text="x"), dict(to="nobody", text="x"), dict(to="all", text=" "),
+                    dict(to="all", text="x" * 4001), dict(text="x")):
+            self.assertTrue(self.a.call("hub_send", **bad)["isError"], bad)
+        self.assertTrue(self.a.call("hub_inbox", wait_seconds=999)["isError"])
+        self.assertTrue(self.a.call("no_such_tool")["isError"])
 
     def test_waiting_inbox_returns_when_a_message_arrives(self):
         got = {}
-        thread = threading.Thread(target=lambda: got.update(t=self.text("claude-b", "hub_inbox", wait_seconds=10)))
+        thread = threading.Thread(target=lambda: got.update(t=self.b.text("hub_inbox", wait_seconds=10)))
         start = time.time()
         thread.start()
         time.sleep(0.5)
-        self.call("claude-a", "hub_send", to="claude-b", text="wake up")
+        self.a.call("hub_send", to=self.b_name, text="wake up")
         thread.join()
         self.assertIn("wake up", got["t"])
         self.assertLess(time.time() - start, 4)
 
-    def test_ack_marks_read_and_peek_does_not(self):
-        self.call("claude-a", "hub_send", to="cursor-a", text="one")
-        first = self.text("cursor-a", "hub_inbox", peek=True)
-        number = int(first.split("[#")[1].split(" ")[0])
-        self.assertIn("one", self.text("cursor-a", "hub_inbox", peek=True))
-        self.assertEqual(self.text("cursor-a", "hub_inbox", peek=True, ack=number), "No new messages.")
+    def test_status_shows_in_the_roster(self):
+        self.c.call("hub_status", text="building  the\n thing")
+        self.assertIn("status: building the thing", self.a.text("hub_agents"))
+        self.assertNotIn("Owner", self.a.text("hub_agents"))
 
-    def test_status_and_agents(self):
-        self.call("cursor-a", "hub_status", text="building  the\n thing")
-        listing = self.text("claude-a", "hub_agents")
-        self.assertIn("status: building the thing", listing)
-        self.assertIn("claude-a (you)", listing)
-        self.assertNotIn("Owner", listing)
+    def test_agents_can_write_to_the_owner(self):
+        self.a.call("hub_send", to="Owner", text="a question")
+        self.assertIn("%s -> Owner: a question" % self.a_name, cli("say", "--to", self.a_name, "an answer") and
+                      self.b.text("hub_history"))
+        self.assertIn("Owner -> you: an answer", self.a.text("hub_inbox"))
 
 
 class Tasks(Base):
     def setUp(self):
-        self.drain()
-
-    def post(self, to, text, kind="task"):
-        return crewchat.post_json(self.base + "/api/send", self.tok["Owner"], {"to": to, "text": text, "kind": kind})["id"]
+        self.crew = [self.agent() for _ in range(4)]
 
     def test_exactly_one_agent_wins_a_race_for_a_task(self):
-        task = self.post("all", "Add a dark icon")
-        self.assertIn("Owner -> all: [TASK, open] Add a dark icon", self.text("claude-b", "hub_inbox"))
+        task = self.say("all", "Add a dark icon", "task")
+        self.assertIn("Owner -> all: [TASK, open] Add a dark icon", self.crew[0][0].text("hub_inbox"))
         results = {}
-        threads = [threading.Thread(target=lambda a=a: results.update({a: self.call(a, "hub_take", id=task)}))
-                   for a in AGENTS]
+        threads = [threading.Thread(target=lambda s=s, n=n: results.update({n: s.call("hub_take", id=task)}))
+                   for s, n in self.crew]
         [t.start() for t in threads]
         [t.join() for t in threads]
-        winners = [a for a, r in results.items() if not r["isError"]]
+        winners = [n for n, r in results.items() if not r["isError"]]
         self.assertEqual(len(winners), 1)
-        for agent, result in results.items():
-            if agent != winners[0]:
+        for name, result in results.items():
+            if name != winners[0]:
                 self.assertIn("already taken by " + winners[0], result["content"][0]["text"])
-        self.assertFalse(self.call(winners[0], "hub_take", id=task)["isError"])
-        other = next(a for a in AGENTS if a != winners[0])
-        self.assertIn("%s -> all: I am taking task #%d" % (winners[0], task), self.text(other, "hub_history"))
-        self.assertIn("[TASK, taken by %s]" % winners[0], self.text(other, "hub_history"))
+        history = self.crew[0][0].text("hub_history")
+        self.assertIn("%s -> all: I am taking task #%d" % (winners[0], task), history)
+        self.assertIn("[TASK, taken by %s]" % winners[0], history)
 
     def test_a_task_for_one_agent_is_only_that_agents(self):
-        task = self.post("cursor-a", "Only for you")
-        self.assertIn("was given to cursor-a", self.text("claude-a", "hub_take", id=task))
-        self.assertFalse(self.call("cursor-a", "hub_take", id=task)["isError"])
+        (a, a_name), (b, _) = self.crew[:2]
+        task = self.say(a_name, "Only for you", "task")
+        self.assertIn("was given to " + a_name, b.text("hub_take", id=task))
+        self.assertFalse(a.call("hub_take", id=task)["isError"])
 
     def test_only_tasks_can_be_taken(self):
-        message = self.post("all", "just a note", kind="msg")
-        self.assertTrue(self.call("claude-a", "hub_take", id=message)["isError"])
-        self.assertTrue(self.call("claude-a", "hub_take", id=999999)["isError"])
+        message = self.say("all", "just a note")
+        self.assertTrue(self.crew[0][0].call("hub_take", id=message)["isError"])
+        self.assertTrue(self.crew[0][0].call("hub_take", id=999999)["isError"])
 
     def test_agents_cannot_post_as_owner(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            crewchat.post_json(self.base + "/api/send", self.tok["claude-a"], {"to": "all", "text": "x"})
+            crewchat.post_json(self.base + "/api/send", self.token, {"to": "all", "text": "x"})
         self.assertEqual(ctx.exception.code, 403)
 
     def test_say_command(self):
-        self.assertIn("Posted task #", cli("say", "--task", "--to", "claude-a", "Check", "the", "build"))
-        self.assertIn("Owner -> you: [TASK, open] Check the build", self.text("claude-a", "hub_inbox"))
+        a, a_name = self.crew[0]
+        self.assertIn("Posted task #", cli("say", "--task", "--to", a_name, "Check", "the", "build"))
+        self.assertIn("Owner -> you: [TASK, open] Check the build", a.text("hub_inbox"))
         self.assertIn("Posted message #", cli("say", "plain note"))
+        with self.assertRaises(SystemExit):
+            cli("say", "--to", "nobody-here", "hello")
+
+
+class Linking(Base):
+    """Hooks reach an agent through a link key that the agent ties to itself with hub_link."""
+
+    def hook(self, key, token=None, **extra):
+        return crewchat.post_json(self.base + "/api/hook", token or self.token, dict({"key": key}, **extra))
+
+    def test_link_then_messages_arrive_through_the_hook(self):
+        session = Session(self.base, self.token)
+        self.assertEqual(self.hook("key-first-0001"), {"link": True})
+        note = session.text("hub_link", key="key-first-0001")
+        name = session.me
+        self.assertIn("Linked. You are %s." % name, note)
+        self.assertIn("%s (you)" % name, note)
+        self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0})
+        number = self.say(name, "through the hook")
+        answer = self.hook("key-first-0001")
+        self.assertIn("Owner -> you: through the hook", answer["text"])
+        self.assertEqual(answer["last"], number)
+        self.assertIn("through the hook", self.hook("key-first-0001")["text"])  # still unread
+        self.assertEqual(self.hook("key-first-0001", ack=number)["text"], "")
+
+    def test_a_resumed_conversation_gets_its_name_back(self):
+        first = Session(self.base, self.token)
+        first.call("hub_link", key="key-resume-0001")
+        name = first.me
+        before = self.names()
+        # The tool restarts: new MCP session, same conversation, so the hook has the same key.
+        again = Session(self.base, self.token)
+        self.assertIn("This session is %s again." % name, again.text("hub_link", key="key-resume-0001"))
+        self.assertEqual(again.me, name)
+        self.assertEqual(self.names(), before)
+
+    def test_a_reconnect_that_already_spoke_is_merged_back(self):
+        first = Session(self.base, self.token)
+        first.call("hub_link", key="key-merge-00001")
+        name = first.me
+        time.sleep(0.05)
+        again = Session(self.base, self.token)
+        stand_in = again.me  # used a tool before linking: it was given a name of its own
+        self.assertNotEqual(stand_in, name)
+        self.assertEqual(self.hook("key-merge-00001"), {"link": True})  # the hook notices and asks
+        again.call("hub_link", key="key-merge-00001")
+        self.assertEqual(again.me, name)
+        self.assertNotIn(stand_in, self.names())
+        self.assertIn("* %s is %s (session resumed)" % (stand_in, name), again.text("hub_history"))
+        self.assertIn("agent", self.hook("key-merge-00001"))
+
+    def test_a_new_neighbour_makes_the_hook_ask_only_once(self):
+        mine = Session(self.base, self.token)
+        mine.call("hub_link", key="key-neighbour-01")
+        name = mine.me
+        time.sleep(0.05)
+        neighbour = Session(self.base, self.token)
+        self.assertEqual(self.hook("key-neighbour-01"), {"link": True})
+        self.assertIn("agent", self.hook("key-neighbour-01"))  # asked once, then carries on
+        mine.call("hub_link", key="key-neighbour-01")  # the no-op re-link changes nothing
+        self.assertEqual(mine.me, name)
+        self.assertNotEqual(neighbour.me, name)
+
+    def test_keys_do_not_cross_places_and_bad_keys_are_refused(self):
+        session = Session(self.base, self.token)
+        session.call("hub_link", key="key-private-001")
+        other_place, other_token = self.join_place("other")
+        self.assertEqual(self.hook("key-private-001", token=other_token), {"link": True})
+        intruder = Session(self.base, other_token)
+        intruder.call("hub_link", key="key-private-001")
+        self.assertNotEqual(intruder.me, session.me)
+        self.assertTrue(session.call("hub_link", key="short")["isError"])
+        with self.assertRaises(urllib.error.HTTPError):
+            self.hook("no")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            crewchat.post_json(self.base + "/api/hook", self.owner, {"key": "key-private-001"})
+        self.assertEqual(ctx.exception.code, 403)
 
 
 class ChatPage(Base):
@@ -241,10 +446,12 @@ class ChatPage(Base):
         self.assertEqual(headers["Referrer-Policy"], "same-origin")
 
     def test_sign_in_codes(self):
-        agent = {"Authorization": "Bearer " + self.tok["claude-a"]}
-        self.assertEqual(self.raw("/api/login-code", b"{}", agent)[0], 403)
+        place = {"Authorization": "Bearer " + self.token}
+        self.assertEqual(self.raw("/api/login-code", b"{}", place)[0], 403)
+        self.assertEqual(self.raw("/api/invite", b"{}", place)[0], 403)
+        self.assertEqual(self.raw("/api/admin", b'{"op":"remove","name":"x"}', place)[0], 403)
         self.assertEqual(self.raw("/login?code=WRONGCOD", headers={"X-Forwarded-For": "7.7.7.1"})[0], 401)
-        code = crewchat.post_json(self.base + "/api/login-code", self.tok["Owner"], {})["code"]
+        code = crewchat.post_json(self.base + "/api/login-code", self.owner, {})["code"]
         typed = ("code=%s-%s" % (code[:4].lower(), code[4:])).encode()
         form = {"Content-Type": "application/x-www-form-urlencoded"}
         # Browsers send "Origin: null" when a page's referrer policy is no-referrer: must be refused.
@@ -256,6 +463,7 @@ class ChatPage(Base):
         self.assertEqual(self.raw("/login?code=" + code, headers={"X-Forwarded-For": "7.7.7.2"})[0], 401)
 
     def test_chat_page_and_api(self):
+        session, name = self.agent("cursor")
         opener, _ = self.owner_browser()
         status, body, headers = self.raw("/", opener=opener)
         self.assertEqual(status, 200)
@@ -265,19 +473,21 @@ class ChatPage(Base):
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)
         self.assertEqual(send({"to": "all", "text": "x"}, {"Origin": "https://evil.example"})[0], 403)
         self.assertEqual(send({"to": "all", "text": "hello agents"}, {"Origin": self.base})[0], 200)
-        for bad in ({"to": "Owner", "text": "x"}, {"to": "all", "text": " "}, {"to": "all"}):
+        for bad in ({"to": "Owner", "text": "x"}, {"to": "all", "text": " "}, {"to": "all"}, {"to": "ghost", "text": "x"}):
             self.assertEqual(send(bad)[0], 400, bad)
         data = json.loads(self.raw("/api/poll?after=0&v=-1&wait=0", opener=opener)[1])
         self.assertEqual(data["project"], "Demo")
-        self.assertEqual([a["agent"] for a in data["agents"]], AGENTS)
+        row = next(a for a in data["agents"] if a["agent"] == name)
+        self.assertEqual((row["client"], row["place"], row["online"]), ("cursor", self.place, True))
         self.assertEqual(data["messages"][-1]["text"], "hello agents")
+        self.assertTrue(any(m["kind"] == "event" and name + " joined" in m["text"] for m in data["messages"]))
         got = {}
         path = "/api/poll?after=%d&v=%d&wait=20" % (data["messages"][-1]["id"], data["version"])
         thread = threading.Thread(target=lambda: got.update(d=json.loads(self.raw(path, opener=opener)[1])))
         start = time.time()
         thread.start()
         time.sleep(0.5)
-        self.call("cursor-b", "hub_send", to="Owner", text="a question")
+        session.call("hub_send", to="Owner", text="a question")
         thread.join()
         self.assertLess(time.time() - start, 4)
         self.assertEqual(got["d"]["messages"][0]["text"], "a question")
@@ -292,23 +502,24 @@ class Joining(Base):
         subprocess.run(["git", "init", "-q", str(folder)], check=False)
         return folder
 
-    def invite(self, agent, client):
-        out = cli("invite", agent, "--client", client, "--local")
+    def invite(self, *extra):
+        out = cli("invite", "--local", *extra)
         line = next(l.strip() for l in out.splitlines() if l.strip().startswith("crewchat join"))
         return line.split()[1:]  # the join arguments
 
-    def test_claude_join_writes_connection_and_hooks(self):
+    def test_one_join_connects_claude_code_and_cursor(self):
         folder = self.project()
         (folder / ".claude").mkdir()
         (folder / ".claude" / "settings.local.json").write_text(json.dumps(
             {"permissions": {"allow": ["Bash(ls:*)"]},
              "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}))
-        args = self.invite("claude-a", "claude")
-        out = cli(*args, "--project", str(folder))
-        self.assertIn("claude-a joined the crewchat for Demo", out)
+        out = cli(*self.invite("--place", "Work Laptop"), "--project", str(folder))
+        self.assertIn('joined the crewchat for Demo as "work-laptop"', out)
+        token = crewchat.read_token("work-laptop")
         mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
-        self.assertEqual(mcp["url"], self.mcp)
-        self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + self.tok["claude-a"])
+        self.assertEqual((mcp["url"], mcp["headers"]["Authorization"]), (self.mcp, "Bearer " + token))
+        cursor = json.loads((folder / ".cursor" / "mcp.json").read_text())["mcpServers"]["crewchat"]
+        self.assertEqual(cursor["headers"]["Authorization"], "Bearer " + token)
         settings = json.loads((folder / ".claude" / "settings.local.json").read_text())
         self.assertEqual(settings["permissions"], {"allow": ["Bash(ls:*)"]})
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
@@ -316,54 +527,44 @@ class Joining(Base):
         self.assertEqual(stop[0], "echo mine")
         self.assertTrue(stop[1].endswith(" hook claude stop") and "crewchat.py" in stop[1])
         self.assertEqual(len(settings["hooks"]["UserPromptSubmit"]), 1)
-        exclude = (folder / ".git" / "info" / "exclude").read_text()
-        self.assertIn(".mcp.json", exclude)
+        hooks = json.loads((folder / ".cursor" / "hooks.json").read_text())
+        self.assertTrue(hooks["hooks"]["stop"][0]["command"].endswith(" hook cursor stop"))
+        self.assertIn(".mcp.json", (folder / ".git" / "info" / "exclude").read_text())
         self.assertNotIn("do not commit", out)
-        # Joining again replaces our hooks instead of stacking them.
-        cli(*self.invite("claude-a", "claude"), "--project", str(folder))
+        # Two sessions opened in that folder are two agents.
+        one, two = Session(self.base, token), Session(self.base, token, "cursor")
+        self.assertEqual((one.me, two.me), ("claude-work-laptop", "cursor-work-laptop"))
+        # Joining again replaces our hooks instead of stacking them, and gets its own place.
+        cli(*self.invite("--place", "Work Laptop"), "--project", str(folder))
         settings = json.loads((folder / ".claude" / "settings.local.json").read_text())
         self.assertEqual(len(settings["hooks"]["Stop"]), 2)
         self.assertEqual(settings["enabledMcpjsonServers"].count("crewchat"), 1)
+        self.assertIn("work-laptop-2", crewchat.list_places())
 
-    def test_cursor_join(self):
+    def test_join_for_one_client_only(self):
         folder = self.project()
-        cli(*self.invite("cursor-a", "cursor"), "--project", str(folder))
-        mcp = json.loads((folder / ".cursor" / "mcp.json").read_text())["mcpServers"]["crewchat"]
-        self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + self.tok["cursor-a"])
-        hooks = json.loads((folder / ".cursor" / "hooks.json").read_text())
-        self.assertEqual(hooks["version"], 1)
-        self.assertTrue(hooks["hooks"]["stop"][0]["command"].endswith(" hook cursor stop"))
+        cli(*self.invite("--client", "cursor"), "--project", str(folder))
+        self.assertTrue((folder / ".cursor" / "mcp.json").exists())
+        self.assertFalse((folder / ".mcp.json").exists())
+
+    def test_the_place_defaults_to_the_machine_name(self):
+        folder = self.project()
+        out = cli(*self.invite(), "--project", str(folder))
+        place = re.search(r'as "([^"]+)"', out).group(1)
+        self.assertRegex(place, r"^[a-z][a-z0-9-]{0,15}$")
 
     def test_generic_join_prints_settings(self):
-        out = cli(*self.invite("claude-b", "generic"))
+        out = cli(*self.invite("--client", "generic", "--place", "other-tool"))
         self.assertIn('"url": "%s"' % self.mcp, out)
-        self.assertIn(self.tok["claude-b"], out)
+        self.assertIn(crewchat.read_token("other-tool"), out)
 
     def test_a_join_code_works_once_and_wrong_codes_fail(self):
-        args = self.invite("cursor-b", "generic")
+        args = self.invite("--client", "generic")
         cli(*args)
         with self.assertRaises(SystemExit):
             cli(*args)
         with self.assertRaises(SystemExit):
             cli("join", "--url", self.base, "--code", "AAAA-AAAA", "--client", "generic")
-        with self.assertRaises(SystemExit):
-            cli("invite", "nobody")
-        agent = {"Authorization": "Bearer " + self.tok["claude-a"], "Content-Type": "application/json"}
-        self.assertEqual(self.raw("/api/invite", b'{"agent":"claude-a"}', agent)[0], 403)
-
-    def test_agents_can_be_added_and_removed_while_running(self):
-        cli("agent", "add", "late-joiner")
-        token = crewchat.read_token("late-joiner")
-        self.assertIn("late-joiner (you)", crewchat.rpc(
-            self.mcp, token, "tools/call", {"name": "hub_agents", "arguments": {}})["result"]["content"][0]["text"])
-        self.assertIn("late-joiner", cli("agent", "list"))
-        cli("agent", "remove", "late-joiner")
-        with self.assertRaises(urllib.error.HTTPError) as ctx:
-            crewchat.rpc(self.mcp, token, "ping")
-        self.assertEqual(ctx.exception.code, 401)
-        for bad in ("Owner", "all", "has space", "9lives", ""):
-            with self.assertRaises(SystemExit, msg=bad):
-                cli("agent", "add", bad)
 
 
 class Hooks(Base):
@@ -373,8 +574,8 @@ class Hooks(Base):
     def setUpClass(cls):
         super().setUpClass()
         cls.folder = Path(tempfile.mkdtemp(prefix="hooks-", dir=TMP))
-        crewchat.install_claude(cls.folder, cls.base, cls.tok["claude-a"])
-        crewchat.install_cursor(cls.folder, cls.base, cls.tok["cursor-a"])
+        crewchat.install_claude(cls.folder, cls.base, cls.token)
+        crewchat.install_cursor(cls.folder, cls.base, cls.token)
         cls.state = tempfile.mkdtemp(prefix="hookstate-", dir=TMP)
 
     def hook(self, client, event, payload, project=None, listen="0"):
@@ -386,63 +587,101 @@ class Hooks(Base):
         self.assertEqual(out.returncode, 0, out.stderr)
         return out.stdout
 
-    def unread(self, agent):
-        line = next(l for l in self.text("claude-b", "hub_agents").splitlines() if l.startswith(agent))
-        return int(line.split("unread ")[1].split(";")[0])
+    def linked(self, conversation, client="claude-code"):
+        """A session that has done what the first hook asks: called hub_link with its key."""
+        session = Session(self.base, self.token, client)
+        asked = self.hook("claude", "prompt", {"session_id": conversation})
+        key = re.search(r'key "([^"]+)"', asked).group(1)
+        session.call("hub_link", key=key)
+        return session, session.me
+
+    def unread(self, name):
+        return next(row["unread"] for row in self.hub.rows() if row["agent"] == name)
 
     def setUp(self):
-        self.drain()
         shutil.rmtree(self.state, ignore_errors=True)
         os.makedirs(self.state)
 
+    def test_the_first_hook_asks_the_agent_to_link(self):
+        session = Session(self.base, self.token)
+        asked = self.hook("claude", "prompt", {"session_id": "L"})
+        self.assertIn("Call the hub_link tool once with key", asked)
+        key = re.search(r'key "([^"]+)"', asked).group(1)
+        # If the agent ignores it, the stop hook insists, but only a couple of times.
+        for _ in range(crewchat.MAX_LINK_ASKS - 1):
+            self.assertIn(key, json.loads(self.hook("claude", "stop", {"session_id": "L"}))["reason"])
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "L"}), "")
+        session.call("hub_link", key=key)
+        self.say(session.me, "now it works")
+        self.assertIn("now it works", self.hook("claude", "stop", {"session_id": "L"}))
+
+    def test_two_sessions_in_one_folder_each_get_their_own_messages(self):
+        (one, name1), (two, name2) = self.linked("S1"), self.linked("S2")
+        self.assertNotEqual(name1, name2)
+        self.say(name1, "for the first")
+        self.say(name2, "for the second")
+        out1, out2 = (self.hook("claude", "stop", {"session_id": s}) for s in ("S1", "S2"))
+        self.assertIn("for the first", out1)
+        self.assertNotIn("for the second", out1)
+        self.assertIn("for the second", out2)
+        self.assertNotIn("for the first", out2)
+
     def test_an_interrupted_turn_gets_the_message_again(self):
-        cli("say", "--to", "claude-a", "m1")
+        session, name = self.linked("A")
+        self.say(name, "m1")
         blocked = json.loads(self.hook("claude", "stop", {"session_id": "A"}))
         self.assertEqual(blocked["decision"], "block")
         self.assertIn("Owner -> you: m1", blocked["reason"])
-        self.assertEqual(self.unread("claude-a"), 1)  # not confirmed yet
-        # Session A dies. A new session's prompt hook delivers it again.
-        again = self.hook("claude", "prompt", {"session_id": "B"})
-        self.assertIn("m1", again)
-        self.assertEqual(self.unread("claude-a"), 1)
-        # B's next hook call proves it had a turn: confirmed, nothing new.
-        self.assertEqual(self.hook("claude", "stop", {"session_id": "B"}), "")
-        self.assertEqual(self.unread("claude-a"), 0)
+        self.assertEqual(self.unread(name), 1)  # not confirmed yet
+        # The turn is interrupted. The next prompt delivers it again.
+        self.assertIn("m1", self.hook("claude", "prompt", {"session_id": "A"}))
+        self.assertEqual(self.unread(name), 1)
+        # The next hook call proves the agent had a turn: confirmed, nothing new.
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "A"}), "")
+        self.assertEqual(self.unread(name), 0)
 
     def test_no_duplicates_in_a_healthy_session(self):
-        cli("say", "--to", "claude-a", "m2")
+        session, name = self.linked("C")
+        self.say(name, "m2")
         self.assertIn("m2", self.hook("claude", "stop", {"session_id": "C"}))
         self.assertEqual(self.hook("claude", "stop", {"session_id": "C"}), "")
-        cli("say", "--to", "claude-a", "m3")
+        self.say(name, "m3")
         self.assertIn("m3", self.hook("claude", "prompt", {"session_id": "C"}))
-        cli("say", "--to", "claude-a", "m4")
+        self.say(name, "m4")
         out = self.hook("claude", "stop", {"session_id": "C"})
         self.assertIn("m4", out)
         self.assertNotIn("m3", out)
 
     def test_loop_guard_holds_messages_for_the_user(self):
+        session, name = self.linked("D")
         delivered = 0
         for i in range(crewchat.MAX_CHAIN + 2):
-            cli("say", "--to", "claude-a", "loop %d" % i)
+            self.say(name, "loop %d" % i)
             delivered += bool(self.hook("claude", "stop", {"session_id": "D"}))
         self.assertEqual(delivered, crewchat.MAX_CHAIN)
-        self.assertEqual(self.unread("claude-a"), 2)
-        shown = self.hook("claude", "prompt", {"session_id": "D"})
-        self.assertIn("loop %d" % (crewchat.MAX_CHAIN + 1), shown)
-        cli("say", "--to", "claude-a", "after the prompt")
+        self.assertEqual(self.unread(name), 2)
+        self.assertIn("loop %d" % (crewchat.MAX_CHAIN + 1), self.hook("claude", "prompt", {"session_id": "D"}))
+        self.say(name, "after the prompt")
         self.assertIn("after the prompt", self.hook("claude", "stop", {"session_id": "D"}))
 
-    def test_cursor_gets_a_followup_message(self):
-        cli("say", "--to", "cursor-a", "for cursor")
-        out = json.loads(self.hook("cursor", "stop", {"status": "completed", "loop_count": 0, "conversation_id": "c"}))
+    def test_cursor_is_asked_to_link_and_then_gets_followups(self):
+        session = Session(self.base, self.token, "cursor")
+        first = json.loads(self.hook("cursor", "stop", {"status": "completed", "loop_count": 0, "conversation_id": "c"}))
+        key = re.search(r'key "([^"]+)"', first["followup_message"]).group(1)
+        session.call("hub_link", key=key)
+        name = session.me
+        self.assertTrue(name.startswith("cursor-"))
+        self.say(name, "for cursor")
+        out = json.loads(self.hook("cursor", "stop", {"status": "completed", "loop_count": 1, "conversation_id": "c"}))
         self.assertIn("for cursor", out["followup_message"])
-        cli("say", "--to", "cursor-a", "later")
+        self.say(name, "later")
         self.assertEqual(self.hook("cursor", "stop", {"status": "aborted", "loop_count": 0, "conversation_id": "c"}), "")
         self.assertEqual(self.hook("cursor", "stop", {"status": "completed", "loop_count": crewchat.MAX_CHAIN,
                                                      "conversation_id": "c"}), "")
 
     def test_listening_wakes_when_a_message_arrives(self):
-        timer = threading.Timer(1.0, lambda: cli("say", "--to", "claude-a", "wake"))
+        session, name = self.linked("E")
+        timer = threading.Timer(1.0, lambda: self.say(name, "wake"))
         start = time.time()
         timer.start()
         out = self.hook("claude", "stop", {"session_id": "E"}, listen="20")
@@ -456,7 +695,7 @@ class Hooks(Base):
         dead = Path(tempfile.mkdtemp(prefix="dead-", dir=TMP))
         crewchat.install_claude(dead, "http://127.0.0.1:1", "x")
         self.assertEqual(self.hook("claude", "stop", {}, project=dead), "")
-        self.assertEqual(self.hook("claude", "stop", "not json at all"), "")
+        self.assertEqual(self.hook("claude", "prompt", "not an object"), self.hook("claude", "prompt", "not an object"))
 
     def test_listen_command(self):
         folder = Path(tempfile.mkdtemp(prefix="listen-", dir=TMP))
@@ -467,19 +706,21 @@ class Hooks(Base):
         self.assertFalse((folder / ".crewchat-listen").exists())
 
 
-class Persistence(unittest.TestCase):
-    def test_messages_read_state_and_task_owners_survive_a_restart(self):
-        roster = crewchat.Roster()
-        hub = crewchat.Hub(roster)
-        task = hub.send("Owner", "all", "persist me", "task")
-        hub.take(AGENTS[0], task["id"])
-        hub.inbox(AGENTS[1], 0, False)
-        hub.set_status(AGENTS[1], "busy")
-        again = crewchat.Hub(roster)
-        self.assertEqual(again.taken[str(task["id"])], AGENTS[0])
-        self.assertEqual(again.status[AGENTS[1]], "busy")
-        self.assertEqual(again._unread(AGENTS[1]), [])
-        self.assertEqual(again.send("Owner", "all", "next")["id"], hub.next_id)
+class Persistence(Base):
+    def test_everything_survives_a_restart(self):
+        session, name = self.agent()
+        session.call("hub_link", key="key-persist-001")
+        session.call("hub_status", text="busy")
+        task = self.say("all", "persist me", "task")
+        session.call("hub_take", id=task)
+        session.call("hub_inbox")
+        again = crewchat.Hub(crewchat.Roster())  # what a restarted server loads
+        self.assertEqual(again.agent_for(session.sid, create=False), name)
+        self.assertEqual(again.links["key-persist-001"], name)
+        self.assertEqual(again.taken[str(task)], name)
+        self.assertEqual(again.agents[name]["status"], "busy")
+        self.assertEqual(again._unread(name), [])
+        self.assertEqual(again.send("Owner", "all", "next")["id"], self.hub.next_id)
 
 
 class Service(unittest.TestCase):
