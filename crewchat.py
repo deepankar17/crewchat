@@ -162,12 +162,13 @@ def place_label(text):
     return slug(str(text).split(".")[0], 16, "machine")
 
 
-def load_config():
-    path = home() / "config.json"
+def load_config(root=None):
+    root = root or home()
+    path = root / "config.json"
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except OSError:
-        die("not set up here yet; run `crewchat setup` first (looked in %s)" % home())
+        die("not set up here yet; run `crewchat setup` first (looked in %s)" % root)
     except ValueError:
         die("%s is not valid JSON" % path)
     data.setdefault("project", "this project")
@@ -177,21 +178,21 @@ def load_config():
     return data
 
 
-def save_config(config):
-    path = home() / "config.json"
+def save_config(config, root=None):
+    path = (root or home()) / "config.json"
     tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, path)
 
 
-def token_path(name):
+def token_path(name, root=None):
     """Owner's token, or a place's token (a place is one joined folder on one machine)."""
-    return home() / "tokens" / ("%s.token" % (name if name == OWNER else "place-" + name))
+    return (root or home()) / "tokens" / ("%s.token" % (name if name == OWNER else "place-" + name))
 
 
-def ensure_token(name):
+def ensure_token(name, root=None):
     """Create the token if there is none. True if one was created."""
-    path = token_path(name)
+    path = token_path(name, root)
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -201,15 +202,15 @@ def ensure_token(name):
     return True
 
 
-def read_token(name):
+def read_token(name, root=None):
     try:
-        return token_path(name).read_text(encoding="utf-8").strip()
+        return token_path(name, root).read_text(encoding="utf-8").strip()
     except OSError:
         return ""
 
 
-def list_places():
-    folder = home() / "tokens"
+def list_places(root=None):
+    folder = (root or home()) / "tokens"
     try:
         return sorted(p.name[len("place-"):-len(".token")] for p in folder.glob("place-*.token"))
     except OSError:
@@ -219,7 +220,8 @@ def list_places():
 class Roster:
     """Project settings and the tokens that may connect, re-read when they change on disk."""
 
-    def __init__(self):
+    def __init__(self, root=None):
+        self.root = Path(root) if root else home()
         self._stamp = None
         self.project = ""
         self.forget = FORGET_HOURS * 3600
@@ -228,7 +230,7 @@ class Roster:
 
     def _mtimes(self):
         out = []
-        for path in (home() / "config.json", home() / "tokens"):
+        for path in (self.root / "config.json", self.root / "tokens"):
             try:
                 out.append(path.stat().st_mtime_ns)
             except OSError:
@@ -239,18 +241,19 @@ class Roster:
         stamp = self._mtimes()
         if stamp == self._stamp:
             return
-        config = load_config()
+        config = load_config(self.root)
+        self.config = config
         self.project = str(config["project"])
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
         except (TypeError, ValueError):
             self.forget = FORGET_HOURS * 3600
         self.tokens = {}
-        owner = read_token(OWNER)
+        owner = read_token(OWNER, self.root)
         if owner:
             self.tokens[sha(owner)] = ("owner", None)
-        for place in list_places():
-            token = read_token(place)
+        for place in list_places(self.root):
+            token = read_token(place, self.root)
             if token:
                 self.tokens[sha(token)] = ("place", place)
         self._stamp = stamp
@@ -285,7 +288,7 @@ class Hub:
 
     def __init__(self, roster):
         self.roster = roster
-        self.home = home()
+        self.home = roster.root
         self.lock = threading.Condition()
         self.messages = []  # {id, seq, ts, from, to, text, kind[, task, origin]}; kind: msg|task|take|event
         self.ids = {}  # message id -> seq, for the messages in memory
@@ -1271,12 +1274,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json(401, {"error": "that code is wrong or has expired"})
             return
         base = place_label(fixed or data.get("place") or "machine")
-        taken, place, number = set(list_places()), base, 2
+        root = self.roster.root
+        taken, place, number = set(list_places(root)), base, 2
         while place in taken:
             place, number = "%s-%d" % (base[:13], number), number + 1
-        ensure_token(place)
+        ensure_token(place, root)
         self.roster.refresh()
-        self._json(200, {"place": place, "token": read_token(place), "project": self.roster.project})
+        self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project})
 
     def _send_as_owner(self, raw):
         data = self._object(raw)
@@ -1299,9 +1303,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.hub.remove(data.get("name"))
             elif op == "remove-place":
                 place = data.get("place")
-                if place not in list_places():
+                if place not in list_places(self.roster.root):
                     raise HubError("no place called %s" % place)
-                token_path(place).unlink()
+                token_path(place, self.roster.root).unlink()
                 self.roster.refresh()
                 self.hub.remove_place(place)
             else:
@@ -1534,6 +1538,12 @@ def cmd_serve(args):
         die("cannot listen on %s:%d (%s). Is crewchat already running?" % (BIND, port, e))
     sys.stderr.write("%s crewchat %s for %s on http://%s:%d (MCP at /mcp, chat at /)\n"
                      % (now_iso(), __version__, config["project"], BIND, port))
+    if config.get("cloud"):
+        try:
+            import crewchat_cloud
+            crewchat_cloud.start(server.RequestHandlerClass.hub)
+        except Exception as e:  # the local chat keeps working without the cloud
+            sys.stderr.write("%s cloud sync is off: %s\n" % (now_iso(), e))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2535,6 +2545,14 @@ def build_parser():
     p = sub.add_parser("rules", help="print a section about the chat for your AGENTS.md / CLAUDE.md")
     p.set_defaults(fn=cmd_rules)
 
+    try:
+        import crewchat_cloud
+        crewchat_cloud.add_parser(sub)
+    except ImportError:  # crewchat.py copied on its own: no cloud sync
+        p = sub.add_parser("cloud", help="sync with other machines (needs crewchat_cloud.py next to crewchat.py)")
+        p.add_argument("rest", nargs="*")
+        p.set_defaults(fn=lambda args: die("cloud sync needs crewchat_cloud.py next to crewchat.py"))
+
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])
     p.add_argument("event", choices=["prompt", "stop"])
@@ -2543,6 +2561,9 @@ def build_parser():
 
 
 def main(argv=None):
+    # crewchat_cloud imports this file as `crewchat`; when it runs as a script, make that the same
+    # module rather than a second copy.
+    sys.modules.setdefault("crewchat", sys.modules[__name__])
     parser = build_parser()
     args = parser.parse_args(argv)
     if not getattr(args, "fn", None):
