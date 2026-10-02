@@ -160,6 +160,14 @@ class Protocol(Base):
         stolen = {"Authorization": "Bearer " + other_token, "Mcp-Session-Id": session.sid}
         self.assertEqual(self.raw("/mcp", b'{"jsonrpc":"2.0","id":1,"method":"ping"}', stolen)[0], 404)
 
+    def test_a_probe_before_initialize_creates_nothing(self):
+        """Claude Code sends server/discover first, without a session id."""
+        place, token = self.join_place("probe")
+        before = len(self.hub.sessions)
+        self.assertIn("error", crewchat.rpc(self.mcp, token, "server/discover"))
+        self.assertIn("tools", crewchat.rpc(self.mcp, token, "tools/list")["result"])
+        self.assertEqual(len(self.hub.sessions), before)
+
     def test_bad_tokens_lock_an_address_out(self):
         ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
         for i in range(crewchat.FAIL_LIMIT):

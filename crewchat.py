@@ -827,19 +827,19 @@ def int_arg(args, key, default, low, high):
     return value
 
 
-def call_tool(hub, sid, name, args):
-    """Run one tool for a session. sid None means the owner (the `crewchat` command line)."""
+def call_tool(hub, sid, name, args, owner=False):
+    """Run one tool for a session, or for the owner (the `crewchat` command line)."""
     if not isinstance(args, dict):
         raise HubError("arguments must be an object")
     if name not in [t["name"] for t in TOOLS]:
         raise HubError("unknown tool: %s" % name)
     if name == "hub_link":
-        if sid is None:
+        if owner:
             raise HubError("the owner has no session to link")
         me, note = hub.link(sid, args.get("key"))
         hub.touch(me, active=True)
         return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
-    me = OWNER if sid is None else hub.agent_for(sid)
+    me = OWNER if owner else hub.agent_for(sid)
     hub.touch(me, active=True)
     if name == "hub_send":
         to = args.get("to")
@@ -851,7 +851,7 @@ def call_tool(hub, sid, name, args):
             return "No new messages."
         return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in unread)
     if name == "hub_take":
-        if sid is None:
+        if owner:
             raise HubError("the owner posts tasks; agents take them")
         mid = int_arg(args, "id", None, 1, 10 ** 9)
         hub.take(me, mid)
@@ -863,7 +863,7 @@ def call_tool(hub, sid, name, args):
         if not rows:
             return "No messages yet."
         return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in rows)
-    if sid is None:
+    if owner:
         raise HubError("only agents have a status and a name")
     if name == "hub_status":
         text = args.get("text")
@@ -876,7 +876,7 @@ def call_tool(hub, sid, name, args):
     return "You are now %s. Everyone has been told." % new
 
 
-def handle_rpc(hub, sid, req):
+def handle_rpc(hub, sid, req, owner=False):
     """One JSON-RPC message in, a response dict out (None for notifications)."""
     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
         return {"jsonrpc": "2.0", "id": None, "error": {"code": -32600, "message": "Invalid Request"}}
@@ -912,7 +912,7 @@ def handle_rpc(hub, sid, req):
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
             return err(-32602, "Invalid params")
         try:
-            text = call_tool(hub, sid, params["name"], params.get("arguments") or {})
+            text = call_tool(hub, sid, params["name"], params.get("arguments") or {}, owner)
             return ok({"content": [{"type": "text", "text": text}], "isError": False})
         except HubError as e:
             return ok({"content": [{"type": "text", "text": "Error: %s" % e}], "isError": True})
@@ -1158,6 +1158,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         items = payload if isinstance(payload, list) else [payload]
         extra, sid = {}, None
+        methods = ",".join(str(p.get("method", "response")) for p in items if isinstance(p, dict))
+        given = self.headers.get("Mcp-Session-Id")
+        sys.stderr.write("%s %s mcp %s (%s, session %s)\n" % (
+            now_iso(), self._client(), methods, who[1] or "owner", "sent" if given else "not sent"))
         if who[0] == "place":
             place = who[1]
             hello = next((p for p in items if isinstance(p, dict) and p.get("method") == "initialize"), None)
@@ -1172,16 +1176,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(404, {"jsonrpc": "2.0", "id": None,
                                      "error": {"code": -32001, "message": "Session not found; initialize again"}})
                     return
-            else:
+            elif any(isinstance(p, dict) and p.get("method") == "tools/call" for p in items):
+                # A client that keeps no session id: all its sessions in this place share one
+                # identity. (Requests sent before initialize, such as a discovery probe, get none.)
                 sid = self.hub.fallback_session(place)
-            name = self.hub.agent_for(sid, create=False)
+            name = self.hub.agent_for(sid, create=False) if sid else None
             if name:
                 self.hub.touch(name)
+        owner = who[0] == "owner"
         if isinstance(payload, list):
-            out = [r for r in (handle_rpc(self.hub, sid, p) for p in payload) if r is not None]
+            out = [r for r in (handle_rpc(self.hub, sid, p, owner) for p in payload) if r is not None]
             out = out or None
         else:
-            out = handle_rpc(self.hub, sid, payload)
+            out = handle_rpc(self.hub, sid, payload, owner)
         if out is None:
             self._reply(202, b"", extra=extra)
         else:
