@@ -48,7 +48,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -73,6 +73,8 @@ MAX_CHAIN = 6  # hook-driven turns in a row before an agent waits for its user a
 MAX_LISTEN = 55 * 60
 ONLINE_SECS = 900  # an agent heard from this recently counts as online
 FORGET_HOURS = 24  # an agent silent this long drops off the roster
+REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offline (cloud sync)
+REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 SERVICE_LABEL = "io.crewchat.hub"
 KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
 
@@ -271,22 +273,35 @@ class Hub:
     Two ids lead to an agent. The MCP session id (issued at `initialize`) identifies the session
     when it calls tools. The link key identifies it when its hooks ask for messages; the agent
     ties the two together once per session by calling hub_link.
+
+    Every message has two numbers. `seq` is this server's own running order, used for read
+    positions. `id` is the name everyone uses ("12" on a single machine; "A12" with cloud sync,
+    where A is this machine's tag), and is the same on every machine.
+
+    With cloud sync (crewchat_cloud.py), `self.sync` is set: messages written here are published,
+    messages from other machines arrive through ingest(), agents on other machines appear in the
+    roster through set_remote(), and taking a task is settled across machines by sync.claim_task().
     """
 
     def __init__(self, roster):
         self.roster = roster
         self.home = home()
         self.lock = threading.Condition()
-        self.messages = []  # {id, ts, from, to, text, kind}; kind: msg | task | take | event
+        self.messages = []  # {id, seq, ts, from, to, text, kind[, task, origin]}; kind: msg|task|take|event
+        self.ids = {}  # message id -> seq, for the messages in memory
         self.agents = {}  # name -> {place, client, created, seen, active, cursor, status, checked}
         self.sessions = {}  # MCP session id -> {agent (None until first tool call), place, client, created}
         self.links = {}  # hook link key -> agent name
-        self.taken = {}  # task message id (str) -> agent
+        self.taken = {}  # task message id -> agent
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
         self.invites = {}  # join code -> (place label or "", expiry) (memory only)
-        self.next_id = 1
+        self.remote = {}  # device id -> {"device": name, "agents": [rows], "updated": time} (cloud sync)
+        self.sync = None  # set by crewchat_cloud when cloud sync is on
+        self.prefix = ""  # this machine's tag in message ids when cloud sync is on
+        self.device = ""  # this machine's device name when cloud sync is on
+        self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self._load()
 
@@ -299,11 +314,17 @@ class Hub:
                     msg = json.loads(line)
                 except ValueError:
                     continue
+                if not isinstance(msg, dict) or "id" not in msg:
+                    continue
+                if "seq" not in msg:  # written by 0.2: the id was the running number
+                    msg["seq"] = int(msg["id"])
+                msg["id"] = str(msg["id"])
                 msg.setdefault("kind", "msg")
                 self.messages.append(msg)
             self.messages = self.messages[-KEEP_MESSAGES:]
             if self.messages:
-                self.next_id = self.messages[-1]["id"] + 1
+                self.next_seq = self.messages[-1]["seq"] + 1
+            self.ids = {m["id"]: m["seq"] for m in self.messages}
         try:
             data = json.loads((self.home / "state.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -342,27 +363,81 @@ class Hub:
     def _changed(self):
         self.version += 1
         self.lock.notify_all()
+        if self.sync is not None:
+            self.sync.state_changed()
 
-    def _append(self, sender, to, text, kind):
-        msg = {"id": self.next_id, "ts": time.time(), "from": sender, "to": to, "text": text, "kind": kind}
-        self.next_id += 1
+    def _store(self, msg):
+        """Add a message to memory and to messages.jsonl. Caller holds the lock."""
         self.messages.append(msg)
-        del self.messages[:-KEEP_MESSAGES]
+        self.ids[msg["id"]] = msg["seq"]
+        if len(self.messages) > KEEP_MESSAGES:
+            for old in self.messages[:-KEEP_MESSAGES]:
+                self.ids.pop(old["id"], None)
+            del self.messages[:-KEEP_MESSAGES]
         with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+
+    def _append(self, sender, to, text, kind, task=None):
+        """A message written on this machine: stored, and published when cloud sync is on."""
+        seq = self.next_seq
+        self.next_seq += 1
+        msg = {"id": "%s%d" % (self.prefix, seq), "seq": seq, "ts": time.time(),
+               "from": sender, "to": to, "text": text, "kind": kind}
+        if task:
+            msg["task"] = task
+        if self.sync is not None:
+            msg["origin"] = self.sync.device_id
+        self._store(msg)
+        if self.sync is not None:
+            self.sync.publish(msg)
         return msg
+
+    def ingest(self, msg):
+        """A message from another machine (cloud sync). Returns False if it was already here."""
+        with self.lock:
+            mid = str(msg.get("id", ""))
+            if not mid or mid in self.ids:
+                return False
+            seq = self.next_seq
+            self.next_seq += 1
+            kept = {"id": mid, "seq": seq, "ts": float(msg.get("ts") or time.time()),
+                    "from": str(msg.get("from", "")), "to": str(msg.get("to", "all")),
+                    "text": str(msg.get("text", "")), "kind": str(msg.get("kind", "msg")),
+                    "origin": str(msg.get("origin", ""))}
+            if msg.get("task"):
+                kept["task"] = str(msg["task"])
+            self._store(kept)
+            if kept["kind"] == "take" and kept.get("task") and kept["task"] not in self.taken:
+                self.taken[kept["task"]] = kept["from"]
+                self._save()
+            self._changed()
+            return True
 
     def _event(self, text):
         """A line in the chat that is shown to everyone but never counts as unread."""
         self._append(SERVER_NAME, "all", text, "event")
 
+    def seq_of(self, mid):
+        """This server's running number for a message id, or 0 if it is not here."""
+        return self.ids.get(str(mid), 0)
+
+    def id_at(self, seq):
+        """The id of the newest message at or before a running number, or ""."""
+        for msg in reversed(self.messages):
+            if msg["seq"] <= seq:
+                return msg["id"]
+        return ""
+
     # The roster ------------------------------------------------------------------------------
+    def _remote_names(self):
+        return [row["agent"] for dev in self.remote.values() for row in dev["agents"]]
+
     @property
     def names(self):
-        return list(self.agents) + [OWNER]
+        return list(self.agents) + [n for n in self._remote_names() if n not in self.agents] + [OWNER]
 
     def _free_name(self, base):
-        taken = {n.lower() for n in self.agents}
+        taken = {n.lower() for n in list(self.agents) + self._remote_names()}
         if base.lower() not in taken:
             return base
         number = 2
@@ -375,7 +450,7 @@ class Hub:
         name = self._free_name("%s-%s" % (client, place))
         self.agents[name] = {
             "place": place, "client": client, "created": now, "seen": now, "active": now,
-            "cursor": self.next_id - 1,  # a newcomer does not inherit the backlog as unread
+            "cursor": self.next_seq - 1,  # a newcomer does not inherit the backlog as unread
             "status": "", "checked": now,
         }
         self._event("%s joined (%s on %s)" % (name, client, place))
@@ -477,14 +552,23 @@ class Hub:
             self._changed()
             return mine, "Linked. You are %s." % mine
 
+    def _remote_device_of(self, name):
+        for dev in self.remote.values():
+            if any(row["agent"] == name for row in dev["agents"]):
+                return dev["device"]
+        return None
+
     def rename(self, name, new):
         check_name(new)
         with self.lock:
             if name not in self.agents:
+                elsewhere = self._remote_device_of(name)
+                if elsewhere:
+                    raise HubError("%s runs on %s; rename it there" % (name, elsewhere))
                 raise HubError("no agent called %s" % name)
             if new == name:
                 return
-            if new.lower() in {n.lower() for n in self.agents if n != name}:
+            if new.lower() in {n.lower() for n in list(self.agents) + self._remote_names() if n != name}:
                 raise HubError("the name %s is taken" % new)
             self.agents = {(new if n == name else n): a for n, a in self.agents.items()}
             for row in self.sessions.values():
@@ -499,6 +583,9 @@ class Hub:
     def remove(self, name):
         with self.lock:
             if name not in self.agents:
+                elsewhere = self._remote_device_of(name)
+                if elsewhere:
+                    raise HubError("%s runs on %s; remove it there" % (name, elsewhere))
                 raise HubError("no agent called %s" % name)
             self._forget(name, "was removed by the owner")
             self._save()
@@ -512,14 +599,55 @@ class Hub:
             self._save()
             self._changed()
 
+    def set_remote(self, device_id, device, agents, updated):
+        """The roster another machine published (cloud sync)."""
+        with self.lock:
+            rows = []
+            for row in agents if isinstance(agents, list) else []:
+                if isinstance(row, dict) and NAME_RE.match(str(row.get("agent", ""))):
+                    rows.append({k: row.get(k) for k in
+                                 ("agent", "client", "place", "seen", "status", "read_id", "unread")})
+            self.remote[device_id] = {"device": str(device), "agents": rows, "updated": float(updated or 0)}
+            self.version += 1
+            self.lock.notify_all()
+
+    def drop_remote(self, device_id):
+        with self.lock:
+            if self.remote.pop(device_id, None) is not None:
+                self.version += 1
+                self.lock.notify_all()
+
+    def local_state(self):
+        """This machine's roster as other machines need it (cloud sync)."""
+        with self.lock:
+            return [
+                {"agent": n, "client": a["client"], "place": a["place"], "seen": round(a["seen"]),
+                 "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n))}
+                for n, a in self.agents.items()
+            ]
+
     def _rows(self):
         now = time.time()
-        return [
+        rows = [
             {"agent": n, "client": a["client"], "place": a["place"], "seen": a["seen"],
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
-             "unread": len(self._unread(n))}
+             "unread": len(self._unread(n)), "device": self.device, "remote": False}
             for n, a in self.agents.items()
         ]
+        for dev in self.remote.values():
+            fresh = now - dev["updated"] < REMOTE_STALE_SECS
+            for row in dev["agents"]:
+                if row["agent"] in self.agents:
+                    continue
+                seen = float(row.get("seen") or 0)
+                rows.append({
+                    "agent": row["agent"], "client": str(row.get("client") or "agent"),
+                    "place": str(row.get("place") or ""), "seen": seen,
+                    "online": fresh and now - seen < ONLINE_SECS + REMOTE_SEEN_SLACK,
+                    "status": str(row.get("status") or ""), "cursor": self.seq_of(row.get("read_id") or ""),
+                    "unread": int(row.get("unread") or 0), "device": dev["device"], "remote": True,
+                })
+        return rows
 
     def rows(self):
         with self.lock:
@@ -542,7 +670,7 @@ class Hub:
         cur = self._cursor(name)
         return [
             m for m in self.messages
-            if m["id"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
+            if m["seq"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
         ]
 
     def send(self, sender, to, text, kind="msg"):
@@ -553,23 +681,41 @@ class Hub:
             self._changed()
             return msg
 
+    def _record_take(self, agent, mid, task):
+        """Caller holds the lock."""
+        self.taken[mid] = agent
+        self._save()
+        summary = " ".join(task["text"].split())
+        self._append(agent, "all", "I am taking task #%s: %s" % (mid, summary[:120]), "take", task=mid)
+        self._changed()
+
     def take(self, agent, mid):
+        mid = clean_id(mid)
         with self.lock:
             task = next((m for m in self.messages if m["id"] == mid), None)
             if task is None or task["kind"] != "task":
-                raise HubError("#%d is not a task" % mid)
+                raise HubError("#%s is not a task" % mid)
             if task["to"] not in ("all", agent):
-                raise HubError("task #%d was given to %s" % (mid, task["to"]))
-            holder = self.taken.get(str(mid))
+                raise HubError("task #%s was given to %s" % (mid, task["to"]))
+            holder = self.taken.get(mid)
             if holder == agent:
                 return task
             if holder is not None:
-                raise HubError("task #%d is already taken by %s" % (mid, holder))
-            self.taken[str(mid)] = agent
-            self._save()
-            summary = " ".join(task["text"].split())
-            self._append(agent, "all", "I am taking task #%d: %s" % (mid, summary[:120]), "take")
-            self._changed()
+                raise HubError("task #%s is already taken by %s" % (mid, holder))
+            if self.sync is None:
+                self._record_take(agent, mid, task)
+                return task
+        # Several machines: Firestore decides who was first. Network, so outside the lock.
+        holder = self.sync.claim_task(mid, agent)
+        with self.lock:
+            if self.taken.get(mid) == agent:
+                return task
+            if holder != agent:
+                self.taken[mid] = holder
+                self._save()
+                self._changed()
+                raise HubError("task #%s is already taken by %s" % (mid, holder))
+            self._record_take(agent, mid, task)
             return task
 
     def inbox(self, name, wait_seconds, peek, ack=0):
@@ -579,7 +725,7 @@ class Hub:
                 return []
             if ack > self._cursor(name):
                 # The caller confirms it has handled everything up to this message.
-                self._set_cursor(name, min(ack, self.next_id - 1))
+                self._set_cursor(name, min(ack, self.next_seq - 1))
                 self._save()
                 self._changed()
             unread = self._unread(name)
@@ -589,10 +735,10 @@ class Hub:
                     return []
                 unread = self._unread(name)
             if unread and not peek:
-                self._set_cursor(name, unread[-1]["id"])
+                self._set_cursor(name, unread[-1]["seq"])
                 self._save()
                 self._changed()
-            return [dict(m, taken=self.taken.get(str(m["id"]))) for m in unread]
+            return [dict(m, taken=self.taken.get(m["id"])) for m in unread]
 
     def set_status(self, name, text):
         with self.lock:
@@ -602,7 +748,7 @@ class Hub:
 
     def history(self, limit):
         with self.lock:
-            return [dict(m, taken=self.taken.get(str(m["id"]))) for m in self.messages[-limit:]]
+            return [dict(m, taken=self.taken.get(m["id"])) for m in self.messages[-limit:]]
 
     def poll(self, after, version, wait_seconds):
         """Chat page long-poll: returns when something changed since `version`, or on timeout."""
@@ -614,7 +760,8 @@ class Hub:
                 "version": self.version,
                 "now": time.time(),
                 "project": self.roster.project,
-                "messages": [m for m in self.messages if m["id"] > after][-500:],
+                "device": self.device,
+                "messages": [m for m in self.messages if m["seq"] > after][-500:],
                 "taken": dict(self.taken),
                 "agents": self._rows(),
             }
@@ -641,7 +788,7 @@ class Hub:
             agent["seen"] = time.time()
         unread = self.inbox(name, wait_seconds, True, ack)
         text = TRUST_NOTE + "\n\n" + "\n".join(fmt(m, name) for m in unread) if unread else ""
-        return {"agent": name, "text": text, "last": unread[-1]["id"] if unread else 0,
+        return {"agent": name, "text": text, "last": unread[-1]["seq"] if unread else 0,
                 "owner": any(m["from"] == OWNER for m in unread)}
 
     # Single-use codes ----------------------------------------------------------------------
@@ -693,8 +840,16 @@ class Hub:
             return place if place is not None and expiry > time.time() else None
 
 
+def clean_id(value):
+    """A message id as agents may write it: 12, "12", "#A12"."""
+    text = str(value if value is not None else "").strip().lstrip("#")
+    if not re.match(r"^[A-Za-z]{0,3}[0-9]{1,9}$", text):
+        raise HubError("a message number looks like 12 or A12")
+    return text
+
+
 def fmt(msg, viewer=None):
-    stamp = "[#%d %s]" % (msg["id"], now_iso(msg["ts"]))
+    stamp = "[#%s %s]" % (msg["id"], now_iso(msg["ts"]))
     if msg["kind"] == "event":
         return "%s * %s" % (stamp, msg["text"])
     to = "you" if msg["to"] == viewer else msg["to"]
@@ -723,6 +878,8 @@ def roster_text(rows, me=None):
         lines.append("%s%s: %s on %s; %s; unread %d; status: %s" % (
             row["agent"], " (you)" if row["agent"] == me else "", row["client"], row["place"], seen,
             row["unread"], row["status"] or "-"))
+        if row.get("remote"):
+            lines[-1] += " (on another machine: %s)" % row.get("device")
     return "\n".join(lines)
 
 
@@ -763,10 +920,11 @@ TOOLS = [
     {
         "name": "hub_take",
         "description": "Take a [TASK] the owner posted. Only the first agent to call this gets it, "
-        "and everyone is told. Call it only after reading the other agents' bids.",
+        "on every machine, and everyone is told. Call it only after reading the other agents' bids.",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "integer", "minimum": 1, "description": "The task's message number."}},
+            "properties": {"id": {"type": ["string", "integer"],
+                                  "description": "The task's message number, as shown: 12 or A12."}},
             "required": ["id"],
             "additionalProperties": False,
         },
@@ -847,7 +1005,7 @@ def call_tool(hub, sid, name, args, owner=False):
     if name == "hub_send":
         to = args.get("to")
         msg = hub.send(me, to, clean_text(to, args.get("text"), me))
-        return "Sent #%d to %s." % (msg["id"], to)
+        return "Sent #%s to %s." % (msg["id"], to)
     if name == "hub_inbox":
         unread = hub.inbox(me, int_arg(args, "wait_seconds", 0, 0, MAX_WAIT), bool(args.get("peek", False)))
         if not unread:
@@ -856,9 +1014,9 @@ def call_tool(hub, sid, name, args, owner=False):
     if name == "hub_take":
         if owner:
             raise HubError("the owner posts tasks; agents take them")
-        mid = int_arg(args, "id", None, 1, 10 ** 9)
+        mid = clean_id(args.get("id"))
         hub.take(me, mid)
-        return "Task #%d is yours and everyone has been told. Set hub_status and start." % mid
+        return "Task #%s is yours and everyone has been told. Set hub_status and start." % mid
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -1479,7 +1637,7 @@ def cmd_ui(args):
 def cmd_say(args):
     out = owner_call("/api/send", {"to": args.to, "text": " ".join(args.text),
                                    "kind": "task" if args.task else "msg"})
-    print("Posted %s #%d to %s." % ("task" if args.task else "message", out["id"], args.to))
+    print("Posted %s #%s to %s." % ("task" if args.task else "message", out["id"], args.to))
 
 
 def cmd_status(_args):
@@ -2140,7 +2298,7 @@ function named(tag, cls, name) {
 
 function receipt(m) {
   const targets = m.to === "all" ? state.agents.map((a) => a.agent) : [m.to];
-  const read = state.agents.filter((a) => targets.includes(a.agent) && a.cursor >= m.id).map((a) => a.agent);
+  const read = state.agents.filter((a) => targets.includes(a.agent) && a.cursor >= m.seq).map((a) => a.agent);
   if (!read.length) return "Not read yet";
   if (read.length === targets.length) return targets.length > 1 ? "Read by everyone" : "Read";
   return "Read by " + read.join(", ");
@@ -2196,7 +2354,7 @@ function addMessages(list, first) {
     if (day !== state.lastDay) { log.append(el("p", "day", day)); state.lastDay = day; }
     log.append(buildMessage(m));
     state.messages.push(m);
-    state.after = m.id;
+    state.after = m.seq;
   }
   if (document.hidden && !first) {
     state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;

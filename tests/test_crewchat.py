@@ -338,7 +338,7 @@ class Tasks(Base):
             if name != winners[0]:
                 self.assertIn("already taken by " + winners[0], result["content"][0]["text"])
         history = self.crew[0][0].text("hub_history")
-        self.assertIn("%s -> all: I am taking task #%d" % (winners[0], task), history)
+        self.assertIn("%s -> all: I am taking task #%s" % (winners[0], task), history)
         self.assertIn("[TASK, taken by %s]" % winners[0], history)
 
     def test_a_task_for_one_agent_is_only_that_agents(self):
@@ -346,6 +346,11 @@ class Tasks(Base):
         task = self.say(a_name, "Only for you", "task")
         self.assertIn("was given to " + a_name, b.text("hub_take", id=task))
         self.assertFalse(a.call("hub_take", id=task)["isError"])
+
+    def test_a_task_number_can_be_written_with_a_hash(self):
+        (a, a_name) = self.crew[0]
+        task = self.say("all", "hash me", "task")
+        self.assertIn("Task #%s is yours" % task, a.text("hub_take", id="#%s" % task))
 
     def test_only_tasks_can_be_taken(self):
         message = self.say("all", "just a note")
@@ -383,9 +388,9 @@ class Linking(Base):
         number = self.say(name, "through the hook")
         answer = self.hook("key-first-0001")
         self.assertIn("Owner -> you: through the hook", answer["text"])
-        self.assertEqual(answer["last"], number)
+        self.assertEqual(answer["last"], self.hub.seq_of(number))
         self.assertIn("through the hook", self.hook("key-first-0001")["text"])  # still unread
-        self.assertEqual(self.hook("key-first-0001", ack=number)["text"], "")
+        self.assertEqual(self.hook("key-first-0001", ack=self.hub.seq_of(number))["text"], "")
 
     def test_a_resumed_conversation_gets_its_name_back(self):
         first = Session(self.base, self.token)
@@ -490,7 +495,7 @@ class ChatPage(Base):
         self.assertEqual(data["messages"][-1]["text"], "hello agents")
         self.assertTrue(any(m["kind"] == "event" and name + " joined" in m["text"] for m in data["messages"]))
         got = {}
-        path = "/api/poll?after=%d&v=%d&wait=20" % (data["messages"][-1]["id"], data["version"])
+        path = "/api/poll?after=%d&v=%d&wait=20" % (data["messages"][-1]["seq"], data["version"])
         thread = threading.Thread(target=lambda: got.update(d=json.loads(self.raw(path, opener=opener)[1])))
         start = time.time()
         thread.start()
@@ -756,7 +761,34 @@ class Persistence(Base):
         self.assertEqual(again.taken[str(task)], name)
         self.assertEqual(again.agents[name]["status"], "busy")
         self.assertEqual(again._unread(name), [])
-        self.assertEqual(again.send("Owner", "all", "next")["id"], self.hub.next_id)
+        self.assertEqual(again.send("Owner", "all", "next")["seq"], self.hub.next_seq)
+
+
+class Upgrade(unittest.TestCase):
+    def test_history_written_by_0_2_still_loads(self):
+        old_home = os.environ["CREWCHAT_HOME"]
+        folder = Path(tempfile.mkdtemp(prefix="upgrade-", dir=TMP))
+        os.environ["CREWCHAT_HOME"] = str(folder)
+        try:
+            (folder / "config.json").write_text(json.dumps({"project": "Old"}))
+            (folder / "messages.jsonl").write_text("\n".join(json.dumps(m) for m in (
+                {"id": 1, "ts": 1.0, "from": "Owner", "to": "all", "text": "old one", "kind": "msg"},
+                {"id": 2, "ts": 2.0, "from": "Owner", "to": "all", "text": "old task", "kind": "task"},
+            )) + "\n")
+            (folder / "state.json").write_text(json.dumps({"taken": {"2": "someone"}}))
+            hub = crewchat.Hub(crewchat.Roster())
+            self.assertEqual([(m["id"], m["seq"]) for m in hub.messages], [("1", 1), ("2", 2)])
+            self.assertEqual(hub.taken, {"2": "someone"})
+            self.assertEqual(hub.send("Owner", "all", "new")["id"], "3")
+        finally:
+            os.environ["CREWCHAT_HOME"] = old_home
+
+    def test_message_numbers_as_agents_write_them(self):
+        for written, clean in ((12, "12"), ("12", "12"), ("#12", "12"), ("A12", "A12"), (" #AB3 ", "AB3")):
+            self.assertEqual(crewchat.clean_id(written), clean)
+        for bad in ("", None, "12a", "ABCD1", "1.5", "#", "x" * 20):
+            with self.assertRaises(crewchat.HubError, msg=bad):
+                crewchat.clean_id(bad)
 
 
 class Service(unittest.TestCase):
