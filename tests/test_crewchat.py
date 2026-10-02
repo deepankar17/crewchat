@@ -792,6 +792,15 @@ class Upgrade(unittest.TestCase):
 
 
 class Service(unittest.TestCase):
+    def test_windows_task_runs_this_program_without_a_window(self):
+        task = crewchat.windows_task()
+        self.assertEqual(task[:4], ["schtasks", "/Create", "/TN", "crewchat"])
+        self.assertIn("ONLOGON", task)
+        action = task[-1]
+        self.assertIn("crewchat.py", action)
+        self.assertIn("serve --log", action)
+        self.assertIn("CREWCHAT_HOME", action)  # the tests run with a custom home
+
     def test_service_files_run_this_program(self):
         plist = crewchat.launchd_plist(keep_awake=True)
         self.assertIn("<string>/usr/bin/caffeinate</string>", plist)

@@ -1530,6 +1530,10 @@ def cmd_setup(args):
 
 
 def cmd_serve(args):
+    if getattr(args, "log", None) or sys.stderr is None:
+        path = Path(getattr(args, "log", None) or (home() / "hub.log"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = open(path, "a", encoding="utf-8", buffering=1)
     config = load_config()
     port = args.port or int(config["port"])
     try:
@@ -1662,6 +1666,14 @@ def cmd_status(_args):
         return
     print("Server:  running")
     print("Places:  %s" % (", ".join(list_places()) or "none joined yet"))
+    if config.get("cloud"):
+        try:
+            import crewchat_cloud
+            device = crewchat_cloud.Device()
+            print("Cloud:   on, this machine is \"%s\" (%s)" % (device.name, "approved" if device.ready else
+                                                                  "waiting for approval: see `crewchat cloud status`"))
+        except Exception as e:
+            print("Cloud:   set up, but cannot be read here (%s)" % e)
     print(out["result"]["content"][0]["text"])
 
 
@@ -2022,13 +2034,49 @@ def run(command):
     return subprocess.run(command, capture_output=True, text=True)
 
 
+def windows_task():
+    """The Task Scheduler command that starts crewchat at log on, with no console window."""
+    python, script = self_command()
+    windowless = str(Path(python).with_name("pythonw.exe")) if Path(python).name.lower() == "python.exe" else python
+    action = '"%s" "%s" serve --log "%s"' % (windowless, script, home() / "hub.log")
+    if os.environ.get("CREWCHAT_HOME"):
+        action = 'cmd /c "set CREWCHAT_HOME=%s&& %s"' % (home(), action)
+    return ["schtasks", "/Create", "/TN", "crewchat", "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", action]
+
+
+def cmd_service_windows(args):
+    if args.action == "install":
+        out = run(windows_task())
+        if out.returncode != 0:
+            die("could not add the Task Scheduler task: %s" % (out.stderr.strip() or out.stdout.strip()))
+        run(["schtasks", "/Run", "/TN", "crewchat"])
+        print("crewchat now starts when you log on to Windows. Log: %s" % (home() / "hub.log"))
+        print("Windows may still sleep when idle: agents on other machines lose the chat while it sleeps.")
+    elif args.action == "uninstall":
+        run(["schtasks", "/End", "/TN", "crewchat"])
+        run(["schtasks", "/Delete", "/TN", "crewchat", "/F"])
+        print("crewchat no longer starts at log on.")
+    elif args.action == "restart":
+        run(["schtasks", "/End", "/TN", "crewchat"])
+        out = run(["schtasks", "/Run", "/TN", "crewchat"])
+        if out.returncode != 0:
+            die("could not restart: is the service installed? (%s)" % (out.stderr.strip() or out.stdout.strip()))
+        print("Restarted.")
+    else:
+        installed = run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0
+        print("Service: %s" % ("installed" if installed else "not installed"))
+        cmd_status(args)
+
+
 def cmd_service(args):
     load_config()
     mac = sys.platform == "darwin"
     linux = sys.platform.startswith("linux")
+    if os.name == "nt":
+        cmd_service_windows(args)
+        return
     if not (mac or linux):
-        die("starting at login is automated on macOS and Linux only. On Windows, add a Task "
-            "Scheduler task that runs at log on:\n  \"%s\" \"%s\" serve" % tuple(self_command()))
+        die("starting at login is automated on macOS, Linux and Windows only. Run `crewchat serve` instead.")
     uid = os.getuid()
     plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
     unit = Path.home() / ".config" / "systemd" / "user" / "crewchat.service"
@@ -2285,7 +2333,8 @@ function renderAgents() {
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.setAttribute("aria-hidden", "true");
     top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
-    card.append(top, el("div", "where", a.client + " on " + a.place), el("div", "status", a.status || "No status set"));
+    card.append(top, el("div", "where", a.client + " on " + a.place + (a.remote ? " · machine " + a.device : "")),
+                el("div", "status", a.status || "No status set"));
     if (a.unread) card.append(el("div", "unread", a.unread + " unread"));
     box.append(card);
   }
@@ -2476,9 +2525,10 @@ def build_parser():
 
     p = sub.add_parser("serve", help="run the chat server in this terminal")
     p.add_argument("--port", type=int)
+    p.add_argument("--log", help="write the server log to this file instead of the terminal")
     p.set_defaults(fn=cmd_serve)
 
-    p = sub.add_parser("service", help="start the server at login (macOS, Linux)")
+    p = sub.add_parser("service", help="start the server at login (macOS, Linux, Windows)")
     p.add_argument("action", choices=["install", "uninstall", "restart", "status"])
     p.add_argument("--keep-awake", action="store_true", help="macOS: keep the machine from sleeping while it runs")
     p.set_defaults(fn=cmd_service)

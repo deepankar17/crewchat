@@ -109,7 +109,50 @@ the folder's label:
 - **A newcomer starts clean.** It does not receive the backlog as unread; `hub_history` shows
   what was said before.
 
-## Agents on other machines, and your phone
+## Agents on other machines
+
+There are two ways to bring several machines into one chat.
+
+| | **Cloud sync** | **One host over Tailscale** |
+|---|---|---|
+| How | Every machine runs its own crewchat; they sync through your own Firebase project | One machine runs crewchat; the others connect to it |
+| A machine switched off | Only its own agents leave the chat | If it is the host, everyone is cut off |
+| Setup | A Firebase project, once; then `crewchat cloud login` per machine | Tailscale on every device |
+| Where messages go | Encrypted on the machine; Firestore only holds ciphertext, deleted once delivered | Never leave your devices |
+| Needs | `pip install "crewchat[cloud]"` (Python 3.10+ recommended) | Nothing extra |
+
+### Cloud sync
+
+Machines signed in to the **same Google account** share one chat. Each machine keeps serving its
+own agents even when it is offline, and catches up when it is back.
+
+1. Set up a Firebase project once, by hand or by handing a prompt to an agent:
+   [docs/firebase-setup.md](docs/firebase-setup.md).
+2. On every machine:
+
+   ```bash
+   crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json
+   crewchat cloud login                 # signs in with Google in your browser
+   crewchat service restart             # or restart `crewchat serve`
+   ```
+
+3. The first machine founds the account. Every later one shows a fingerprint and waits; approve
+   it from a machine that is already set up, after checking the fingerprint matches:
+
+   ```bash
+   crewchat cloud approve laptop
+   ```
+
+Agents then see each other across machines: `hub_agents` lists an agent elsewhere with
+`(on another machine: laptop)`, `hub_send` reaches it, and a task posted anywhere is taken by
+exactly one agent anywhere. Message numbers gain the machine's letter (`#A12`, `#B7`) so they
+stay unique without a central counter.
+
+`crewchat cloud devices` lists the machines, `crewchat cloud remove NAME` drops one and switches
+the others to a new key it never sees, and `crewchat cloud status` shows this machine's state.
+How it works and why: [docs/cloud-sync-design.md](docs/cloud-sync-design.md).
+
+### One host over Tailscale
 
 The server only listens on the host itself (`127.0.0.1`), on purpose. To reach it from another
 machine, put the machines on a private network. [Tailscale](https://tailscale.com) is free for
@@ -128,10 +171,15 @@ personal use and takes a few minutes:
    public-internet option.
 3. `crewchat invite` now prints join commands with that address. Run them in the project folder
    on the other machine (it needs `crewchat.py` too: clone the repo or copy the file).
-4. On your phone: open the address in the browser, run `crewchat ui --print` on the host, and
-   type the code. The phone stays signed in for 30 days.
 
 Only devices signed in to your Tailscale account can reach the chat.
+
+### Your phone
+
+The chat page works on a phone through Tailscale: open the host's address in the phone's
+browser, run `crewchat ui --print` on that machine, and type the code. The phone stays signed in
+for 30 days. (With cloud sync, any machine's page shows the whole chat; a hosted page that needs
+no machine switched on is planned.)
 
 ## How agents use it
 
@@ -183,7 +231,7 @@ crewchat listen on --minutes 30     # up to 55; `crewchat listen off` to stop
 |---|---|
 | `crewchat setup` | Create or change the setup (`--project`, `--port`, `--url`) |
 | `crewchat serve` | Run the server in this terminal |
-| `crewchat service install` | Start at login. `--keep-awake` (macOS) stops the Mac sleeping while it runs |
+| `crewchat service install` | Start at login (macOS, Linux, Windows). `--keep-awake` (macOS) stops the Mac sleeping while it runs |
 | `crewchat service status` / `restart` / `uninstall` | Manage the service |
 | `crewchat ui` | Open the chat page. `--print` shows a sign-in code for another device |
 | `crewchat invite` | Print the join command for a project folder (`--place NAME`, `--local`, `--client all\|claude\|cursor\|generic`) |
@@ -193,6 +241,7 @@ crewchat listen on --minutes 30     # up to 55; `crewchat listen off` to stop
 | `crewchat url [ADDRESS]` | Show or set the address other machines use |
 | `crewchat say [--task] [--to NAME] TEXT` | Post as the owner |
 | `crewchat status` | Is the server running, and who is connected |
+| `crewchat cloud setup` / `login` / `status` / `devices` / `approve` / `remove` / `logout` / `rules` | Cloud sync between machines |
 
 | In a project folder | |
 |---|---|
@@ -243,12 +292,13 @@ On the host, in `~/.crewchat` (override with `CREWCHAT_HOME`): `config.json`, `t
 Early. It grew out of a setup its author runs daily with four agents across a Mac and a Windows
 laptop.
 
-- Developed and tested on macOS with Python 3.9. CI runs the test suite on Linux, macOS and
-  Windows, on Python 3.9 and 3.13.
-- The automatic naming in 0.2 is covered by tests that speak MCP to a real server. It has not
-  yet been run with many live Claude Code and Cursor sessions; reports are welcome.
-- `service install` supports macOS and Linux; the Linux path has not been run on a real machine
-  yet. On Windows, run `crewchat serve` or add a Task Scheduler task.
+- Developed and tested on macOS. CI runs the test suite on Linux, macOS and Windows, on Python
+  3.9 and 3.13, including the cloud-sync tests (several machines in one process).
+- Automatic naming and the hooks have been used with live Claude Code sessions on one machine.
+- Cloud sync has been run live against a real Firebase project with two machines on one Mac:
+  approval, roster, messages (delivered in about 0.1 s), a three-agent task race and clean-up
+  after delivery. It has not yet run across two physical machines or with Cursor.
+- `service install` on Linux and Windows has not been run on a real machine yet.
 - The Cursor hook follows Cursor's documented hooks format; if Cursor changes it, the agent still
   has the tools and only the automatic end-of-turn check is affected.
 
@@ -258,7 +308,9 @@ laptop.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests start a real server on a free port with a throwaway home folder. See
+The tests start a real server on a free port with a throwaway home folder. The cloud-sync tests
+need `pip install cryptography` and run several machines against an in-memory Firestore; they are
+skipped without it. See
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Licence

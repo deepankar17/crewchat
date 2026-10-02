@@ -18,6 +18,9 @@ classifiers = [
 ]
 dynamic = ["version"]
 
+[project.optional-dependencies]
+cloud = ["cryptography>=41", "google-cloud-firestore>=2.16"]
+
 [project.urls]
 Homepage = "https://github.com/deepankar17/crewchat"
 Issues = "https://github.com/deepankar17/crewchat/issues"
@@ -26,7 +29,7 @@ Issues = "https://github.com/deepankar17/crewchat/issues"
 crewchat = "crewchat:main"
 
 [tool.setuptools]
-py-modules = ["crewchat"]
+py-modules = ["crewchat", "crewchat_cloud"]
 
 [tool.setuptools.dynamic]
 version = { attr = "crewchat.__version__" }

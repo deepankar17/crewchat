@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0
+
+**Cloud sync**: machines signed in to the same Google account share one chat through the
+owner's own Firebase project, with no host machine and no Tailscale. Optional; single-machine
+use is unchanged and still needs nothing but Python.
+
+- Every machine runs its own crewchat for its local agents and syncs with the others through
+  Firestore, pushed in real time. A machine that is off only takes its own agents out.
+- End-to-end encryption: each machine has an RSA-3072 key pair; one AES-256 account key, wrapped
+  for each approved machine, seals every message, roster and task claim (AES-GCM). Firestore
+  only ever holds ciphertext.
+- New machines are approved by an existing one after comparing fingerprints. The trusted list is
+  signed; a list not signed by a trusted machine is ignored. Removing a machine rotates the key.
+- Messages are deleted from Firestore once every machine has them, and after 24 hours at the
+  latest (`cloud_ttl_hours` in config.json). Offline machines queue and catch up.
+- Agents on other machines appear in `hub_agents` and on the chat page with their machine, and
+  can be messaged. A task is taken by exactly one agent across all machines.
+- `crewchat cloud setup | login | status | devices | approve | remove | logout | rules`.
+- [docs/firebase-setup.md](docs/firebase-setup.md): set up Firebase by hand, or hand the prompt
+  in it to an agent.
+
+Also:
+
+- Message numbers are now ids: `#12` on one machine, `#A12` with cloud sync. `hub_take` accepts
+  `12`, `"#12"` or `"A12"`. History written by 0.2 loads unchanged.
+- `crewchat service install` now works on Windows (Task Scheduler, no console window).
+- `crewchat serve --log FILE`.
+- `crewchat status` shows the cloud state.
+
 ## 0.2.0
 
 Agents are no longer listed in advance. A project folder joins once, and every agent session

@@ -12,6 +12,33 @@
   Content-Security-Policy. The owner token never reaches a browser.
 - **Guessing.** Ten wrong tokens or codes from one address lock it out for ten minutes.
 
+## Cloud sync
+
+- **Who can read.** Firestore's rules confine each Google account to its own data. Within an
+  account, everything is encrypted on the machine before it is sent: messages, rosters and task
+  claims are sealed with an AES-256-GCM account key, bound to the account, message, key and
+  sending machine, so a stored item cannot be altered, moved or replayed as another. Whoever
+  administers the Firebase project sees only ciphertext, timestamps and how many machines and
+  messages there are.
+- **Who can join.** All of an account's machines sign in as the same user, so the rules cannot
+  tell them apart. Membership is therefore enforced by signatures: each machine has an RSA-3072
+  key, the list of trusted machines is signed by a trusted machine, and the account key is only
+  wrapped for machines on that list. A new machine is added only when a trusted one approves it
+  after the person compares fingerprints on both screens.
+- **The first approval is trust on first use.** A new machine accepts the list that its approver
+  signed. `crewchat cloud status` on the new machine shows who signed it and their fingerprint;
+  compare that with `crewchat cloud status` on the approving machine. Someone controlling the
+  Firebase project could otherwise impersonate the approver to a brand-new machine.
+- **Removing a machine** drops it from the list and switches the others to a new account key.
+  It can still read what was sent before it was removed and is still in Firestore (at most 24
+  hours), and, being signed in to the same Google account, it can delete or flood the account's
+  data. Sign it out of your Google account too (Google Account → Security → Your devices).
+- **No forward secrecy beyond deletion.** Someone who later obtains a machine's private key and
+  the account key can decrypt what is still in Firestore. Deleting delivered messages keeps that
+  small.
+- **The OAuth client secret** in `oauth-client.json` identifies the crewchat app to Google; for
+  desktop apps Google does not treat it as a strong secret, but keep it private anyway.
+
 ## What it does not protect
 
 - **Prompt injection between agents.** Agents in the chat can usually run commands. crewchat

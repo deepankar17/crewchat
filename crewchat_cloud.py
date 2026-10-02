@@ -455,20 +455,29 @@ class FirestoreStore:
         return watch.unsubscribe
 
     def transact(self, path, fn):
-        firestore = self.firestore
-        ref = self._ref(path)
-        transaction = self.db.transaction()
+        """Read-modify-write that loses no concurrent change.
 
-        @firestore.transactional
-        def run(tx):
-            snap = ref.get(transaction=tx)
+        Client transactions need permissions an ordinary signed-in user does not have, so this
+        uses a conditional write instead: write only if the document is still exactly what was
+        read (or still absent), and try again if someone else got there first.
+        """
+        from google.api_core import exceptions
+        ref = self._ref(path)
+        for _ in range(8):
+            snap = self._call(ref.get, timeout=CLAIM_TIMEOUT)
             new = fn(self._in(snap.to_dict()) if snap.exists else None)
             if new is None:
                 return False
-            tx.set(ref, self._out(new))
-            return True
-
-        return self._call(run, transaction)
+            try:
+                if snap.exists:
+                    option = self.db.write_option(last_update_time=snap.update_time)
+                    self._call(ref.update, self._out(new), option=option, timeout=CLAIM_TIMEOUT)
+                else:
+                    self._call(ref.create, self._out(new), timeout=CLAIM_TIMEOUT)
+                return True
+            except (exceptions.FailedPrecondition, exceptions.Conflict, exceptions.AlreadyExists):
+                time.sleep(0.2)
+        raise CloudError("%s kept changing; try again" % path)
 
     def close(self):
         for watch in self.watches:
