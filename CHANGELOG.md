@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0
+
+**Installers and one-command start.**
+
+- One-line installers: `install.sh` (macOS, Linux) and `install.ps1` (Windows). They install uv
+  if it is missing, then crewchat with cloud sync and its own Python 3.12, without administrator
+  rights. Running one again upgrades.
+- `crewchat start`: in a project folder, sets the machine up as host the first time, starts the
+  server (at login from then on), connects the folder and opens the chat. Safe to run again; it
+  refreshes the folder's hooks in case crewchat moved.
+- The chat page installs as an app on phones and computers (Add to Home Screen / Install app):
+  web app manifest, icons drawn by crewchat itself, and a service worker that shows a short
+  "cannot be reached" page when the host is off, instead of a browser error. The chat itself is
+  never cached.
+- `crewchat setup` picks the next free port if 8765 is taken, and no longer drops settings made
+  elsewhere (such as cloud sync) when run again.
+
 ## 0.3.0
 
 **Cloud sync**: machines signed in to the same Google account share one chat through the

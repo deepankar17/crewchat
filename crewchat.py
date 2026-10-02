@@ -48,7 +48,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1088,7 +1088,8 @@ def handle_rpc(hub, sid, req, owner=False):
 # --------------------------------------------------------------------------------------------
 PAGE_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-    "connect-src 'self'; img-src data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
+    "form-action 'self'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
     # same-origin, not no-referrer: with no-referrer browsers send "Origin: null" on the sign-in
     # form's POST, which the same-origin check below would refuse.
@@ -1096,6 +1097,100 @@ PAGE_HEADERS = {
     "Cache-Control": "no-store",
 }
 POST_PATHS = ("/mcp", "/login", "/api/send", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+
+# The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
+# names no project: like the icons, it is served without signing in.
+APP_COLOR = "#2b57c4"
+MANIFEST = json.dumps({
+    "name": "crewchat", "short_name": "crewchat", "description": "Group chat for your AI coding agents",
+    "start_url": "/", "scope": "/", "display": "standalone",
+    "background_color": "#f4f2ed", "theme_color": APP_COLOR,
+    "icons": [{"src": "/icon-%d.png" % s, "sizes": "%dx%d" % (s, s), "type": "image/png", "purpose": p}
+              for s in (192, 512) for p in ("any", "maskable")],
+}).encode("utf-8")
+APP_HEAD = ('<link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="%s">'
+            '<link rel="icon" href="/icon-192.png"><link rel="apple-touch-icon" href="/icon-192.png">'
+            '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" '
+            'content="yes"><meta name="apple-mobile-web-app-title" content="crewchat">' % APP_COLOR)
+# Passes everything through to the server (the chat is never cached), and shows a short page
+# instead of the browser's error when the host cannot be reached.
+SERVICE_WORKER = b"""\
+const OFFLINE = '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,\
+ initial-scale=1"><title>crewchat</title><body style="font:16px/1.5 system-ui,sans-serif;margin:0;\
+min-height:100vh;display:grid;place-items:center;text-align:center;padding:0 24px"><div><h1 style=\
+"font-size:20px">The chat cannot be reached</h1><p>Check that the machine hosting it is switched on\
+ and awake, and that this device is connected to the same private network (for example Tailscale).\
+</p><p><a href="/">Try again</a></p></div>';
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('fetch', e => {
+  if (e.request.mode !== 'navigate' || e.request.method !== 'GET') return;
+  e.respondWith(fetch(e.request).catch(() =>
+    new Response(OFFLINE, {headers: {'Content-Type': 'text/html; charset=utf-8'}})));
+});
+"""
+SW_REGISTER = ("<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')"
+               ".catch(function(){})</script>")
+_icons = {}
+_icons_lock = threading.Lock()
+
+
+def _png(size, rows):
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+    raw = b"".join(b"\x00" + bytes(r) for r in rows)
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+
+
+def app_icon(size):
+    """The app icon as PNG bytes: a white speech bubble on blue, drawn here so the project ships no
+    image files. Everything sits inside the middle 80%, so it also works as a maskable icon."""
+    with _icons_lock:
+        if size in _icons:
+            return _icons[size]
+        bg, fg = (0x2b, 0x57, 0xc4), (0xff, 0xff, 0xff)
+        x0, y0, x1, y1, radius = 0.22, 0.27, 0.78, 0.66, 0.11
+        tail = ((0.31, 0.62), (0.45, 0.62), (0.29, 0.77))
+        dots = [(x, 0.465, 0.045) for x in (0.38, 0.50, 0.62)]
+
+        def edge(px, py, a, b):  # signed distance from the line a->b; negative inside (clockwise)
+            ex, ey = b[0] - a[0], b[1] - a[1]
+            return ((px - a[0]) * ey - (py - a[1]) * ex) / (ex * ex + ey * ey) ** 0.5
+
+        def bubble(px, py):
+            qx = max(abs(px - (x0 + x1) / 2) - ((x1 - x0) / 2 - radius), 0)
+            qy = max(abs(py - (y0 + y1) / 2) - ((y1 - y0) / 2 - radius), 0)
+            box = (qx * qx + qy * qy) ** 0.5 - radius
+            tri = max(edge(px, py, tail[i], tail[(i + 1) % 3]) for i in range(3))
+            return min(box, tri)
+
+        def mix(a, b, t):
+            return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+        rows, blank = [], list(bg) * size
+        for j in range(size):
+            py = (j + 0.5) / size
+            if py < y0 - 0.01 or py > tail[2][1] + 0.01:
+                rows.append(blank)
+                continue
+            row = []
+            for i in range(size):
+                px = (i + 0.5) / size
+                cover = min(1.0, max(0.0, 0.5 - bubble(px, py) * size))
+                colour = mix(bg, fg, cover)
+                for cx, cy, r in dots:
+                    d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5 - r
+                    dot = min(1.0, max(0.0, 0.5 - d * size))
+                    if dot:
+                        colour = mix(colour, bg, dot)
+                row.extend(colour)
+            rows.append(row)
+        _icons[size] = _png(size, rows)
+        return _icons[size]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1221,6 +1316,14 @@ class Handler(BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         if url.path == "/health":
             self._reply(200, b"ok\n", ctype="text/plain")
+        elif url.path == "/manifest.webmanifest":
+            self._reply(200, MANIFEST, ctype="application/manifest+json", extra={"Cache-Control": "max-age=86400"})
+        elif url.path in ("/icon-192.png", "/icon-512.png"):
+            self._reply(200, app_icon(int(url.path[6:9])), ctype="image/png",
+                        extra={"Cache-Control": "max-age=86400"})
+        elif url.path == "/sw.js":
+            self._reply(200, SERVICE_WORKER, ctype="text/javascript; charset=utf-8",
+                        extra={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
         elif url.path == "/mcp":
             self._reply(405, b"", extra={"Allow": "POST, DELETE"})
         elif url.path == "/":
@@ -1502,24 +1605,47 @@ def self_command():
 # --------------------------------------------------------------------------------------------
 # Host commands
 # --------------------------------------------------------------------------------------------
-def cmd_setup(args):
+def free_port(start):
+    """The first port from start on that nothing on this machine listens on."""
+    for port in range(start, start + 50):
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind((BIND, port))
+            return port
+        except OSError:
+            continue
+        finally:
+            probe.close()
+    return start
+
+
+def setup_host(project=None, port=None, url=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
-    config = {
-        "project": args.project or existing.get("project") or Path.cwd().name,
-        "port": args.port or existing.get("port") or DEFAULT_PORT,
-        "url": args.url or existing.get("url") or "",
+    config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
+    config.update({
+        "project": project or existing.get("project") or Path.cwd().name,
+        "port": port or existing.get("port") or free_port(DEFAULT_PORT),
+        "url": url or existing.get("url") or "",
         "forget_hours": existing.get("forget_hours", FORGET_HOURS),
-    }
+    })
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
         os.chmod(root / "tokens", 0o700)
     save_config(config)
     ensure_token(OWNER)
-    print("crewchat is set up in %s for %s." % (root, config["project"]))
+    return config
+
+
+def cmd_setup(args):
+    config = setup_host(args.project, args.port, args.url)
+    print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
+    print("  In a project folder:  crewchat start     (starts the server, connects the folder and")
+    print("                                           opens the chat)")
+    print("  Or step by step:")
     print("  1. Start the server:  crewchat service install    (starts at login)")
     print("                        or: crewchat serve          (runs in this terminal)")
     print("  2. Open the chat:     crewchat ui")
@@ -1527,6 +1653,100 @@ def cmd_setup(args):
     print("                        project folder; every agent session opened there then joins")
     print("                        the chat by itself, under its own name)")
     print("  Other machines reach the chat through a private network; see `crewchat url --help`.")
+
+
+def server_up(config=None):
+    try:
+        with urllib.request.urlopen(local_url(config) + "/health", timeout=3) as answer:
+            return answer.status == 200
+    except (urllib.error.URLError, OSError, ValueError):
+        return False
+
+
+def start_background():
+    """Run the server detached from this terminal, until log out or restart."""
+    python, script = self_command()
+    flags = {}
+    if os.name == "nt":
+        if Path(python).name.lower() == "python.exe" and Path(python).with_name("pythonw.exe").exists():
+            python = str(Path(python).with_name("pythonw.exe"))
+        flags["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+    else:
+        flags["start_new_session"] = True
+    subprocess.Popen([python, script, "serve", "--log", str(home() / "hub.log")], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
+
+
+def joined_place(project, config=None):
+    """The place this folder joined this machine's chat as, with its token and the clients set
+    up for it, or (None, None, [])."""
+    want = local_url(config) + "/mcp"
+    tokens = {read_token(p): p for p in list_places()}
+    found, token, clients = None, None, []
+    for client, rel in CLIENT_FILES.items():
+        entry = (read_json(project / rel).get("mcpServers") or {}).get(SERVER_NAME) or {}
+        auth = (entry.get("headers") or {}).get("Authorization", "")
+        if entry.get("url") == want and auth[7:] in tokens:
+            found, token = tokens[auth[7:]], auth[7:]
+            clients.append(client)
+    return found, token, clients
+
+
+def cmd_start(args):
+    project = Path(args.folder or ".").resolve()
+    if not project.is_dir():
+        die("%s is not a folder" % project)
+    print("crewchat %s" % __version__)
+    if not (home() / "config.json").exists():
+        config = setup_host(args.project or project.name, args.port)
+        print("- Set up this machine as the chat's host (%s), for \"%s\"." % (home(), config["project"]))
+    config = load_config()
+
+    if server_up(config):
+        print("- The server is running at %s." % local_url(config))
+    else:
+        supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
+        started = False
+        if supported and not args.no_service:
+            try:
+                cmd_service(argparse.Namespace(action="install", keep_awake=args.keep_awake))
+                started = True
+            except SystemExit as e:
+                print("- Could not register it to start at login (%s); running it in the background "
+                      "instead." % e)
+        if not started:
+            start_background()
+        for _ in range(40):
+            if server_up(config):
+                break
+            time.sleep(0.25)
+        else:
+            die("the server did not start. See %s, or run `crewchat serve` to see why." % (home() / "hub.log"))
+        print("- Started the server at %s%s." % (local_url(config), "" if started else
+                                                  " (until you log out; `crewchat service install` "
+                                                  "starts it at login)"))
+
+    place, token, clients = joined_place(project, config)
+    if place:
+        # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
+        for client in clients:
+            {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
+        print("- %s is connected, as \"%s\"." % (project, place))
+    else:
+        code = owner_call("/api/invite", {"place": args.place or ""})["code"]
+        place = join_folder(local_url(config), code, project, args.place, args.client, quiet=True)
+        print("- Connected %s, as \"%s\"." % (project, place))
+
+    if not args.no_open:
+        cmd_ui(argparse.Namespace(print=False))
+    print()
+    kinds = {"all": ("claude", "cursor"), "claude": ("claude",), "cursor": ("cursor",)}[args.client]
+    where = "this folder" if project == Path.cwd().resolve() else str(project)
+    print("Now open %s in %s. Each new session joins the chat by itself, named %s-%s, %s-%s-2, ..."
+          % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where,
+             kinds[0], place, kinds[0], place))
+    print("Sessions that were already open need a restart. To make agents wait for messages instead")
+    print("of going idle: crewchat listen on")
 
 
 def cmd_serve(args):
@@ -1795,39 +2015,49 @@ def cmd_join(args):
     project = Path(args.project or ".").resolve()
     if not project.is_dir():
         die("%s is not a folder" % project)
+    join_folder(url, args.code, project, args.place, args.client)
+
+
+def join_folder(url, code, project, place=None, client="all", quiet=False):
+    """Swap a join code for a place token and connect the folder's agents. Returns the place."""
     try:
         host = socket.gethostname()
     except OSError:
         host = "machine"
     try:
-        answer = post_json(url + "/api/join", None, {"code": args.code, "place": args.place or host}, timeout=30)
+        answer = post_json(url + "/api/join", None, {"code": code, "place": place or host}, timeout=30)
     except urllib.error.HTTPError as e:
         die("that code is wrong, already used or expired; ask for a new `crewchat invite`" if e.code == 401
             else "the server refused (HTTP %d)" % e.code)
     except (urllib.error.URLError, OSError) as e:
         die("cannot reach %s (%s)" % (url, getattr(e, "reason", e)))
     place, token = answer["place"], answer["token"]
-    if args.client == "generic":
+    if client == "generic":
         print("This folder joined the crewchat for %s as \"%s\". Add this MCP server to your client:"
               % (answer["project"], place))
         print(json.dumps({"mcpServers": {SERVER_NAME: {
             "type": "http", "url": url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}}}}, indent=2))
         print("Keep the token private. Hooks are only installed for Claude Code and Cursor; tell other")
         print("agents in their instructions to check hub_inbox.")
-        return
+        return place
     written = []
-    if args.client in ("all", "claude"):
+    if client in ("all", "claude"):
         written += install_claude(project, url, token)
-    if args.client in ("all", "cursor"):
+    if client in ("all", "cursor"):
         written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
+    if quiet:
+        if not ignored:
+            print("- %s hold a secret token: do not commit them." % ", ".join(written))
+        return place
     print("%s joined the crewchat for %s as \"%s\"." % (project, answer["project"], place))
     print("Wrote: %s" % ", ".join(written))
     if not ignored:
         print("These files hold a secret token or machine paths: do not commit them.")
     print("Every new Claude Code or Cursor session in this folder now joins the chat under its own")
     print("name (%s-%s, %s-%s-2, ...). Sessions that are already open need a restart." % (
-        "claude" if args.client != "cursor" else "cursor", place, "claude" if args.client != "cursor" else "cursor", place))
+        "claude" if client != "cursor" else "cursor", place, "claude" if client != "cursor" else "cursor", place))
+    return place
 
 
 def find_project(client):
@@ -2169,12 +2399,14 @@ h1{font-size:20px;margin:0 0 4px}p{margin:0 0 16px;color:#6a665e}code{font-famil
 input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px}
 input{border:1px solid #c9c5bc;background:#fff;color:inherit;letter-spacing:.12em;text-transform:uppercase}
 button{margin-top:10px;border:0;background:#2b57c4;color:#fff;font-weight:600;cursor:pointer}
-.err{color:#b3261e}@media(prefers-color-scheme:dark){body{background:#131210;color:#edeae4}
+.err{color:#b3261e}.tip{margin-top:20px;font-size:14px}@media(prefers-color-scheme:dark){body{background:#131210;color:#edeae4}
 p{color:#a09b91}input{background:#1c1b18;border-color:#3a3833}.err{color:#f2b8b5}}</style>
 <main><h1>crewchat</h1><p>On the machine that hosts the chat, run <code>crewchat ui --print</code>
 and type the code it shows. A code works once, for two minutes.</p>__ERROR__
 <form method="post" action="/login"><input name="code" aria-label="Sign-in code" autocomplete="off"
-autofocus required maxlength="12"><button>Sign in</button></form></main></html>"""
+autofocus required maxlength="12"><button>Sign in</button></form>
+<p class="tip">On a phone, sign in, then use <b>Add to Home Screen</b> to keep the chat as an app.
+An iPhone app keeps its own sign-in, so you sign in once more inside it.</p></main></html>"""
 
 CHAT_PAGE = r"""<!doctype html>
 <html lang="en">
@@ -2504,6 +2736,8 @@ loop();
 </body>
 </html>
 """
+LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1)
+CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1)
 
 
 # --------------------------------------------------------------------------------------------
@@ -2512,10 +2746,25 @@ loop();
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="crewchat", description="A group chat for your AI coding agents and you.",
-        epilog="Host: setup, serve, service, ui, invite, agents, agent, places, place, url, say, status. "
+        epilog="Quick start: crewchat start (in a project folder). Host: setup, serve, service, ui, invite, agents, agent, places, place, url, say, status. "
                "Project folder: join, listen. Docs: README.md")
     parser.add_argument("--version", action="version", version="crewchat " + __version__)
     sub = parser.add_subparsers(dest="cmd", metavar="command")
+
+    p = sub.add_parser("start", help="the quick way: host a chat here and connect this folder to it",
+                       description="Sets this machine up as the chat's host if it is not yet, starts the "
+                       "server (at login from now on), connects the folder and opens the chat. Safe to "
+                       "run again.")
+    p.add_argument("folder", nargs="?", help="project folder (default: the current folder)")
+    p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
+    p.add_argument("--client", choices=["all", "claude", "cursor"], default="all")
+    p.add_argument("--project", help="chat name on first setup (default: the folder's name)")
+    p.add_argument("--port", type=int, help="local port on first setup (default: %d or the next free one)"
+                   % DEFAULT_PORT)
+    p.add_argument("--no-service", action="store_true", help="run the server until log out, not at every login")
+    p.add_argument("--keep-awake", action="store_true", help="macOS: keep the machine from sleeping while it runs")
+    p.add_argument("--no-open", action="store_true", help="do not open the chat page")
+    p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("setup", help="set up the chat on this machine (the host)")
     p.add_argument("--project", help="name shown on the chat page (default: this folder's name)")

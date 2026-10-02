@@ -20,3 +20,44 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: python -m pip install cryptography
       - run: python -m unittest discover -s tests -v
+
+  installers:
+    # The one-line installers, run as a user would, against this commit.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          CREWCHAT_SOURCE="file://$PWD" sh install.sh
+          export PATH="$HOME/.local/bin:$PATH" CREWCHAT_HOME="$RUNNER_TEMP/crewchat-home"
+          mkdir "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project" && git init -q
+          crewchat start --no-service --no-open
+          crewchat status
+          curl -sf "http://127.0.0.1:8765/manifest.webmanifest" > /dev/null
+          crewchat cloud status || true
+          "$(uv tool dir 2>/dev/null || echo "$HOME/.local/share/uv/tools")/crewchat/bin/python" -c "import google.cloud.firestore, cryptography"
+      - name: install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:CREWCHAT_SOURCE = ([System.Uri](Get-Location).Path).AbsoluteUri
+          .\install.ps1
+          if (-not $?) { exit 1 }
+          $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+          $env:CREWCHAT_HOME = "$env:RUNNER_TEMP\crewchat-home"
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\project" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\project"
+          git init -q
+          crewchat start --no-service --no-open
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          crewchat status
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/manifest.webmanifest).StatusCode
+          $tools = (uv tool dir).Trim()
+          & "$tools\crewchat\Scripts\python.exe" -c "import google.cloud.firestore, cryptography"
+          if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -33,47 +33,65 @@ It is one Python file with no dependencies.
 
 ## Quick start
 
-You need Python 3.9 or newer. Pick one machine to host the chat; it should be on while your
-agents work.
+Pick one machine to host the chat; it should be on while your agents work.
 
-### 1. Get it
+### 1. Install
 
-```bash
-git clone https://github.com/deepankar17/crewchat.git
-cd crewchat
-```
-
-Run it as `python3 crewchat.py …`, or install the `crewchat` command with
-`pipx install .` (or `pip install .`). The rest of this guide writes `crewchat`.
-
-### 2. Set up the host
+macOS or Linux:
 
 ```bash
-crewchat setup --project "My app"
-crewchat service install        # starts now and at every login (macOS, Linux)
-crewchat ui                     # opens the chat page, signed in as you
+curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
 ```
 
-No service? Run `crewchat serve` in a terminal instead.
+Windows (PowerShell):
 
-### 3. Connect a project folder
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+```
 
-On the host, ask for an invitation:
+The installer needs no administrator rights or password. It installs
+[uv](https://docs.astral.sh/uv/) if it is missing, and uv installs crewchat with its own
+Python 3.12, so the Python already on the machine does not matter. Run it again to upgrade.
+`CREWCHAT_LEAN=1` leaves out the cloud-sync libraries (about 70 MB).
+
+<details>
+<summary>Without the installer</summary>
+
+crewchat is one Python file with no dependencies (Python 3.9 or newer). Clone the repository and
+run `python3 crewchat.py …`, or install the command with `pipx install .` (add `[cloud]` for cloud
+sync: `pipx install ".[cloud]"`, Python 3.10+).
+</details>
+
+### 2. Start
+
+In the project folder your agents work in:
 
 ```bash
-crewchat invite --local
+crewchat start
 ```
 
-It prints a command with a single-use code. Run that command **in the project folder** your
-agents work in:
+That one command:
+
+1. sets this machine up as the chat's host, the first time;
+2. starts the server, and from now on at every login (`--no-service` to skip that);
+3. connects the folder: every Claude Code or Cursor session you open there joins the chat by
+   itself, under its own name;
+4. opens the chat page in your browser, signed in as you.
+
+It is safe to run again, and in other folders. Open your agents in the folder and they appear in
+the chat. You do not list or name agents anywhere.
+
+### 3. More folders and machines
+
+`crewchat start` in another folder on the same machine connects that one too. For a folder on
+another machine, ask the host for an invitation:
 
 ```bash
-crewchat join --url http://127.0.0.1:8765 --code ABCD-EFGH
+crewchat invite
 ```
 
-That is all. Every Claude Code or Cursor session you open in that folder from now on joins the
-chat by itself. You do not list or name agents anywhere. Drop `--local` when the folder is on
-another machine (see below).
+It prints a `crewchat join` command with a single-use code to run in that folder (see
+[Agents on other machines](#agents-on-other-machines)).
 
 ### 4. Talk
 
@@ -119,7 +137,7 @@ There are two ways to bring several machines into one chat.
 | A machine switched off | Only its own agents leave the chat | If it is the host, everyone is cut off |
 | Setup | A Firebase project, once; then `crewchat cloud login` per machine | Tailscale on every device |
 | Where messages go | Encrypted on the machine; Firestore only holds ciphertext, deleted once delivered | Never leave your devices |
-| Needs | `pip install "crewchat[cloud]"` (Python 3.10+ recommended) | Nothing extra |
+| Needs | Included by the installer (otherwise `pip install "crewchat[cloud]"`, Python 3.10+) | Nothing extra |
 
 ### Cloud sync
 
@@ -128,7 +146,7 @@ own agents even when it is offline, and catches up when it is back.
 
 1. Set up a Firebase project once, by hand or by handing a prompt to an agent:
    [docs/firebase-setup.md](docs/firebase-setup.md).
-2. On every machine:
+2. On every machine, install crewchat, run `crewchat start` in the project folder, then:
 
    ```bash
    crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json
@@ -170,16 +188,27 @@ personal use and takes a few minutes:
    Tailscale asks you to enable Serve for your account. Leave **Funnel** off: Funnel is the
    public-internet option.
 3. `crewchat invite` now prints join commands with that address. Run them in the project folder
-   on the other machine (it needs `crewchat.py` too: clone the repo or copy the file).
+   on the other machine, after [installing crewchat](#1-install) there.
 
 Only devices signed in to your Tailscale account can reach the chat.
 
 ### Your phone
 
-The chat page works on a phone through Tailscale: open the host's address in the phone's
-browser, run `crewchat ui --print` on that machine, and type the code. The phone stays signed in
-for 30 days. (With cloud sync, any machine's page shows the whole chat; a hosted page that needs
-no machine switched on is planned.)
+The chat page installs on a phone like an app, with its own icon, opening full-screen. It needs a
+private route to the host, such as Tailscale (above):
+
+1. Install the Tailscale app on the phone and sign in to the same Tailscale account.
+2. Open the host's address (`crewchat url` shows it) in Safari or Chrome.
+3. On the host, run `crewchat ui --print` and type the code it shows.
+4. **iPhone:** Share → **Add to Home Screen**. **Android:** menu → **Install app** (or **Add to
+   Home screen**).
+
+On an iPhone the installed app keeps its own sign-in, so the first time you open it, sign in once
+more with a new code. Sign-ins last 30 days. If the host is off or asleep, the app says so
+instead of showing a browser error.
+
+With cloud sync, any of your machines can serve the page: each has the whole chat. A hosted page
+that needs no machine switched on is planned.
 
 ## How agents use it
 
@@ -226,6 +255,10 @@ crewchat listen on --minutes 30     # up to 55; `crewchat listen off` to stop
 ```
 
 ## Commands
+
+| Quick start | |
+|---|---|
+| `crewchat start [FOLDER]` | Host a chat here if there is none yet, start the server, connect the folder and open the chat. `--place NAME`, `--client`, `--no-service`, `--keep-awake`, `--no-open` |
 
 | On the host | |
 |---|---|
@@ -298,6 +331,10 @@ laptop.
 - Cloud sync has been run live against a real Firebase project with two machines on one Mac:
   approval, roster, messages (delivered in about 0.1 s), a three-agent task race and clean-up
   after delivery. It has not yet run across two physical machines or with Cursor.
+- CI runs both installers as a user would, on Linux, macOS and Windows (Windows PowerShell 5.1),
+  then `crewchat start` against the installed copy.
+- The installed phone app has been checked in Chrome (installable, offline page, sign-in); not
+  yet on a real iPhone or Android phone.
 - `service install` on Linux and Windows has not been run on a real machine yet.
 - The Cursor hook follows Cursor's documented hooks format; if Cursor changes it, the agent still
   has the tools and only the automatic end-of-turn check is affected.

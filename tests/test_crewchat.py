@@ -508,6 +508,25 @@ class ChatPage(Base):
     def test_ui_print_gives_a_code(self):
         self.assertRegex(cli("ui", "--print"), r"Sign-in code .*: [A-Z2-9]{4}-[A-Z2-9]{4}")
 
+    def test_installs_as_an_app(self):
+        status, body, headers = self.raw("/manifest.webmanifest")
+        self.assertEqual((status, headers["Content-Type"]), (200, "application/manifest+json"))
+        manifest = json.loads(body)
+        self.assertEqual((manifest["display"], manifest["start_url"]), ("standalone", "/"))
+        self.assertNotIn("Demo", body.decode())  # served without signing in: no project name
+        for size in (192, 512):
+            status, body, headers = self.raw("/icon-%d.png" % size)
+            self.assertEqual((status, headers["Content-Type"], body[:8]), (200, "image/png", b"\x89PNG\r\n\x1a\n"))
+            self.assertEqual(int.from_bytes(body[16:20], "big"), size)
+        status, body, headers = self.raw("/sw.js")
+        self.assertEqual(status, 200)
+        self.assertIn(b"addEventListener('fetch'", body)
+        _, login, headers = self.raw("/login")
+        self.assertIn(b'<link rel="manifest" href="/manifest.webmanifest">', login)
+        self.assertIn("manifest-src 'self'", headers["Content-Security-Policy"])
+        opener, _ = self.owner_browser()
+        self.assertIn(b"serviceWorker.register('/sw.js')", self.raw("/", opener=opener)[1])
+
 
 class Joining(Base):
     def project(self):
@@ -570,6 +589,20 @@ class Joining(Base):
         out = cli(*self.invite("--client", "generic", "--place", "other-tool"))
         self.assertIn('"url": "%s"' % self.mcp, out)
         self.assertIn(crewchat.read_token("other-tool"), out)
+
+    def test_start_connects_the_folder_once(self):
+        folder = self.project().resolve()
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk")
+        self.assertIn("The server is running at %s." % self.base, out)
+        self.assertIn('- Connected %s, as "desk".' % folder, out)
+        token = crewchat.read_token("desk")
+        mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
+        self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + token)
+        self.assertTrue((folder / ".cursor" / "hooks.json").exists())
+        places = crewchat.list_places()
+        out = cli("start", str(folder), "--no-open", "--no-service")
+        self.assertIn('%s is connected, as "desk".' % folder, out)
+        self.assertEqual(crewchat.list_places(), places)  # no second place for the same folder
 
     def test_a_join_code_works_once_and_wrong_codes_fail(self):
         args = self.invite("--client", "generic")
@@ -782,6 +815,27 @@ class Upgrade(unittest.TestCase):
             self.assertEqual(hub.send("Owner", "all", "new")["id"], "3")
         finally:
             os.environ["CREWCHAT_HOME"] = old_home
+
+    def test_setup_again_keeps_other_settings(self):
+        old_home = os.environ["CREWCHAT_HOME"]
+        os.environ["CREWCHAT_HOME"] = str(Path(tempfile.mkdtemp(prefix="resetup-", dir=TMP)))
+        try:
+            cli("setup", "--project", "One", "--port", "8799")
+            config = crewchat.load_config()
+            config.update(cloud=True, cloud_ttl_hours=12)
+            crewchat.save_config(config)
+            cli("setup", "--project", "Two")
+            config = crewchat.load_config()
+            self.assertEqual((config["project"], config["port"], config["cloud"], config["cloud_ttl_hours"]),
+                             ("Two", 8799, True, 12))
+        finally:
+            os.environ["CREWCHAT_HOME"] = old_home
+
+    def test_installers_install_this_version(self):
+        for name, pattern in (("install.sh", r'VERSION="\$\{CREWCHAT_VERSION:-([0-9.]+)\}"'),
+                              ("install.ps1", r'else \{ "([0-9.]+)" \}')):
+            found = re.search(pattern, (ROOT / name).read_text(encoding="utf-8"))
+            self.assertEqual(found and found.group(1), crewchat.__version__, name)
 
     def test_message_numbers_as_agents_write_them(self):
         for written, clean in ((12, "12"), ("12", "12"), ("#12", "12"), ("A12", "A12"), (" #AB3 ", "AB3")):
