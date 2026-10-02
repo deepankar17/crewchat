@@ -717,6 +717,14 @@ class Hooks(Base):
         self.assertIn("wake", out)
         self.assertLess(time.time() - start, 8)
 
+    def test_a_listening_hook_survives_the_server_being_away(self):
+        """Pointed at a dead address it keeps retrying for its listen time, then gives up quietly."""
+        dead = Path(tempfile.mkdtemp(prefix="away-", dir=TMP))
+        crewchat.install_claude(dead, "http://127.0.0.1:1", "x")
+        start = time.time()
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "away"}, project=dead, listen="9"), "")
+        self.assertGreater(time.time() - start, 3)
+
     def test_hooks_are_silent_when_not_connected_or_unreachable(self):
         empty = Path(tempfile.mkdtemp(prefix="empty-", dir=TMP))
         self.assertEqual(self.hook("claude", "stop", {}, project=empty), "")

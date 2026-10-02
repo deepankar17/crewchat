@@ -1693,7 +1693,16 @@ def hook_check(base, token, key, wait_total, ack):
     deadline = time.time() + wait_total
     while True:
         wait = int(max(0, min(MAX_WAIT, deadline - time.time())))
-        out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait}, timeout=MAX_WAIT + 30)
+        try:
+            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait}, timeout=MAX_WAIT + 30)
+        except urllib.error.HTTPError:
+            raise
+        except (urllib.error.URLError, OSError):
+            # The server is restarting or briefly unreachable. While listening, keep trying.
+            if time.time() + 5 >= deadline:
+                raise
+            time.sleep(3)
+            continue
         if out.get("link"):
             return "link", "", 0, False
         if out.get("text") or time.time() >= deadline:
