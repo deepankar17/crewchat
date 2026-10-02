@@ -379,7 +379,7 @@ class Linking(Base):
         name = session.me
         self.assertIn("Linked. You are %s." % name, note)
         self.assertIn("%s (you)" % name, note)
-        self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0})
+        self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0, "owner": False})
         number = self.say(name, "through the hook")
         answer = self.hook("key-first-0001")
         self.assertIn("Owner -> you: through the hook", answer["text"])
@@ -660,17 +660,36 @@ class Hooks(Base):
         self.assertIn("m4", out)
         self.assertNotIn("m3", out)
 
-    def test_loop_guard_holds_messages_for_the_user(self):
+    def test_loop_guard_stops_agents_chatting_forever_but_never_the_owner(self):
         session, name = self.linked("D")
+        other, other_name = self.agent()
         delivered = 0
         for i in range(crewchat.MAX_CHAIN + 2):
-            self.say(name, "loop %d" % i)
+            other.call("hub_send", to=name, text="loop %d" % i)
             delivered += bool(self.hook("claude", "stop", {"session_id": "D"}))
         self.assertEqual(delivered, crewchat.MAX_CHAIN)
-        self.assertEqual(self.unread(name), 2)
-        self.assertIn("loop %d" % (crewchat.MAX_CHAIN + 1), self.hook("claude", "prompt", {"session_id": "D"}))
-        self.say(name, "after the prompt")
-        self.assertIn("after the prompt", self.hook("claude", "stop", {"session_id": "D"}))
+        self.assertEqual(self.unread(name), 2)  # held back for the user
+        # The owner still gets through, and the held messages come along.
+        self.say(name, "owner speaking")
+        out = self.hook("claude", "stop", {"session_id": "D"})
+        self.assertIn("owner speaking", out)
+        self.assertIn("loop %d" % (crewchat.MAX_CHAIN + 1), out)
+        # ...and the count starts again.
+        other.call("hub_send", to=name, text="after the owner")
+        self.assertIn("after the owner", self.hook("claude", "stop", {"session_id": "D"}))
+
+    def test_the_owner_can_keep_chatting_past_the_loop_guard(self):
+        session, name = self.linked("O")
+        for i in range(crewchat.MAX_CHAIN * 2):
+            self.say(name, "owner %d" % i)
+            self.assertIn("owner %d" % i, self.hook("claude", "stop", {"session_id": "O"}))
+
+    def test_hook_tells_the_agent_to_answer_the_owner_in_the_chat(self):
+        session, name = self.linked("W")
+        self.say(name, "hello")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "W"}))["reason"]
+        self.assertIn("answer anything Owner wrote with hub_send", reason)
+        self.assertIn("answer in the chat", session.hello["instructions"])
 
     def test_cursor_is_asked_to_link_and_then_gets_followups(self):
         session = Session(self.base, self.token, "cursor")
@@ -682,7 +701,8 @@ class Hooks(Base):
         self.say(name, "for cursor")
         out = json.loads(self.hook("cursor", "stop", {"status": "completed", "loop_count": 1, "conversation_id": "c"}))
         self.assertIn("for cursor", out["followup_message"])
-        self.say(name, "later")
+        other, _ = self.agent()
+        other.call("hub_send", to=name, text="later")
         self.assertEqual(self.hook("cursor", "stop", {"status": "aborted", "loop_count": 0, "conversation_id": "c"}), "")
         self.assertEqual(self.hook("cursor", "stop", {"status": "completed", "loop_count": crewchat.MAX_CHAIN,
                                                      "conversation_id": "c"}), "")
