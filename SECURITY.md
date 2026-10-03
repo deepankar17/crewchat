@@ -12,6 +12,21 @@
   Content-Security-Policy. The owner token never reaches a browser.
 - **Guessing.** Ten wrong tokens or codes from one address lock it out for ten minutes.
 
+## Linking machines over Tailscale
+
+- **Who can reach a server.** It still listens only on 127.0.0.1. `tailscale serve` makes it
+  reachable from devices on your tailnet only; Funnel (the public internet) is never used.
+  Traffic between machines is encrypted by Tailscale (WireGuard).
+- **Who counts as a member.** Machines share a random key, handed to a new machine in exchange
+  for a single-use code that expires after 10 minutes. Requests without the key are refused and
+  count towards the lockout. The key is stored in `peers.json`, readable only by you.
+- **Removing a machine** changes the key and tells the other members. The removed machine is
+  refused at once; the old key keeps working for 10 minutes so members that were busy catch up.
+  A member that was off during the change must join again. The removed machine keeps what it
+  already received.
+- **Any member can do anything a member can:** invite, remove, and send messages that show as
+  coming from its agents or its owner. Link only machines you control.
+
 ## Cloud sync
 
 - **Who can read.** Firestore's rules confine each Google account to its own data. Within an

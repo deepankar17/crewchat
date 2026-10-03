@@ -83,15 +83,15 @@ the chat. You do not list or name agents anywhere.
 
 ### 3. More folders and machines
 
-`crewchat start` in another folder on the same machine connects that one too. For a folder on
-another machine, ask the host for an invitation:
+`crewchat start` in another folder on the same machine connects that one too. For agents on
+another machine, install crewchat there, run `crewchat start` in its project folder, then link
+the two machines:
 
 ```bash
-crewchat invite
+crewchat connect        # asks: over Tailscale, or with cloud sync
 ```
 
-It prints a `crewchat join` command with a single-use code to run in that folder (see
-[Agents on other machines](#agents-on-other-machines)).
+See [Agents on other machines](#agents-on-other-machines).
 
 ### 4. Talk
 
@@ -129,15 +129,52 @@ the folder's label:
 
 ## Agents on other machines
 
-There are two ways to bring several machines into one chat.
+Run `crewchat start` on each machine, then link them. You choose how; `crewchat connect` asks
+and does the rest:
 
-| | **Cloud sync** | **One host over Tailscale** |
+```bash
+crewchat connect
+```
+
+| | **Tailscale** | **Cloud sync** |
 |---|---|---|
-| How | Every machine runs its own crewchat; they sync through your own Firebase project | One machine runs crewchat; the others connect to it |
-| A machine switched off | Only its own agents leave the chat | If it is the host, everyone is cut off |
-| Setup | A Firebase project, once; then `crewchat cloud login` per machine | Tailscale on every device |
-| Where messages go | Encrypted on the machine; Firestore only holds ciphertext, deleted once delivered | Never leave your devices |
-| Needs | Included by the installer (otherwise `pip install "crewchat[cloud]"`, Python 3.10+) | Nothing extra |
+| How | The machines' crewchat servers talk to each other directly over your private network | The servers sync through your own Firebase project |
+| A machine switched off | Only its own agents leave the chat | Only its own agents leave the chat |
+| Setup | Tailscale on every machine, same account; then one invite and one join | A Firebase project, once; then a Google sign-in per machine |
+| Where messages go | Never leave your devices | Encrypted on the machine; Firestore only holds ciphertext, deleted once delivered |
+| Works across | Any networks Tailscale connects | Any network |
+| Needs | Nothing extra | Included by the installer (otherwise `pip install "crewchat[cloud]"`, Python 3.10+) |
+
+Either way, agents see each other across machines: `hub_agents` lists an agent elsewhere with
+`(on another machine: laptop)`, `hub_send` reaches it, and a task posted anywhere is taken by
+exactly one agent anywhere. Message numbers gain the machine's letter (`#A12`, `#B7`) so they
+stay unique without a central counter. A machine uses one way at a time.
+
+### Tailscale
+
+1. Install [Tailscale](https://tailscale.com) on every machine, signed in to the same account
+   (free for personal use).
+2. On the first machine:
+
+   ```bash
+   crewchat peers invite
+   ```
+
+   It gives this machine an address on your tailnet (it runs `tailscale serve` for crewchat's
+   port, private to your account; the first time, Tailscale may ask you to allow Serve) and
+   prints a join command with a single-use code.
+3. On each other machine, run that command:
+
+   ```bash
+   crewchat peers join https://office.your-tailnet.ts.net 7KQ2-M9XD
+   ```
+
+Machines tell each other about new members, so one invite from any member is enough.
+`crewchat peers status` shows who is linked and reachable, `crewchat peers remove NAME` drops a
+machine and changes the shared key, and `crewchat peers leave` unlinks this one.
+
+A task is settled by the machine it was posted on, so taking it needs that machine to be on. A
+machine that was off catches up on the messages it missed when it is back.
 
 ### Cloud sync
 
@@ -146,7 +183,7 @@ own agents even when it is offline, and catches up when it is back.
 
 1. Set up a Firebase project once, by hand or by handing a prompt to an agent:
    [docs/firebase-setup.md](docs/firebase-setup.md).
-2. On every machine, install crewchat, run `crewchat start` in the project folder, then:
+2. On every machine, after `crewchat start`:
 
    ```bash
    crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json
@@ -161,20 +198,16 @@ own agents even when it is offline, and catches up when it is back.
    crewchat cloud approve laptop
    ```
 
-Agents then see each other across machines: `hub_agents` lists an agent elsewhere with
-`(on another machine: laptop)`, `hub_send` reaches it, and a task posted anywhere is taken by
-exactly one agent anywhere. Message numbers gain the machine's letter (`#A12`, `#B7`) so they
-stay unique without a central counter.
-
 `crewchat cloud devices` lists the machines, `crewchat cloud remove NAME` drops one and switches
 the others to a new key it never sees, and `crewchat cloud status` shows this machine's state.
 How it works and why: [docs/cloud-sync-design.md](docs/cloud-sync-design.md).
 
-### One host over Tailscale
+### Or: one host for every machine
 
-The server only listens on the host itself (`127.0.0.1`), on purpose. To reach it from another
-machine, put the machines on a private network. [Tailscale](https://tailscale.com) is free for
-personal use and takes a few minutes:
+A machine can also join a chat without running crewchat's server itself: its agents connect to
+another machine's server directly. Simple, but when that host is off, everyone is cut off. The
+server only listens on the host itself (`127.0.0.1`), on purpose, so this also needs a private
+network such as Tailscale:
 
 1. Install Tailscale on the host and on each other device, signed in to the same account.
 2. On the host:
@@ -283,6 +316,8 @@ Cursor agents check once by default: their waiting has not been tried in Cursor 
 | `crewchat url [ADDRESS]` | Show or set the address other machines use |
 | `crewchat say [--task] [--to NAME] TEXT` | Post as the owner |
 | `crewchat status` | Is the server running, and who is connected |
+| `crewchat connect [tailscale\|cloud]` | Link this machine with your others: asks which way, then sets it up |
+| `crewchat peers invite` / `join URL CODE` / `status` / `remove NAME` / `leave` | Linking over Tailscale |
 | `crewchat cloud setup` / `login` / `status` / `devices` / `approve` / `remove` / `logout` / `rules` | Cloud sync between machines |
 
 | In a project folder | |
@@ -344,6 +379,10 @@ laptop.
   then `crewchat start` against the installed copy.
 - The installed phone app has been checked in Chrome (installable, offline page, sign-in); not
   yet on a real iPhone or Android phone.
+- Linking over Tailscale has been run live with three servers on one Mac (invite, join through
+  a member, messages both ways, removal), and is tested with three servers in one process. Not
+  yet across two physical machines, and the automatic `tailscale serve` setup has only been
+  tested against a stand-in.
 - `service install` on Linux and Windows has not been run on a real machine yet.
 - The Cursor hook follows Cursor's documented hooks format; if Cursor changes it, the agent still
   has the tools and only the automatic end-of-turn check is affected.

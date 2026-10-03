@@ -29,7 +29,7 @@ Issues = "https://github.com/deepankar17/crewchat/issues"
 crewchat = "crewchat:main"
 
 [tool.setuptools]
-py-modules = ["crewchat", "crewchat_cloud"]
+py-modules = ["crewchat", "crewchat_cloud", "crewchat_peers"]
 
 [tool.setuptools.dynamic]
 version = { attr = "crewchat.__version__" }

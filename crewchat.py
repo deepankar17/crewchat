@@ -48,7 +48,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -630,10 +630,15 @@ class Hub:
             for row in agents if isinstance(agents, list) else []:
                 if isinstance(row, dict) and NAME_RE.match(str(row.get("agent", ""))):
                     rows.append({k: row.get(k) for k in
-                                 ("agent", "client", "place", "seen", "status", "read_id", "unread")})
-            self.remote[device_id] = {"device": str(device), "agents": rows, "updated": float(updated or 0)}
-            self.version += 1
-            self.lock.notify_all()
+                                 ("agent", "client", "place", "seen", "status", "read_id", "unread", "activity")})
+            old = self.remote.get(device_id)
+            updated = float(updated or 0)
+            self.remote[device_id] = {"device": str(device), "agents": rows, "updated": updated}
+            # Only a real change wakes the chat page (and other machines' pulls).
+            if (old is None or old["agents"] != rows or old["device"] != str(device)
+                    or (old["updated"] == 0) != (updated == 0)):
+                self.version += 1
+                self.lock.notify_all()
 
     def drop_remote(self, device_id):
         with self.lock:
@@ -1157,6 +1162,7 @@ PAGE_HEADERS = {
     "Cache-Control": "no-store",
 }
 POST_PATHS = ("/mcp", "/login", "/api/send", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
 # names no project: like the icons, it is served without signing in.
@@ -1263,6 +1269,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt_, *args):
         line = (fmt_ % args).split("?")[0]  # never log query strings (sign-in codes)
+        if '"POST /peer/pull ' in line and line.endswith(" 200 -"):
+            return  # linked machines ask every few seconds; failures are still logged
         sys.stderr.write("%s %s %s\n" % (now_iso(), self._client(), line))
 
     def _client(self):
@@ -1467,8 +1475,15 @@ class Handler(BaseHTTPRequestHandler):
     def _admin(self, raw):
         data = self._object(raw)
         op = data.get("op")
+        result = {"ok": True}
         try:
-            if op == "rename":
+            if str(op).startswith("peer"):
+                import crewchat_peers
+                try:
+                    result = crewchat_peers.admin(self.hub, self.roster.root, op, data)
+                except crewchat_peers.PeerError as e:
+                    raise HubError(str(e))
+            elif op == "rename":
                 self.hub.rename(data.get("name"), data.get("new"))
             elif op == "remove":
                 self.hub.remove(data.get("name"))
@@ -1484,7 +1499,23 @@ class Handler(BaseHTTPRequestHandler):
         except HubError as e:
             self._json(400, {"error": str(e)})
             return
-        self._json(200, {"ok": True})
+        self._json(200, result)
+
+    def _peer(self, path, raw):
+        """A request from another of the owner's machines (crewchat_peers)."""
+        handler = getattr(self.hub.sync, "peer_request", None)
+        if handler is None:
+            self._json(404, {"error": "this machine is not linked to other machines"})
+            return
+        if self._locked():
+            self._json(429, {"error": "too many wrong keys or codes; try again later"})
+            return
+        header = self.headers.get("Authorization", "")
+        token = header[7:].strip() if header.startswith("Bearer ") else ""
+        status, out = handler(path, token, self.headers.get("X-Crewchat-Device", ""), self._object(raw))
+        if status == 401:
+            self._fail()
+        self._json(status, out)
 
     def _mcp(self, raw, who):
         try:
@@ -1533,7 +1564,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self.roster.refresh()
         path = urllib.parse.urlsplit(self.path).path
-        if path not in POST_PATHS:
+        if path not in POST_PATHS and path not in PEER_PATHS:
             self._reply(404, b"")
             return
         raw = self._body()
@@ -1548,6 +1579,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/join":
             self._join(raw)
+            return
+        if path in PEER_PATHS:
+            self._peer(path, raw)
             return
         if path == "/api/send":
             # From the chat page (session cookie) or from `crewchat say` (owner token).
@@ -1607,9 +1641,9 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-def make_server(port):
+def make_server(port, root=None):
     """A ready server (not yet serving). Port 0 picks a free one; see server.server_address."""
-    roster = Roster()
+    roster = Roster(root)
     handler = type("BoundHandler", (Handler,), {"roster": roster, "hub": Hub(roster), "failures": {}})
     return Server((BIND, port), handler)
 
@@ -1816,6 +1850,8 @@ def cmd_start(args):
              kinds[0], place, kinds[0], place))
     print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
     print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
+    if not (config.get("peers") or config.get("cloud")):
+        print("Agents on your other machines too? Run `crewchat start` there, then `crewchat connect`.")
 
 
 def cmd_serve(args):
@@ -1837,6 +1873,12 @@ def cmd_serve(args):
             crewchat_cloud.start(server.RequestHandlerClass.hub)
         except Exception as e:  # the local chat keeps working without the cloud
             sys.stderr.write("%s cloud sync is off: %s\n" % (now_iso(), e))
+    elif config.get("peers"):
+        try:
+            import crewchat_peers
+            crewchat_peers.start(server.RequestHandlerClass.hub)
+        except Exception as e:  # the local chat keeps working on its own
+            sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1937,6 +1979,62 @@ def cmd_ui(args):
     print("Opened the chat in your browser.")
 
 
+CONNECT_CHOICES = """How should this machine share the chat with your other machines?
+
+  1. Tailscale   The machines' crewchat servers talk to each other directly over your private
+                 network. Nothing leaves your devices and nothing to sign up for beyond
+                 Tailscale. Machines must be on the same Tailscale account.
+  2. Cloud sync  Through your own Firebase project, signed in with Google. Works from any
+                 network without Tailscale; messages are encrypted before they leave the
+                 machine. Needs a one-time Firebase setup (docs/firebase-setup.md).
+
+Either way, a machine that is switched off only takes its own agents out of the chat.
+"""
+
+
+def cmd_connect(args):
+    """A guide that picks a way to link machines and starts it."""
+    config = load_config()
+    if config.get("peers") or config.get("cloud"):
+        print("This machine is already linked (%s). See `crewchat %s status`." % (
+            ("over Tailscale", "peers") if config.get("peers") else ("with cloud sync", "cloud")))
+        return
+    way = args.way
+    if not way:
+        print(CONNECT_CHOICES)
+        answer = input("Choose 1 or 2: ").strip().lower()
+        way = {"1": "tailscale", "tailscale": "tailscale", "2": "cloud", "cloud": "cloud"}.get(answer)
+        if not way:
+            die("nothing chosen")
+    import crewchat_peers
+    if way == "tailscale":
+        answer = input("Have you already linked another machine (do you have a `crewchat peers join` command "
+                       "from it)? Paste that command, or press Enter if this is the first: ").strip()
+        parts = [p for p in answer.split() if p not in ("crewchat", "peers", "join")]
+        if len(parts) >= 2:
+            crewchat_peers.cmd_peers(argparse.Namespace(action="join", target=parts[0], code=parts[1],
+                                                        name=None, url=None))
+        else:
+            crewchat_peers.cmd_peers(argparse.Namespace(action="invite", target=None, code=None,
+                                                        name=None, url=None))
+        return
+    try:
+        import crewchat_cloud  # noqa: F401
+        import cryptography  # noqa: F401
+        from google.cloud import firestore  # noqa: F401
+    except ImportError:
+        die("cloud sync needs two libraries this install does not have. Run the installer again without "
+            "CREWCHAT_LEAN, or: pip install \"crewchat[cloud]\"")
+    print("Cloud sync, on every machine:")
+    print()
+    print("  1. Once, for all your machines: set up a Firebase project, by hand or by giving the prompt in")
+    print("     docs/firebase-setup.md to an agent (https://github.com/deepankar17/crewchat/blob/main/docs/firebase-setup.md).")
+    print("  2. crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json")
+    print("  3. crewchat cloud login           (signs in with Google in your browser)")
+    print("  4. crewchat service restart")
+    print("  5. On every later machine, approve it from one already set up: crewchat cloud approve NAME")
+
+
 def cmd_say(args):
     out = owner_call("/api/send", {"to": args.to, "text": " ".join(args.text),
                                    "kind": "task" if args.task else "msg"})
@@ -1955,6 +2053,14 @@ def cmd_status(_args):
         return
     print("Server:  running")
     print("Places:  %s" % (", ".join(list_places()) or "none joined yet"))
+    if config.get("peers"):
+        try:
+            import crewchat_peers
+            mesh = crewchat_peers.Mesh()
+            print("Linked:  as \"%s\" with %s (over Tailscale; `crewchat peers status`)" % (
+                mesh.me["name"], ", ".join(m["name"] for m in mesh.members().values()) or "no other machines yet"))
+        except Exception as e:
+            print("Linked:  set up, but cannot be read here (%s)" % e)
     if config.get("cloud"):
         try:
             import crewchat_cloud
@@ -2840,7 +2946,8 @@ CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="crewchat", description="A group chat for your AI coding agents and you.",
-        epilog="Quick start: crewchat start (in a project folder). Host: setup, serve, service, ui, invite, agents, agent, places, place, url, say, status. "
+        epilog="Quick start: crewchat start (in a project folder), then crewchat connect for other "
+               "machines. Host: setup, serve, service, ui, invite, agents, agent, places, place, url, say, status. "
                "Project folder: join, listen. Docs: README.md")
     parser.add_argument("--version", action="version", version="crewchat " + __version__)
     sub = parser.add_subparsers(dest="cmd", metavar="command")
@@ -2945,6 +3052,18 @@ def build_parser():
         p = sub.add_parser("cloud", help="sync with other machines (needs crewchat_cloud.py next to crewchat.py)")
         p.add_argument("rest", nargs="*")
         p.set_defaults(fn=lambda args: die("cloud sync needs crewchat_cloud.py next to crewchat.py"))
+
+    try:
+        import crewchat_peers
+        crewchat_peers.add_parser(sub)
+    except ImportError:  # crewchat.py copied on its own
+        p = sub.add_parser("peers", help="link with your other machines (needs crewchat_peers.py next to crewchat.py)")
+        p.add_argument("rest", nargs="*")
+        p.set_defaults(fn=lambda args: die("linking machines needs crewchat_peers.py next to crewchat.py"))
+
+    p = sub.add_parser("connect", help="share this chat with your other machines: choose Tailscale or cloud sync")
+    p.add_argument("way", nargs="?", choices=["tailscale", "cloud"])
+    p.set_defaults(fn=cmd_connect)
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])

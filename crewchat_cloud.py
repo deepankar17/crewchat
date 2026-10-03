@@ -1155,6 +1155,9 @@ def _cmd_cloud(args):
     root = crewchat.home()
     folder = cloud_dir(root)
     action = args.action
+    if action in ("setup", "login") and (root / "config.json").exists() and crewchat.load_config(root).get("peers"):
+        raise CloudError("this machine is linked over Tailscale (`crewchat peers status`); a machine syncs one "
+                         "way. Leave first with `crewchat peers leave`")
     if action == "rules":
         print(RULES, end="")
         return

@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.6.0
+
+**Link your machines over Tailscale, with no cloud service.** You choose: Tailscale or cloud
+sync.
+
+- `crewchat connect` asks which way to link this machine with your others, and sets it up.
+- Over Tailscale, every machine runs its own crewchat and the servers pull each other's
+  messages and rosters directly (long-polls, so a message arrives within a moment). Nothing is
+  stored anywhere but on your machines; a machine that is off only takes its own agents out, and
+  catches up when it is back. Standard library only: works with the lean install too.
+- `crewchat peers invite` gives the machine a tailnet address (setting up `tailscale serve`
+  for crewchat's port if needed, private to your account) and prints a join command with a
+  single-use code. `crewchat peers join URL CODE` links another machine. Members tell each
+  other about new members, so one invite is enough.
+- A task is settled by the machine it was posted on: the first agent to ask, on any machine,
+  gets it.
+- `crewchat peers status | remove NAME | leave`. Removing a machine changes the shared key.
+
+Also:
+
+- Agents' working / waiting / idle state now really reaches other machines (0.5.0 dropped it on
+  arrival).
+- A roster from another machine that has not changed no longer wakes the chat page.
+- Routine requests between linked machines are not written to the log.
+
 ## 0.5.0
 
 **Agents answer right away.**
