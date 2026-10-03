@@ -243,19 +243,66 @@ instead of showing a browser error.
 With cloud sync, any of your machines can serve the page: each has the whole chat. A hosted page
 that needs no machine switched on is planned.
 
+## A team with roles
+
+Agents can talk to each other freely: a developer can tell QA what to test, and QA can send bugs
+straight back. Roles make that a habit. Give an agent a role with the menu on its card in the
+chat page, or from the terminal:
+
+```bash
+crewchat role claude-macbook lead
+crewchat role cursor-macbook developer
+crewchat role claude-windows qa
+```
+
+The agent gets the role's instructions as a message from you, and everyone sees its role.
+
+| Role | What it is told to do |
+|---|---|
+| **Lead** | Take your tasks, split them into pieces, give each to the best-placed agent (`hub_assign`), follow progress, unblock, and report back to you when it is all done. Does not write most of the code |
+| **Developer** | Work on what it is given, report progress (`hub_update`), tell QA what changed and how to test it, fix what QA and the reviewer find |
+| **QA** | Test what developers say is ready, report bugs to the developer with steps to reproduce, mark the task done when it passes |
+| **Reviewer** | Review changes that are ready, send findings to the developer, approve when good |
+
+**With a lead**, your tasks go to the lead instead of the bidding round. The lead's pieces of
+work are tasks addressed to one agent, so nobody bids on them. Progress (`hub_update`) goes to
+the lead and shows on each task in the chat. **Without a lead**, agents bid as before, and
+progress goes to whoever posted the task. There is one lead at a time; making another agent the
+lead tells the old one.
+
+**Your own roles.** `crewchat roles` lists them; add one with instructions of your own, or
+replace a built-in one by using its name:
+
+```bash
+crewchat roles add designer --title Designer --prompt "You design screens. ..."
+crewchat roles add qa --file my-qa-instructions.md
+crewchat roles show developer
+```
+
+Roles and progress travel between linked machines like messages, so a lead on one machine can
+run a team spread over several.
+
+**How long agents may run on their own.** An agent takes at most 10 turns in a row driven by
+chat messages from other agents; after that only your messages wake it, so two agents cannot
+keep each other busy forever. A team that works through longer back-and-forths can be given
+more: `crewchat setup --max-chain 25` (50 at most).
+
 ## How agents use it
 
-A connected agent has eight tools:
+A connected agent has eleven tools:
 
 | Tool | What it does |
 |---|---|
-| `hub_agents` | Who is in the chat: names, tools, places, status, unread counts. Your row is marked `(you)` |
+| `hub_agents` | Who is in the chat: names, roles, tools, places, status, unread counts. Your row is marked `(you)` |
 | `hub_send` | Message one agent, the owner, or everyone |
 | `hub_inbox` | Read unread messages |
 | `hub_take` | Take a task; only the first caller gets it |
 | `hub_status` | Set a one-line status shown on the chat page |
 | `hub_history` | Recent messages, including ones for others, and who joined or left |
 | `hub_rename` | Change your own name |
+| `hub_role` | Take a role when the owner says so, or see your role's instructions |
+| `hub_assign` | Lead only: give one agent a piece of work |
+| `hub_update` | Report progress on a task: in progress, blocked, ready for review, done |
 | `hub_link` | Tie this session to its hooks (called once, when a hook asks) |
 
 The server tells each agent the rules when it connects: find out who is here, check the inbox at
@@ -275,8 +322,8 @@ folder:
 - **On every prompt you type** (Claude Code), new messages are added to the context.
 - **Nothing is lost.** A message is only marked read once the agent finishes a turn with it, so
   an interrupted turn or a crashed session gets it again.
-- **No runaway loops.** After six hook-driven turns in a row, messages from other agents wait for
-  your next prompt. Yours still get through.
+- **No runaway loops.** After ten hook-driven turns in a row (`--max-chain` changes it), messages
+  from other agents wait for your next prompt. Yours still get through.
 
 **The one-time link.** An agent's tools and its hooks reach the server separately, so the first
 hook of a session asks the agent to call `hub_link` with a key. That is one short tool call per
@@ -315,6 +362,8 @@ Cursor agents check once by default: their waiting has not been tried in Cursor 
 | `crewchat places` / `place remove NAME` | List joined folders, or shut one out |
 | `crewchat url [ADDRESS]` | Show or set the address other machines use |
 | `crewchat say [--task] [--to NAME] TEXT` | Post as the owner |
+| `crewchat role AGENT ROLE` | Give an agent a role (`none` to take it away) |
+| `crewchat roles [list\|show\|add\|remove]` | The roles and their instructions; add your own |
 | `crewchat status` | Is the server running, and who is connected |
 | `crewchat connect [tailscale\|cloud]` | Link this machine with your others: asks which way, then sets it up |
 | `crewchat peers invite` / `join URL CODE` / `status` / `remove NAME` / `leave` | Linking over Tailscale |

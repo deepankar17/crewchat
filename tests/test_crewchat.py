@@ -140,7 +140,8 @@ class Protocol(Base):
         self.assertIn("hub_link", session.hello["instructions"])
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
-                                                      "hub_status", "hub_history", "hub_rename", "hub_link"])
+                                                      "hub_status", "hub_history", "hub_rename", "hub_role",
+                                                      "hub_assign", "hub_update", "hub_link"])
 
     def test_json_rpc_edges(self):
         session = Session(self.base, self.token)
@@ -371,11 +372,120 @@ class Tasks(Base):
             cli("say", "--to", "nobody-here", "hello")
 
 
+class Teams(Base):
+    def role(self, agent, role):
+        return crewchat.post_json(self.base + "/api/role", self.owner, {"agent": agent, "role": role})
+
+    def row(self, name):
+        return next(r for r in self.hub.rows() if r["agent"] == name)
+
+    def test_the_owner_gives_roles_and_the_agent_gets_its_instructions(self):
+        dev, dev_name = self.agent()
+        self.role(dev_name, "developer")
+        self.assertEqual(self.row(dev_name)["role"], "developer")
+        inbox = dev.text("hub_inbox")
+        self.assertIn("[ROLE]", inbox)
+        self.assertIn("Your role in this chat is now: Developer (set by the owner)", inbox)
+        self.assertIn("tell the QA agent", inbox)
+        self.assertIn("%s (you) [developer]:" % dev_name, dev.text("hub_agents"))
+        self.assertIn("You are a developer", dev.text("hub_role"))
+        with self.assertRaises(urllib.error.HTTPError):
+            self.role(dev_name, "astronaut")
+        self.role(dev_name, "none")
+        self.assertEqual(self.row(dev_name)["role"], "")
+        self.assertIn("You have no role", dev.text("hub_role"))
+        # From the chat page too, with the page's session.
+        opener, _ = self.owner_browser()
+        status, _, _ = self.raw("/api/role", json.dumps({"agent": dev_name, "role": "qa"}).encode(),
+                                {"Content-Type": "application/json", "Origin": self.base}, opener)
+        self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
+        poll = json.loads(self.raw("/api/poll?after=0&v=-1&wait=0", opener=opener)[1])
+        self.assertIn({"name": "qa", "title": "QA"}, poll["roles"])
+
+    def test_there_is_one_lead(self):
+        (one, n1), (two, n2) = self.agent(), self.agent()
+        self.role(n1, "lead")
+        self.role(n2, "lead")
+        self.assertEqual((self.row(n1)["role"], self.row(n2)["role"]), ("", "lead"))
+        self.assertIn("You are no longer the lead: %s is." % n2, one.text("hub_inbox"))
+        self.role(n2, "none")
+
+    def test_the_lead_assigns_and_hears_back(self):
+        (lead, lead_name), (dev, dev_name), (qa, qa_name) = self.agent(), self.agent(), self.agent()
+        self.role(lead_name, "lead")
+        self.role(dev_name, "developer")
+        self.role(qa_name, "qa")
+        for s in (lead, dev, qa):
+            s.text("hub_inbox")
+        job = self.say("all", "Add a dark theme", "task")
+        self.assertIn("leave open tasks to the lead", lead.hello["instructions"])
+        self.assertIn("only the lead assigns", dev.call("hub_assign", to=qa_name, text="x")["content"][0]["text"])
+        lead.call("hub_take", id=job)
+        out = lead.text("hub_assign", to=dev_name, text="Build the theme switch", task=job)
+        piece = re.search(r"task #(\w+)", out).group(1)
+        self.assertEqual(self.hub.taken[piece], dev_name)
+        got = dev.text("hub_inbox")
+        self.assertIn("[TASK, assigned to you, part of #%s] Build the theme switch" % job, got)
+        # Progress goes to the lead, and shows on the task.
+        self.assertIn(lead_name, dev.text("hub_update", id=piece, status="review",
+                                                                note="Ready: toggle in Settings"))
+        self.assertEqual(self.hub.progress[piece]["status"], "review")
+        self.assertIn("[UPDATE on #%s: ready for review] Ready: toggle in Settings" % piece, lead.text("hub_inbox"))
+        self.assertIn("[%s: ready for review]" % dev_name, lead.text("hub_history", limit=10))
+        # Developer and QA talk directly.
+        dev.call("hub_send", to=qa_name, text="Theme switch is ready to test: Settings > Theme")
+        qa_in = qa.text("hub_inbox")
+        self.assertIn("ready to test", qa_in)
+        qa.call("hub_send", to=dev_name, text="Bug: the switch resets on restart")
+        self.assertIn("resets on restart", dev.text("hub_inbox"))
+        self.assertIn("status must be one of", qa.call("hub_update", id=piece, status="sideways")["content"][0]["text"])
+        for name in (lead_name, dev_name, qa_name):
+            self.role(name, "none")
+
+    def test_without_a_lead_updates_go_to_whoever_posted_the_task(self):
+        dev, dev_name = self.agent()
+        job = self.say(dev_name, "Fix the login test", "task")
+        dev.call("hub_take", id=job)
+        self.assertIn("the owner has been told", dev.text("hub_update", id=job, status="in_progress"))
+        update = self.hub.history(1)[0]
+        self.assertEqual((update["to"], update["kind"], update["text"]), ("Owner", "update", "in progress"))
+
+    def test_an_agent_takes_a_role_when_told_to_and_custom_roles(self):
+        session, name = self.agent()
+        self.assertIn("Your role in this chat is now: Reviewer (set by %s)" % name,
+                      session.text("hub_role", role="reviewer"))
+        self.assertEqual(self.row(name)["role"], "reviewer")
+        cli("roles", "add", "designer", "--prompt", "You design screens.", "--title", "Designer")
+        self.assertIn("designer     Designer", cli("roles"))
+        self.assertIn("You design screens.", cli("roles", "show", "designer"))
+        cli("role", name, "designer")
+        self.assertIn("You design screens.", session.text("hub_inbox"))
+        cli("roles", "remove", "designer")
+        self.assertNotIn("designer", cli("roles"))
+        cli("role", name, "none")
+
+    def test_the_loop_limit_comes_from_the_config(self):
+        self.assertEqual(self.hub.roster.max_chain, crewchat.MAX_CHAIN)
+        config = crewchat.load_config()
+        config["max_chain"] = 25
+        crewchat.save_config(config)
+        self.hub.roster.refresh()
+        try:
+            self.assertEqual(self.hub.roster.max_chain, 25)
+            out = crewchat.post_json(self.base + "/api/hook", self.token, {"key": "k" * 16, "wait": 0})
+            self.assertEqual((out.get("link"), out.get("max_chain")), (True, 25))
+        finally:
+            config.pop("max_chain")
+            crewchat.save_config(config)
+
+
 class Linking(Base):
     """Hooks reach an agent through a link key that the agent ties to itself with hub_link."""
 
     def hook(self, key, token=None, **extra):
-        return crewchat.post_json(self.base + "/api/hook", token or self.token, dict({"key": key}, **extra))
+        out = crewchat.post_json(self.base + "/api/hook", token or self.token, dict({"key": key}, **extra))
+        self.assertEqual(out.pop("max_chain"), crewchat.MAX_CHAIN)  # every answer carries the loop limit
+        return out
 
     def test_link_then_messages_arrive_through_the_hook(self):
         session = Session(self.base, self.token)

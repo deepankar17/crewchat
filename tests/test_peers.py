@@ -179,6 +179,21 @@ class Linked(unittest.TestCase):
         eventually(lambda: any(r["agent"] == agent and r["activity"] == "working" for r in self.c.hub.rows()),
                    what="gamma to see the agent working")
 
+    def test_roles_and_progress_cross_machines(self):
+        lead, dev = self.a.agent(), self.c.agent()
+        eventually(lambda: self.a.sees(dev) and self.c.sees(lead), what="rosters")
+        self.a.hub.set_role(crewchat.OWNER, lead, "lead")
+        self.a.hub.set_role(crewchat.OWNER, dev, "developer")
+        eventually(lambda: self.c.hub.agents[dev]["role"] == "developer", what="the role to arrive")
+        eventually(lambda: any(r["agent"] == lead and r["role"] == "lead" for r in self.c.hub.rows()),
+                   what="gamma to see the lead")
+        piece = self.a.hub.assign(lead, dev, "Build it")
+        eventually(lambda: self.c.hub.taken.get(piece["id"]) == dev, what="the assignment")
+        _, to = self.c.hub.update(dev, piece["id"], "review", "Ready to test")
+        self.assertEqual(to, lead)
+        eventually(lambda: self.a.hub.progress.get(piece["id"], {}).get("status") == "review", what="the update")
+        self.a.hub.set_role(crewchat.OWNER, lead, "none")
+
     def test_the_key_is_required(self):
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}, token="wrong"), 401)
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}), 401)

@@ -216,6 +216,23 @@ class Sync(unittest.TestCase):
         with self.assertRaises(crewchat.HubError):
             self.a.hub.remove(win_agent)
 
+    def test_roles_and_progress_cross_machines(self):
+        lead, dev = self.a.agent(), self.b.agent()
+        wait_until(lambda: dev in self.a.hub.names and lead in self.b.hub.names, message="rosters")
+        self.a.hub.set_role(crewchat.OWNER, lead, "lead")
+        self.a.hub.set_role(crewchat.OWNER, dev, "developer")  # an agent on the other machine
+        wait_until(lambda: self.b.hub.agents[dev]["role"] == "developer", message="the role to arrive")
+        wait_until(lambda: any(r["agent"] == dev and r["role"] == "developer" for r in self.a.hub.rows()),
+                   message="the role to show on the first machine")
+        wait_until(lambda: any(r["agent"] == lead and r["role"] == "lead" for r in self.b.hub.rows()),
+                   message="the lead to show on the second machine")
+        piece = self.a.hub.assign(lead, dev, "Build it")
+        wait_until(lambda: self.b.hub.taken.get(piece["id"]) == dev, message="the assignment")
+        _, to = self.b.hub.update(dev, piece["id"], "done", "Built")
+        self.assertEqual(to, lead)
+        wait_until(lambda: self.a.hub.progress.get(piece["id"], {}).get("status") == "done", message="the update")
+        self.assertIn("Built", [m["text"] for m in self.a.hub.inbox(lead, 0, True)])
+
     def test_read_receipts_cross_machines(self):
         win_agent = self.b.agent()
         msg = self.a.say(win_agent if wait_until(lambda: win_agent in self.a.hub.names) else "all", "read me")

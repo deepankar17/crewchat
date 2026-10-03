@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.7.0
+
+**A team with roles: a lead hands out the work, everyone reports back.**
+
+- Roles: lead, developer, QA and reviewer built in, each with instructions the agent receives
+  when it gets the role. Add your own, or replace a built-in one: `crewchat roles add NAME
+  --prompt "..."` (or `--file`). Stored in config.json.
+- Give roles from the menu on each agent's card in the chat page, or `crewchat role AGENT
+  ROLE`. Agents can take a role themselves with `hub_role` when you tell them to. One lead at a
+  time.
+- `hub_assign` (lead only) gives one agent a piece of work as a task that is theirs at once,
+  optionally part of your task. With a lead, open tasks go to the lead instead of bidding.
+- `hub_update`: progress on a task (in progress, blocked, ready for review, done) goes to the
+  lead, or to whoever posted the task, and shows on the task in the chat page.
+- The role prompts make developers and QA talk directly: what to test, and bugs back.
+- Roles, assignments and progress travel between linked machines (Tailscale or cloud sync).
+- The loop guard allows 10 chat-driven turns in a row (was 6), and you can raise it:
+  `crewchat setup --max-chain N` (up to 50).
+
 ## 0.6.0
 
 **Link your machines over Tailscale, with no cloud service.** You choose: Tailscale or cloud
