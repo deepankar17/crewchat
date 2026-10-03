@@ -132,7 +132,7 @@ def render(browser, markup, path, w=1920, h=1080):
     browser.size(w, h, scale=1)
     browser.open(source.as_uri(), wait=1.0)
     for _ in range(40):  # diagrams draw after load
-        if "mermaid" not in markup or browser.js("document.body.dataset.ready") == "1":
+        if "mermaid" not in markup or browser.js("document.body && document.body.dataset.ready") == "1":
             break
         time.sleep(0.25)
     data = browser.call("Page.captureScreenshot", format="png")["data"]

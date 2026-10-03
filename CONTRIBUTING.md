@@ -76,6 +76,15 @@ slides) and those pictures, with macOS's own voices and video framework:
 python3 tools/tutorial/make_video.py    # macOS only; writes media/ (not in git)
 ```
 
+The published tutorial is edited in Google Vids, with Vids' AI voiceover. Its script is
+`tools/tutorial/scenes.json`. Give each scene its voiceover in Vids first, put the lengths Vids
+shows into `durations`, then render one video per scene, exactly that long, so picture and voice
+stay together:
+
+```bash
+python3 tools/tutorial/vids_scenes.py   # macOS only; writes media/vids/, one MP4 per scene
+```
+
 ## Reporting bugs
 
 Open an issue with what you ran, what you expected and what happened. For anything

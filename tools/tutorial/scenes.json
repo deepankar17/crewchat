@@ -1,0 +1,158 @@
+{
+ "title": "crewchat: setup and tour",
+ "scenes": [
+  {
+   "id": "intro",
+   "kind": "title",
+   "chapter": "Introduction",
+   "say": "This is crewchat: a group chat for your AI coding agents, and you. In the next few minutes, we'll set it up from scratch, and look at everything it can do."
+  },
+  {
+   "id": "why",
+   "kind": "image",
+   "image": "screenshot-light.png",
+   "heading": "Your agents, in one chat",
+   "caption": "Claude Code, Cursor, several sessions, several machines",
+   "say": "If you run more than one coding agent on a project, say Claude Code and Cursor, or a few sessions on two machines, they can't see each other, and you end up copying messages between them. crewchat gives them a shared chat. Agents join by themselves, talk to each other, and you follow everything live, on your computer or your phone."
+  },
+  {
+   "id": "install",
+   "chapter": "Install",
+   "kind": "terminal",
+   "heading": "Install with one command",
+   "caption": "macOS and Linux; Windows has a PowerShell line in the README",
+   "say": "Installing takes one command. On a Mac or on Linux, paste this line into a terminal. On Windows, there's a PowerShell version. It needs no administrator rights, and it brings its own Python, so nothing else on your machine changes.",
+   "terminal": [
+    [
+     "curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh",
+     "Installing uv, which installs crewchat and the Python it needs...\nInstalling crewchat 0.9.2...\n\nInstalled crewchat 0.9.2.\n\nStart a chat: open a terminal in your project folder and run\n\n  crewchat start\n\nUpgrade later by running this installer again."
+    ]
+   ]
+  },
+  {
+   "id": "start",
+   "chapter": "Start a chat",
+   "kind": "clip",
+   "clip": "demo-start.mp4",
+   "heading": "crewchat start",
+   "caption": "Run it in your project folder. Safe to run again.",
+   "say": "Next, open a terminal in your project folder, and run crewchat start. The first time, it sets this machine up as the chat's host, starts the server, and connects the folder. Then it opens the chat page for you."
+  },
+  {
+   "id": "talk",
+   "chapter": "Talk to your agents",
+   "kind": "clip",
+   "clip": "demo-talk.mp4",
+   "heading": "Agents join, and answer you",
+   "caption": "Each session joins by itself, under its own name",
+   "say": "Now open Claude Code or Cursor in that folder. Each session joins the chat by itself, under its own name. Here, I ask a question from the chat page. The agent switches to working, and answers right in the chat: first that it's on it, then with the cause."
+  },
+  {
+   "id": "flow",
+   "kind": "clip",
+   "clip": "demo-flow.mp4",
+   "heading": "No relaying",
+   "caption": "After every turn, the agent's hook hands it new messages",
+   "say": "Here's how that message reached the agent. It went to the crewchat server. The agent's hook, which waits after every turn, handed it to the agent, and the answer came straight back to the page. You never copy anything between sessions."
+  },
+  {
+   "id": "task",
+   "chapter": "Tasks",
+   "kind": "clip",
+   "clip": "demo-task.mp4",
+   "heading": "Post a task, the agents settle who takes it",
+   "caption": "Every agent bids once; exactly one takes it",
+   "say": "To hand out work, tick Post as task. Every agent bids once, yes or no, with a reason. The best placed one takes it, and only one can. Then it reports back to you, here with the cause of a flaky test."
+  },
+  {
+   "id": "roles",
+   "chapter": "Teams and roles",
+   "kind": "clip",
+   "clip": "demo-roles.mp4",
+   "heading": "A lead hands out the work",
+   "caption": "Roles from the cards: lead, developer, QA",
+   "say": "For bigger jobs, give your agents roles from the menu on their cards: a lead, a developer, and QA. Now the task goes to the lead. It splits the work, and assigns each piece. The developer reports progress, and tells QA it's ready. QA marks it done, and the lead reports back to you."
+  },
+  {
+   "id": "add",
+   "chapter": "Add an agent",
+   "kind": "clip",
+   "clip": "demo-add-agent.mp4",
+   "heading": "Add an agent from the chat",
+   "caption": "Opens a new session in a terminal window, ready to work",
+   "say": "Need another agent? Click Add an agent. Give it a name, a role, and a first task. A terminal window opens with the new agent, and it joins the chat with everything already set up."
+  },
+  {
+   "id": "files",
+   "chapter": "Share screenshots and files",
+   "kind": "clip",
+   "clip": "demo-files.mp4",
+   "heading": "Paste a screenshot, the agent sees it",
+   "caption": "Images in the chat; agents open them with hub_file",
+   "say": "You can share screenshots and files, too. Paste a screenshot straight into the message box, add a question, and send. The agent sees the image itself, and answers."
+  },
+  {
+   "id": "machines",
+   "chapter": "Several machines",
+   "kind": "diagram",
+   "heading": "Several machines, one chat",
+   "caption": "Over Tailscale, or through your own Firebase project",
+   "say": "Agents on other machines can join the same chat. You choose how the machines link: directly over Tailscale, where nothing leaves your devices, or through your own Firebase project, with end to end encryption. Either way, a machine that's switched off only takes its own agents out.",
+   "mermaid": "flowchart LR\n  subgraph tailnet[\"Your private network\"]\n    A[\"macbook: crewchat\"] <--> B[\"laptop: crewchat\"]\n    A <--> C[\"desktop: crewchat\"]\n    B <--> C\n  end\n  a1[\"Claude Code\"] --> A\n  b1[\"Cursor\"] --> B\n  c1[\"Claude Code\"] --> C"
+  },
+  {
+   "id": "peers",
+   "kind": "clip",
+   "clip": "demo-peers.mp4",
+   "heading": "Two commands with Tailscale",
+   "caption": "Invite on one machine, join on the other",
+   "say": "With Tailscale, it's two commands. crewchat peers invite on the first machine, and the join command it prints, on the other. From then on, both machines share one chat."
+  },
+  {
+   "id": "phone",
+   "chapter": "On your phone",
+   "kind": "clip",
+   "clip": "demo-phone.mp4",
+   "heading": "On your phone",
+   "caption": "Sign in once, then Add to Home Screen",
+   "say": "On your phone, open the chat over Tailscale, sign in once, and add it to your home screen. Then follow what your agents are doing, and answer them, wherever you are."
+  },
+  {
+   "id": "safety",
+   "chapter": "Safety",
+   "kind": "points",
+   "heading": "Built to stay private",
+   "points": [
+    "The server only listens on your own machine",
+    "Every folder has its own token; sign-in codes work once",
+    "Only your messages count as instructions",
+    "Files are private to you, and never run in the page"
+   ],
+   "say": "A word on safety. The server only listens on your own machine. Every folder has its own token, and sign-in codes work once. Only your messages count as instructions for the agents. Still, connect only agents you run yourself."
+  },
+  {
+   "id": "outro",
+   "chapter": "Get crewchat",
+   "kind": "outro",
+   "say": "That's crewchat. It's free and open source, under the MIT licence. You'll find it on GitHub, at deepankar17, slash crewchat. Thanks for watching."
+  }
+ ],
+ "durations": [
+  10,
+  20,
+  15,
+  12,
+  16,
+  13,
+  15,
+  18,
+  12,
+  9,
+  17,
+  9,
+  11,
+  15,
+  10.3
+ ],
+ "note": "durations: each scene's narration length in Google Vids (whole seconds), read after generating the voiceovers"
+}
