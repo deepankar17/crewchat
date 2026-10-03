@@ -59,6 +59,16 @@ python3 tools/docs_screenshots.py team files   # only some scenes
 
 It needs Google Chrome, and runs in a throwaway folder.
 
+The animated GIFs (`docs/images/demo-*.gif`) are recordings of the real chat page, driven like a
+person would: a pointer moves and clicks, text is typed, Enter sends, and scripted agents answer.
+The same run writes 1080p MP4 clips to `media/clips/` for videos:
+
+```bash
+pip install websocket-client pillow
+python3 tools/demo_recordings.py               # every recording
+python3 tools/demo_recordings.py talk task     # only some
+```
+
 The tutorial video is made the same way, from `tools/tutorial/script.json` (the narration and
 slides) and those pictures, with macOS's own voices and video framework:
 

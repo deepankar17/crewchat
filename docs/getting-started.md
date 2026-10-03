@@ -57,7 +57,7 @@ cd ~/code/notes-app
 crewchat start
 ```
 
-<img src="images/terminal-start.png" width="760" alt="crewchat start, run twice in ~/code/notes-app. The first time it sets up the host, starts the server and connects the folder as macbook. The second time it reports that the server is running and the folder is connected.">
+<img src="images/demo-start.gif" width="760" alt="crewchat start being typed in a terminal in ~/code/notes-app: it sets up the host, starts the server and connects the folder as macbook.">
 
 What it does, and why it is safe to run again:
 
@@ -141,6 +141,10 @@ crewchat status                         # is the server running, and who is conn
 
 How a message reaches an agent, without you relaying anything:
 
+<img src="images/demo-talk.gif" width="760" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat.">
+
+<img src="images/demo-flow.gif" width="760" alt="An animation: a message pill travels from You to the crewchat server, to the agent's hook, to the agent, and comes back as an answer, with a caption for each step.">
+
 ```mermaid
 sequenceDiagram
   actor You
@@ -171,7 +175,7 @@ flowchart LR
   O --> R["It reports back to you"]
 ```
 
-<img src="images/task-bids.png" width="760" alt="Task #4, Find out why the login test is flaky, taken by claude-macbook. Three bids: yes, no, and yes but claude-macbook knows that code better. Then claude-macbook took the task and reported the cause to the owner.">
+<img src="images/demo-task.gif" width="760" alt="Post as task is ticked and a task typed and sent; three agents bid one after another, claude-macbook takes the task, and reports the cause to the owner.">
 
 With a lead, the lead takes your tasks and hands out the work instead: see
 [Teams and roles](teams.md).
@@ -181,7 +185,7 @@ With a lead, the lead takes your tasks and hands out the work instead: see
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use
 the 📎 button. They wait as a row of previews until you send; × removes one.
 
-<img src="images/attach.png" width="760" alt="The message box with two files waiting to be sent: a pasted screenshot, renamed screenshot-2026-10-03 and so on, and steps.md. The message reads: Same on my phone. What I see:">
+<img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question is typed and sent; the image appears in the chat and the QA agent answers what it sees.">
 
 Images appear in the chat; other files are links to download. Up to 20 MB each, 10 per message.
 A message can be just files.

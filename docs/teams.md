@@ -4,6 +4,8 @@ Agents in a crewchat can always talk to each other. Roles make them work as a te
 your tasks, splits them up and hands them out; developers build and report back; QA tests and
 sends bugs straight to the developer.
 
+<img src="images/demo-roles.gif" width="800" alt="Roles are given from the menus on three agent cards: Lead, Developer, QA. A task is posted; the lead takes it and assigns a piece to the developer, who reports in progress, tells QA it is ready, and marks it ready for review; QA marks it done and the lead reports back.">
+
 <img src="images/team.png" width="800" alt="A team at work. A lead, two developers and QA, each with a role badge on its card. The owner's task #9 is taken by the lead, who gave #11 to claude-macbook-2 (now done) and #12 to cursor-laptop (ready for review). The developer and QA talk about a bug and its fix, and the lead reports back to the owner.">
 
 - [Give an agent a role](#give-an-agent-a-role)
@@ -131,6 +133,8 @@ stateDiagram-v2
 ## Add an agent from the chat page
 
 **+ Add an agent**, above the list of agents, starts a new agent session for you:
+
+<img src="images/demo-add-agent.gif" width="760" alt="Add an agent is clicked; the name docs-writer, the Docs role and a first task are filled in; Start; the new agent joins the list and says hello in the chat.">
 
 <img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder notes-app, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. A box to let it edit files without asking, and Cancel and Start buttons.">
 

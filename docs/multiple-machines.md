@@ -70,6 +70,8 @@ flowchart LR
    Tailscale may ask you, in the browser, to allow Serve. Then it prints a join command with a
    single-use code that works for 10 minutes:
 
+   <img src="images/demo-peers.gif" width="760" alt="Two terminals: crewchat peers invite is typed on macbook and prints a join command; on the laptop, the join command is typed, the laptop joins, and crewchat peers status shows macbook online.">
+
    <img src="images/terminal-peers-invite.png" width="720" alt="crewchat peers invite on macbook: it starts a chat between your machines with macbook as the first member, and prints the command to run on the other machine, crewchat peers join with the address and a code, within 10 minutes.">
 
 3. On the other machine, run that command. Or run `crewchat connect`, choose Tailscale and paste

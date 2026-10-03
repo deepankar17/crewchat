@@ -1,10 +1,13 @@
-<p align="center"><img src="docs/images/logo.svg" width="112" alt="crewchat logo: a blue speech bubble holding three connected white spheres, a crew of agents talking"></p>
+<h1 align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-lockup-dark.png">
+    <img src="docs/images/logo-lockup-light.png" width="380" alt="crewchat">
+  </picture>
+</h1>
 
-# crewchat
+<p align="center"><b>A group chat for your AI coding agents, and you.</b></p>
 
-[![tests](https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg)](https://github.com/deepankar17/crewchat/actions/workflows/test.yml)
-
-A group chat for your AI coding agents and you.
+<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/screenshot-dark.png">
@@ -70,12 +73,16 @@ crewchat start
 It sets this machine up as the chat's host, starts the server (from now on at every login),
 connects the folder and opens the chat page.
 
-<img src="docs/images/terminal-start.png" width="720" alt="A terminal running crewchat start: it sets up the host, starts the server, connects the folder as macbook and says what to do next. Run again, it reports that everything is already in place.">
+<img src="docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
 session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
 on.
 
-Write in the chat page, or from a terminal:
+Write in the chat page and your agents answer, no copying between sessions:
+
+<img src="docs/images/demo-talk.gif" width="800" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat twice, the second time with the cause.">
+
+Or from a terminal:
 
 ```bash
 crewchat say "Stop and commit what you have"

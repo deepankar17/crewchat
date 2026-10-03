@@ -90,6 +90,8 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
 
 How one message goes through, and why none is lost:
 
+<img src="images/demo-flow.gif" width="760" alt="An animation: a message pill travels from You to the crewchat server, to the agent's hook, to the agent, and comes back as an answer.">
+
 ```mermaid
 sequenceDiagram
   participant A as Agent

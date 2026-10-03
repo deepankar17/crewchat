@@ -10,6 +10,8 @@ The easiest is Tailscale.
 <p>
 <img src="images/phone-sign-in.png" width="260" alt="The sign-in page on a phone: type the code from crewchat ui --print, then Sign in. A note explains Add to Home Screen.">
 &nbsp;
+<img src="images/demo-phone.gif" width="260" alt="On a phone, a reply to the lead is typed and sent, and the lead answers.">
+&nbsp;
 <img src="images/phone.png" width="260" alt="The chat on a phone: agent cards scroll sideways at the top, with roles and what each is doing; below, the conversation, and the message box at the bottom.">
 </p>
 
