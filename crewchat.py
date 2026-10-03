@@ -237,11 +237,19 @@ def load_config(root=None):
     return data
 
 
+def all_roles(config):
+    """Built-in roles, plus the owner's own from config.json ("roles": {name: {title, prompt}}),
+    as {name: (title, prompt)}. An owner's role with a built-in name replaces it."""
+    out = dict(ROLES)
+    custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
+    for name, spec in custom.items():
+        if isinstance(spec, dict) and NAME_RE.match(str(name)) and spec.get("prompt"):
+            out[str(name)] = (str(spec.get("title") or name), str(spec["prompt"]))
+    return out
+
+
 def save_config(config, root=None):
-    path = (root or home()) / "config.json"
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    write_json((root or home()) / "config.json", config)
 
 
 def token_path(name, root=None):
@@ -302,6 +310,7 @@ class Roster:
             return
         config = load_config(self.root)
         self.config = config
+        self.roles = all_roles(config)
         self.project = str(config["project"])
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
@@ -425,15 +434,10 @@ class Hub:
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
 
     def _save(self):
-        tmp = self.home / "state.json.tmp"
-        data = {
+        write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web,
-        }
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.replace(tmp, self.home / "state.json")
+        }, private=True, indent=None)
 
     def _changed(self):
         self.version += 1
@@ -448,19 +452,20 @@ class Hub:
         if len(self.messages) > KEEP_MESSAGES:
             for old in self.messages[:-KEEP_MESSAGES]:
                 self.ids.pop(old["id"], None)
+                self.progress.pop(old["id"], None)
             del self.messages[:-KEEP_MESSAGES]
         with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-    def _append(self, sender, to, text, kind, task=None, **extra):
+    def _append(self, sender, to, text, kind, task=None, role=None, status=None):
         """A message written on this machine: stored, and published when cloud sync is on."""
         seq = self.next_seq
         self.next_seq += 1
         msg = {"id": "%s%d" % (self.prefix, seq), "seq": seq, "ts": time.time(),
                "from": sender, "to": to, "text": text, "kind": kind}
-        if task:
-            msg["task"] = task
-        msg.update({k: v for k, v in extra.items() if k in EXTRA_FIELDS and v is not None})
+        for field, value in zip(EXTRA_FIELDS, (task, role, status)):
+            if value is not None:
+                msg[field] = value
         if self.sync is not None:
             msg["origin"] = self.sync.device_id
         self._store(msg)
@@ -485,9 +490,6 @@ class Hub:
                 if msg.get(field) is not None:
                     kept[field] = str(msg[field])
             self._store(kept)
-            if kept["kind"] == "take" and kept.get("task") and kept["task"] not in self.taken:
-                self.taken[kept["task"]] = kept["from"]
-                self._save()
             self._effects(kept)
             self._changed()
             return True
@@ -496,15 +498,17 @@ class Hub:
         """What a message changes besides the chat, wherever it was written. Caller holds the lock.
         Roles and task progress travel as messages, so they work across machines too."""
         kind = msg["kind"]
-        if kind == "role" and msg["to"] in self.agents:
+        if kind == "take" and msg.get("task") and msg["task"] not in self.taken:
+            self.taken[msg["task"]] = msg["from"]
+            self._save()
+        elif kind == "role" and msg["to"] in self.agents:
             self.agents[msg["to"]]["role"] = msg.get("role", "")
             self._save()
         elif kind == "task" and msg.get("status") == "assigned" and msg["to"] != "all":
             self.taken.setdefault(msg["id"], msg["to"])
             self._save()
         elif kind == "update" and msg.get("task") and msg.get("status") in STATUSES:
-            self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"], "note": msg["text"],
-                                          "ts": msg["ts"]}
+            self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
             self._save()
 
     def _event(self, text):
@@ -795,8 +799,7 @@ class Hub:
 
     def send(self, sender, to, text, kind="msg"):
         with self.lock:
-            if to != "all" and to not in self.names:
-                raise HubError("nobody here is called %s; hub_agents lists who is" % to)
+            self._check_recipient(to, everyone=True)
             msg = self._append(sender, to, text, kind)
             self._changed()
             return msg
@@ -820,6 +823,25 @@ class Hub:
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "expires": now + START_TTL}
             return key
+
+    def launch(self, tool, folder, name="", role="", task="", accept_edits=False):
+        """Open a new agent session in a connected folder on this machine; it checks in with a
+        start key and gets this name, role and first task."""
+        if tool not in LAUNCH_TOOLS:
+            raise HubError("unknown agent tool %s" % tool)
+        if folder not in [f["path"] for f in launch_folders(self.roster.config, self.home)]:
+            raise HubError("that folder is not connected to this chat on this machine")
+        key = self.new_start(name, role, task)
+        try:
+            launch_agent(tool, folder, key, accept_edits, self.home)
+        except (HubError, OSError) as e:
+            with self.lock:
+                self.starts.pop(key, None)
+            raise HubError(str(e))
+        with self.lock:
+            self._event("Owner started a new %s agent in %s%s" % (
+                LAUNCH_TOOLS[tool][0], Path(folder).name, " as %s" % name if name else ""))
+            self._changed()
 
     def start_link(self, sid, key):
         """A launched agent checking in with its start key. Returns (name, note for the agent)."""
@@ -851,33 +873,39 @@ class Hub:
 
     # Roles and teamwork ----------------------------------------------------------------------
     def roles(self):
-        """Built-in roles, plus any defined in config.json ("roles": {name: {title, prompt}})."""
-        out = dict(ROLES)
-        custom = self.roster.config.get("roles") if isinstance(self.roster.config.get("roles"), dict) else {}
-        for name, spec in custom.items():
-            if isinstance(spec, dict) and NAME_RE.match(str(name)) and spec.get("prompt"):
-                out[str(name)] = (str(spec.get("title") or name), str(spec["prompt"]))
-        return out
+        return self.roster.roles
 
     def _lead(self):
         """The agent with the lead role, local or on another machine, or None. Caller holds the lock."""
-        return next((r["agent"] for r in self._rows() if r.get("role") == "lead"), None)
+        local = next((n for n, a in self.agents.items() if a.get("role") == "lead"), None)
+        return local or next((row["agent"] for dev in self.remote.values() for row in dev["agents"]
+                              if row.get("role") == "lead" and row["agent"] not in self.agents), None)
+
+    def _check_recipient(self, to, everyone=False):
+        """An agent's name, or with `everyone` also "all" and Owner. Caller holds the lock."""
+        if not (to in self.names and (everyone or to != OWNER) or everyone and to == "all"):
+            raise HubError("nobody here is called %s; hub_agents lists who is" % to)
+
+    def _task(self, mid):
+        """The task message with this id. Caller holds the lock."""
+        task = next((m for m in reversed(self.messages) if m["id"] == mid), None)
+        if task is None or task["kind"] != "task":
+            raise HubError("#%s is not a task" % mid)
+        return task
 
     def set_role(self, by, agent, role):
         """Give an agent a role (or none, with role ""). The agent gets its role's instructions
         as a message. There is one lead at a time."""
         role = "" if role in (None, "", "none") else str(role)
         with self.lock:
-            if agent not in self.names or agent == OWNER:
-                raise HubError("nobody here is called %s; hub_agents lists who is" % agent)
+            self._check_recipient(agent)
             roles = self.roles()
             if role and role not in roles:
                 raise HubError("no role called %s. Roles: %s" % (role, ", ".join(sorted(roles))))
-            if role == "lead":
-                for row in self._rows():
-                    if row.get("role") == "lead" and row["agent"] != agent:
-                        self._append(by, row["agent"], "You are no longer the lead: %s is. Carry on with the "
-                                     "work you have; take new work from the lead." % agent, "role", role="")
+            old = self._lead() if role == "lead" else None
+            if old and old != agent:
+                self._append(by, old, "You are no longer the lead: %s is. Carry on with the work you have; "
+                             "take new work from the lead." % agent, "role", role="")
             if role:
                 title, prompt = roles[role]
                 text = ("Your role in this chat is now: %s (set by %s).\n\n%s\n\nhub_agents shows everyone's "
@@ -895,12 +923,9 @@ class Hub:
             if lead != OWNER and (self.agents.get(lead) or {}).get("role") != "lead":
                 raise HubError("only the lead assigns work (hub_agents shows who that is); ask the lead, or "
                                "message the agent with hub_send")
-            if to not in self.names or to == OWNER:
-                raise HubError("nobody here is called %s; hub_agents lists who is" % to)
+            self._check_recipient(to)
             if parent:
-                parent = clean_id(parent)
-                if not any(m["id"] == parent and m["kind"] == "task" for m in self.messages):
-                    raise HubError("#%s is not a task" % parent)
+                parent = self._task(clean_id(parent))["id"]
             msg = self._append(lead, to, text, "task", task=parent, status="assigned")
             self._changed()
             return msg
@@ -911,9 +936,7 @@ class Hub:
         if status not in STATUSES:
             raise HubError("status must be one of: %s" % ", ".join(STATUSES))
         with self.lock:
-            task = next((m for m in self.messages if m["id"] == mid), None)
-            if task is None or task["kind"] != "task":
-                raise HubError("#%s is not a task" % mid)
+            task = self._task(mid)
             lead = self._lead()
             if lead and lead != agent:
                 to = lead
@@ -936,9 +959,7 @@ class Hub:
     def take(self, agent, mid):
         mid = clean_id(mid)
         with self.lock:
-            task = next((m for m in self.messages if m["id"] == mid), None)
-            if task is None or task["kind"] != "task":
-                raise HubError("#%s is not a task" % mid)
+            task = self._task(mid)
             if task["to"] not in ("all", agent):
                 raise HubError("task #%s was given to %s" % (mid, task["to"]))
             holder = self.taken.get(mid)
@@ -1017,6 +1038,7 @@ class Hub:
                 "progress": dict(self.progress),
                 "agents": self._rows(),
                 "roles": [{"name": k, "title": v[0]} for k, v in self.roles().items()],
+                "statuses": STATUSES,
             }
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
@@ -1334,11 +1356,8 @@ def call_tool(hub, sid, name, args, owner=False):
         if owner:
             raise HubError("the owner has no session to link")
         key = args.get("key")
-        if isinstance(key, str) and key.startswith("start-"):
-            me, note = hub.start_link(sid, key)
-            hub.touch(me, active=True)
-            return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
-        me, note = hub.link(sid, key)
+        launched = isinstance(key, str) and key.startswith("start-")  # an agent started from the chat page
+        me, note = (hub.start_link if launched else hub.link)(sid, key)
         hub.touch(me, active=True)
         return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
     me = OWNER if owner else hub.agent_for(sid)
@@ -1381,9 +1400,10 @@ def call_tool(hub, sid, name, args, owner=False):
         role = args.get("role")
         if role is None:
             current = (hub.agents.get(me) or {}).get("role", "")
-            if not current or current not in hub.roles():
-                return "You have no role. Roles: %s." % ", ".join(sorted(hub.roles()))
-            title, prompt = hub.roles()[current]
+            roles = hub.roles()
+            if current not in roles:
+                return "You have no role. Roles: %s." % ", ".join(sorted(roles))
+            title, prompt = roles[current]
             return "Your role: %s.\n\n%s" % (title, prompt)
         if not isinstance(role, str):
             raise HubError("role must be a string")
@@ -1712,7 +1732,7 @@ class Handler(BaseHTTPRequestHandler):
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
                 return
-            self._json(200, launch_options(self.roster.root))
+            self._json(200, launch_options(self.roster.config, self.roster.root))
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -1762,16 +1782,21 @@ class Handler(BaseHTTPRequestHandler):
         self.roster.refresh()
         self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project})
 
-    def _send_as_owner(self, raw):
-        data = self._object(raw)
+    # The owner's actions, from the chat page or the command line: each takes the request body and
+    # returns the answer, or raises HubError for a 400.
+    def _send_as_owner(self, data):
         to = data.get("to")
         kind = "task" if data.get("kind") == "task" else "msg"
-        try:
-            msg = self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER), kind)
-        except HubError as e:
-            self._json(400, {"error": str(e)})
-            return
-        self._json(200, {"id": msg["id"]})
+        return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER), kind)["id"]}
+
+    def _role(self, data):
+        return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
+
+    def _launch(self, data):
+        """Add an agent: a new agent session on this machine."""
+        self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
+                        data.get("task"), bool(data.get("accept_edits")))
+        return {"ok": True}
 
     def _admin(self, raw):
         data = self._object(raw)
@@ -1801,31 +1826,6 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(e)})
             return
         self._json(200, result)
-
-    def _launch(self, raw):
-        """The owner starts a new agent session on this machine (the chat page's Add an agent)."""
-        data = self._object(raw)
-        options = launch_options(self.roster.root)
-        tool, folder = data.get("tool"), data.get("folder")
-        if tool not in [t["id"] for t in options["tools"]]:
-            self._json(400, {"error": "that tool is not installed on this machine"})
-            return
-        if folder not in [f["path"] for f in options["folders"]]:
-            self._json(400, {"error": "that folder is not connected to this chat on this machine"})
-            return
-        key = None
-        try:
-            key = self.hub.new_start(data.get("name"), data.get("role"), data.get("task"))
-            launch_agent(tool, folder, key, bool(data.get("accept_edits")), self.roster.root)
-        except (HubError, OSError) as e:
-            self.hub.starts.pop(key, None)
-            self._json(400, {"error": str(e)})
-            return
-        with self.hub.lock:
-            self.hub._event("Owner started a new %s agent in %s%s" % (
-                LAUNCH_TOOLS[tool][0], Path(folder).name, " as %s" % data["name"] if data.get("name") else ""))
-            self.hub._changed()
-        self._json(200, {"ok": True})
 
     def _peer(self, path, raw):
         """A request from another of the owner's machines (crewchat_peers)."""
@@ -1924,19 +1924,11 @@ class Handler(BaseHTTPRequestHandler):
             elif who[0] != "owner":
                 self._json(403, {"error": "only the owner can do this"})
                 return
-            if path == "/api/launch":
-                self._launch(raw)
-                return
-            if path == "/api/role":
-                data = self._object(raw)
-                try:
-                    msg = self.hub.set_role(OWNER, data.get("agent"), data.get("role"))
-                except HubError as e:
-                    self._json(400, {"error": str(e)})
-                    return
-                self._json(200, {"id": msg["id"]})
-                return
-            self._send_as_owner(raw)
+            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch}[path]
+            try:
+                self._json(200, action(self._object(raw)))
+            except HubError as e:
+                self._json(400, {"error": str(e)})
             return
         who = self._bearer()
         if who is None:
@@ -1950,8 +1942,10 @@ class Handler(BaseHTTPRequestHandler):
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
                 event = "prompt" if data.get("event") == "prompt" else "stop"
-                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, bool(data.get("owner_only")))
-                out["max_chain"] = self.roster.max_chain
+                # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
+                capped = int(data.get("chain") or 0) >= self.roster.max_chain
+                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped)
+                out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
                 self._json(400, {"error": "bad request"})
@@ -2073,7 +2067,7 @@ def setup_host(project=None, port=None, url=None, max_chain=None):
         "forget_hours": existing.get("forget_hours", FORGET_HOURS),
     })
     if max_chain:
-        config["max_chain"] = max(1, min(MAX_CHAIN_LIMIT, int(max_chain)))
+        config["max_chain"] = int(max_chain)  # Roster.max_chain keeps it within bounds
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -2146,23 +2140,15 @@ LAUNCH_PROMPT = ("You were started from the crewchat by your owner. Call the cre
                  "%s now: it tells you your name, your role and your first task.")
 
 
-def remember_folder(project, place, root=None):
-    """Note a folder connected to this machine's chat, so agents can be launched in it."""
+def remember(project, place, root=None):
+    """Note a folder connected to this machine's chat, and where Claude Code and Cursor's agent
+    are (as found in the user's own shell), so the chat page can start agents there."""
     config = load_config(root)
-    folders = dict(config.get("folders") or {})
-    if folders.get(str(project)) != place:
-        folders[str(project)] = place
-        config["folders"] = folders
-        save_config(config, root)
-
-
-def remember_tools(root=None):
-    """Note where Claude Code and Cursor's agent are, as found in the user's own shell."""
-    config = load_config(root)
-    tools = {t: shutil.which(exe) for t, (_, exe) in LAUNCH_TOOLS.items()}
-    tools = {t: path for t, path in tools.items() if path}
-    if tools and tools != config.get("tools"):
-        config["tools"] = dict(config.get("tools") or {}, **tools)
+    folders = dict(config.get("folders") or {}, **{str(project): place})
+    tools = dict(config.get("tools") or {})
+    tools.update({t: path for t, path in ((t, shutil.which(exe)) for t, (_, exe) in LAUNCH_TOOLS.items()) if path})
+    if folders != config.get("folders") or tools != (config.get("tools") or {}):
+        config["folders"], config["tools"] = folders, tools
         save_config(config, root)
 
 
@@ -2182,15 +2168,19 @@ def find_tool(tool, config):
     return None
 
 
-def launch_options(root=None):
-    """What the chat page's "Add an agent" offers on this machine."""
-    config = load_config(root)
+def launch_folders(config, root=None):
+    """The project folders on this machine still connected to its chat, as `crewchat start` noted."""
     folders = []
     for path, place in sorted((config.get("folders") or {}).items()):
         if Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
             folders.append({"path": path, "name": Path(path).name, "place": place})
+    return folders
+
+
+def launch_options(config, root=None):
+    """What the chat page's "Add an agent" offers on this machine."""
     tools = [{"id": t, "label": label} for t, (label, _) in LAUNCH_TOOLS.items() if find_tool(t, config)]
-    return {"tools": tools, "folders": folders}
+    return {"tools": tools, "folders": launch_folders(config, root)}
 
 
 def launch_command(exe, tool, key, accept_edits=False):
@@ -2276,13 +2266,12 @@ def cmd_start(args):
         # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
         for client in clients:
             {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
+        remember(project, place)
         print("- %s is connected, as \"%s\"." % (project, place))
     else:
         code = owner_call("/api/invite", {"place": args.place or ""})["code"]
         place = join_folder(local_url(config), code, project, args.place, args.client, quiet=True)
         print("- Connected %s, as \"%s\"." % (project, place))
-    remember_folder(project, place)
-    remember_tools()
 
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))
@@ -2500,21 +2489,19 @@ def cmd_role(args):
 def cmd_roles(args):
     config = load_config()
     custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
+    roles = all_roles(config)
     if args.action == "list":
-        for name, (title, _) in sorted(ROLES.items()):
-            print("  %-12s %s (built in)" % (name, title))
-        for name, spec in sorted(custom.items()):
-            print("  %-12s %s" % (name, spec.get("title") or name))
+        for name, (title, _) in sorted(roles.items()):
+            print("  %-12s %s%s" % (name, title, " (yours)" if name in custom else ""))
         print("\nGive an agent a role: crewchat role AGENT ROLE (or use the menu on its card in the chat page).")
         return
     if not args.name:
         die("usage: crewchat roles %s NAME" % args.action)
     name = args.name.lower()
     if args.action == "show":
-        spec = custom.get(name) or ({"title": ROLES[name][0], "prompt": ROLES[name][1]} if name in ROLES else None)
-        if not spec:
+        if name not in roles:
             die("no role called %s" % name)
-        print("%s\n\n%s" % (spec.get("title") or name, spec["prompt"]))
+        print("%s\n\n%s" % roles[name])
     elif args.action == "add":
         if not NAME_RE.match(name):
             die("a role name is letters, digits, - _ . (32 at most)")
@@ -2603,11 +2590,16 @@ def read_json(path):
     return data if isinstance(data, dict) else {}
 
 
-def write_json(path, data, private=False):
+def write_json(path, data, private=False, indent=2):
+    """Write JSON in one step (a temporary file, then a rename), so a reader never sees it half
+    written. A private file is readable only by this user from the moment it exists."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    if private and os.name != "nt":
-        os.chmod(path, 0o600)
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=indent) + "\n")
+    os.replace(tmp, path)
 
 
 def git_exclude(project, paths):
@@ -2724,7 +2716,7 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
         written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
     if (home() / "config.json").exists() and url == local_url():
-        remember_folder(project, place)
+        remember(project, place)
     if quiet:
         if not ignored:
             print("- %s hold a secret token: do not commit them." % ", ".join(written))
@@ -2776,13 +2768,14 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", owner_only=False):
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
     """Ask the server for this session's messages without marking them read.
 
-    Returns ("link", "", 0, False) if the session must call hub_link first, else
-    ("ok", text, last id, whether the owner wrote any of it), where text is '' when nothing arrived
-    within wait_total seconds. `ack` first confirms the messages a previous hook call delivered.
-    With owner_only, only a message from the owner ends the wait.
+    Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
+    the session must call hub_link first, else "ok"; text is '' when nothing arrived within
+    wait_total seconds. `ack` first confirms the messages a previous hook call delivered. `chain`
+    is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
+    answers "capped", and only a message from the owner ends the wait.
     """
     deadline = time.time() + wait_total
     while True:
@@ -2790,7 +2783,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", owner_only=False
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
         try:
             out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
-                                                        "owner_only": owner_only}, timeout=MAX_WAIT + 30)
+                                                        "chain": chain}, timeout=MAX_WAIT + 30)
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -2799,12 +2792,11 @@ def hook_check(base, token, key, wait_total, ack, event="stop", owner_only=False
                 raise
             time.sleep(3)
             continue
+        capped = bool(out.get("capped"))
         if out.get("link"):
-            return "link", "", 0, False
-        if out.get("max_chain"):
-            hook_check.max_chain = int(out["max_chain"])
+            return "link", "", 0, False, capped
         if out.get("text") or time.time() >= deadline:
-            return "ok", out.get("text", ""), int(out.get("last") or 0), bool(out.get("owner"))
+            return "ok", out.get("text", ""), int(out.get("last") or 0), bool(out.get("owner")), capped
 
 
 def run_hook(client, event):
@@ -2835,19 +2827,15 @@ def run_hook(client, event):
     # that dies, never confirms, so the messages are delivered again.
     pending = int(state.get("pending", 0))
 
-    # The owner's limit on chat-driven turns in a row, as the server last said (config: max_chain).
-    hook_check.max_chain = int(state.get("max_chain") or MAX_CHAIN)
-
     def save(chain, pending, asks):
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
-                                          "max_chain": hook_check.max_chain}))
+        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks}))
 
     if event == "prompt":
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _ = hook_check(base, token, key, 0, 0, "prompt")
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt")
         if kind == "link":
             save(0, pending, 1)
             if client == "claude":
@@ -2863,10 +2851,8 @@ def run_hook(client, event):
         if data.get("status") not in (None, "completed"):
             return
         chain = int(data.get("loop_count") or 0)
-    capped = chain >= hook_check.max_chain
-    # After that many turns in a row driven by the chat, only the owner can wake the agent.
-    kind, text, last, from_owner = hook_check(base, token, key, listen_seconds(project, client), pending,
-                                              owner_only=capped)
+    kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
+                                                      pending, chain=chain)
     if kind == "link":
         if capped or asks >= MAX_LINK_ASKS:
             return  # asked enough; the next user prompt asks again
@@ -3282,8 +3268,8 @@ const el = (tag, cls, text) => {
   if (text !== undefined) n.textContent = text;
   return n;
 };
-const STATUS = { in_progress: "in progress", blocked: "blocked", review: "ready for review", done: "done" };
-const state = { after: 0, version: -1, messages: [], taken: {}, progress: {}, roles: [], agents: [], names: "", title: "crewchat",
+const state = { after: 0, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
+                agents: [], names: "", title: "crewchat",
                 now: Date.now() / 1000, lastDay: "" };
 
 // Colour by position in the roster; agents that have left the chat stay neutral.
@@ -3299,6 +3285,15 @@ function ago(seen, now) {
   if (s < 3600) return Math.round(s / 60) + " min ago";
   if (s < 86400) return Math.round(s / 3600) + " h ago";
   return Math.round(s / 86400) + " d ago";
+}
+
+// POST to the chat server. Sends the page to sign-in on 401; throws the server's error otherwise.
+async function postJSON(path, body) {
+  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body) });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+  return res.json();
 }
 
 async function openLaunch() {
@@ -3329,11 +3324,8 @@ async function startAgent(event) {
   $("l-start").disabled = true;
   note.textContent = "Starting…";
   try {
-    const res = await fetch("/api/launch", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(),
-                             role: $("l-role").value, task: $("l-task").value.trim(), accept_edits: $("l-edits").checked }) });
-    if (res.status === 401) { location.href = "/login"; return; }
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+    await postJSON("/api/launch", { tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(),
+                                    role: $("l-role").value, task: $("l-task").value.trim(), accept_edits: $("l-edits").checked });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
     $("l-name").value = ""; $("l-task").value = "";
     setTimeout(() => $("launch").close(), 4000);
@@ -3351,10 +3343,7 @@ function roleTitle(name) {
 async function setRole(agent, role, pick) {
   pick.disabled = true;
   try {
-    const res = await fetch("/api/role", { method: "POST", headers: { "Content-Type": "application/json" },
-                                           body: JSON.stringify({ agent, role }) });
-    if (res.status === 401) { location.href = "/login"; return; }
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+    await postJSON("/api/role", { agent, role });
   } catch (err) {
     $("error").textContent = "Role not changed: " + err.message;
   }
@@ -3449,7 +3438,7 @@ function buildMessage(m) {
     body.append(label);
   }
   if (m.kind === "update") {
-    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (STATUS[m.status] || m.status)));
+    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (state.statuses[m.status] || m.status)));
   }
   body.append(document.createTextNode(m.text));
   box.append(meta, body);
@@ -3458,17 +3447,15 @@ function buildMessage(m) {
 }
 
 function refreshDynamic() {
-  for (const m of state.messages) {
-    if (m.from !== "Owner" && m.kind !== "task") continue;
-    const node = $("log").querySelector('.msg[data-id="' + m.id + '"]');
-    if (!node) continue;
+  // Only your messages (read receipts) and tasks (who has them, progress) change after they are shown.
+  for (const [m, node] of state.nodes.values()) {
     if (m.from === "Owner") node.querySelector(".receipt").textContent = receipt(m);
     if (m.kind === "task") {
       const who = state.taken[m.id];
       const p = state.progress[m.id];
       const st = node.querySelector(".state");
       st.textContent = (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
-        + (p ? " · " + (STATUS[p.status] || p.status) : "");
+        + (p ? " · " + (state.statuses[p.status] || p.status) : "");
       st.className = "state" + (who ? " " + colour(who) : "");
     }
   }
@@ -3481,7 +3468,9 @@ function addMessages(list, first) {
   for (const m of list) {
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
     if (day !== state.lastDay) { log.append(el("p", "day", day)); state.lastDay = day; }
-    log.append(buildMessage(m));
+    const node = buildMessage(m);
+    log.append(node);
+    if (node.classList.contains("msg") && (m.from === "Owner" || m.kind === "task")) state.nodes.set(m.id, [m, node]);
     state.messages.push(m);
     state.after = m.seq;
   }
@@ -3508,7 +3497,7 @@ async function loop() {
       $("banner").classList.remove("show");
       const first = state.version < 0;
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
-      state.progress = data.progress || {}; state.roles = data.roles || [];
+      state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       if (data.project && data.project + " · crewchat" !== state.title) {
         state.title = data.project + " · crewchat";
         $("project").textContent = data.project;
@@ -3552,13 +3541,7 @@ $("form").addEventListener("submit", async (e) => {
   $("send").disabled = true;
   $("error").textContent = "";
   try {
-    const res = await fetch("/api/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to: $("to").value, text: value, kind: $("task").checked ? "task" : "msg" }),
-    });
-    if (res.status === 401) { location.href = "/login"; return; }
-    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+    await postJSON("/api/send", { to: $("to").value, text: value, kind: $("task").checked ? "task" : "msg" });
     text.value = "";
     $("task").checked = false;
     $("task").dispatchEvent(new Event("change"));

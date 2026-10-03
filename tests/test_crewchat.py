@@ -472,8 +472,9 @@ class Teams(Base):
         self.hub.roster.refresh()
         try:
             self.assertEqual(self.hub.roster.max_chain, 25)
-            out = crewchat.post_json(self.base + "/api/hook", self.token, {"key": "k" * 16, "wait": 0})
-            self.assertEqual((out.get("link"), out.get("max_chain")), (True, 25))
+            hook = lambda chain: crewchat.post_json(self.base + "/api/hook", self.token,  # noqa: E731
+                                                    {"key": "k" * 16, "wait": 0, "chain": chain})["capped"]
+            self.assertEqual((hook(24), hook(25)), (False, True))
         finally:
             config.pop("max_chain")
             crewchat.save_config(config)
@@ -564,7 +565,7 @@ class Linking(Base):
 
     def hook(self, key, token=None, **extra):
         out = crewchat.post_json(self.base + "/api/hook", token or self.token, dict({"key": key}, **extra))
-        self.assertEqual(out.pop("max_chain"), crewchat.MAX_CHAIN)  # every answer carries the loop limit
+        self.assertFalse(out.pop("capped"))  # every answer says whether the loop limit was reached
         return out
 
     def test_link_then_messages_arrive_through_the_hook(self):

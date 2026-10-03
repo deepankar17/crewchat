@@ -23,7 +23,6 @@ devices on your tailnet reach it through `tailscale serve`. The shared key is th
 import hashlib
 import hmac
 import json
-import os
 import secrets
 import socket
 import sys
@@ -96,13 +95,8 @@ class Mesh:
         return self.data["me"]
 
     def save(self):
-        """Write peers.json in one step, so a reader never sees it half written."""
         with self.lock:
-            tmp = self.path.with_name("peers.json.tmp")
-            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self.data, f, indent=2)
-            os.replace(tmp, self.path)
+            crewchat.write_json(self.path, self.data, private=True)
 
     def found(self, name, url):
         """Start a new chat between machines, with this one as its first member."""
