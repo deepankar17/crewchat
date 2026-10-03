@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.2
+
+**A logo.**
+
+- crewchat has a logo: a glossy 3D speech bubble holding three connected spheres, a crew of agents
+  talking. It is on the chat page next to the project name, on the sign-in page with the
+  wordmark, as the browser tab's icon (SVG), and as the phone's home-screen icon, which crewchat
+  draws itself so the project still ships no image files.
+- The README has it at the top (`docs/images/logo.svg`).
+- The documentation uses a made-up "Notes App" as its example project.
+
 ## 0.9.1
 
 **Richer documentation.**

@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1674,7 +1674,8 @@ MANIFEST = json.dumps({
               for s in (192, 512) for p in ("any", "maskable")],
 }).encode("utf-8")
 APP_HEAD = ('<link rel="manifest" href="/manifest.webmanifest"><meta name="theme-color" content="%s">'
-            '<link rel="icon" href="/icon-192.png"><link rel="apple-touch-icon" href="/icon-192.png">'
+            '<link rel="icon" href="/icon.svg" type="image/svg+xml"><link rel="icon" href="/icon-192.png" sizes="192x192">'
+            '<link rel="apple-touch-icon" href="/icon-192.png">'
             '<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" '
             'content="yes"><meta name="apple-mobile-web-app-title" content="crewchat">' % APP_COLOR)
 # Passes everything through to the server (the chat is never cached), and shows a short page
@@ -1711,48 +1712,121 @@ def _png(size, rows):
             + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
 
 
+# The logo: a speech bubble holding three connected dots, a crew of agents talking, drawn in 3D: a
+# glossy bubble with depth and a soft shadow, and three shaded spheres. On a 64-unit grid.
+LOGO_SVG = (
+    '<svg %s viewBox="0 0 64 64"><defs>'
+    '<linearGradient id="cc-face" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5b8cff"/>'
+    '<stop offset=".55" stop-color="#2f5fd6"/><stop offset="1" stop-color="#2148ad"/></linearGradient>'
+    '<linearGradient id="cc-gloss" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#fff" stop-opacity=".55"/>'
+    '<stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient>'
+    '<radialGradient id="cc-ball" cx=".36" cy=".32" r=".78"><stop offset="0" stop-color="#fff"/>'
+    '<stop offset=".55" stop-color="#eef3ff"/><stop offset="1" stop-color="#b4c6f3"/></radialGradient>'
+    '<filter id="cc-soft" x="-20%%" y="-20%%" width="140%%" height="160%%"><feGaussianBlur stdDeviation="1.6"/></filter>'
+    '<path id="cc-bub" d="M18 6h28a14 14 0 0 1 14 14v13a14 14 0 0 1-14 14H27l-10.4 8.6A1.6 1.6 0 0 1 14 54.4V46A14 14 0 0 1'
+    ' 4 33V20A14 14 0 0 1 18 6z"/></defs>'
+    '<use href="#cc-bub" transform="translate(0 4.2)" fill="#0b1f55" opacity=".35" filter="url(#cc-soft)"/>'
+    '<use href="#cc-bub" transform="translate(0 2.6)" fill="#17388f"/><use href="#cc-bub" fill="url(#cc-face)"/>'
+    '<path d="M18 7.2h28a12.8 12.8 0 0 1 12.8 12.8v1.2C49 17.5 38 16.6 31 18.3 22 20.5 12 23.3 5.2 25.5V20A12.8 12.8 0 0 1'
+    ' 18 7.2z" fill="url(#cc-gloss)"/>'
+    '<path d="M32 16.5 21.5 33.5M32 16.5 42.5 33.5M21.5 33.5h21" fill="none" stroke="#dfe7ff" stroke-width="3"'
+    ' stroke-linecap="round" opacity=".85"/>'
+    '<g fill="#0b1f55" opacity=".35"><ellipse cx="32" cy="22.6" rx="5.4" ry="2"/><ellipse cx="21.5" cy="39.6" rx="5.4"'
+    ' ry="2"/><ellipse cx="42.5" cy="39.6" rx="5.4" ry="2"/></g>'
+    '<g fill="url(#cc-ball)"><circle cx="32" cy="16.5" r="5.8"/><circle cx="21.5" cy="33.5" r="5.8"/>'
+    '<circle cx="42.5" cy="33.5" r="5.8"/></g></svg>')
+LOGO_INLINE = LOGO_SVG % 'class="logo" aria-hidden="true"'
+LOGO_FILE = (LOGO_SVG % 'xmlns="http://www.w3.org/2000/svg"').encode("utf-8")
+
+
+def _ramp(stops, t):
+    """A colour along a gradient: stops are (position, (r, g, b))."""
+    t = min(1.0, max(0.0, t))
+    for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
+        if t <= p1:
+            k = (t - p0) / (p1 - p0) if p1 > p0 else 0
+            return tuple(c0[i] + (c1[i] - c0[i]) * k for i in range(3))
+    return stops[-1][1]
+
+
 def app_icon(size):
-    """The app icon as PNG bytes: a white speech bubble on blue, drawn here so the project ships no
-    image files. Everything sits inside the middle 80%, so it also works as a maskable icon."""
+    """The app icon as PNG bytes: the 3D logo on a soft light background, drawn here (like
+    LOGO_SVG) so the project ships no image files. It sits inside the middle 80%, so it also works
+    as a maskable icon."""
     with _icons_lock:
         if size in _icons:
             return _icons[size]
-        bg, fg = (0x2b, 0x57, 0xc4), (0xff, 0xff, 0xff)
-        x0, y0, x1, y1, radius = 0.22, 0.27, 0.78, 0.66, 0.11
-        tail = ((0.31, 0.62), (0.45, 0.62), (0.29, 0.77))
-        dots = [(x, 0.465, 0.045) for x in (0.38, 0.50, 0.62)]
+        hexc = lambda h: tuple(int(h[k:k + 2], 16) for k in (1, 3, 5))  # noqa: E731
+        backdrop = ((0, hexc("#f7f9ff")), (1, hexc("#d9e2f6")))
+        face = ((0, hexc("#5b8cff")), (0.55, hexc("#2f5fd6")), (1, hexc("#2148ad")))
+        ball = ((0, hexc("#ffffff")), (0.55, hexc("#eef3ff")), (1, hexc("#b4c6f3")))
+        side, ink, link = hexc("#17388f"), hexc("#0b1f55"), hexc("#dfe7ff")
+        scale = 0.0108  # icon widths per logo unit: the bubble is 56 units wide
+        unit = 1.0 / (size * scale)  # one pixel, in logo units
+        nodes = ((32, 16.5), (21.5, 33.5), (42.5, 33.5))
+        tail = ((14, 42.0), (27, 47.0), (15, 55.6))
 
-        def edge(px, py, a, b):  # signed distance from the line a->b; negative inside (clockwise)
+        def polygon(u, v, pts):  # signed distance to a convex polygon; negative inside
+            area = sum(pts[i][0] * pts[i - 1][1] - pts[i - 1][0] * pts[i][1] for i in range(len(pts)))
+            best = -1e9
+            for i in range(len(pts)):
+                (ax, ay), (bx, by) = pts[i - 1], pts[i]
+                ex, ey = bx - ax, by - ay
+                d = ((u - ax) * ey - (v - ay) * ex) / (ex * ex + ey * ey) ** 0.5
+                best = max(best, -d if area > 0 else d)
+            return best
+
+        def bubble(u, v):
+            qx = max(abs(u - 32) - 14, 0)
+            qy = max(abs(v - 26.5) - 6.5, 0)
+            return min((qx * qx + qy * qy) ** 0.5 - 14, polygon(u, v, tail))
+
+        def segment(u, v, a, b):
             ex, ey = b[0] - a[0], b[1] - a[1]
-            return ((px - a[0]) * ey - (py - a[1]) * ex) / (ex * ex + ey * ey) ** 0.5
+            t = max(0.0, min(1.0, ((u - a[0]) * ex + (v - a[1]) * ey) / (ex * ex + ey * ey)))
+            return ((u - a[0] - t * ex) ** 2 + (v - a[1] - t * ey) ** 2) ** 0.5
 
-        def bubble(px, py):
-            qx = max(abs(px - (x0 + x1) / 2) - ((x1 - x0) / 2 - radius), 0)
-            qy = max(abs(py - (y0 + y1) / 2) - ((y1 - y0) / 2 - radius), 0)
-            box = (qx * qx + qy * qy) ** 0.5 - radius
-            tri = max(edge(px, py, tail[i], tail[(i + 1) % 3]) for i in range(3))
-            return min(box, tri)
+        def cover(d, soft=None):
+            return min(1.0, max(0.0, 0.5 - d / (soft or unit)))
 
-        def mix(a, b, t):
-            return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+        def over(base, top, alpha):
+            return tuple(base[i] + (top[i] - base[i]) * alpha for i in range(3))
 
-        rows, blank = [], list(bg) * size
+        def gloss_edge(u):  # the gloss's lower edge, as in LOGO_SVG
+            return 25.5 + (u - 5) * (17.5 - 25.5) / 26 if u < 31 else 17.5 + (u - 31) * (21.2 - 17.5) / 28
+
+        rows = []
         for j in range(size):
-            py = (j + 0.5) / size
-            if py < y0 - 0.01 or py > tail[2][1] + 0.01:
-                rows.append(blank)
+            v = 31 + ((j + 0.5) / size - 0.5) / scale
+            back = _ramp(backdrop, j / max(1, size - 1))
+            if v < 4 or v > 62:
+                rows.append([int(round(c)) for c in back] * size)
                 continue
             row = []
             for i in range(size):
-                px = (i + 0.5) / size
-                cover = min(1.0, max(0.0, 0.5 - bubble(px, py) * size))
-                colour = mix(bg, fg, cover)
-                for cx, cy, r in dots:
-                    d = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5 - r
-                    dot = min(1.0, max(0.0, 0.5 - d * size))
-                    if dot:
-                        colour = mix(colour, bg, dot)
-                row.extend(colour)
+                u = 32 + ((i + 0.5) / size - 0.5) / scale
+                colour = back
+                colour = over(colour, ink, 0.35 * cover(bubble(u, v - 4.2) + 0.5, 3.2))  # soft shadow
+                colour = over(colour, side, cover(bubble(u, v - 2.6)))  # depth
+                inside = cover(bubble(u, v))
+                if inside:
+                    colour = over(colour, _ramp(face, (v - 6) / 41), inside)
+                    edge = gloss_edge(u)
+                    if v < edge and bubble(u, v) < -1.2:
+                        colour = over(colour, (255, 255, 255), 0.55 * (1 - (v - 6) / max(1.0, edge - 6)) * inside)
+                    links = min(segment(u, v, nodes[a], nodes[b]) for a, b in ((0, 1), (0, 2), (1, 2))) - 1.5
+                    colour = over(colour, link, 0.85 * cover(links))
+                    for x, y in nodes:
+                        e = (((u - x) / 5.4) ** 2 + ((v - y - 6.1) / 2) ** 2) ** 0.5 - 1
+                        colour = over(colour, ink, 0.35 * cover(e * 2, unit * 1.5))
+                for x, y in nodes:
+                    d = ((u - x) ** 2 + (v - y) ** 2) ** 0.5
+                    on = cover(d - 5.8)
+                    if on:
+                        hx, hy = x - 0.28 * 5.8, y - 0.36 * 5.8
+                        shade = ((u - hx) ** 2 + (v - hy) ** 2) ** 0.5 / (1.56 * 5.8)
+                        colour = over(colour, _ramp(ball, shade), on)
+                row.extend(int(round(c)) for c in colour)
             rows.append(row)
         _icons[size] = _png(size, rows)
         return _icons[size]
@@ -1914,6 +1988,8 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path in ("/icon-192.png", "/icon-512.png"):
             self._reply(200, app_icon(int(url.path[6:9])), ctype="image/png",
                         extra={"Cache-Control": "max-age=86400"})
+        elif url.path == "/icon.svg":
+            self._reply(200, LOGO_FILE, ctype="image/svg+xml", extra={"Cache-Control": "max-age=86400"})
         elif url.path == "/sw.js":
             self._reply(200, SERVICE_WORKER, ctype="text/javascript; charset=utf-8",
                         extra={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
@@ -3341,13 +3417,16 @@ LOGIN_PAGE = """<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>crewchat sign-in</title>
 <style>:root{color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center;
 font:16px/1.5 system-ui,sans-serif;background:#f4f2ed;color:#1d1b18}main{width:min(92vw,360px)}
-h1{font-size:20px;margin:0 0 4px}p{margin:0 0 16px;color:#6a665e}code{font-family:ui-monospace,monospace}
+h1{font-size:24px;margin:0 0 10px;display:flex;align-items:center;gap:10px;letter-spacing:-.02em}
+h1 b{color:#2b57c4}.logo{width:40px;height:40px}
+p{margin:0 0 16px;color:#6a665e}code{font-family:ui-monospace,monospace}
 input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px}
 input{border:1px solid #c9c5bc;background:#fff;color:inherit;letter-spacing:.12em;text-transform:uppercase}
 button{margin-top:10px;border:0;background:#2b57c4;color:#fff;font-weight:600;cursor:pointer}
 .err{color:#b3261e}.tip{margin-top:20px;font-size:14px}@media(prefers-color-scheme:dark){body{background:#131210;color:#edeae4}
-p{color:#a09b91}input{background:#1c1b18;border-color:#3a3833}.err{color:#f2b8b5}}</style>
-<main><h1>crewchat</h1><p>On the machine that hosts the chat, run <code>crewchat ui --print</code>
+p{color:#a09b91}input{background:#1c1b18;border-color:#3a3833}.err{color:#f2b8b5}
+h1 b{color:#8fb0ff}}</style>
+<main><h1>__LOGO__<span>crew<b>chat</b></span></h1><p>On the machine that hosts the chat, run <code>crewchat ui --print</code>
 and type the code it shows. A code works once, for two minutes.</p>__ERROR__
 <form method="post" action="/login"><input name="code" aria-label="Sign-in code" placeholder="ABCD-EFGH" autocomplete="off"
 autofocus required maxlength="12"><button>Sign in</button></form>
@@ -3386,7 +3465,8 @@ body {
   display: grid; grid-template-columns: 280px minmax(0, 1fr); grid-template-rows: 100dvh;
 }
 aside { border-right: 1px solid var(--line); padding: 20px 16px; overflow-y: auto; }
-h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywhere; }
+h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywhere; display: flex; align-items: center; gap: 9px; }
+.logo { width: 30px; height: 30px; flex: none; }
 .sub { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
 .agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
 .agent .top { display: flex; align-items: center; gap: 8px; }
@@ -3488,7 +3568,7 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
 </head>
 <body>
 <aside>
-  <h1 id="project">crewchat</h1>
+  <h1>__LOGO__<span id="project">crewchat</span></h1>
   <p class="sub">Everything your agents say to each other, live.</p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
@@ -3916,8 +3996,8 @@ loop();
 </body>
 </html>
 """
-LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1)
-CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1)
+LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
+CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 
 
 # --------------------------------------------------------------------------------------------

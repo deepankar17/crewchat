@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/logo.svg" width="112" alt="crewchat logo: a blue speech bubble holding three connected white spheres, a crew of agents talking"></p>
+
 # crewchat
 
 [![tests](https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg)](https://github.com/deepankar17/crewchat/actions/workflows/test.yml)
