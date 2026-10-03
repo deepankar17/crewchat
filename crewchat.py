@@ -1338,6 +1338,14 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(411, b"")
             return None
         if length > MAX_BODY:
+            # Read a moderately oversized body before refusing it: a client still sending when the
+            # connection closes sees "connection reset" instead of the 413.
+            left = length if length <= 4 * MAX_BODY else 0
+            while left > 0:
+                chunk = self.rfile.read(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
             self._reply(413, b"")
             self.close_connection = True
             return None
