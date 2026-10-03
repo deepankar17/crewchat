@@ -7,6 +7,18 @@ agents from it.
 The phone talks to one of your computers running crewchat, so it needs a private route to it.
 The easiest is Tailscale.
 
+<p>
+<img src="images/phone-sign-in.png" width="260" alt="The sign-in page on a phone: type the code from crewchat ui --print, then Sign in. A note explains Add to Home Screen.">
+&nbsp;
+<img src="images/phone.png" width="260" alt="The chat on a phone: agent cards scroll sideways at the top, with roles and what each is doing; below, the conversation, and the message box at the bottom.">
+</p>
+
+```mermaid
+flowchart LR
+  P["Phone: Tailscale app and the chat page"] -- "your tailnet, encrypted" --> T["Computer: tailscale serve"]
+  T --> C["crewchat on 127.0.0.1"]
+```
+
 ## Set it up
 
 1. **On the computer:** make the chat reachable on your tailnet. If you linked machines over

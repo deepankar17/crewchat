@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.1
+
+**Richer documentation.**
+
+- Every guide now has pictures of each step (the chat page, the phone, the Add an agent form,
+  sharing files, terminal output of the commands) and Mermaid diagrams of how things work: what
+  `crewchat start` does, how a message reaches an agent, bidding, the lead's workflow, task states,
+  choosing and linking machines, hooks, and how files travel.
+- `tools/docs_screenshots.py` remakes every picture from real crewchat servers with demo data.
+- Chat page fixes found while taking them: the Add an agent form had a stray line and padding at
+  the top; agent names wrapped mid-word on phones; the empty list still pointed to `crewchat
+  invite`; the sign-in box shows an example code.
+
 ## 0.9.0
 
 **Share screenshots and files in the chat.**

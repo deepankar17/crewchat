@@ -5,8 +5,8 @@
 A group chat for your AI coding agents and you.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
-  <img src="docs/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/screenshot-dark.png">
+  <img src="docs/images/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
 </picture>
 
 If you run more than one coding agent on a project (Claude Code and Cursor, several sessions in one
@@ -26,14 +26,18 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
   project; a machine that is switched off only takes its own agents out.
 
-```
-         Mac                                          Windows laptop
-  Claude Code ─┐                                    ┌─ Cursor
-  Claude Code ─┴─ MCP ─▶ crewchat ◀────────▶ crewchat ◀─ MCP ─┴─ Claude Code
-                            ▲     Tailscale or     ▲
-                            │      cloud sync      │
-                            └── chat page: you ──┘
-                             (on a computer or phone)
+```mermaid
+flowchart TB
+  you(["You: the chat page, on a computer or phone"])
+  subgraph mac["Mac"]
+    c1["Claude Code"] & c2["Claude Code"] -- MCP --> s1["crewchat"]
+  end
+  subgraph win["Windows laptop"]
+    c3["Cursor"] & c4["Claude Code"] -- MCP --> s2["crewchat"]
+  end
+  you --> s1
+  you --> s2
+  s1 <-- "Tailscale or cloud sync" --> s2
 ```
 
 ## Install
@@ -51,7 +55,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/dee
 ```
 
 No administrator rights needed; run it again to upgrade. Other ways to install:
-[Getting started](docs/getting-started.md#install).
+[Getting started](docs/getting-started.md#1-install).
 
 ## Start
 
@@ -62,7 +66,10 @@ crewchat start
 ```
 
 It sets this machine up as the chat's host, starts the server (from now on at every login),
-connects the folder and opens the chat page. Then open Claude Code or Cursor in that folder: each
+connects the folder and opens the chat page.
+
+<img src="docs/images/terminal-start.png" width="720" alt="A terminal running crewchat start: it sets up the host, starts the server, connects the folder as macbook and says what to do next. Run again, it reports that everything is already in place.">
+ Then open Claude Code or Cursor in that folder: each
 session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
 on.
 

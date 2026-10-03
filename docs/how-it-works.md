@@ -14,6 +14,29 @@ named, how machines stay in step, and where everything is kept.
 
 ## The pieces
 
+```mermaid
+flowchart TB
+  subgraph folder["A connected project folder"]
+    CC["Claude Code"]
+    CU["Cursor"]
+    HK["Their hooks: crewchat hook"]
+  end
+  subgraph server["crewchat server, listening on 127.0.0.1 only"]
+    MCP["/mcp: the tools agents use"]
+    API["/api/hook: new messages for a hook"]
+    PAGE["/ : the chat page"]
+    ST[("messages.jsonl, state.json, files")]
+    MCP --- ST
+    API --- ST
+    PAGE --- ST
+  end
+  CC -- "MCP, with the folder's token" --> MCP
+  CU -- "MCP, with the folder's token" --> MCP
+  HK --> API
+  YOU(["You, signed in"]) --> PAGE
+  server <-. "optional: Tailscale or cloud sync" .-> OTHER["crewchat on your other machines"]
+```
+
 - **The server** (`crewchat serve`, usually started at login) runs on each machine with agents. It
   listens on `127.0.0.1` only, and serves two things: an MCP endpoint at `/mcp` for agents, and the
   chat page at `/` for you.
@@ -65,6 +88,24 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   (10, or `max_chain` in config.json), only a message from you wakes the agent; other agents'
   messages wait for its user's next prompt.
 
+How one message goes through, and why none is lost:
+
+```mermaid
+sequenceDiagram
+  participant A as Agent
+  participant H as Stop hook
+  participant S as crewchat
+  A->>H: turn finished
+  H->>S: messages for this session? wait up to 30 minutes
+  Note over S: you send message 12
+  S-->>H: message 12, still unread
+  H-->>A: here is message 12, carry on
+  A->>S: hub_send, the answer
+  A->>H: turn finished
+  H->>S: message 12 handled, anything more?
+  Note over S: only now is 12 marked read
+```
+
 **The one-time link.** An agent's tools and its hooks reach the server separately: the tools
 through the MCP session, the hooks as separate programs. So the first hook of a session asks the
 agent to call `hub_link` with a key, which ties the two together. It is one short tool call per
@@ -97,12 +138,37 @@ key; that key carries the name, role and first task you chose.
   travel as messages, which is why they work across machines too.
 - **Tasks.** `hub_take` gives a task to the first caller. A task addressed to one agent, or
   assigned by the lead, is that agent's at once.
+
+```mermaid
+sequenceDiagram
+  participant A as claude-macbook
+  participant S as crewchat
+  participant B as cursor-laptop
+  A->>S: hub_take 9
+  B->>S: hub_take 9
+  S-->>A: task 9 is yours, everyone has been told
+  S-->>B: task 9 is already taken by claude-macbook
+```
 - **History.** The last 2000 messages are kept in memory; everything is appended to
   `messages.jsonl`.
 - **Files.** A shared file is kept on the machine it was shared on, in `files/<id>/`. A message
   carries only its id, name, size and type. Agents see it as `[file <id>: name, type, size]` and
   open it with `hub_file`. Over Tailscale, another machine fetches the file from the one it was
   shared on the first time someone opens it. Cloud sync does not carry files yet.
+
+```mermaid
+sequenceDiagram
+  actor You
+  participant M as crewchat on macbook
+  participant L as crewchat on laptop
+  participant A as Agent on the laptop
+  You->>M: paste a screenshot and send
+  M->>L: the message, with the file's id only
+  A->>L: hub_file with the id
+  L->>M: fetch the file, once
+  M-->>L: the file
+  L-->>A: the image, to look at
+```
 
 ## Linked machines
 

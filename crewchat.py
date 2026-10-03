@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -3349,7 +3349,7 @@ button{margin-top:10px;border:0;background:#2b57c4;color:#fff;font-weight:600;cu
 p{color:#a09b91}input{background:#1c1b18;border-color:#3a3833}.err{color:#f2b8b5}}</style>
 <main><h1>crewchat</h1><p>On the machine that hosts the chat, run <code>crewchat ui --print</code>
 and type the code it shows. A code works once, for two minutes.</p>__ERROR__
-<form method="post" action="/login"><input name="code" aria-label="Sign-in code" autocomplete="off"
+<form method="post" action="/login"><input name="code" aria-label="Sign-in code" placeholder="ABCD-EFGH" autocomplete="off"
 autofocus required maxlength="12"><button>Sign in</button></form>
 <p class="tip">On a phone, sign in, then use <b>Add to Home Screen</b> to keep the chat as an app.
 An iPhone app keeps its own sign-in, so you sign in once more inside it.</p></main></html>"""
@@ -3435,7 +3435,7 @@ form, #banner { flex: none; }
 .c0 { color: var(--a0); } .c1 { color: var(--a1); } .c2 { color: var(--a2); } .c3 { color: var(--a3); }
 .c4 { color: var(--a4); } .c5 { color: var(--a5); } .c6 { color: var(--a6); } .c7 { color: var(--a7); }
 
-form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px max(16px, calc((100% - 820px) / 2)) max(12px, env(safe-area-inset-bottom)); }
+#form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px max(16px, calc((100% - 820px) / 2)) max(12px, env(safe-area-inset-bottom)); }
 .row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
 select, textarea, button { font: inherit; color: inherit; }
 select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; max-width: 60vw; }
@@ -3449,7 +3449,7 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 .chip .s { color: var(--muted); }
 .chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
 .chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
-form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
 .msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
 .msg .body > .files:first-child { margin-top: 0; }
 .msg .file { display: inline-flex; gap: 6px; align-items: baseline; color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; text-decoration: none; background: var(--bg); color: var(--ink); }
@@ -3479,8 +3479,9 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
   .sub, .hint { display: none; }
   h1 { margin-bottom: 8px; }
   #agents { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
-  .agent { flex: none; width: 200px; margin: 0; }
-  .agent .status { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .agent { flex: none; width: 240px; margin: 0; }
+  .agent .name { min-width: 0; }
+  .agent .name, .agent .where, .agent .status, .agent .activity { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .msg { max-width: 94%; }
 }
 </style>
@@ -3625,7 +3626,7 @@ function renderAgents() {
   const box = $("agents");
   if (box.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;  // menu open
   box.replaceChildren();
-  if (!state.agents.length) box.append(el("p", "none", "No agents yet. On the host, run `crewchat invite`, then open an agent session in the joined folder."));
+  if (!state.agents.length) box.append(el("p", "none", "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use Add an agent above."));
   for (const a of state.agents) {
     const age = a.seen ? state.now - a.seen : Infinity;
     const card = el("div", "agent");
