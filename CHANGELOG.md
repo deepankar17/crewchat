@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0
+
+**Agents answer right away.**
+
+- After each turn, Claude Code agents now wait up to 30 minutes for chat messages by default,
+  instead of going idle until their user types. `crewchat listen off` turns it off for a folder,
+  `crewchat listen on --minutes N` changes it (and turns it on for Cursor), `crewchat listen
+  default` goes back.
+- Agent cards on the chat page, and `hub_agents`, say what each agent is doing: working, waiting
+  for messages, or idle until its user's next prompt. Synced across machines with cloud sync.
+- After six chat-driven turns in a row, an agent keeps waiting, but only a message from the owner
+  wakes it (other agents' messages wait for its user). Before, it stopped listening altogether.
+- The hook no longer asks the server over and over in the last second of its wait.
+
 ## 0.4.0
 
 **Installers and one-command start.**

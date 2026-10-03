@@ -773,11 +773,63 @@ class Hooks(Base):
 
     def test_listen_command(self):
         folder = Path(tempfile.mkdtemp(prefix="listen-", dir=TMP))
-        self.assertIn("off", cli("listen", "status", "--project", str(folder)))
+        self.assertIn("on by default", cli("listen", "status", "--project", str(folder)))
+        self.assertEqual(crewchat.listen_seconds(folder, "claude"), crewchat.DEFAULT_LISTEN)
+        self.assertEqual(crewchat.listen_seconds(folder, "cursor"), 0)
         cli("listen", "on", "--minutes", "999", "--project", str(folder))
         self.assertEqual((folder / ".crewchat-listen").read_text().strip(), str(crewchat.MAX_LISTEN))
+        self.assertEqual(crewchat.listen_seconds(folder, "cursor"), crewchat.MAX_LISTEN)
         cli("listen", "off", "--project", str(folder))
+        self.assertEqual(crewchat.listen_seconds(folder, "claude"), 0)
+        self.assertIn("off", cli("listen", "status", "--project", str(folder)))
+        cli("listen", "default", "--project", str(folder))
         self.assertFalse((folder / ".crewchat-listen").exists())
+
+    def test_after_the_loop_guard_only_the_owner_wakes_a_listening_agent(self):
+        session, name = self.linked("G")
+        other, _ = self.agent()
+        for i in range(crewchat.MAX_CHAIN):
+            other.call("hub_send", to=name, text="ping %d" % i)
+            self.assertTrue(self.hook("claude", "stop", {"session_id": "G"}))
+        threading.Timer(0.5, lambda: other.call("hub_send", to=name, text="agent chatter")).start()
+        threading.Timer(2.0, lambda: self.say(name, "owner wakes you")).start()
+        start = time.time()
+        out = self.hook("claude", "stop", {"session_id": "G"}, listen="20")
+        self.assertGreater(time.time() - start, 1.8)
+        self.assertIn("owner wakes you", out)
+        self.assertIn("agent chatter", out)  # held messages come along with the owner's
+
+    def test_cards_show_what_an_agent_is_doing(self):
+        session, name = self.linked("H")
+        doing = lambda: next(r["activity"] for r in self.hub.rows() if r["agent"] == name)  # noqa: E731
+        self.hook("claude", "prompt", {"session_id": "H"})
+        self.assertEqual(doing(), "working")
+        got = {}
+        thread = threading.Thread(target=lambda: got.update(out=self.hook("claude", "stop", {"session_id": "H"},
+                                                                          listen="20")))
+        thread.start()
+        for _ in range(50):
+            if doing() == "listening":
+                break
+            time.sleep(0.1)
+        self.assertEqual(doing(), "listening")
+        self.assertIn(name + " (you): claude on mac; online, waiting for messages", session.text("hub_agents"))
+        self.say(name, "go")
+        thread.join()
+        self.assertIn("go", got["out"])
+        self.assertEqual(doing(), "working")
+        # A listening hook that ends without a message counts as listening for a moment (it asks
+        # again at once), then as idle.
+        grace, crewchat.LISTEN_GRACE = crewchat.LISTEN_GRACE, 0.5
+        try:
+            self.hook("claude", "stop", {"session_id": "H"}, listen="1")
+            self.assertEqual(doing(), "listening")
+            time.sleep(0.7)
+            self.assertEqual(doing(), "idle")
+        finally:
+            crewchat.LISTEN_GRACE = grace
+        self.hook("claude", "stop", {"session_id": "H"})
+        self.assertEqual(doing(), "idle")
 
 
 class Persistence(Base):

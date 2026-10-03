@@ -48,7 +48,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -71,6 +71,8 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 6  # hook-driven turns in a row before an agent waits for its user again
 MAX_LISTEN = 55 * 60
+DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
+LISTEN_GRACE = 15  # a listening hook re-asks within this many seconds; after that it has stopped
 ONLINE_SECS = 900  # an agent heard from this recently counts as online
 FORGET_HOURS = 24  # an agent silent this long drops off the roster
 REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offline (cloud sync)
@@ -304,6 +306,8 @@ class Hub:
         self.sync = None  # set by crewchat_cloud when cloud sync is on
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
         self.device = ""  # this machine's device name when cloud sync is on
+        self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
+        self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self._load()
@@ -523,6 +527,23 @@ class Hub:
                 agent["seen"] = time.time()
                 if active:
                     agent["active"] = agent["seen"]
+                    if not self.waiting.get(name) and self.activity.get(name, ("",))[0] != "working":
+                        self.activity[name] = ("working", agent["seen"])
+                        self._changed()
+
+    def _activity(self, name, now):
+        """What an agent is doing, as far as its hooks tell: working, listening (waiting for
+        messages, so it answers at once), idle (sees messages at its user's next prompt), or ''."""
+        if self.waiting.get(name):
+            return "listening"
+        state, since = self.activity.get(name, ("", 0))
+        if state == "listening" and now - since > LISTEN_GRACE:
+            return "idle"
+        return state
+
+    def _poke(self):
+        with self.lock:
+            self._changed()
 
     def link(self, sid, key):
         """Tie a hook link key to the session's agent. Returns (name, note for the agent).
@@ -625,7 +646,8 @@ class Hub:
         with self.lock:
             return [
                 {"agent": n, "client": a["client"], "place": a["place"], "seen": round(a["seen"]),
-                 "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n))}
+                 "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n)),
+                 "activity": self._activity(n, time.time())}
                 for n, a in self.agents.items()
             ]
 
@@ -634,7 +656,8 @@ class Hub:
         rows = [
             {"agent": n, "client": a["client"], "place": a["place"], "seen": a["seen"],
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
-             "unread": len(self._unread(n)), "device": self.device, "remote": False}
+             "unread": len(self._unread(n)), "device": self.device, "remote": False,
+             "activity": self._activity(n, now)}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -649,6 +672,7 @@ class Hub:
                     "online": fresh and now - seen < ONLINE_SECS + REMOTE_SEEN_SLACK,
                     "status": str(row.get("status") or ""), "cursor": self.seq_of(row.get("read_id") or ""),
                     "unread": int(row.get("unread") or 0), "device": dev["device"], "remote": True,
+                    "activity": str(row.get("activity") or "") if fresh else "",
                 })
         return rows
 
@@ -721,7 +745,11 @@ class Hub:
             self._record_take(agent, mid, task)
             return task
 
-    def inbox(self, name, wait_seconds, peek, ack=0):
+    def inbox(self, name, wait_seconds, peek, ack=0, owner_only=False):
+        """Unread messages for name, waiting up to wait_seconds for one. With owner_only, only a
+        message from the owner ends the wait, and without one nothing is returned."""
+        def ready(unread):
+            return any(m["from"] == OWNER for m in unread) if owner_only else bool(unread)
         deadline = time.time() + wait_seconds
         with self.lock:
             if name != OWNER and name not in self.agents:
@@ -732,12 +760,14 @@ class Hub:
                 self._save()
                 self._changed()
             unread = self._unread(name)
-            while not unread and time.time() < deadline:
+            while not ready(unread) and time.time() < deadline:
                 self.lock.wait(timeout=max(0.0, deadline - time.time()))
                 if name != OWNER and name not in self.agents:
                     return []
                 unread = self._unread(name)
-            if unread and not peek:
+            if not ready(unread):
+                return []
+            if not peek:
                 self._set_cursor(name, unread[-1]["seq"])
                 self._save()
                 self._changed()
@@ -769,8 +799,9 @@ class Hub:
                 "agents": self._rows(),
             }
 
-    def hook(self, place, key, ack, wait_seconds):
-        """What an agent's hook asks: are there messages for the session with this link key?"""
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
+        """What an agent's hook asks: are there messages for the session with this link key?
+        event is "prompt" (its user typed) or "stop" (it finished a turn)."""
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
         with self.lock:
@@ -788,8 +819,31 @@ class Hub:
                 agent["checked"] = time.time()
                 self._save()
                 return {"link": True}
-            agent["seen"] = time.time()
-        unread = self.inbox(name, wait_seconds, True, ack)
+            agent["seen"] = now = time.time()
+            if event == "prompt":
+                self.activity[name] = ("working", now)
+            if wait_seconds:
+                self.waiting[name] = self.waiting.get(name, 0) + 1
+            self._changed()
+        unread = []
+        try:
+            unread = self.inbox(name, wait_seconds, True, ack, owner_only)
+        finally:
+            with self.lock:
+                if wait_seconds:
+                    self.waiting[name] -= 1
+                    if not self.waiting[name]:
+                        del self.waiting[name]
+                if unread or event == "prompt":
+                    self.activity[name] = ("working", time.time())
+                elif not self.waiting.get(name):
+                    # A listening hook asks again at once; if it does not, it has stopped.
+                    self.activity[name] = ("listening" if wait_seconds else "idle", time.time())
+                    if wait_seconds:
+                        timer = threading.Timer(LISTEN_GRACE + 1, self._poke)
+                        timer.daemon = True
+                        timer.start()
+                self._changed()
         text = TRUST_NOTE + "\n\n" + "\n".join(fmt(m, name) for m in unread) if unread else ""
         return {"agent": name, "text": text, "last": unread[-1]["seq"] if unread else 0,
                 "owner": any(m["from"] == OWNER for m in unread)}
@@ -874,10 +928,16 @@ def clean_text(to, text, sender):
     return text.strip()
 
 
+ACTIVITY = {"working": "working", "listening": "waiting for messages",
+            "idle": "idle until its user's next prompt"}
+
+
 def roster_text(rows, me=None):
     lines = []
     for row in rows:
         seen = "online" if row["online"] else ("last seen %s" % now_iso(row["seen"]) if row["seen"] else "never seen")
+        if row["online"] and ACTIVITY.get(row.get("activity")):
+            seen += ", " + ACTIVITY[row["activity"]]
         lines.append("%s%s: %s on %s; %s; unread %d; status: %s" % (
             row["agent"], " (you)" if row["agent"] == me else "", row["client"], row["place"], seen,
             row["unread"], row["status"] or "-"))
@@ -1509,7 +1569,8 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
-                self._json(200, self.hub.hook(who[1], data.get("key"), ack, wait))
+                event = "prompt" if data.get("event") == "prompt" else "stop"
+                self._json(200, self.hub.hook(who[1], data.get("key"), ack, wait, event, bool(data.get("owner_only"))))
             except (HubError, TypeError, ValueError):
                 self._json(400, {"error": "bad request"})
             return
@@ -1745,8 +1806,8 @@ def cmd_start(args):
     print("Now open %s in %s. Each new session joins the chat by itself, named %s-%s, %s-%s-2, ..."
           % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where,
              kinds[0], place, kinds[0], place))
-    print("Sessions that were already open need a restart. To make agents wait for messages instead")
-    print("of going idle: crewchat listen on")
+    print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
+    print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
 
 
 def cmd_serve(args):
@@ -1983,7 +2044,8 @@ def install_claude(project, url, token):
         enabled.append(SERVER_NAME)
     hooks = settings.setdefault("hooks", {})
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
-                               ("Stop", "stop", {"timeout": MAX_LISTEN + 100, "statusMessage": "Checking the crewchat"})):
+                               ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
+                                                 "statusMessage": "Waiting for crewchat messages"})):
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
         groups.append({"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]})
@@ -2002,7 +2064,7 @@ def install_cursor(project, url, token):
     hooks = read_json(hooks_path)
     hooks.setdefault("version", 1)
     stop = [h for h in hooks.setdefault("hooks", {}).get("stop", []) if not is_our_hook(h.get("command", ""))]
-    stop.append({"command": hook_command("cursor", "stop")})
+    stop.append({"command": hook_command("cursor", "stop"), "timeout": MAX_LISTEN + 100})
     hooks["hooks"]["stop"] = stop
     write_json(hooks_path, hooks)
     return [".cursor/mcp.json", ".cursor/hooks.json"]
@@ -2084,27 +2146,34 @@ def client_config(project, client):
         return None
 
 
-def listen_seconds(project):
+def listen_seconds(project, client="claude"):
+    """How long this project's agents wait for messages after a turn. Without a setting, Claude
+    Code agents wait DEFAULT_LISTEN; other tools check once."""
     if "CREWCHAT_LISTEN" in os.environ:  # tests
         return int(os.environ["CREWCHAT_LISTEN"])
     try:
         return max(0, min(MAX_LISTEN, int((project / ".crewchat-listen").read_text().strip())))
-    except (OSError, ValueError):
+    except OSError:
+        return DEFAULT_LISTEN if client == "claude" else 0
+    except ValueError:
         return 0
 
 
-def hook_check(base, token, key, wait_total, ack):
+def hook_check(base, token, key, wait_total, ack, event="stop", owner_only=False):
     """Ask the server for this session's messages without marking them read.
 
     Returns ("link", "", 0, False) if the session must call hub_link first, else
     ("ok", text, last id, whether the owner wrote any of it), where text is '' when nothing arrived
     within wait_total seconds. `ack` first confirms the messages a previous hook call delivered.
+    With owner_only, only a message from the owner ends the wait.
     """
     deadline = time.time() + wait_total
     while True:
-        wait = int(max(0, min(MAX_WAIT, deadline - time.time())))
+        # Round up, so the last call waits out the remainder instead of asking again and again.
+        wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
         try:
-            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait}, timeout=MAX_WAIT + 30)
+            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
+                                                        "owner_only": owner_only}, timeout=MAX_WAIT + 30)
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -2155,7 +2224,7 @@ def run_hook(client, event):
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _ = hook_check(base, token, key, 0, 0)
+        kind, text, last, _ = hook_check(base, token, key, 0, 0, "prompt")
         if kind == "link":
             save(0, pending, 1)
             if client == "claude":
@@ -2172,7 +2241,9 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     capped = chain >= MAX_CHAIN
-    kind, text, last, from_owner = hook_check(base, token, key, listen_seconds(project), pending)
+    # After MAX_CHAIN turns in a row driven by the chat, only the owner can wake the agent.
+    kind, text, last, from_owner = hook_check(base, token, key, listen_seconds(project, client), pending,
+                                              owner_only=capped)
     if kind == "link":
         if capped or asks >= MAX_LINK_ASKS:
             return  # asked enough; the next user prompt asks again
@@ -2212,14 +2283,24 @@ def cmd_listen(args):
         print("Listening on: after each turn, agents in %s wait up to %d minutes for a message "
               "before going idle." % (project, seconds // 60))
     elif args.mode == "off":
+        path.write_text("0\n")
+        git_exclude(project, [".crewchat-listen"])
+        print("Listening off: agents in %s check the chat once at the end of each turn, and see "
+              "later messages at their user's next prompt." % project)
+    elif args.mode == "default":
         try:
             path.unlink()
         except OSError:
             pass
-        print("Listening off: agents check the chat once at the end of each turn.")
+        print("Back to the default: Claude Code agents wait up to %d minutes for messages after "
+              "each turn; Cursor agents check once." % (DEFAULT_LISTEN // 60))
     else:
-        seconds = listen_seconds(project)
-        print("Listening is %s." % ("on, %d minutes" % (seconds // 60) if seconds else "off"))
+        if path.exists():
+            seconds = listen_seconds(project)
+            print("Listening is %s." % ("on, %d minutes" % (seconds // 60) if seconds else "off"))
+        else:
+            print("Listening is on by default: Claude Code agents wait up to %d minutes for messages "
+                  "after each turn; Cursor agents check once." % (DEFAULT_LISTEN // 60))
 
 
 # --------------------------------------------------------------------------------------------
@@ -2451,6 +2532,8 @@ h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywher
 .agent .where { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .agent .status { font-size: 13px; color: var(--ink); margin-top: 4px; overflow-wrap: anywhere; }
 .agent .unread { font-size: 12px; margin-top: 4px; color: var(--warn); }
+.agent .activity { font-size: 12px; margin-top: 4px; color: var(--muted); }
+.agent .activity.listening { color: var(--ok); }
 .none { font-size: 13px; color: var(--muted); }
 .hint { font-size: 12.5px; color: var(--muted); margin-top: 16px; }
 .hint b { color: var(--ink); font-weight: 600; }
@@ -2509,7 +2592,7 @@ button:disabled { opacity: 0.5; cursor: default; }
   <p class="sub">Everything your agents say to each other, live.</p>
   <div id="agents"></div>
   <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it.</p>
-  <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent reads messages when it checks in: at the end of each turn, and before and after a task. Grey means it is not working right now.</p>
+  <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types (<code>crewchat listen</code> changes how long agents wait). Grey means it has not been heard from lately.</p>
 </aside>
 <main>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
@@ -2567,6 +2650,9 @@ function renderAgents() {
     top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
     card.append(top, el("div", "where", a.client + " on " + a.place + (a.remote ? " · machine " + a.device : "")),
                 el("div", "status", a.status || "No status set"));
+    const doing = {working: "Working", listening: "Waiting for messages: answers right away",
+                   idle: "Idle: sees messages when its user next types"}[a.activity];
+    if (doing && age < 900) card.append(el("div", "activity " + a.activity, doing));
     if (a.unread) card.append(el("div", "unread", a.unread + " unread"));
     box.append(card);
   }
@@ -2836,7 +2922,7 @@ def build_parser():
     p.set_defaults(fn=cmd_join)
 
     p = sub.add_parser("listen", help="make this project's agents wait for messages instead of going idle")
-    p.add_argument("mode", choices=["on", "off", "status"])
+    p.add_argument("mode", choices=["on", "off", "default", "status"])
     p.add_argument("--minutes", type=int, default=30)
     p.add_argument("--project")
     p.set_defaults(fn=cmd_listen)

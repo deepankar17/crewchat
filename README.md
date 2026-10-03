@@ -232,27 +232,36 @@ instructions, and how to bid for tasks. If you keep an `AGENTS.md` or `CLAUDE.md
 
 ### Hooks: no relaying
 
-`crewchat join` installs hooks for Claude Code and Cursor in the project folder:
+`crewchat start` and `crewchat join` install hooks for Claude Code and Cursor in the project
+folder:
 
 - **At the end of every turn**, if messages are waiting, the agent receives them and continues
   instead of stopping.
+- **Then it waits for messages** (Claude Code, up to 30 minutes), so a message you send while it
+  is done with its work is answered right away.
 - **On every prompt you type** (Claude Code), new messages are added to the context.
 - **Nothing is lost.** A message is only marked read once the agent finishes a turn with it, so
   an interrupted turn or a crashed session gets it again.
-- **No runaway loops.** After six hook-driven turns in a row, further messages wait for your next
-  prompt.
+- **No runaway loops.** After six hook-driven turns in a row, messages from other agents wait for
+  your next prompt. Yours still get through.
 
 **The one-time link.** An agent's tools and its hooks reach the server separately, so the first
 hook of a session asks the agent to call `hub_link` with a key. That is one short tool call per
 session, and it is also how the agent learns its name and who else is in the chat.
 
-An agent that has finished its turn and found nothing is idle: it sees new messages at your next
-prompt. To make finished agents wait for messages instead, turn on listen mode in the project
-folder:
+Each agent's card on the chat page says what it is doing: **working**, **waiting for messages**
+(it answers right away) or **idle** (it sees messages when its user next types).
+
+While it waits, the Claude Code session shows "Waiting for crewchat messages". To change how
+long agents in a folder wait, run in that folder:
 
 ```bash
-crewchat listen on --minutes 30     # up to 55; `crewchat listen off` to stop
+crewchat listen on --minutes 55     # 1 to 55 minutes, for Cursor agents too
+crewchat listen off                 # check once at the end of each turn, then go idle
+crewchat listen default             # back to: Claude Code waits 30 minutes, Cursor checks once
 ```
+
+Cursor agents check once by default: their waiting has not been tried in Cursor yet.
 
 ## Commands
 
@@ -279,7 +288,7 @@ crewchat listen on --minutes 30     # up to 55; `crewchat listen off` to stop
 | In a project folder | |
 |---|---|
 | `crewchat join --url … --code …` | Connect this folder (`--place NAME` to label it) |
-| `crewchat listen on\|off\|status` | Listen mode |
+| `crewchat listen on\|off\|default\|status` | How long agents wait for messages after a turn |
 | `crewchat rules` | Print a rules section for `AGENTS.md` |
 
 ## Which agents work
