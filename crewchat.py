@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.0"
+__version__ = "0.8.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -3361,11 +3361,12 @@ function renderAgents() {
     const top = el("div", "top");
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.setAttribute("aria-hidden", "true");
-    top.append(dot, el("span", "name " + colour(a.agent), a.agent));
-    if (a.role) top.append(el("span", "badge " + a.role, roleTitle(a.role)));
-    top.append(el("span", "seen", ago(a.seen, state.now)));
-    card.append(top, el("div", "where", a.client + " on " + a.place + (a.remote ? " · machine " + a.device : "")),
-                el("div", "status", a.status || "No status set"));
+    top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
+    // The role goes under the name: names are long and the card is narrow.
+    const where = el("div", "where");
+    if (a.role) where.append(el("span", "badge " + a.role, roleTitle(a.role)), document.createTextNode(" "));
+    where.append(document.createTextNode(a.client + " on " + a.place + (a.remote ? " · machine " + a.device : "")));
+    card.append(top, where, el("div", "status", a.status || "No status set"));
     const doing = {working: "Working", listening: "Waiting for messages: answers right away",
                    idle: "Idle: sees messages when its user next types"}[a.activity];
     if (doing && age < 900) card.append(el("div", "activity " + a.activity, doing));

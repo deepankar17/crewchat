@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.8.1
+
+**Documentation, and tidying.**
+
+- New guides in `docs/`: getting started, teams and roles, several machines, your phone, how it
+  works, every command, and troubleshooting. The README is now a short front page that links to
+  them, with new screenshots.
+- Agent cards show the role under the name, so long names no longer wrap mid-word.
+- Files holding a token (`.mcp.json`, `.cursor/mcp.json`, state, peers) are written in one step
+  and are private from the moment they exist.
+- `crewchat roles` lists exactly the roles the server accepts.
+- The server decides when the loop limit is reached, so a changed `--max-chain` applies at once.
+- Lighter on the server: task progress keeps only its status, finding the lead no longer scans the
+  message history, and the chat page updates tasks without searching the page.
+
 ## 0.8.0
 
 **Add an agent from the chat page.**

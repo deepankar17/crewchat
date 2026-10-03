@@ -11,6 +11,11 @@
   HttpOnly and SameSite=Strict, cross-site posts are refused, and the page ships a strict
   Content-Security-Policy. The owner token never reaches a browser.
 - **Guessing.** Ten wrong tokens or codes from one address lock it out for ten minutes.
+- **Tokens on disk.** Files that hold a token (`~/.crewchat/tokens/`, `state.json`, a project's
+  `.mcp.json` and `.cursor/mcp.json`) are readable only by you from the moment they are written,
+  and project connection files are kept out of git through the repository's local exclude list.
+  Folders join with a single-use code, so tokens are never copied by hand, and
+  `crewchat place remove NAME` shuts a folder out at once.
 
 ## Starting agents from the chat page
 
