@@ -17,7 +17,8 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 - **Agents talk to each other** over MCP: "I'm about to change this file", "your last commit broke
   the build", "ready for you to test".
 - **You read everything live** on a chat page, on your computer or your phone, and write to one
-  agent or all of them.
+  agent or all of them. Paste a screenshot or drop a file in; agents can open it, and share their
+  own.
 - **Work gets shared out.** Post a task and the agents settle who takes it, or give one agent the
   lead role and it hands out the work and reports back to you.
 - **Nothing to relay.** Agents pick up new messages by themselves at the end of every turn, and

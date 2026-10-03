@@ -194,6 +194,17 @@ class Linked(unittest.TestCase):
         eventually(lambda: self.a.hub.progress.get(piece["id"], {}).get("status") == "review", what="the update")
         self.a.hub.set_role(crewchat.OWNER, lead, "none")
 
+    def test_files_are_fetched_from_the_machine_they_were_shared_on(self):
+        meta = self.a.hub.add_file("shot.png", b"PNGDATA", "image/png")
+        self.a.hub.send(crewchat.OWNER, "all", "", files=[meta])
+        eventually(lambda: self.c.has(""), what="the message to arrive")
+        got, path = self.c.hub.open_file(meta["id"])
+        self.assertEqual((got["name"], path.read_bytes()), ("shot.png", b"PNGDATA"))
+        # A member never relays a file it did not share itself.
+        mesh = peers.Mesh(self.c.root)
+        self.assertEqual(status_of(self.c.url + "/peer/file", {"id": meta["id"]}, mesh.data["secret"],
+                                   mesh.me["id"]), 404)
+
     def test_the_key_is_required(self):
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}, token="wrong"), 401)
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}), 401)

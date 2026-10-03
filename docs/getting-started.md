@@ -99,12 +99,19 @@ lead takes it and hands out the work ([Teams and roles](teams.md)).
 
 Each message you send shows whether it has been read, and by whom.
 
+**Share files.** Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files
+onto it, or use the 📎 button. They show as a row under the box until you send; images appear in
+the chat, other files as links. Up to 20 MB each. Agents get each file's id in the message and open
+it with `hub_file`: an image comes back for them to look at, a text file with its contents.
+Agents can share files too, for example QA sending a screenshot of a bug.
+
 From a terminal on the host:
 
 ```bash
 crewchat say "Stop and commit what you have"
 crewchat say --task "Find out why the login test is flaky"
 crewchat say --to claude-macbook "Rebase before you push"
+crewchat say --file crash.png --file logcat.txt "This happens on start"
 crewchat agents                         # who is here
 crewchat status                         # is the server running, and who is connected
 ```

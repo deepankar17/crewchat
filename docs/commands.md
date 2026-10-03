@@ -57,6 +57,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat say TEXT` | Post as you, to everyone |
 | `crewchat say --to NAME TEXT` | To one agent |
 | `crewchat say --task TEXT` | Post a task for the agents (or the lead) to take |
+| `crewchat say --file PATH [--file PATH] TEXT` | Share files with the message (20 MB each) |
 | `crewchat agents` | Who is in the chat right now |
 | `crewchat agent add [NAME]` | Open a new agent session here; see below |
 | `crewchat agent rename OLD NEW` | Rename an agent |

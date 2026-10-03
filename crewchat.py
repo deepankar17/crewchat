@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -59,6 +59,15 @@ PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 MAX_BODY = 256 * 1024
+MAX_UPLOAD = 20 * 1024 * 1024  # one shared file
+MAX_FILES = 10  # files on one message
+MAX_TOOL_IMAGE = 5 * 1024 * 1024  # hub_file hands images up to this size to the agent itself
+MAX_TOOL_TEXT = 200 * 1024  # and text files up to this size
+FILE_ID_RE = re.compile(r"^[0-9a-f]{16}$")
+# Shown in the chat page. Anything else, SVG and HTML included, is only ever offered as a download.
+INLINE_IMAGES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
+              "application/javascript", "application/x-sh", "application/sql")
 MAX_TEXT = 4000
 MAX_STATUS = 200
 MAX_WAIT = 50
@@ -457,7 +466,7 @@ class Hub:
         with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-    def _append(self, sender, to, text, kind, task=None, role=None, status=None):
+    def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None):
         """A message written on this machine: stored, and published when cloud sync is on."""
         seq = self.next_seq
         self.next_seq += 1
@@ -466,6 +475,8 @@ class Hub:
         for field, value in zip(EXTRA_FIELDS, (task, role, status)):
             if value is not None:
                 msg[field] = value
+        if files:
+            msg["files"] = files
         if self.sync is not None:
             msg["origin"] = self.sync.device_id
         self._store(msg)
@@ -489,6 +500,8 @@ class Hub:
             for field in EXTRA_FIELDS:
                 if msg.get(field) is not None:
                     kept[field] = str(msg[field])
+            if msg.get("files"):
+                kept["files"] = clean_files(msg["files"])
             self._store(kept)
             self._effects(kept)
             self._changed()
@@ -797,12 +810,76 @@ class Hub:
             if m["seq"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
         ]
 
-    def send(self, sender, to, text, kind="msg"):
+    def send(self, sender, to, text, kind="msg", files=None):
         with self.lock:
             self._check_recipient(to, everyone=True)
-            msg = self._append(sender, to, text, kind)
+            msg = self._append(sender, to, text, kind, files=files or None)
             self._changed()
             return msg
+
+    # Shared files ------------------------------------------------------------------------------
+    # Each file is kept in files/<id>/ with its own name, next to meta.json. Messages carry only
+    # {id, name, size, type}; a machine that does not have a file asks the one it came from.
+    def _file_dir(self, fid):
+        return self.home / "files" / fid
+
+    def _keep_file(self, fid, name, data, kind):
+        folder = self._file_dir(fid)
+        folder.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(folder / name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        meta = {"id": fid, "name": name, "size": len(data), "type": kind}
+        write_json(folder / "meta.json", meta, private=True)
+        return meta
+
+    def add_file(self, name, data, kind=""):
+        """Keep a file someone shares. Returns what a message carries about it."""
+        if len(data) > MAX_UPLOAD:
+            raise HubError("%s is too big: %s at most" % (clean_filename(name), human_size(MAX_UPLOAD)))
+        name = clean_filename(name)
+        return self._keep_file(secrets.token_hex(8), name, data, file_type(name, kind))
+
+    def file(self, fid):
+        """(meta, path) of a file kept on this machine, or (None, None)."""
+        if not FILE_ID_RE.match(str(fid)):
+            return None, None
+        try:
+            meta = json.loads((self._file_dir(fid) / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None, None
+        path = self._file_dir(fid) / clean_filename(meta.get("name"))
+        return (meta, path) if path.is_file() else (None, None)
+
+    def attach(self, ids):
+        """The attachments for a message, from the ids of files already kept here."""
+        out = []
+        for fid in ids if isinstance(ids, list) else []:
+            meta, _ = self.file(str(fid))
+            if meta is None:
+                raise HubError("no shared file with id %s" % fid)
+            out.append(meta)
+        if len(out) > MAX_FILES:
+            raise HubError("%d files at most on one message" % MAX_FILES)
+        return out
+
+    def open_file(self, fid):
+        """(meta, path) of a shared file, fetched from the machine it came from if need be."""
+        meta, path = self.file(fid)
+        if meta:
+            return meta, path
+        with self.lock:
+            msg = next((m for m in reversed(self.messages) if any(f["id"] == fid for f in m.get("files") or [])),
+                       None)
+        if msg is None:
+            raise HubError("no shared file with id %s" % fid)
+        info = next(f for f in msg["files"] if f["id"] == fid)
+        fetch = getattr(self.sync, "fetch_file", None)
+        if fetch is None or not msg.get("origin"):
+            raise HubError("%s was shared on another machine, and files only travel between machines linked "
+                           "over Tailscale" % info["name"])
+        self._keep_file(fid, clean_filename(info["name"]), fetch(msg["origin"], fid), info["type"])
+        return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
     def new_start(self, name="", role="", task=""):
@@ -1039,6 +1116,8 @@ class Hub:
                 "agents": self._rows(),
                 "roles": [{"name": k, "title": v[0]} for k, v in self.roles().items()],
                 "statuses": STATUSES,
+                "images": INLINE_IMAGES,
+                "max_upload": MAX_UPLOAD,
             }
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
@@ -1165,14 +1244,67 @@ def fmt(msg, viewer=None):
         tag = "[UPDATE on #%s: %s] " % (msg.get("task"), STATUSES.get(msg.get("status"), msg.get("status")))
     elif msg["kind"] == "role":
         tag = "[ROLE] "
-    return "%s %s -> %s: %s%s" % (stamp, msg["from"], to, tag, msg["text"])
+    files = "".join("\n    [file %s: %s, %s, %s; open it with hub_file]" % (
+        f["id"], f["name"], f["type"], human_size(f["size"])) for f in msg.get("files") or [])
+    return "%s %s -> %s: %s%s%s" % (stamp, msg["from"], to, tag, msg["text"], files)
 
 
-def clean_text(to, text, sender):
+def clean_filename(name):
+    """A file's own name, safe to store and to show: no folders, no odd characters."""
+    name = str(name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = "".join(c for c in name if c.isprintable() and c not in '<>:"|?*').strip(" .")
+    return name[:120] or "file"
+
+
+# Text files that the system's type table does not know (or, like .ts, takes for something else).
+TEXT_EXTENSIONS = (".md", ".markdown", ".txt", ".log", ".kt", ".kts", ".gradle", ".java", ".swift", ".ts",
+                   ".tsx", ".jsx", ".py", ".rb", ".go", ".rs", ".c", ".h", ".cpp", ".cs", ".toml", ".ini",
+                   ".yaml", ".yml", ".csv", ".diff", ".patch", ".sql", ".properties", ".env.example")
+
+
+def file_type(name, given=""):
+    import mimetypes
+    if name.lower().endswith(TEXT_EXTENSIONS):
+        return "text/plain" if not name.lower().endswith((".md", ".markdown")) else "text/markdown"
+    kind = str(given or "").split(";")[0].strip().lower()
+    if not kind or kind == "application/octet-stream" or "/" not in kind:
+        kind = mimetypes.guess_type(name)[0] or "application/octet-stream"
+    return kind
+
+
+def is_text(kind):
+    return kind.startswith("text/") or kind in TEXT_TYPES
+
+
+def human_size(size):
+    for unit in ("bytes", "KB", "MB"):
+        if size < 1024 or unit == "MB":
+            return "%d %s" % (size, unit) if unit == "bytes" else "%.1f %s" % (size, unit)
+        size /= 1024.0
+
+
+def clean_files(files):
+    """The attachments a message carries, as sent between machines: [{id, name, size, type}]."""
+    out = []
+    for f in files if isinstance(files, list) else []:
+        if isinstance(f, dict) and FILE_ID_RE.match(str(f.get("id", ""))):
+            try:
+                size = max(0, int(f.get("size") or 0))
+            except (TypeError, ValueError):
+                size = 0
+            out.append({"id": str(f["id"]), "name": clean_filename(f.get("name")), "size": size,
+                        "type": file_type(str(f.get("name", "")), f.get("type"))[:100]})
+    return out[:MAX_FILES]
+
+
+def clean_text(to, text, sender, files=None):
+    """The text of a message, checked. It may be empty when the message carries files."""
     if not isinstance(to, str) or not to:
         raise HubError("say who it is for: an agent's name, Owner, or all")
     if to == sender:
         raise HubError("you cannot message yourself")
+    if files and (text is None or text == ""):
+        return ""
     if not isinstance(text, str) or not text.strip():
         raise HubError("text must not be empty")
     if len(text) > MAX_TEXT:
@@ -1214,6 +1346,9 @@ TOOLS = [
             "properties": {
                 "to": {"type": "string", "description": "An agent's name, 'Owner', or 'all'."},
                 "text": {"type": "string", "maxLength": MAX_TEXT, "description": "The message."},
+                "files": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_FILES,
+                          "description": "Absolute paths of files on this machine to share with the message: "
+                          "screenshots, logs, documents (20 MB each)."},
             },
             "required": ["to", "text"],
             "additionalProperties": False,
@@ -1280,6 +1415,18 @@ TOOLS = [
             "type": "object",
             "properties": {"name": {"type": "string", "maxLength": 32}},
             "required": ["name"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "hub_file",
+        "description": "Open a file shared in the chat (messages show it as [file ID: name ...]). An "
+        "image comes back so you can see it, a text file with its contents; for anything else you get "
+        "its path on this machine, to open with your own tools.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "The file's id from the message."}},
+            "required": ["id"],
             "additionalProperties": False,
         },
     },
@@ -1364,8 +1511,11 @@ def call_tool(hub, sid, name, args, owner=False):
     hub.touch(me, active=True)
     if name == "hub_send":
         to = args.get("to")
-        msg = hub.send(me, to, clean_text(to, args.get("text"), me))
-        return "Sent #%s to %s." % (msg["id"], to)
+        files = [share_file(hub, path) for path in args.get("files") or []]
+        msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
+        return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
+    if name == "hub_file":
+        return open_shared_file(hub, args.get("id"))
     if name == "hub_inbox":
         unread = hub.inbox(me, int_arg(args, "wait_seconds", 0, 0, MAX_WAIT), bool(args.get("peek", False)))
         if not unread:
@@ -1421,6 +1571,38 @@ def call_tool(hub, sid, name, args, owner=False):
     return "You are now %s. Everyone has been told." % new
 
 
+def share_file(hub, path):
+    """An agent shares a file from this machine (hub_send files)."""
+    if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
+        raise HubError("files must be absolute paths on this machine")
+    path = Path(path).expanduser()
+    try:
+        if path.stat().st_size > MAX_UPLOAD:
+            raise HubError("%s is too big: %s at most" % (path.name, human_size(MAX_UPLOAD)))
+        data = path.read_bytes()
+    except OSError as e:
+        raise HubError("cannot read %s (%s)" % (path, e.strerror or e))
+    return hub.add_file(path.name, data)
+
+
+def open_shared_file(hub, fid):
+    """hub_file: an image to look at, a text file's contents, or else where the file is."""
+    fid = str(fid or "").strip().lower()
+    if not FILE_ID_RE.match(fid):
+        raise HubError("id must be the file id a message shows, like [file 1a2b3c4d5e6f7a8b: ...]")
+    meta, path = hub.open_file(fid)
+    if meta is None:
+        raise HubError("no shared file with id %s" % fid)
+    head = "%s (%s, %s), saved at %s" % (meta["name"], meta["type"], human_size(meta["size"]), path)
+    if meta["type"] in INLINE_IMAGES and meta["size"] <= MAX_TOOL_IMAGE:
+        import base64
+        return [{"type": "text", "text": head},
+                {"type": "image", "data": base64.b64encode(path.read_bytes()).decode("ascii"), "mimeType": meta["type"]}]
+    if is_text(meta["type"]) and meta["size"] <= MAX_TOOL_TEXT:
+        return "%s:\n\n%s" % (head, path.read_text(encoding="utf-8", errors="replace"))
+    return head + ". Open it from that path with your own tools."
+
+
 def handle_rpc(hub, sid, req, owner=False):
     """One JSON-RPC message in, a response dict out (None for notifications)."""
     if not isinstance(req, dict) or req.get("jsonrpc") != "2.0":
@@ -1457,8 +1639,9 @@ def handle_rpc(hub, sid, req, owner=False):
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
             return err(-32602, "Invalid params")
         try:
-            text = call_tool(hub, sid, params["name"], params.get("arguments") or {}, owner)
-            return ok({"content": [{"type": "text", "text": text}], "isError": False})
+            out = call_tool(hub, sid, params["name"], params.get("arguments") or {}, owner)
+            content = out if isinstance(out, list) else [{"type": "text", "text": out}]
+            return ok({"content": content, "isError": False})
         except HubError as e:
             return ok({"content": [{"type": "text", "text": "Error: %s" % e}], "isError": True})
     return err(-32601, "Method not found: %s" % method)
@@ -1469,7 +1652,7 @@ def handle_rpc(hub, sid, req, owner=False):
 # --------------------------------------------------------------------------------------------
 PAGE_HEADERS = {
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-    "connect-src 'self'; img-src 'self' data:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
+    "connect-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
     "form-action 'self'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
     # same-origin, not no-referrer: with no-referrer browsers send "Origin: null" on the sign-in
@@ -1477,8 +1660,8 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
-PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave")  # crewchat_peers
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
 # names no project: like the icons, it is served without signing in.
@@ -1655,13 +1838,31 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return urllib.parse.urlsplit(origin).netloc == self.headers.get("Host", "")
 
-    def _body(self):
+    def _owner_request(self):
+        """Is this the owner: the chat page (signed in, same origin) or the owner token from the
+        command line? If not, answers the request and returns False."""
+        who = self._bearer(quiet=True)
+        if who is None:
+            if self.headers.get("Authorization"):
+                return False  # a wrong token: _bearer has answered
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return False
+            if not self._same_origin():
+                self._json(403, {"error": "wrong origin"})
+                return False
+        elif who[0] != "owner":
+            self._json(403, {"error": "only the owner can do this"})
+            return False
+        return True
+
+    def _body(self, limit=MAX_BODY):
         try:
             length = int(self.headers.get("Content-Length", ""))
         except ValueError:
             self._reply(411, b"")
             return None
-        if length > MAX_BODY:
+        if length > limit:
             # Read a moderately oversized body before refusing it: a client still sending when the
             # connection closes sees "connection reset" instead of the 413.
             left = length if length <= 4 * MAX_BODY else 0
@@ -1728,6 +1929,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._sign_in(query["code"][0])
             else:
                 self._login_page(200)
+        elif url.path.startswith("/files/"):
+            self._file(url.path)
         elif url.path == "/api/launch":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -1787,7 +1990,8 @@ class Handler(BaseHTTPRequestHandler):
     def _send_as_owner(self, data):
         to = data.get("to")
         kind = "task" if data.get("kind") == "task" else "msg"
-        return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER), kind)["id"]}
+        files = self.hub.attach(data.get("files") or [])
+        return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
 
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
@@ -1827,6 +2031,30 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _file(self, path):
+        """A shared file, for the signed-in chat page. Only plain images are shown in the page;
+        everything else is a download, and nothing in a file can run as part of the page."""
+        if not self._owner_session():
+            self._reply(401, b"", ctype="text/plain")
+            return
+        fid = path.split("/")[2] if path.count("/") >= 2 else ""
+        try:
+            meta, local = self.hub.open_file(fid)
+        except HubError as e:
+            self._reply(404, str(e).encode("utf-8"), ctype="text/plain; charset=utf-8")
+            return
+        if meta is None:
+            self._reply(404, b"", ctype="text/plain")
+            return
+        inline = meta["type"] in INLINE_IMAGES
+        quoted = urllib.parse.quote(meta["name"])
+        self._reply(200, local.read_bytes(), ctype=meta["type"] if inline else "application/octet-stream", extra={
+            "Content-Disposition": "%s; filename*=UTF-8''%s" % ("inline" if inline else "attachment", quoted),
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, max-age=86400",
+        })
+
     def _peer(self, path, raw):
         """A request from another of the owner's machines (crewchat_peers)."""
         handler = getattr(self.hub.sync, "peer_request", None)
@@ -1841,7 +2069,10 @@ class Handler(BaseHTTPRequestHandler):
         status, out = handler(path, token, self.headers.get("X-Crewchat-Device", ""), self._object(raw))
         if status == 401:
             self._fail()
-        self._json(status, out)
+        if isinstance(out, bytes):
+            self._reply(status, out, ctype="application/octet-stream")
+        else:
+            self._json(status, out)
 
     def _mcp(self, raw, who):
         try:
@@ -1893,6 +2124,19 @@ class Handler(BaseHTTPRequestHandler):
         if path not in POST_PATHS and path not in PEER_PATHS:
             self._reply(404, b"")
             return
+        if path == "/api/upload":
+            # Check who it is before reading up to MAX_UPLOAD bytes.
+            if not self._owner_request():
+                self.close_connection = True
+                return
+            raw = self._body(MAX_UPLOAD)
+            if raw is not None:
+                name = urllib.parse.unquote(self.headers.get("X-File-Name", ""))
+                try:
+                    self._json(200, self.hub.add_file(name, raw, self.headers.get("Content-Type", "")))
+                except HubError as e:
+                    self._json(400, {"error": str(e)})
+            return
         raw = self._body()
         if raw is None:
             return
@@ -1910,19 +2154,7 @@ class Handler(BaseHTTPRequestHandler):
             self._peer(path, raw)
             return
         if path in ("/api/send", "/api/role", "/api/launch"):
-            # From the chat page (session cookie) or from the command line (owner token).
-            who = self._bearer(quiet=True)
-            if who is None:
-                if self.headers.get("Authorization"):
-                    return
-                if not self._owner_session():
-                    self._json(401, {"error": "sign in"})
-                    return
-                if not self._same_origin():
-                    self._json(403, {"error": "wrong origin"})
-                    return
-            elif who[0] != "owner":
-                self._json(403, {"error": "only the owner can do this"})
+            if not self._owner_request():
                 return
             action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch}[path]
             try:
@@ -2522,9 +2754,29 @@ def cmd_roles(args):
         print("Role %s removed. Agents that had it keep it until you change their role." % name)
 
 
+def upload(path):
+    """Share a file from this machine as the owner; returns its id."""
+    path = Path(path).expanduser()
+    try:
+        data = path.read_bytes()
+    except OSError as e:
+        die("cannot read %s (%s)" % (path, e.strerror or e))
+    req = urllib.request.Request(local_url() + "/api/upload", data=data, method="POST", headers={
+        "Authorization": "Bearer " + owner_token(), "Content-Type": file_type(path.name),
+        "X-File-Name": urllib.parse.quote(path.name)})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as answer:
+            return json.loads(answer.read().decode("utf-8"))["id"]
+    except urllib.error.HTTPError as e:
+        die("%s was not shared (%s)" % (path.name, e.read().decode("utf-8", "replace") or "HTTP %d" % e.code))
+    except (urllib.error.URLError, OSError) as e:
+        die("the chat server is not running here (%s)" % getattr(e, "reason", e))
+
+
 def cmd_say(args):
+    files = [upload(path) for path in args.file or []]
     out = owner_call("/api/send", {"to": args.to, "text": " ".join(args.text),
-                                   "kind": "task" if args.task else "msg"})
+                                   "kind": "task" if args.task else "msg", "files": files})
     print("Posted %s #%s to %s." % ("task" if args.task else "message", out["id"], args.to))
 
 
@@ -3189,6 +3441,21 @@ select, textarea, button { font: inherit; color: inherit; }
 select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; max-width: 60vw; }
 label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 .compose { display: flex; gap: 8px; align-items: flex-end; }
+.attach { background: transparent; color: var(--muted); border: 1px solid var(--line); padding: 9px 11px; font-size: 16px; line-height: 1; }
+#pending { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+#pending:empty { display: none; }
+.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 3px 4px 3px 6px; font-size: 12.5px; background: var(--bg); max-width: 100%; }
+.chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; }
+.chip .s { color: var(--muted); }
+.chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+.chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
+form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
+.msg .body > .files:first-child { margin-top: 0; }
+.msg .file { display: inline-flex; gap: 6px; align-items: baseline; color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; text-decoration: none; background: var(--bg); color: var(--ink); }
+.msg .file .s { color: var(--muted); font-size: 12px; }
+.msg .file.image { padding: 0; border: 0; background: none; }
+.msg .file.image img { display: block; max-width: min(320px, 100%); max-height: 240px; border-radius: 8px; border: 1px solid var(--line); }
 textarea { flex: 1; min-width: 0; resize: none; max-height: 40dvh; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
 button { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 10px; padding: 9px 18px; font-weight: 600; cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -3252,7 +3519,10 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
       <select id="to"><option value="all">Everyone</option></select>
       <label class="check"><input type="checkbox" id="task"> Post as task</label>
     </div>
+    <div id="pending" aria-label="Files to send"></div>
     <div class="compose">
+      <button type="button" class="attach" id="attach" title="Attach files (or paste a screenshot)" aria-label="Attach files">📎</button>
+      <input type="file" id="files" multiple hidden>
       <textarea id="text" rows="1" maxlength="4000" placeholder="Message the agents…" aria-label="Message"></textarea>
       <button id="send" disabled>Send</button>
     </div>
@@ -3269,6 +3539,7 @@ const el = (tag, cls, text) => {
   return n;
 };
 const state = { after: 0, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
+                images: [], maxUpload: 20 * 1024 * 1024, pending: [],
                 agents: [], names: "", title: "crewchat",
                 now: Date.now() / 1000, lastDay: "" };
 
@@ -3404,6 +3675,28 @@ function receipt(m) {
   return "Read by " + read.join(", ");
 }
 
+function sizeText(n) {
+  return n < 1024 ? n + " bytes" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
+}
+
+function fileLinks(files) {
+  const list = el("div", "files");
+  for (const f of files) {
+    const a = el("a", "file");
+    a.href = "/files/" + f.id + "/" + encodeURIComponent(f.name);
+    a.target = "_blank"; a.rel = "noopener";
+    a.title = f.name + " (" + sizeText(f.size) + ")";
+    if (state.images.includes(f.type)) {
+      const img = el("img"); img.src = a.href; img.alt = f.name; img.loading = "lazy";
+      a.classList.add("image"); a.append(img);
+    } else {
+      a.append(el("span", "", "📄 " + f.name), el("span", "s", sizeText(f.size)));
+    }
+    list.append(a);
+  }
+  return list;
+}
+
 function buildMessage(m) {
   if (m.kind === "event") return el("p", "sys", m.text);
   if (m.kind === "role") {
@@ -3441,7 +3734,8 @@ function buildMessage(m) {
   if (m.kind === "update") {
     meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (state.statuses[m.status] || m.status)));
   }
-  body.append(document.createTextNode(m.text));
+  if (m.text) body.append(document.createTextNode(m.text));
+  if (m.files && m.files.length) body.append(fileLinks(m.files));
   box.append(meta, body);
   if (own) box.append(el("div", "receipt"));
   return box;
@@ -3499,6 +3793,7 @@ async function loop() {
       const first = state.version < 0;
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
+      state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       if (data.project && data.project + " · crewchat" !== state.title) {
         state.title = data.project + " · crewchat";
         $("project").textContent = data.project;
@@ -3526,9 +3821,58 @@ const text = $("text");
 function fit() {
   text.style.height = "auto";
   text.style.height = text.scrollHeight + 2 + "px";
-  $("send").disabled = !text.value.trim();
+  $("send").disabled = !text.value.trim() && !state.pending.length;
 }
 text.addEventListener("input", fit);
+// Files waiting to be sent: chosen with the paperclip, pasted (a screenshot) or dropped.
+function addFiles(list) {
+  for (let file of list) {
+    if (file.size > state.maxUpload) { $("error").textContent = file.name + " is too big: " + sizeText(state.maxUpload) + " at most."; continue; }
+    if (/^image\.(png|jpe?g|gif|webp)$/i.test(file.name)) {  // a pasted screenshot: give it a useful name
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+      file = new File([file], "screenshot-" + stamp + "." + file.name.split(".").pop(), { type: file.type });
+    }
+    state.pending.push(file);
+  }
+  renderPending();
+}
+
+function renderPending() {
+  const box = $("pending");
+  box.replaceChildren(...state.pending.map((file, i) => {
+    const chip = el("span", "chip");
+    if (file.type.startsWith("image/")) { const img = el("img"); img.src = URL.createObjectURL(file); img.alt = ""; chip.append(img); }
+    chip.append(el("span", "n", file.name), el("span", "s", sizeText(file.size)));
+    const drop = el("button", "", "×");
+    drop.type = "button"; drop.setAttribute("aria-label", "Remove " + file.name);
+    drop.addEventListener("click", () => { state.pending.splice(i, 1); renderPending(); });
+    chip.append(drop);
+    return chip;
+  }));
+  fit();
+}
+
+async function uploadFile(file) {
+  const res = await fetch("/api/upload", { method: "POST", body: file,
+    headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+  return (await res.json()).id;
+}
+
+$("attach").addEventListener("click", () => $("files").click());
+$("files").addEventListener("change", () => { addFiles($("files").files); $("files").value = ""; });
+text.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+$("form").addEventListener("dragover", (e) => { e.preventDefault(); $("form").classList.add("dragging"); });
+$("form").addEventListener("dragleave", () => $("form").classList.remove("dragging"));
+$("form").addEventListener("drop", (e) => {
+  e.preventDefault(); $("form").classList.remove("dragging");
+  addFiles(e.dataTransfer.files);
+});
+
 text.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
 });
@@ -3538,17 +3882,24 @@ $("task").addEventListener("change", () => {
 $("form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const value = text.value.trim();
-  if (!value) return;
+  if (!value && !state.pending.length) return;
   $("send").disabled = true;
   $("error").textContent = "";
   try {
-    await postJSON("/api/send", { to: $("to").value, text: value, kind: $("task").checked ? "task" : "msg" });
+    const files = [];
+    for (const [i, file] of state.pending.entries()) {
+      $("send").textContent = state.pending.length > 1 ? "Sending " + (i + 1) + "/" + state.pending.length + "…" : "Sending…";
+      files.push(await uploadFile(file));
+    }
+    await postJSON("/api/send", { to: $("to").value, text: value, kind: $("task").checked ? "task" : "msg", files });
+    state.pending = []; renderPending();
     text.value = "";
     $("task").checked = false;
     $("task").dispatchEvent(new Event("change"));
   } catch (err) {
-    $("error").textContent = "Not sent: " + err.message + ". Your text is still here; try again.";
+    $("error").textContent = "Not sent: " + err.message + ". Your text and files are still here; try again.";
   }
+  $("send").textContent = "Send";
   fit();
   text.focus();
 });
@@ -3659,7 +4010,8 @@ def build_parser():
     p = sub.add_parser("say", help="post a message as the owner from the terminal")
     p.add_argument("--to", default="all", help="an agent's name, or all (default)")
     p.add_argument("--task", action="store_true", help="post it as a task for the agents to settle")
-    p.add_argument("text", nargs="+")
+    p.add_argument("--file", action="append", metavar="PATH", help="share a file with the message (repeat for more)")
+    p.add_argument("text", nargs="*")
     p.set_defaults(fn=cmd_say)
 
     p = sub.add_parser("role", help="give an agent a role (lead, developer, qa, reviewer, or your own)")

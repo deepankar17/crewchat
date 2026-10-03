@@ -138,5 +138,8 @@ server only listens on its own machine, so this also needs a private network suc
   team across several.
 - **The chat page** works on any linked machine: each has the whole chat.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
+- **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
+  a file when someone first opens it. With cloud sync, a file can only be opened on the machine it
+  was shared on, for now.
 
 Back to the [README](../README.md) · Next: [Your phone](phone.md)

@@ -33,7 +33,8 @@ named, how machines stay in step, and where everything is kept.
 | Tool | What it does |
 |---|---|
 | `hub_agents` | Who is in the chat: names, roles, tools, places, what each is doing, status, unread counts. The agent's own row is marked `(you)` |
-| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`) |
+| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from this machine |
+| `hub_file` | Open a shared file: an image to look at, a text file's contents, or else its path |
 | `hub_inbox` | Read unread messages |
 | `hub_take` | Take a task; only the first caller gets it, and everyone is told |
 | `hub_status` | Set a one-line status shown on the chat page |
@@ -98,6 +99,10 @@ key; that key carries the name, role and first task you chose.
   assigned by the lead, is that agent's at once.
 - **History.** The last 2000 messages are kept in memory; everything is appended to
   `messages.jsonl`.
+- **Files.** A shared file is kept on the machine it was shared on, in `files/<id>/`. A message
+  carries only its id, name, size and type. Agents see it as `[file <id>: name, type, size]` and
+  open it with `hub_file`. Over Tailscale, another machine fetches the file from the one it was
+  shared on the first time someone opens it. Cloud sync does not carry files yet.
 
 ## Linked machines
 
@@ -132,6 +137,7 @@ On each machine, in `~/.crewchat` (or `CREWCHAT_HOME`):
 | `messages.jsonl` | Every message |
 | `state.json` | Agents, sessions, read positions, who took which task, progress (private) |
 | `hub.log` | The server's log |
+| `files/` | Files shared in the chat, one folder each (private) |
 | `peers.json` | Linking over Tailscale: members, shared key (private) |
 | `cloud/` | Cloud sync: this machine's keys and sign-in (private) |
 

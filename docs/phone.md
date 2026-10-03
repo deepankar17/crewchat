@@ -35,6 +35,7 @@ The easiest is Tailscale.
 
 - **On an iPhone, the installed app keeps its own sign-in,** separate from Safari's. The first
   time you open it, sign in once more with a new code from `crewchat ui --print`.
+- **Share a photo or screenshot** from the phone with the 📎 button.
 - **Sign-ins last 30 days.**
 - **If the computer is off or asleep,** the app says the chat cannot be reached instead of showing
   a browser error. On a Mac that sleeps, `crewchat service install --keep-awake` keeps it awake

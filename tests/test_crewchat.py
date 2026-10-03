@@ -1,4 +1,5 @@
 """End-to-end tests: a real server on a free port, a throwaway home folder, real HTTP."""
+import base64
 import contextlib
 import http.cookiejar
 import io
@@ -13,6 +14,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -140,7 +142,7 @@ class Protocol(Base):
         self.assertIn("hub_link", session.hello["instructions"])
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
-                                                      "hub_status", "hub_history", "hub_rename", "hub_role",
+                                                      "hub_status", "hub_history", "hub_rename", "hub_file", "hub_role",
                                                       "hub_assign", "hub_update", "hub_link"])
 
     def test_json_rpc_edges(self):
@@ -478,6 +480,97 @@ class Teams(Base):
         finally:
             config.pop("max_chain")
             crewchat.save_config(config)
+
+
+PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
+                    "0000000c4944415408d763f8cfc000000301010018dd8db00000000049454e44ae426082")
+
+
+class Files(Base):
+    def upload(self, name, data, kind="", token=None):
+        req = urllib.request.Request(self.base + "/api/upload", data=data, method="POST", headers={
+            "Authorization": "Bearer " + (token or self.owner), "Content-Type": kind,
+            "X-File-Name": urllib.parse.quote(name)})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as answer:
+                return json.loads(answer.read())
+        except urllib.error.HTTPError as e:
+            return {"status": e.code}
+
+    def test_the_owner_shares_a_screenshot_and_an_agent_sees_it(self):
+        session, name = self.agent()
+        meta = self.upload("image.png", PNG, "image/png")
+        self.assertEqual((meta["name"], meta["type"], meta["size"]), ("image.png", "image/png", len(PNG)))
+        out = crewchat.post_json(self.base + "/api/send", self.owner, {"to": name, "text": "", "files": [meta["id"]]})
+        msg = self.hub.history(1)[0]
+        self.assertEqual((msg["id"], msg["text"], msg["files"]), (out["id"], "", [meta]))
+        self.assertIn("[file %s: image.png, image/png, %d bytes; open it with hub_file]" % (meta["id"], len(PNG)),
+                      session.text("hub_inbox"))
+        content = session.call("hub_file", id=meta["id"])["content"]
+        self.assertEqual(content[1], {"type": "image", "data": base64.b64encode(PNG).decode(), "mimeType": "image/png"})
+        self.assertIn("saved at", content[0]["text"])
+
+    def test_text_files_come_back_as_text_and_others_as_a_path(self):
+        session, _ = self.agent()
+        notes = self.upload("notes.md", "# Plan\nShip it".encode())
+        self.assertEqual(notes["type"], "text/markdown")
+        self.assertIn("# Plan\nShip it", session.text("hub_file", id=notes["id"]))
+        pdf = self.upload("spec.pdf", b"%PDF-1.4 fake", "application/pdf")
+        out = session.text("hub_file", id=pdf["id"])
+        self.assertIn("Open it from that path", out)
+        self.assertTrue(Path(re.search(r"saved at (.+?)\. Open", out).group(1)).is_file())
+        self.assertIn("no shared file", session.text("hub_file", id="0123456789abcdef"))
+
+    def test_an_agent_shares_a_file_it_made(self):
+        session, name = self.agent()
+        other, other_name = self.agent()
+        shot = Path(tempfile.mkdtemp(dir=TMP)) / "bug.png"
+        shot.write_bytes(PNG)
+        self.assertIn("with 1 file(s)", session.text("hub_send", to=other_name, text="See the bug", files=[str(shot)]))
+        got = other.text("hub_inbox")
+        fid = re.search(r"\[file (\w+): bug.png", got).group(1)
+        self.assertEqual(other.call("hub_file", id=fid)["content"][1]["data"], base64.b64encode(PNG).decode())
+        self.assertIn("absolute paths", session.text("hub_send", to=other_name, text="x", files=["bug.png"]))
+        self.assertIn("cannot read", session.text("hub_send", to=other_name, text="x", files=[str(shot) + ".gone"]))
+
+    def test_the_page_shows_images_and_offers_everything_else_as_a_download(self):
+        png = self.upload("shot.png", PNG, "image/png")
+        svg = self.upload("logo.svg", b"<svg onload='alert(1)'/>", "image/svg+xml")
+        self.assertEqual(self.raw("/files/%s/shot.png" % png["id"])[0], 401)
+        opener, _ = self.owner_browser()
+        status, body, headers = self.raw("/files/%s/shot.png" % png["id"], opener=opener)
+        self.assertEqual((status, body, headers["Content-Type"]), (200, PNG, "image/png"))
+        self.assertTrue(headers["Content-Disposition"].startswith("inline"))
+        self.assertIn("sandbox", headers["Content-Security-Policy"])
+        status, body, headers = self.raw("/files/%s/logo.svg" % svg["id"], opener=opener)
+        self.assertEqual(headers["Content-Type"], "application/octet-stream")
+        self.assertTrue(headers["Content-Disposition"].startswith("attachment"))
+        self.assertEqual(self.raw("/files/nothing/x", opener=opener)[0], 404)
+
+    def test_only_the_owner_uploads_and_size_is_limited(self):
+        self.assertEqual(self.upload("a.txt", b"x", token=self.token)["status"], 403)
+        self.assertEqual(self.upload("a.txt", b"x", token="wrong")["status"], 401)
+        limit, crewchat.MAX_UPLOAD = crewchat.MAX_UPLOAD, 10
+        try:
+            self.assertEqual(self.upload("big.bin", b"x" * 11)["status"], 413)
+        finally:
+            crewchat.MAX_UPLOAD = limit
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/send", self.owner, {"to": "all", "text": "x", "files": ["0123456789abcdef"]})
+
+    def test_say_with_a_file(self):
+        doc = Path(tempfile.mkdtemp(dir=TMP)) / "release notes.txt"
+        doc.write_text("v1")
+        cli("say", "--file", str(doc), "Please review")
+        msg = self.hub.history(1)[0]
+        self.assertEqual((msg["text"], msg["files"][0]["name"]), ("Please review", "release notes.txt"))
+
+    def test_file_names_are_cleaned(self):
+        self.assertEqual(crewchat.clean_filename("../../etc/pass:wd.png"), "passwd.png")
+        self.assertEqual(crewchat.clean_filename("C:\\Users\\me\\shot.png"), "shot.png")
+        self.assertEqual(crewchat.clean_filename(".."), "file")
+        self.assertEqual([crewchat.file_type(n) for n in ("a.md", "b.ts", "c.png")],
+                         ["text/markdown", "text/plain", "image/png"])
 
 
 class Launching(Base):

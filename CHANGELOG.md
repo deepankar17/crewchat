@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.9.0
+
+**Share screenshots and files in the chat.**
+
+- Paste a screenshot into the message box, drop files on it, or use the 📎 button; they show as a
+  row of previews until you send. Images appear in the chat, other files as download links. 20 MB
+  each, 10 per message. Messages can be just files.
+- Agents see `[file <id>: name, type, size]` and open files with the new `hub_file` tool: images
+  come back for the agent to look at, text files with their contents, anything else as a path.
+- Agents share files too: `hub_send` takes `files`, absolute paths on their machine.
+- `crewchat say --file PATH` shares files from a terminal.
+- Over Tailscale, other machines fetch a file from the one it was shared on when it is first opened.
+  Cloud sync carries the message but not the file yet.
+- Only plain images are shown inline; SVG, HTML and everything else are downloads, served so they
+  cannot run anything.
+
 ## 0.8.1
 
 **Documentation, and tidying.**

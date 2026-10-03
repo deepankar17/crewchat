@@ -264,8 +264,19 @@ class PeerSync:
             raise crewchat.HubError("cannot reach %s, the machine task #%s was posted on (%s). Try again when "
                                     "it is back." % (member["name"], task, e))
 
+    def fetch_file(self, origin, fid):
+        """The bytes of a file shared on another member (Hub.open_file)."""
+        member = self.mesh.members().get(origin)
+        if member is None:
+            raise crewchat.HubError("that file was shared on a machine that has left the chat")
+        try:
+            return self._call(member, "/peer/file", {"id": fid}, timeout=120, raw=True)
+        except PeerError as e:
+            raise crewchat.HubError("cannot fetch the file from %s (%s)" % (member["name"], e))
+
     # Talking to members ----------------------------------------------------------------------
-    def _call(self, member, path, body, timeout=PULL_WAIT + 20, key=None):
+    def _call(self, member, path, body, timeout=PULL_WAIT + 20, key=None, raw=False):
+        """POST to another member; its JSON answer, or with raw its bytes."""
         body = dict(body, sender=dict(self.mesh.me, id=self.device_id))
         req = urllib.request.Request(
             member["url"] + path, data=json.dumps(body).encode("utf-8"), method="POST",
@@ -273,7 +284,8 @@ class PeerSync:
                      "X-Crewchat-Device": self.device_id})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as answer:
-                return json.loads(answer.read().decode("utf-8"))
+                data = answer.read()
+                return data if raw else json.loads(data.decode("utf-8"))
         except urllib.error.HTTPError as e:
             try:
                 reason = json.loads(e.read().decode("utf-8")).get("error") or "HTTP %d" % e.code
@@ -368,6 +380,15 @@ class PeerSync:
                 self._watch(new)
         if path == "/peer/pull":
             return 200, self._pull(body)
+        if path == "/peer/file":
+            meta, local = self.hub.file(str(body.get("id") or ""))
+            with self.hub.lock:  # only files shared here: a member never relays another's
+                ours = meta is not None and any(
+                    m.get("origin") == self.device_id and any(f["id"] == meta["id"] for f in m.get("files") or [])
+                    for m in self.hub.messages)
+            if not ours:
+                return 404, {"error": "no such file here"}
+            return 200, local.read_bytes()
         if path == "/peer/claim":
             task = crewchat.clean_id(body.get("id", ""))
             with self.hub.lock:

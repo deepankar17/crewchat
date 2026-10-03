@@ -793,7 +793,7 @@ class CloudSync:
 
     def _send_message(self, msg):
         payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind") if k in msg}
-        payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS if msg.get(k) is not None})
+        payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
         doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._uid(), msg["id"], self.device_id), payload)
         doc["created"] = SERVER_TIME
         self.store.set("messages/" + msg["id"], doc)

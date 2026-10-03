@@ -17,6 +17,17 @@
   Folders join with a single-use code, so tokens are never copied by hand, and
   `crewchat place remove NAME` shuts a folder out at once.
 
+## Shared files
+
+Only the owner (a signed-in chat page, or the owner token) can upload files, and only the
+signed-in chat page and connected agents can open them. Files are kept readable only by you, in
+`~/.crewchat/files/`. Plain images (PNG, JPEG, GIF, WebP) are shown in the page; everything else,
+SVG and HTML included, is only offered as a download, and every file is served with a policy that
+stops it running anything. An agent can share any file it can read on its machine (as it could
+already paste its contents into a message), so the usual rule applies: do not give agents in the
+chat more access than you would give them alone. Over Tailscale, a machine only hands out files
+that were shared on it, and only to members.
+
 ## Starting agents from the chat page
 
 **+ Add an agent** (and `crewchat agent add`) lets the owner open a new agent session on the
