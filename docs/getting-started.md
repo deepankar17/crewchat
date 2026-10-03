@@ -53,11 +53,11 @@ Pick one machine to host the chat; it should be on while your agents work. In th
 your agents work in:
 
 ```bash
-cd ~/code/phoniq
+cd ~/code/notes-app
 crewchat start
 ```
 
-<img src="images/terminal-start.png" width="760" alt="crewchat start, run twice in ~/code/phoniq. The first time it sets up the host, starts the server and connects the folder as macbook. The second time it reports that the server is running and the folder is connected.">
+<img src="images/terminal-start.png" width="760" alt="crewchat start, run twice in ~/code/notes-app. The first time it sets up the host, starts the server and connects the folder as macbook. The second time it reports that the server is running and the folder is connected.">
 
 What it does, and why it is safe to run again:
 

@@ -46,7 +46,7 @@ def free_port():
 # A demo chat
 # ------------------------------------------------------------------------------------------
 class Chat:
-    def __init__(self, project="PhonIQ"):
+    def __init__(self, project="Notes App"):
         self.root = TMP / ("chat-%d" % free_port())
         self.root.mkdir()
         self.port = free_port()
@@ -194,7 +194,7 @@ def run(args, home, cwd, ports=()):
     """Run a crewchat command for real; its output, with throwaway paths and ports made readable."""
     out = subprocess.run([sys.executable, str(ROOT / "crewchat.py")] + args, cwd=str(cwd), capture_output=True,
                          text=True, env=dict(os.environ, CREWCHAT_HOME=str(home)))
-    text = (out.stdout + out.stderr).replace(str(cwd), "~/code/phoniq").replace(str(home), "~/.crewchat")
+    text = (out.stdout + out.stderr).replace(str(cwd), "~/code/notes-app").replace(str(home), "~/.crewchat")
     for port in ports:
         text = text.replace("127.0.0.1:%s" % port, "127.0.0.1:8765")
     return text
@@ -301,7 +301,7 @@ def scene_add_agent(b):
     old = crewchat.launch_options
     crewchat.launch_options = lambda config, root=None: {
         "tools": [{"id": "claude", "label": "Claude Code"}, {"id": "cursor", "label": "Cursor"}],
-        "folders": [{"path": "/Users/you/code/phoniq", "name": "phoniq", "place": "macbook"}]}
+        "folders": [{"path": "/Users/you/code/notes-app", "name": "notes-app", "place": "macbook"}]}
     try:
         b.size(1100, 760)
         b.open(chat.sign_in())
@@ -367,20 +367,20 @@ def scene_phone(b):
 
 
 def scene_terminals(b):
-    home, project = TMP / "home", TMP / "phoniq"
+    home, project = TMP / "home", TMP / "notes-app"
     project.mkdir()
     subprocess.run(["git", "init", "-q", str(project)])
     port = str(free_port())
     start = run(["start", "--no-service", "--no-open", "--port", port, "--place", "macbook"], home, project, [port])
     again = run(["start", "--no-service", "--no-open"], home, project, [port])
-    terminal(b, "terminal-start", "~/code/phoniq", [("crewchat start", start), ("crewchat start", again)])
+    terminal(b, "terminal-start", "~/code/notes-app", [("crewchat start", start), ("crewchat start", again)])
     roles = run(["roles"], home, project)
-    terminal(b, "terminal-roles", "~/code/phoniq", [("crewchat roles", roles)])
+    terminal(b, "terminal-roles", "~/code/notes-app", [("crewchat roles", roles)])
     listen = run(["listen", "status"], home, project)
     status = run(["status"], home, project, [port])
-    terminal(b, "terminal-status", "~/code/phoniq", [("crewchat status", status), ("crewchat listen status", listen)])
+    terminal(b, "terminal-status", "~/code/notes-app", [("crewchat status", status), ("crewchat listen status", listen)])
     # Two machines linked over Tailscale (here: two servers on this machine, with local addresses).
-    home2, project2 = TMP / "home2", TMP / "phoniq2"
+    home2, project2 = TMP / "home2", TMP / "notes-app-2"
     project2.mkdir()
     subprocess.run(["git", "init", "-q", str(project2)])
     port2 = str(free_port())
@@ -394,8 +394,8 @@ def scene_terminals(b):
     time.sleep(2)
     status = run(["peers", "status"], home2, project2)
     tidy = lambda t: t.replace(url, shown_url).replace("http://127.0.0.1:%s" % port2, "https://laptop.your-tailnet.ts.net")  # noqa: E731
-    terminal(b, "terminal-peers-invite", "macbook: ~/code/phoniq", [("crewchat peers invite", tidy(invite))])
-    terminal(b, "terminal-peers-join", "laptop: ~/code/phoniq", [
+    terminal(b, "terminal-peers-invite", "macbook: ~/code/notes-app", [("crewchat peers invite", tidy(invite))])
+    terminal(b, "terminal-peers-join", "laptop: ~/code/notes-app", [
         ("crewchat peers join %s %s" % (shown_url, code), tidy(join)), ("crewchat peers status", tidy(status))])
     for h in (home, home2):
         subprocess.run(["pkill", "-f", "serve --log %s" % (h / "hub.log")])

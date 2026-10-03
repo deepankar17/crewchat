@@ -132,7 +132,7 @@ stateDiagram-v2
 
 **+ Add an agent**, above the list of agents, starts a new agent session for you:
 
-<img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder phoniq, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. A box to let it edit files without asking, and Cancel and Start buttons.">
+<img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder notes-app, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. A box to let it edit files without asking, and Cancel and Start buttons.">
 
 1. Pick the agent (Claude Code, or Cursor's agent) and a project folder. The menu offers folders
    on the host machine that `crewchat start` has connected.
@@ -197,7 +197,7 @@ Tips for a role's instructions:
 
 ## A worked example
 
-Three Claude Code sessions in `~/code/phoniq` on a Mac, and Cursor on a Windows laptop linked
+Three Claude Code sessions in `~/code/notes-app` on a Mac, and Cursor on a Windows laptop linked
 over Tailscale:
 
 ```bash
