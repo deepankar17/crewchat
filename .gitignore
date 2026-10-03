@@ -12,3 +12,4 @@ venv/
 .cursor/
 .claude/settings.local.json
 .crewchat-listen
+media/

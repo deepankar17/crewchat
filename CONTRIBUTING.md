@@ -59,6 +59,13 @@ python3 tools/docs_screenshots.py team files   # only some scenes
 
 It needs Google Chrome, and runs in a throwaway folder.
 
+The tutorial video is made the same way, from `tools/tutorial/script.json` (the narration and
+slides) and those pictures, with macOS's own voices and video framework:
+
+```bash
+python3 tools/tutorial/make_video.py    # macOS only; writes media/ (not in git)
+```
+
 ## Reporting bugs
 
 Open an issue with what you ran, what you expected and what happened. For anything
