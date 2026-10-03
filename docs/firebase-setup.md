@@ -87,12 +87,16 @@ crewchat cloud login
 crewchat service restart          # or restart `crewchat serve`
 ```
 
+![crewchat cloud setup, login and restart on the first machine](images/demo-cloud-setup.gif)
+
 The first machine founds the account. Each later machine prints a fingerprint and waits; approve
 it from a machine that is already set up, after checking the fingerprint matches:
 
 ```bash
 crewchat cloud approve NEW-MACHINE-NAME
 ```
+
+![A new machine waits with its fingerprint; a machine already set up approves it](images/demo-cloud-approve.gif)
 
 Copy the two files between machines privately (for example over AirDrop, Tailscale or a USB
 stick), and delete the copies once `crewchat cloud setup` has read them.

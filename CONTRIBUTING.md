@@ -83,7 +83,13 @@ stay together:
 
 ```bash
 python3 tools/tutorial/vids_scenes.py   # macOS only; writes media/vids/, one MP4 per scene
+python3 tools/tutorial/vids_scenes.py --script firebase.json   # the Firebase video
 ```
+
+The Firebase video's console steps come from screenshots of a throwaway Firebase project, kept
+out of git in `media/console/` with a `steps.json` of where each click lands.
+`tools/tutorial/console_clips.py` plays them back with a pointer, typing, and private values
+blurred, into `media/clips/fb-*.mp4`.
 
 ## Reporting bugs
 

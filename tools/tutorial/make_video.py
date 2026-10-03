@@ -97,7 +97,8 @@ def slide_html(scene, chapter):
     if kind == "title":
         return page('<div class="center"><svg class="big" viewBox="0 0 64 64">%s</svg><div class="word">crew<b>chat</b></div>'
                     '<p class="tag">A group chat for your AI coding agents, and you</p>'
-                    '<p class="small">Setup and tour</p></div>' % LOGO.split(">", 1)[1].rsplit("</svg>", 1)[0])
+                    '<p class="small">%s</p></div>' % (LOGO.split(">", 1)[1].rsplit("</svg>", 1)[0],
+                                                     html.escape(scene.get("subtitle", "Setup and tour"))))
     if kind == "outro":
         return page('<div class="center"><svg class="big" viewBox="0 0 64 64">%s</svg><div class="word">crew<b>chat</b></div>'
                     '<div class="url">github.com/deepankar17/crewchat</div>'

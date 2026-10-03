@@ -1,0 +1,131 @@
+{
+ "title": "crewchat: linking machines with Firebase",
+ "scenes": [
+  {
+   "id": "intro",
+   "kind": "title",
+   "chapter": "Introduction",
+   "subtitle": "Linking machines with Firebase",
+   "say": "This is crewchat, a group chat for your AI coding agents. In this short video, we'll link machines through your own Firebase project, so agents on different networks share one chat."
+  },
+  {
+   "id": "why",
+   "kind": "diagram",
+   "heading": "Firebase or Tailscale?",
+   "caption": "Firebase works from anywhere; everything is encrypted end to end",
+   "mermaid": "flowchart LR\n  subgraph g[\"Your Google account\"]\n    F[(\"Firestore: your project\")]\n  end\n  A[\"macbook: crewchat\"] <-->|encrypted| F\n  B[\"laptop: crewchat\"] <-->|encrypted| F\n  a1[\"Claude Code\"] --> A\n  b1[\"Cursor\"] --> B",
+   "say": "crewchat can link machines in two ways. Tailscale connects them directly, but they need to be on one private network. Firebase works from anywhere. Each machine syncs through a Firestore database in your own Google account, and everything is encrypted end to end, so Google stores the messages, but can't read them."
+  },
+  {
+   "id": "project",
+   "chapter": "In the Firebase console",
+   "kind": "clip",
+   "clip": "fb-project.mp4",
+   "heading": "1. Create a Firebase project",
+   "caption": "Gemini and Google Analytics are not needed",
+   "say": "First, open the Firebase console, and create a project. Name it, for example, crewchat. Gemini and Google Analytics aren't needed, so switch them off, and create the project. It's ready in a few seconds."
+  },
+  {
+   "id": "database",
+   "kind": "clip",
+   "clip": "fb-database.mp4",
+   "heading": "2. Create the Firestore database",
+   "caption": "Standard edition, a location near you, production mode",
+   "say": "Next, open Databases and storage, then Firestore, and create a database. Choose the Standard edition, a location near you, and production mode, then click Create."
+  },
+  {
+   "id": "rules",
+   "kind": "clip",
+   "clip": "fb-rules.mp4",
+   "heading": "3. Publish crewchat's security rules",
+   "caption": "Copy them from: crewchat cloud rules",
+   "say": "In the Rules tab, replace the rules with the ones printed by crewchat cloud rules, and publish. They let each Google account read and write only its own data."
+  },
+  {
+   "id": "auth",
+   "kind": "clip",
+   "clip": "fb-auth.mp4",
+   "heading": "4. Turn on Google sign-in",
+   "caption": "Authentication, Sign-in method, Google",
+   "say": "Now open Authentication, click Get started, and choose Google. Switch it on, give the project a public name, pick your email for support, and save."
+  },
+  {
+   "id": "webapp",
+   "kind": "clip",
+   "clip": "fb-webapp.mp4",
+   "heading": "5. Register a web app",
+   "caption": "Save its projectId and apiKey in firebase-web.json",
+   "say": "Then, in Project settings, add a web app. Call it crewchat, without hosting, and register it. From the config it shows, save the project ID and the API key, in a file called firebase-web dot json."
+  },
+  {
+   "id": "oauth",
+   "chapter": "In the Google Cloud console",
+   "kind": "clip",
+   "clip": "fb-oauth.mp4",
+   "heading": "6. Create a desktop sign-in client",
+   "caption": "Credentials, OAuth client ID, Desktop app; download the JSON",
+   "say": "The last console step is in Google Cloud. Under Credentials, create an OAuth client ID. Pick Desktop app, name it crewchat cli, and create it. Download its JSON, and save it as oauth-client dot json."
+  },
+  {
+   "id": "agent",
+   "chapter": "The shortcut",
+   "kind": "points",
+   "heading": "Or let your agent do it",
+   "points": [
+    "Open docs/firebase-setup.md in the crewchat repository",
+    "Copy the prompt under \"With an agent\"",
+    "Paste it into Claude Code or Cursor",
+    "You only sign in to Google yourself"
+   ],
+   "say": "If you'd rather not click through all that, the setup guide has a prompt you can paste into Claude Code or Cursor. Your agent does the console steps for you, and you only sign in to Google yourself."
+  },
+  {
+   "id": "setup",
+   "chapter": "On each machine",
+   "kind": "clip",
+   "clip": "demo-cloud-setup.mp4",
+   "heading": "Set up, sign in, restart",
+   "caption": "The first machine holds the account key",
+   "say": "Now, on your first machine, run crewchat cloud setup with the two files, then crewchat cloud login, and sign in with Google in your browser. The first machine holds the account key. Restart the server, and it starts syncing."
+  },
+  {
+   "id": "approve",
+   "kind": "clip",
+   "clip": "demo-cloud-approve.mp4",
+   "heading": "Approve each new machine",
+   "caption": "Check the fingerprint matches on both machines, then type yes",
+   "say": "On each new machine, run the same two commands. It shows a fingerprint, and waits. On a machine that's already set up, run crewchat cloud approve, check that the fingerprint matches, and type yes. The new machine gets the key, and joins the chat."
+  },
+  {
+   "id": "result",
+   "chapter": "Done",
+   "kind": "image",
+   "image": "screenshot-light.png",
+   "heading": "One chat, across networks",
+   "caption": "Agents from every machine; only your machines can read it",
+   "say": "That's it. Agents on both machines now share one chat, wherever they are, and only your machines can read it."
+  },
+  {
+   "id": "outro",
+   "chapter": "Get crewchat",
+   "kind": "outro",
+   "say": "crewchat is free and open source. The full Firebase guide is in the docs, on GitHub, at deepankar17, slash crewchat. Thanks for watching."
+  }
+ ],
+ "durations": [
+  10.9,
+  18,
+  12,
+  11,
+  9,
+  10,
+  15,
+  16.8,
+  10,
+  13,
+  15,
+  6,
+  10.3
+ ],
+ "note": "durations: each scene's narration length in Google Vids (whole seconds), read after generating the voiceovers"
+}

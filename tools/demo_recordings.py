@@ -455,6 +455,7 @@ window.term = {
   out(i, text) { const k = this.pre(i).querySelector(".k"); k.remove(); this.pre(i).append(document.createTextNode("\\n" + text)); this.pre(i).append(k); },
   prompt(i) { const k = this.pre(i).querySelector(".k"); k.remove();
     this.pre(i).insertAdjacentHTML("beforeend", '\\n\\n<span class="p">$</span> <span class="c"></span>'); this.pre(i).append(k); },
+  answer(i, ch) { const k = this.pre(i).querySelector(".k"); k.before(document.createTextNode(ch)); },
 };
 </script>"""
 
@@ -524,6 +525,55 @@ def scene_peers(r):
     return r.stop(2.8)
 
 
+# Cloud sync talks to a real Firebase project and a Google sign-in, so these two scenes replay
+# what the commands print (the same messages, from crewchat_cloud.py) rather than running them.
+SIGN_IN = ("Opening your browser to sign in with Google. If it does not open, visit:\n"
+           "  https://accounts.google.com/o/oauth2/v2/auth?client_id=...\nSigned in as you@example.com.")
+SETUP_CMD = "crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json"
+SETUP_OUT = "Cloud sync is set up for Firebase project crewchat-demo. Next: crewchat cloud login"
+RESTART = "Restart the server so it starts syncing: crewchat service restart (or crewchat serve)."
+
+
+def scene_cloud_setup(r):
+    r.size(1280, 720)
+    r.open(terminal_page(["macbook: ~/code/notes-app"], 1180, 620, 19), wait=0.5)
+    r.js("term.start(0)")
+    r.start()
+    terminal_type(r, 0, SETUP_CMD, SETUP_OUT, 0.03)
+    r.js("term.prompt(0)")
+    terminal_type(r, 0, "crewchat cloud login", SIGN_IN)
+    time.sleep(0.8)
+    terminal_type(r, 0, "", 'This machine is device "macbook" (tag A). Its fingerprint: 3f9a 1c07 b2e4 58d1\n'
+                  "It is the first device on this account, so it holds the account key.\n \n" + RESTART)
+    r.js("term.prompt(0)")
+    terminal_type(r, 0, "crewchat service restart", "Restarted.")
+    return r.stop(2.6)
+
+
+def scene_cloud_approve(r):
+    fp = "7c2e 90ab 4d13 e6f5"
+    r.size(1280, 720)
+    r.open(terminal_page(["laptop: ~/code/notes-app", "macbook: ~/code/notes-app"], 600, 560, 15), wait=0.5)
+    r.js("term.start(0); term.start(1)")
+    r.start()
+    terminal_type(r, 0, "crewchat cloud login", SIGN_IN + '\nThis machine is device "laptop" (tag B). Its fingerprint: '
+                  + fp + "\n \nBefore it can read or send anything, approve it from a machine that is already set up:\n"
+                  "  crewchat cloud approve laptop\nThat command shows a fingerprint: it must be " + fp + ".")
+    time.sleep(1.0)
+    terminal_type(r, 1, "crewchat cloud approve laptop", 'Device "laptop" shows the fingerprint:\n  ' + fp +
+                  "\nDoes the new machine show exactly this? Type yes to approve: ")
+    time.sleep(0.8)
+    for ch in " yes":
+        r.js("term.answer(1, %s)" % json.dumps(ch))
+        time.sleep(0.12)
+    time.sleep(0.5)
+    terminal_type(r, 1, "", "Approved laptop. It receives the account key and starts syncing within a few seconds.")
+    time.sleep(0.6)
+    r.js("term.prompt(0)")
+    terminal_type(r, 0, "crewchat service restart", "Restarted.")
+    return r.stop(2.8)
+
+
 FLOW = """<!doctype html><meta charset="utf-8"><style>
 body { margin: 0; height: 100vh; background: #f4f5f9; font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1d1b18; }
 .row { position: absolute; top: 200px; left: 60px; right: 60px; display: flex; justify-content: space-between; }
@@ -572,6 +622,7 @@ SCENES = {
     "talk": (scene_talk, 960), "task": (scene_task, 960), "roles": (scene_roles, 960),
     "add-agent": (scene_add_agent, 960), "files": (scene_files, 960), "phone": (scene_phone, 360),
     "start": (scene_start, 860), "peers": (scene_peers, 960), "flow": (scene_flow, 860),
+    "cloud-setup": (scene_cloud_setup, 860), "cloud-approve": (scene_cloud_approve, 960),
 }
 
 

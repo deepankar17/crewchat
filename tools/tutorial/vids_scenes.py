@@ -2,11 +2,13 @@
 narration, so picture and voice stay together.
 
     pip install websocket-client
-    python3 tools/tutorial/vids_scenes.py              # every scene
-    python3 tools/tutorial/vids_scenes.py talk files   # only some
+    python3 tools/tutorial/vids_scenes.py                       # every scene of scenes.json
+    python3 tools/tutorial/vids_scenes.py talk files            # only some
+    python3 tools/tutorial/vids_scenes.py --script firebase.json  # another video's script
 
-Reads tools/tutorial/scenes.json (the script, and each scene's narration length as Google Vids
-reported it) and the recordings in media/clips (tools/demo_recordings.py). Writes media/vids/.
+Reads tools/tutorial/scenes.json (or the --script given) (the script, and each scene's narration length as Google Vids
+reported it) and the recordings in media/clips (tools/demo_recordings.py, console_clips.py). Writes media/vids/ (scenes.json)
+or media/vids/<script name>/.
 In Vids, give every scene its voiceover first, read the lengths, put them in scenes.json, then
 drop each rendered scene into its scene.
 """
@@ -57,8 +59,13 @@ def clip_slide(scene, chapter, rect):
 
 
 def main():
-    spec = json.loads((HERE / "scenes.json").read_text(encoding="utf-8"))
-    OUT.mkdir(parents=True, exist_ok=True)
+    args = sys.argv[1:]
+    script = "scenes.json"
+    if args[:1] == ["--script"]:
+        script, args = args[1], args[2:]
+    spec = json.loads((HERE / script).read_text(encoding="utf-8"))
+    out = OUT if script == "scenes.json" else OUT / Path(script).stem
+    out.mkdir(parents=True, exist_ok=True)
     (OUT / "work").mkdir(exist_ok=True)
     mv.WORK = OUT / "work"
     silence = OUT / "work" / "silence.wav"
@@ -74,11 +81,11 @@ def main():
     try:
         for i, (scene, seconds) in enumerate(zip(spec["scenes"], spec["durations"])):
             chapter = scene.get("chapter", chapter)
-            if sys.argv[1:] and scene["id"] not in sys.argv[1:]:
+            if args and scene["id"] not in args:
                 continue
             name = "%02d-%s" % (i + 1, scene["id"])
             png = OUT / "work" / (name + ".png")
-            job = {"background": str(png), "duration": seconds + PAD, "output": str(OUT / (name + ".mp4")),
+            job = {"background": str(png), "duration": seconds + PAD, "output": str(out / (name + ".mp4")),
                    "silence": str(silence), "lead": 0.4, "tail": 0.9}
             if scene["kind"] == "clip":
                 clip = CLIPS / scene["clip"]
