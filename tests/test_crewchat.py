@@ -62,8 +62,8 @@ class Session:
     @property
     def me(self):
         """This session's name, as hub_agents reports it (creates the agent if it has none yet)."""
-        line = next(l for l in self.text("hub_agents").splitlines() if " (you):" in l)
-        return line.split(" (you):")[0]
+        line = next(l for l in self.text("hub_agents").splitlines() if " (you)" in l)
+        return line.split(" (you)")[0]
 
 
 class Base(unittest.TestCase):
@@ -477,6 +477,86 @@ class Teams(Base):
         finally:
             config.pop("max_chain")
             crewchat.save_config(config)
+
+
+class Launching(Base):
+    """Add an agent from the chat page: the launcher is replaced, so no window opens."""
+
+    def setUp(self):
+        self.launched = []
+        self.saved = crewchat.launch_agent, crewchat.find_tool
+        crewchat.launch_agent = lambda tool, folder, key, edits=False, root=None: self.launched.append(
+            (tool, folder, key, edits))
+        crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
+        self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
+        cli("start", str(self.folder), "--no-open", "--no-service", "--place", "Studio")
+        self.place = crewchat.joined_place(self.folder)[0]
+
+    def tearDown(self):
+        crewchat.launch_agent, crewchat.find_tool = self.saved
+
+    def launch(self, **body):
+        try:
+            return crewchat.post_json(self.base + "/api/launch", self.owner,
+                                      dict({"tool": "claude", "folder": str(self.folder)}, **body))
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "error": json.loads(e.read())["error"]}
+
+    def test_the_page_lists_folders_and_tools(self):
+        opener, _ = self.owner_browser()
+        status, body, _ = self.raw("/api/launch", opener=opener)
+        options = json.loads(body)
+        self.assertIn({"path": str(self.folder), "name": self.folder.name, "place": self.place}, options["folders"])
+        self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor"])
+        self.assertEqual(self.raw("/api/launch")[0], 401)
+
+    def test_a_launched_agent_gets_its_name_role_and_task(self):
+        self.assertEqual(self.launch(name="docs-writer", role="docs", task="Write the settings guide"), {"ok": True})
+        tool, folder, key, edits = self.launched[-1]
+        self.assertEqual((tool, folder, edits), ("claude", str(self.folder), False))
+        self.assertTrue(key.startswith("start-"))
+        self.assertIn("Owner started a new Claude Code agent in %s as docs-writer" % self.folder.name,
+                      [m["text"] for m in self.hub.history(5)])
+        # The new session checks in with its key, as the launch prompt tells it to.
+        token = crewchat.read_token(self.place)
+        session = Session(self.base, token)
+        out = session.text("hub_link", key=key)
+        self.assertIn("You are docs-writer, started from the crewchat by the owner.", out)
+        self.assertIn("Your role's instructions and your first task are in hub_inbox", out)
+        self.assertEqual(session.me, "docs-writer")
+        row = next(r for r in self.hub.rows() if r["agent"] == "docs-writer")
+        self.assertEqual(row["role"], "docs")
+        inbox = session.text("hub_inbox")
+        self.assertIn("Your role in this chat is now: Docs", inbox)
+        self.assertIn("[TASK, assigned to you] Write the settings guide", inbox)
+        # A start key works once.
+        again = Session(self.base, token).call("hub_link", key=key)["content"][0]["text"]
+        self.assertIn("unknown or has expired", again)
+
+    def test_bad_launches_are_refused(self):
+        self.assertEqual(self.launch(folder="/etc")["status"], 400)
+        self.assertEqual(self.launch(tool="vim")["status"], 400)
+        self.assertIn("no role called", self.launch(role="astronaut")["error"])
+        self.assertIn("reserved", self.launch(name="Owner")["error"])
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.hub.starts, {})
+
+    def test_the_command_line_can_add_one(self):
+        out = cli("agent", "add", "tester", "--folder", str(self.folder), "--role", "qa", "--accept-edits")
+        self.assertIn("Opened a new Claude Code session in %s" % self.folder, out)
+        self.assertEqual(self.launched[-1][3], True)
+
+    def test_the_launch_command_carries_no_typed_text(self):
+        command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", accept_edits=True)
+        self.assertEqual(command[:3], ["/x/claude", "--permission-mode", "acceptEdits"])
+        self.assertEqual(command[3], crewchat.LAUNCH_PROMPT % "start-0123456789abcdef")
+        self.assertRegex(command[3], r"^[A-Za-z0-9 .,:_-]+$")  # safe in any shell, cmd.exe included
+        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1", True)[1:2],
+                         [crewchat.LAUNCH_PROMPT % "start-1"])
+        script = crewchat.macos_script("/tmp/it's a folder", command)
+        self.assertIn("cd '/tmp/it'\"'\"'s a folder' || exit 1", script)
+        self.assertIn("exec /x/claude --permission-mode acceptEdits 'You were started", script)
 
 
 class Linking(Base):

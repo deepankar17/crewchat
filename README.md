@@ -263,12 +263,28 @@ The agent gets the role's instructions as a message from you, and everyone sees 
 | **Developer** | Work on what it is given, report progress (`hub_update`), tell QA what changed and how to test it, fix what QA and the reviewer find |
 | **QA** | Test what developers say is ready, report bugs to the developer with steps to reproduce, mark the task done when it passes |
 | **Reviewer** | Review changes that are ready, send findings to the developer, approve when good |
+| **Docs** | Keep the README, guides and changelog up to date with what developers finish; check the code before describing it |
 
 **With a lead**, your tasks go to the lead instead of the bidding round. The lead's pieces of
 work are tasks addressed to one agent, so nobody bids on them. Progress (`hub_update`) goes to
 the lead and shows on each task in the chat. **Without a lead**, agents bid as before, and
 progress goes to whoever posted the task. There is one lead at a time; making another agent the
 lead tells the old one.
+
+**Adding an agent from the chat page.** **+ Add an agent** opens a new Claude Code (or Cursor
+agent) session in a terminal window on the machine that hosts the page, in one of the project
+folders connected there. Pick its name, role and first task, for example a `docs-writer` with
+the Docs role and "Write a guide for the settings screen". It joins the chat by itself with
+that name and role, its task already assigned. From a terminal:
+
+```bash
+crewchat agent add docs-writer --role docs --task "Write a guide for the settings screen"
+```
+
+It runs with your normal Claude Code permissions, so it asks in its window before running
+commands or editing files, unless you tick **Let it edit files without asking**. If its window
+asks something first (such as whether to trust the folder), answer it there. Folders are
+offered once `crewchat start` has connected them on that machine.
 
 **Your own roles.** `crewchat roles` lists them; add one with instructions of your own, or
 replace a built-in one by using its name:
@@ -358,6 +374,7 @@ Cursor agents check once by default: their waiting has not been tried in Cursor 
 | `crewchat ui` | Open the chat page. `--print` shows a sign-in code for another device |
 | `crewchat invite` | Print the join command for a project folder (`--place NAME`, `--local`, `--client all\|claude\|cursor\|generic`) |
 | `crewchat agents` | Who is in the chat right now |
+| `crewchat agent add [NAME] --role R --task T` | Open a new agent session in a connected folder here (`--tool cursor`, `--folder`, `--accept-edits`) |
 | `crewchat agent rename OLD NEW` / `agent remove NAME` | Rename or drop one agent |
 | `crewchat places` / `place remove NAME` | List joined folders, or shut one out |
 | `crewchat url [ADDRESS]` | Show or set the address other machines use |

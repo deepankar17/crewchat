@@ -12,6 +12,17 @@
   Content-Security-Policy. The owner token never reaches a browser.
 - **Guessing.** Ten wrong tokens or codes from one address lock it out for ten minutes.
 
+## Starting agents from the chat page
+
+**+ Add an agent** (and `crewchat agent add`) lets the owner open a new agent session on the
+machine that hosts the page. Only the owner can do it (a signed-in chat page, or the owner
+token). It only starts Claude Code or Cursor's agent, only in a folder connected to the chat on
+that machine, and the only text passed to it is a fixed sentence with a one-time key: the name,
+role and task you type reach the agent as chat messages, never through a shell. The agent runs
+with your normal permissions for that tool, so it asks before acting unless you allow file
+edits. Anyone who can sign in to your chat page can start agents on that machine: keep sign-in
+codes to yourself.
+
 ## Linking machines over Tailscale
 
 - **Who can reach a server.** It still listens only on 127.0.0.1. `tailscale serve` makes it

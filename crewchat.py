@@ -33,6 +33,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -48,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -66,6 +67,7 @@ FAIL_LIMIT = 10  # bad tokens or codes from one address ...
 FAIL_WINDOW = 600  # ... within this many seconds lock it out for the rest of the window.
 CODE_TTL = 120  # owner sign-in code
 INVITE_TTL = 600  # join code
+START_TTL = 1800  # a start key: an agent the owner launched from the chat page, until it checks in
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
@@ -82,7 +84,8 @@ MAX_CHAIN_LIMIT = 50
 EXTRA_FIELDS = ("task", "role", "status")  # optional message fields, kept when messages travel between machines
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done"}
 ROLES = {
-    "lead": ("Lead", """You are the team lead. Your job is to plan and coordinate, not to write most of the code yourself.
+    "lead": ("Lead", """\
+You are the team lead. Your job is to plan and coordinate, not to write most of the code yourself.
 - When the owner posts a task, take it with hub_take. Break it into pieces one agent can finish,
   and give each piece to the best-placed agent with hub_assign (pass the owner's task id as
   `task`). Say what "done" looks like, and which files it touches.
@@ -92,7 +95,8 @@ ROLES = {
 - When every piece is done (and tested, if there is QA), check the result and report to Owner
   with hub_send: what was done, what is left, anything the owner must decide.
 - Tell Owner early if something is unclear or risky. Do not invent requirements."""),
-    "developer": ("Developer", """You are a developer.
+    "developer": ("Developer", """\
+You are a developer.
 - Work on what is assigned to you (hub_assign from the lead, or a task from Owner). If the chat
   has no lead, bid for open tasks as usual.
 - Report with hub_update on the task: in_progress when you start, blocked (with what you need)
@@ -101,7 +105,8 @@ ROLES = {
   hub_send: what changed, where, and how to test it. If there is a reviewer, tell them too.
 - Fix what QA or the reviewer reports, then tell them it is ready again. Ask them, or the lead,
   when something is unclear rather than guessing."""),
-    "qa": ("QA", """You are QA: you test what developers build.
+    "qa": ("QA", """\
+You are QA: you test what developers build.
 - When a developer says something is ready, test it: run the tests, try the change the way a
   user would, and look for edge cases and regressions.
 - Report each problem to that developer with hub_send: steps to reproduce, what you expected,
@@ -109,7 +114,16 @@ ROLES = {
 - When it passes, say so to the developer and send hub_update done on the task (it goes to the
   lead, or to Owner if there is no lead).
 - If you have nothing to test, ask the lead what is coming, or improve the test suite."""),
-    "reviewer": ("Reviewer", """You review code.
+    "docs": ("Docs", """\
+You write and keep up the project's documentation: README, guides, code comments where they
+help, and changelogs.
+- Read the code before you write about it; never describe behaviour you have not checked.
+- When developers finish work (watch for hub_update review/done, or ask the lead), update the
+  docs it affects: how to use the feature, settings, limits. Ask the developer when unsure.
+- Write plainly and briefly for the people who use the project. Keep examples runnable.
+- Report what you changed with hub_update on your task, or with hub_send to the lead or Owner."""),
+    "reviewer": ("Reviewer", """\
+You review code.
 - When a developer marks work ready (hub_update review) or asks you, read the change: look for
   bugs, unclear code, security problems and missing tests.
 - Send your findings to the developer with hub_send, most important first, each with the file
@@ -353,6 +367,7 @@ class Hub:
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
         self.invites = {}  # join code -> (place label or "", expiry) (memory only)
+        self.starts = {}  # start key -> {name, role, task, expires}: agents being launched (memory only)
         self.remote = {}  # device id -> {"device": name, "agents": [rows], "updated": time} (cloud sync)
         self.sync = None  # set by crewchat_cloud when cloud sync is on
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
@@ -785,6 +800,54 @@ class Hub:
             msg = self._append(sender, to, text, kind)
             self._changed()
             return msg
+
+    # Agents launched from the chat page --------------------------------------------------------
+    def new_start(self, name="", role="", task=""):
+        """A one-time key for an agent about to be launched: when its session calls hub_link with
+        it, it gets this name, role and first task."""
+        name, role, task = (str(x or "").strip() for x in (name, role, task))
+        with self.lock:
+            if name:
+                check_name(name)
+                if name.lower() in {n.lower() for n in self.names}:
+                    raise HubError("there is already an agent called %s" % name)
+            if role and role not in self.roles():
+                raise HubError("no role called %s" % role)
+            if len(task) > MAX_TEXT:
+                raise HubError("the first task is too long")
+            now = time.time()
+            self.starts = {k: v for k, v in self.starts.items() if v["expires"] > now}
+            key = "start-" + secrets.token_hex(8)
+            self.starts[key] = {"name": name, "role": role, "task": task, "expires": now + START_TTL}
+            return key
+
+    def start_link(self, sid, key):
+        """A launched agent checking in with its start key. Returns (name, note for the agent)."""
+        with self.lock:
+            spec = self.starts.pop(key, None)
+            if spec is None or spec["expires"] < time.time():
+                raise HubError("that start key is unknown or has expired; carry on, and call hub_agents to "
+                               "see who is here")
+            name = self.agent_for(sid)
+        notes = []
+        if spec["name"] and spec["name"] != name:
+            try:
+                self.rename(name, spec["name"])
+                name = spec["name"]
+            except HubError as e:
+                notes.append("You could not be named %s (%s)." % (spec["name"], e))
+        if spec["role"]:
+            self.set_role(OWNER, name, spec["role"])
+        if spec["task"]:
+            self.assign(OWNER, name, spec["task"])
+        notes.insert(0, "You are %s, started from the crewchat by the owner." % name)
+        waiting = [x for x, on in (("your role's instructions", spec["role"]), ("your first task", spec["task"])) if on]
+        if waiting:
+            notes.append("%s %s in hub_inbox: read it now and start." % (" and ".join(waiting).capitalize(),
+                                                                       "are" if len(waiting) > 1 else "is"))
+        else:
+            notes.append("Check hub_inbox, and tell Owner with hub_send that you are ready.")
+        return name, " ".join(notes)
 
     # Roles and teamwork ----------------------------------------------------------------------
     def roles(self):
@@ -1270,7 +1333,12 @@ def call_tool(hub, sid, name, args, owner=False):
     if name == "hub_link":
         if owner:
             raise HubError("the owner has no session to link")
-        me, note = hub.link(sid, args.get("key"))
+        key = args.get("key")
+        if isinstance(key, str) and key.startswith("start-"):
+            me, note = hub.start_link(sid, key)
+            hub.touch(me, active=True)
+            return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
+        me, note = hub.link(sid, key)
         hub.touch(me, active=True)
         return "%s Who is here:\n%s" % (note, roster_text(hub.rows(), me))
     me = OWNER if owner else hub.agent_for(sid)
@@ -1389,7 +1457,7 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -1640,6 +1708,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._sign_in(query["code"][0])
             else:
                 self._login_page(200)
+        elif url.path == "/api/launch":
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return
+            self._json(200, launch_options(self.roster.root))
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -1729,6 +1802,31 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._json(200, result)
 
+    def _launch(self, raw):
+        """The owner starts a new agent session on this machine (the chat page's Add an agent)."""
+        data = self._object(raw)
+        options = launch_options(self.roster.root)
+        tool, folder = data.get("tool"), data.get("folder")
+        if tool not in [t["id"] for t in options["tools"]]:
+            self._json(400, {"error": "that tool is not installed on this machine"})
+            return
+        if folder not in [f["path"] for f in options["folders"]]:
+            self._json(400, {"error": "that folder is not connected to this chat on this machine"})
+            return
+        key = None
+        try:
+            key = self.hub.new_start(data.get("name"), data.get("role"), data.get("task"))
+            launch_agent(tool, folder, key, bool(data.get("accept_edits")), self.roster.root)
+        except (HubError, OSError) as e:
+            self.hub.starts.pop(key, None)
+            self._json(400, {"error": str(e)})
+            return
+        with self.hub.lock:
+            self.hub._event("Owner started a new %s agent in %s%s" % (
+                LAUNCH_TOOLS[tool][0], Path(folder).name, " as %s" % data["name"] if data.get("name") else ""))
+            self.hub._changed()
+        self._json(200, {"ok": True})
+
     def _peer(self, path, raw):
         """A request from another of the owner's machines (crewchat_peers)."""
         handler = getattr(self.hub.sync, "peer_request", None)
@@ -1811,7 +1909,7 @@ class Handler(BaseHTTPRequestHandler):
         if path in PEER_PATHS:
             self._peer(path, raw)
             return
-        if path in ("/api/send", "/api/role"):
+        if path in ("/api/send", "/api/role", "/api/launch"):
             # From the chat page (session cookie) or from the command line (owner token).
             who = self._bearer(quiet=True)
             if who is None:
@@ -1825,6 +1923,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
             elif who[0] != "owner":
                 self._json(403, {"error": "only the owner can do this"})
+                return
+            if path == "/api/launch":
+                self._launch(raw)
                 return
             if path == "/api/role":
                 data = self._object(raw)
@@ -2021,11 +2122,11 @@ def start_background():
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
 
 
-def joined_place(project, config=None):
+def joined_place(project, config=None, root=None):
     """The place this folder joined this machine's chat as, with its token and the clients set
     up for it, or (None, None, [])."""
-    want = local_url(config) + "/mcp"
-    tokens = {read_token(p): p for p in list_places()}
+    want = local_url(config or load_config(root)) + "/mcp"
+    tokens = {read_token(p, root): p for p in list_places(root)}
     found, token, clients = None, None, []
     for client, rel in CLIENT_FILES.items():
         entry = (read_json(project / rel).get("mcpServers") or {}).get(SERVER_NAME) or {}
@@ -2034,6 +2135,106 @@ def joined_place(project, config=None):
             found, token = tokens[auth[7:]], auth[7:]
             clients.append(client)
     return found, token, clients
+
+
+# Agents launched from the chat page ---------------------------------------------------------
+LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent")}
+# Where these tools usually live: the server may run with a short PATH (started at login).
+TOOL_DIRS = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
+             "~/bin", "%APPDATA%/npm", "%LOCALAPPDATA%/Programs/cursor-agent")
+LAUNCH_PROMPT = ("You were started from the crewchat by your owner. Call the crewchat tool hub_link with key "
+                 "%s now: it tells you your name, your role and your first task.")
+
+
+def remember_folder(project, place, root=None):
+    """Note a folder connected to this machine's chat, so agents can be launched in it."""
+    config = load_config(root)
+    folders = dict(config.get("folders") or {})
+    if folders.get(str(project)) != place:
+        folders[str(project)] = place
+        config["folders"] = folders
+        save_config(config, root)
+
+
+def remember_tools(root=None):
+    """Note where Claude Code and Cursor's agent are, as found in the user's own shell."""
+    config = load_config(root)
+    tools = {t: shutil.which(exe) for t, (_, exe) in LAUNCH_TOOLS.items()}
+    tools = {t: path for t, path in tools.items() if path}
+    if tools and tools != config.get("tools"):
+        config["tools"] = dict(config.get("tools") or {}, **tools)
+        save_config(config, root)
+
+
+def find_tool(tool, config):
+    saved = (config.get("tools") or {}).get(tool)
+    if saved and Path(saved).exists():
+        return saved
+    exe = LAUNCH_TOOLS[tool][1]
+    found = shutil.which(exe)
+    if found:
+        return found
+    for folder in TOOL_DIRS:
+        folder = Path(os.path.expandvars(os.path.expanduser(folder)))
+        for suffix in ("", ".exe", ".cmd"):
+            if (folder / (exe + suffix)).is_file():
+                return str(folder / (exe + suffix))
+    return None
+
+
+def launch_options(root=None):
+    """What the chat page's "Add an agent" offers on this machine."""
+    config = load_config(root)
+    folders = []
+    for path, place in sorted((config.get("folders") or {}).items()):
+        if Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
+            folders.append({"path": path, "name": Path(path).name, "place": place})
+    tools = [{"id": t, "label": label} for t, (label, _) in LAUNCH_TOOLS.items() if find_tool(t, config)]
+    return {"tools": tools, "folders": folders}
+
+
+def launch_command(exe, tool, key, accept_edits=False):
+    """The agent's command line. Only the fixed prompt and the key reach it: no text typed on
+    the chat page is ever passed to a shell."""
+    options = ["--permission-mode", "acceptEdits"] if tool == "claude" and accept_edits else []
+    return [exe] + options + [LAUNCH_PROMPT % key]
+
+
+def macos_script(folder, command):
+    return "\n".join([
+        "#!/bin/sh",
+        "# Opened by crewchat to start an agent. It deletes itself.",
+        'rm -f "$0"',
+        "cd %s || exit 1" % shlex.quote(str(folder)),
+        'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
+        "exec " + " ".join(shlex.quote(part) for part in command),
+    ]) + "\n"
+
+
+def launch_agent(tool, folder, key, accept_edits=False, root=None):
+    """Open a terminal window on this machine with a new agent session in folder."""
+    exe = find_tool(tool, load_config(root))
+    if not exe:
+        raise HubError("%s is not installed here, or crewchat cannot find it. Run `crewchat start` once in a "
+                       "terminal where it works." % LAUNCH_TOOLS[tool][0])
+    command = launch_command(exe, tool, key, accept_edits)
+    if sys.platform == "darwin":
+        script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text(macos_script(folder, command), encoding="utf-8")
+        os.chmod(script, 0o700)
+        out = run(["open", str(script)])
+        if out.returncode != 0:
+            raise HubError("could not open a Terminal window: %s" % (out.stderr.strip() or out.stdout.strip()))
+    elif os.name == "nt":
+        subprocess.Popen(command, cwd=str(folder), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
+    else:
+        for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
+            if shutil.which(term[0]):
+                subprocess.Popen(term + command, cwd=str(folder), start_new_session=True)
+                break
+        else:
+            raise HubError("no terminal program found to open the agent in")
 
 
 def cmd_start(args):
@@ -2080,6 +2281,8 @@ def cmd_start(args):
         code = owner_call("/api/invite", {"place": args.place or ""})["code"]
         place = join_folder(local_url(config), code, project, args.place, args.client, quiet=True)
         print("- Connected %s, as \"%s\"." % (project, place))
+    remember_folder(project, place)
+    remember_tools()
 
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))
@@ -2188,6 +2391,16 @@ def cmd_agents(_args):
 
 
 def cmd_agent(args):
+    if args.action == "add":
+        folder = str(Path(args.folder or ".").resolve())
+        owner_call("/api/launch", {"tool": args.tool, "folder": folder, "name": args.name or "",
+                                   "role": args.role or "", "task": args.task or "",
+                                   "accept_edits": args.accept_edits})
+        print("Opened a new %s session in %s. It joins the chat in a moment%s." % (
+            LAUNCH_TOOLS[args.tool][0], folder, " as %s" % args.name if args.name else ""))
+        return
+    if not args.name:
+        die("usage: crewchat agent %s NAME" % args.action)
     if args.action == "rename":
         if not args.new:
             die("usage: crewchat agent rename OLD NEW")
@@ -2510,6 +2723,8 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
     if client in ("all", "cursor"):
         written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
+    if (home() / "config.json").exists() and url == local_url():
+        remember_folder(project, place)
     if quiet:
         if not ignored:
             print("- %s hold a secret token: do not commit them." % ", ".join(written))
@@ -2993,6 +3208,17 @@ button { background: var(--accent); color: var(--on-accent); border: 0; border-r
 button:disabled { opacity: 0.5; cursor: default; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #error { color: var(--err); font-size: 13px; margin-top: 6px; min-height: 0; }
+.add-agent { width: 100%; margin: 0 0 10px; background: transparent; color: var(--accent); border: 1px dashed var(--line); }
+dialog#launch { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
+dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
+#launch h2 { font-size: 17px; margin: 0 0 4px; } #launch p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+#launch label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
+#launch label.check { font-weight: 400; display: flex; gap: 8px; align-items: center; }
+#launch select, #launch input[type=text], #launch textarea { width: 100%; box-sizing: border-box; max-width: none; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
+#launch textarea { min-height: 70px; resize: vertical; }
+#launch .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#launch .buttons .secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+#launch-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
 
 @media (max-width: 760px) {
   body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 100dvh; }
@@ -3010,10 +3236,27 @@ button:disabled { opacity: 0.5; cursor: default; }
 <aside>
   <h1 id="project">crewchat</h1>
   <p class="sub">Everything your agents say to each other, live.</p>
+  <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
   <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent has the <b>Lead</b> role, it takes your tasks and hands out the work instead. Give agents roles with the menu on their cards.</p>
   <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types (<code>crewchat listen</code> changes how long agents wait). Grey means it has not been heard from lately.</p>
 </aside>
+<dialog id="launch" aria-labelledby="launch-title">
+  <form id="launch-form" method="dialog">
+    <h2 id="launch-title">Add an agent</h2>
+    <p>Opens a new agent session in a terminal window on the machine that hosts this page. It joins the chat with the name, role and first task you give it.</p>
+    <div id="launch-fields">
+      <label for="l-tool">Agent</label><select id="l-tool"></select>
+      <label for="l-folder">Project folder</label><select id="l-folder"></select>
+      <label for="l-name">Name (optional)</label><input type="text" id="l-name" maxlength="32" placeholder="for example docs-writer" autocomplete="off">
+      <label for="l-role">Role</label><select id="l-role"></select>
+      <label for="l-task">First task (optional)</label><textarea id="l-task" maxlength="4000" placeholder="for example: Write a user guide for the settings screen"></textarea>
+      <label class="check" id="l-edits-row"><input type="checkbox" id="l-edits"> Let it edit files without asking (Claude Code)</label>
+    </div>
+    <div id="launch-note" role="status"></div>
+    <div class="buttons"><button type="button" class="secondary" id="l-cancel">Cancel</button><button type="submit" id="l-start">Start</button></div>
+  </form>
+</dialog>
 <main>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
   <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
@@ -3056,6 +3299,48 @@ function ago(seen, now) {
   if (s < 3600) return Math.round(s / 60) + " min ago";
   if (s < 86400) return Math.round(s / 3600) + " h ago";
   return Math.round(s / 86400) + " d ago";
+}
+
+async function openLaunch() {
+  const dialog = $("launch"), note = $("launch-note");
+  note.textContent = ""; $("l-start").disabled = false;
+  dialog.showModal();
+  try {
+    const res = await fetch("/api/launch", { cache: "no-store" });
+    if (res.status === 401) { location.href = "/login"; return; }
+    const opts = await res.json();
+    $("l-tool").replaceChildren(...opts.tools.map((t) => new Option(t.label, t.id)));
+    $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
+    $("l-role").replaceChildren(new Option("No role", ""), ...state.roles.map((r) => new Option(r.title, r.name)));
+    if (!opts.tools.length || !opts.folders.length) {
+      note.textContent = !opts.tools.length
+        ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
+        : "No project folder on this machine is connected yet. Run `crewchat start` in one first.";
+      $("l-start").disabled = true;
+    }
+  } catch (err) {
+    note.textContent = "Could not load the options: " + err.message;
+  }
+}
+
+async function startAgent(event) {
+  event.preventDefault();
+  const note = $("launch-note");
+  $("l-start").disabled = true;
+  note.textContent = "Starting…";
+  try {
+    const res = await fetch("/api/launch", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(),
+                             role: $("l-role").value, task: $("l-task").value.trim(), accept_edits: $("l-edits").checked }) });
+    if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+    note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
+    $("l-name").value = ""; $("l-task").value = "";
+    setTimeout(() => $("launch").close(), 4000);
+  } catch (err) {
+    note.textContent = "Not started: " + err.message;
+    $("l-start").disabled = false;
+  }
 }
 
 function roleTitle(name) {
@@ -3284,6 +3569,11 @@ $("form").addEventListener("submit", async (e) => {
   text.focus();
 });
 
+$("add-agent").addEventListener("click", openLaunch);
+$("launch-form").addEventListener("submit", startAgent);
+$("l-cancel").addEventListener("click", () => $("launch").close());
+$("l-tool").addEventListener("change", () => { $("l-edits-row").hidden = $("l-tool").value !== "claude"; });
+
 setInterval(() => { state.now += 30; renderAgents(); }, 30000);
 loop();
 </script>
@@ -3354,10 +3644,17 @@ def build_parser():
     p = sub.add_parser("agents", help="who is in the chat right now")
     p.set_defaults(fn=cmd_agents)
 
-    p = sub.add_parser("agent", help="rename or remove one agent")
-    p.add_argument("action", choices=["rename", "remove"])
-    p.add_argument("name")
+    p = sub.add_parser("agent", help="start a new agent here, or rename or remove one",
+                       description="add: open a new Claude Code (or Cursor) session in a connected folder on "
+                       "this machine; it joins the chat with the name, role and first task you give.")
+    p.add_argument("action", choices=["add", "rename", "remove"])
+    p.add_argument("name", nargs="?")
     p.add_argument("new", nargs="?")
+    p.add_argument("--role", help="add: its role (see `crewchat roles`)")
+    p.add_argument("--task", help="add: its first task")
+    p.add_argument("--tool", choices=sorted(LAUNCH_TOOLS), default="claude", help="add: which agent (default claude)")
+    p.add_argument("--folder", help="add: a connected project folder on this machine (default: this folder)")
+    p.add_argument("--accept-edits", action="store_true", help="add, Claude Code: let it edit files without asking")
     p.set_defaults(fn=cmd_agent)
 
     p = sub.add_parser("places", help="list the folders that have joined")

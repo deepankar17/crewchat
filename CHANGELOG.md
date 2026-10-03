@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.0
+
+**Add an agent from the chat page.**
+
+- **+ Add an agent** opens a new Claude Code (or Cursor agent) session in a terminal window on
+  the host, in a project folder connected there. Choose its name, role and first task; it joins
+  the chat with them, its task already assigned. `crewchat agent add NAME --role R --task T`
+  does the same from a terminal.
+- The session is told only to check in with a one-time key; everything else reaches it as chat
+  messages. It keeps your normal permissions unless you tick "let it edit files without asking".
+- New built-in role: Docs (keeps the documentation in step with what developers finish).
+- `crewchat start` remembers the folders it connects and where Claude Code and Cursor's agent are
+  installed, so the page can offer them.
+
 ## 0.7.0
 
 **A team with roles: a lead hands out the work, everyone reports back.**
