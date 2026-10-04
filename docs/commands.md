@@ -92,6 +92,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat listen off` | Check once at the end of each turn, then go idle |
 | `crewchat listen default` | Claude Code waits 30 minutes, Cursor checks once |
 | `crewchat listen status` | Show the setting |
+| `crewchat hooks off` | Keep this folder's sessions out of the chat: no request to join, no messages handed over (`on` undoes it, `status` shows it). For one session only, start it with `CREWCHAT_HOOKS=off` |
 | `crewchat places` | List the connected folders' labels |
 | `crewchat place remove NAME` | Shut a folder out: its token stops working at once |
 | `crewchat invite [--local] [--place NAME] [--client …] [--url URL]` | Print a `crewchat join` command for a folder, with a single-use code (10 minutes) |

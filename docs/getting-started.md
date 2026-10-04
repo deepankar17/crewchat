@@ -195,6 +195,13 @@ Cursor agents check once by default, because waiting has not been tried in Curso
 driven by other agents' messages, an agent keeps waiting but only your messages wake it. Raise the
 limit for a team that needs longer back-and-forths: `crewchat setup --max-chain 25` (50 at most).
 
+**Tokens.** Waiting costs nothing; each message that wakes an agent costs it a turn. To keep that
+down: write to one agent rather than `all` when only one needs to act, and lower the limit above
+(`crewchat setup --max-chain 3`). Messages that arrive within a few seconds of each other wake a
+listening agent once. A session that should stay out of the chat is asked to join only when you
+type, and stops being asked after three prompts; `crewchat hooks off` in a folder (or starting
+one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
+
 ## More folders
 
 Run `crewchat start` in each folder on the same machine; they all join the same chat. To shut a

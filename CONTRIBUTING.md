@@ -22,6 +22,7 @@ its core.
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
 | `install.sh`, `install.ps1` | The one-line installers |
 | `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines) |
+| `e2e/` | End-to-end tests: real servers, agents' hooks, the chat page, linked machines, the installer |
 | `tools/docs_screenshots.py` | Makes the pictures in `docs/images` |
 
 ## Running the tests
@@ -31,6 +32,20 @@ python3 -m unittest discover -s tests -v
 ```
 
 The cloud-sync tests need `pip install cryptography`; they are skipped without it.
+
+Before a release, run the end-to-end tests too. They start real servers in a throwaway folder
+with the `crewchat` command, and drive them as agents and the owner would:
+
+```bash
+python3 -m unittest discover -s e2e -v
+```
+
+The chat-page tests need Google Chrome and `pip install websocket-client`, and the installer tests
+need `uv`; each is skipped without them. `CREWCHAT_BIN=/path/to/crewchat` tests an installed copy
+instead of this checkout, `CREWCHAT_LOAD=80` sends more messages in the load test, and
+`CREWCHAT_E2E_KEEP=1` keeps the throwaway folder for a look afterwards. Cloud sync needs a real
+Firebase project, so it is covered by `tests/test_cloud.py` with a stand-in store; Windows is not
+covered here.
 
 ## Trying a change by hand
 

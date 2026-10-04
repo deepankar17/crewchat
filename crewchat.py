@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -69,6 +69,7 @@ INLINE_IMAGES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
               "application/javascript", "application/x-sh", "application/sql")
 MAX_TEXT = 4000
+PAGE_BATCH = 500  # messages the chat page gets in one answer
 MAX_STATUS = 200
 MAX_WAIT = 50
 KEEP_MESSAGES = 2000
@@ -150,41 +151,29 @@ TRUST_NOTE = (
     "your project or your own."
 )
 
+# Sent once when an agent connects. Claude Code keeps only about the first 2,000 characters of a
+# server's instructions, so this stays well under that, most important first (a test checks).
 PROTOCOL = """\
-You are connected to the crewchat for {project}: a shared chat between the project's AI agents and
-their owner. The owner reads every message on a chat page and writes there as Owner.
+You are connected to the crewchat for {project}: a chat between the project's AI agents and
+their owner, who reads it on a chat page and writes as Owner.
 
-- You get your own name the first time you use a chat tool. Call hub_agents now: it shows your
-  name as "(you)" and who else is here. If your owner gave you a name, take it with hub_rename.
-- If a hook asks you to call hub_link with a key, do it once: it ties this session to your name so
-  your messages reach you.
-- Check hub_inbox when you start work, before you take on a task, after you finish one, and before
-  you go idle. If hooks are installed they also hand you new messages at the end of each turn.
-- Use hub_send (to one agent, to Owner, or to all) when someone needs to know something: you are
-  about to change a file they are working in, you changed something they depend on, you found a
-  bug in their work, you need something checked on their machine, or you have a question.
-- Set hub_status to one line when you start a task and when you finish it.
-- Always answer the owner, and answer in the chat: the owner reads the chat page, not your
-  session, so reply to Owner's messages with hub_send (to Owner, or to all), even when the answer
-  is one line. Tell Owner when you start a task, finish it or are blocked.
-- A message marked [TASK, open] is work the owner wants done. If the chat has a lead (hub_agents
-  marks it [lead]), leave open tasks to the lead: it takes them and hands out the work with
-  hub_assign. Otherwise reply once to all with "BID #<id>: yes" or "no" and one line of why
-  (free or busy, already in those files, right or wrong machine). Read the other bids, then call
-  hub_take if you bid yes and nobody better placed did. hub_take gives the task to the first
-  caller and tells everyone; if it says someone else has it, stop. A task addressed only to you
-  is yours: take it without bidding.
-- Before you start work on a task (one you took, or one assigned or addressed to you), first send
-  hub_update on it with in_progress and one line on your plan: the owner sees at once that it was
-  picked up, rather than hearing nothing until you finish. Then report blocked, review and done
-  with hub_update as you go.
-- Roles: hub_agents shows each agent's role ([lead], [developer], [qa], ...). If you get a role,
-  follow its instructions; hub_role with no arguments shows them again. Take a role with
-  hub_role only when your owner tells you to.
-- Keep it short. Do not reply to another agent just to acknowledge, and never put secrets in a
-  message.
 - {trust}
-{roster}"""
+- Call hub_agents now: it shows your name as "(you)", who else is here and their roles. If a
+  hook asks you to call hub_link with a key, do it once. If your owner names you, use hub_rename.
+- Always answer the owner, and answer in the chat: Owner reads the chat page, not your session,
+  so reply with hub_send (to Owner or all), even in one line.
+- Before you work on a task (taken, assigned or addressed to you), first send hub_update on it
+  with in_progress and one line on your plan, so the owner sees it was picked up, rather than
+  hearing nothing until you finish. Then report blocked, review and done the same way.
+- An open [TASK] is the owner's. If the chat has a [lead], leave open tasks to the lead: it hands
+  out work with hub_assign. Otherwise reply to all "BID #<id>: yes" or "no" with one line of why,
+  read the other bids, and hub_take it if you are best placed; if someone has it, stop. A task
+  addressed only to you is yours.
+- If you get a role, follow it (hub_role shows it again); take one only when the owner says so.
+- Hooks hand you new messages after each turn; also check hub_inbox when you start and finish.
+- Use hub_send when someone needs to know: you will touch their files, you changed what they
+  depend on, you found a bug in their work, or you have a question. Keep it short: no replies
+  just to acknowledge, and no secrets."""
 
 
 def home():
@@ -965,6 +954,13 @@ class Hub:
         return local or next((row["agent"] for dev in self.remote.values() for row in dev["agents"]
                               if row.get("role") == "lead" and row["agent"] not in self.agents), None)
 
+    def on_this_machine(self, agent):
+        """Is the agent in a folder on this machine (connected with `crewchat start`, or joined
+        here), rather than one connected from another machine?"""
+        with self.lock:
+            place = (self.agents.get(agent) or {}).get("place")
+        return place is not None and place in (self.roster.config.get("folders") or {}).values()
+
     def _check_recipient(self, to, everyone=False):
         """An agent's name, or with `everyone` also "all" and Owner. Caller holds the lock."""
         if not (to in self.names and (everyone or to != OWNER) or everyone and to == "all"):
@@ -1113,12 +1109,17 @@ class Hub:
         with self.lock:
             while self.version == version and time.time() < deadline:
                 self.lock.wait(timeout=max(0.0, deadline - time.time()))
+            new = [m for m in self.messages if m["seq"] > after]
+            # A new page (after -1) shows the latest messages. After that the page catches up in order, a batch
+            # at a time ("more": ask again at once), so one that slept through a busy night misses nothing.
+            batch = new[-PAGE_BATCH:] if after < 0 else new[:PAGE_BATCH]
             return {
                 "version": self.version,
                 "now": time.time(),
                 "project": self.roster.project,
                 "device": self.device,
-                "messages": [m for m in self.messages if m["seq"] > after][-500:],
+                "messages": batch,
+                "more": len(batch) < len(new) and after >= 0,
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
                 "agents": self._rows(),
@@ -1147,7 +1148,7 @@ class Hub:
             if newest > max(agent["active"], agent["checked"]):
                 agent["checked"] = time.time()
                 self._save()
-                return {"link": True}
+                return {"link": True, "again": True}
             agent["seen"] = now = time.time()
             if event == "prompt":
                 self.activity[name] = ("working", now)
@@ -1524,6 +1525,10 @@ def call_tool(hub, sid, name, args, owner=False):
     hub.touch(me, active=True)
     if name == "hub_send":
         to = args.get("to")
+        if args.get("files") and not owner and not hub.on_this_machine(me):
+            # The paths would be read here, on the host, not where the agent is.
+            raise HubError("files can only be shared from folders on the chat's own machine; this folder is "
+                           "connected from another machine. Put the text in the message instead.")
         files = [share_file(hub, path) for path in args.get("files") or []]
         msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
@@ -1635,14 +1640,12 @@ def handle_rpc(hub, sid, req, owner=False):
 
     if method == "initialize":
         wanted = params.get("protocolVersion") if isinstance(params, dict) else None
-        rows = hub.rows()
-        roster = "\nIn the chat right now:\n%s\n" % roster_text(rows) if rows else "\nNo other agents are here yet.\n"
         return ok(
             {
                 "protocolVersion": wanted if wanted in PROTOCOLS else PROTOCOLS[0],
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": __version__},
-                "instructions": PROTOCOL.format(project=hub.roster.project, trust=TRUST_NOTE, roster=roster),
+                "instructions": PROTOCOL.format(project=hub.roster.project, trust=TRUST_NOTE),
             }
         )
     if method == "ping":
@@ -1669,6 +1672,7 @@ PAGE_HEADERS = {
     "connect-src 'self'; img-src 'self' data: blob:; manifest-src 'self'; worker-src 'self'; base-uri 'none'; "
     "form-action 'self'; frame-ancestors 'none'",
     "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",  # frame-ancestors, for browsers too old to know it
     # same-origin, not no-referrer: with no-referrer browsers send "Origin: null" on the sign-in
     # form's POST, which the same-origin check below would refuse.
     "Referrer-Policy": "same-origin",
@@ -1905,11 +1909,14 @@ class Handler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         if quiet and not header:
             return None
-        if self._locked():
-            self._json(429, {"error": "too many bad tokens; try again later"})
-            return None
         who = self.roster.tokens.get(sha(header[7:].strip())) if header.startswith("Bearer ") else None
         if who is None:
+            # Only wrong tokens are locked out. A right one always works: tokens are far too long to
+            # guess, and a stale token still in use (a removed folder, an old copy of a project) must
+            # not shut out every agent and the owner, who all reach the server from this machine.
+            if self._locked():
+                self._json(429, {"error": "too many bad tokens; try again later"})
+                return None
             self._fail()
             self._json(401, {"error": "missing or wrong token"}, extra={"WWW-Authenticate": "Bearer"})
             return None
@@ -2031,7 +2038,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"error": "sign in"})
                 return
             try:
-                after = int(query.get("after", ["0"])[0])
+                after = int(query.get("after", ["-1"])[0])
                 version = int(query.get("v", ["-1"])[0])
                 wait = max(0, min(25, int(query.get("wait", ["0"])[0])))
             except ValueError:
@@ -2151,13 +2158,18 @@ class Handler(BaseHTTPRequestHandler):
         if handler is None:
             self._json(404, {"error": "this machine is not linked to other machines"})
             return
-        if self._locked():
+        # Joining takes a short code, so a locked-out address may not try one. Other requests carry
+        # the group's long key, and a right key always works (as tokens do in _bearer).
+        if path == "/peer/join" and self._locked():
             self._json(429, {"error": "too many wrong keys or codes; try again later"})
             return
         header = self.headers.get("Authorization", "")
         token = header[7:].strip() if header.startswith("Bearer ") else ""
         status, out = handler(path, token, self.headers.get("X-Crewchat-Device", ""), self._object(raw))
         if status == 401:
+            if self._locked():
+                self._json(429, {"error": "too many wrong keys or codes; try again later"})
+                return
             self._fail()
         if isinstance(out, bytes):
             self._reply(status, out, ctype="application/octet-stream")
@@ -2907,13 +2919,9 @@ def cmd_status(_args):
 CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}
 HOOK_REASON = (
     "New messages on the crewchat:\n\n%s\n\n"
-    "Handle what is addressed to you: act on Owner instructions, follow your role if you have one, "
-    "for a task you will work on, first send hub_update in_progress with one line on your plan, then "
-    "do it and report with hub_update, bid on an open [TASK] (unless the chat "
-    "has a lead) and take it if you are best placed, answer questions. The owner reads the chat page, not this session: "
-    "answer anything Owner wrote with hub_send (to Owner or to all), even if it is one line. If "
-    "nothing needs a reply or action from you, say so here in one line and stop. Do not reply to "
-    "another agent just to acknowledge."
+    "Handle what is for you, as the crewchat rules say: answer anything Owner wrote with hub_send, "
+    "and before working on a task, first send hub_update in_progress with one line on your plan. "
+    "If nothing needs you, say so in one line and stop."
 )
 HOOK_LINK = (
     'crewchat: this session is not linked to the project chat yet. Call the hub_link tool once with '
@@ -2922,6 +2930,7 @@ HOOK_LINK = (
 )
 MAX_LINK_ASKS = 2  # times a hook insists on hub_link before leaving the agent alone
 MAX_LINK_PROMPTS = 3  # user prompts a session is asked at; after that it is not joining, so hooks stay quiet
+BATCH_SECS = 5  # a listening agent woken by a message waits this long for more, to take them in one turn
 
 
 def read_json(path):
@@ -3099,6 +3108,17 @@ def client_config(project, client):
         return None
 
 
+def hooks_off(project):
+    """Has the owner switched this folder's hooks off (`crewchat hooks off`), or this one session
+    (started with CREWCHAT_HOOKS=off)?"""
+    if os.environ.get("CREWCHAT_HOOKS", "").lower() == "off":
+        return True
+    try:
+        return (project / ".crewchat-hooks").read_text().strip().lower() == "off"
+    except OSError:
+        return False
+
+
 def listen_seconds(project, client="claude"):
     """How long this project's agents wait for messages after a turn. Without a setting, Claude
     Code agents wait DEFAULT_LISTEN; other tools check once."""
@@ -3116,7 +3136,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
-    the session must call hub_link first, else "ok"; text is '' when nothing arrived within
+    the session must call hub_link first, "relink" if it was linked and must link again (another
+    session in its place may be this one reconnecting), else "ok"; text is '' when nothing arrived within
     wait_total seconds. `ack` first confirms the messages a previous hook call delivered. `chain`
     is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
     answers "capped", and only a message from the owner ends the wait.
@@ -3125,6 +3146,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
     while True:
         # Round up, so the last call waits out the remainder instead of asking again and again.
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
+        asked = time.time()
         try:
             out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
                                                         "chain": chain}, timeout=MAX_WAIT + 30)
@@ -3136,9 +3158,18 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
                 raise
             time.sleep(3)
             continue
+        if out.get("text") and wait and time.time() - asked > 1 and time.time() + BATCH_SECS < deadline:
+            # Woken while listening: what follows within a few seconds (a second message, a reply
+            # from another agent) comes in the same turn rather than costing one more.
+            time.sleep(BATCH_SECS)
+            try:
+                out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": 0, "event": event,
+                                                            "chain": chain}, timeout=30)
+            except (urllib.error.URLError, OSError):
+                pass  # keep what came first
         capped = bool(out.get("capped"))
         if out.get("link"):
-            return "link", "", 0, False, capped
+            return "relink" if out.get("again") else "link", "", 0, False, capped
         if out.get("text") or time.time() >= deadline:
             return "ok", out.get("text", ""), int(out.get("last") or 0), bool(out.get("owner")), capped
 
@@ -3152,8 +3183,8 @@ def run_hook(client, event):
         data = {}
     project = find_project(client)
     config = client_config(project, client) if project else None
-    if config is None:
-        return  # this project is not connected to a crewchat
+    if config is None or hooks_off(project):
+        return  # this project is not connected to a crewchat, or its hooks are switched off
     base, token = config
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
@@ -3182,7 +3213,7 @@ def run_hook(client, event):
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
         kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt")
-        if kind == "link":
+        if kind != "ok":
             if ignored >= MAX_LINK_PROMPTS:
                 # Asked at several prompts and never linked: this session is not joining (or has no
                 # crewchat tools). Leave it alone; it can still link with the same key any time.
@@ -3205,9 +3236,13 @@ def run_hook(client, event):
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
                                                       pending, chain=chain)
-    if kind == "link":
-        if capped or asks >= MAX_LINK_ASKS:
-            return  # asked enough; the next user prompt asks again
+    if kind != "ok":
+        # Asking here makes the agent take one more turn, which costs a whole turn's tokens. Claude
+        # Code is asked at its user's prompt instead; here only a session that was linked and must
+        # link again (it may be listening, with no prompt to come), and Cursor, which has no
+        # prompt hook.
+        if capped or asks >= MAX_LINK_ASKS or (client == "claude" and kind == "link"):
+            return
         save(chain + 1, pending, asks + 1)
         text = HOOK_LINK % key
     elif not text:
@@ -3232,6 +3267,25 @@ def cmd_hook(args):
         run_hook(args.client, args.event)
     except Exception:  # a hook must never break the agent's turn
         pass
+
+
+def cmd_hooks(args):
+    project = Path(args.project or ".").resolve()
+    path = project / ".crewchat-hooks"
+    if args.mode == "off":
+        path.write_text("off\n")
+        git_exclude(project, [".crewchat-hooks"])
+        print("Hooks off in %s: its sessions are not asked to join the chat and are not handed messages. "
+              "An agent there can still use the chat tools itself. `crewchat hooks on` undoes it." % project)
+    elif args.mode == "on":
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        print("Hooks on in %s: new sessions join the chat and get its messages." % project)
+        print("Hooks on in %s: new sessions join the chat and get its messages after each turn." % project)
+    else:
+        print("Hooks are %s in %s." % ("off" if hooks_off(project) else "on", project))
 
 
 def cmd_listen(args):
@@ -3643,7 +3697,7 @@ const el = (tag, cls, text) => {
   if (text !== undefined) n.textContent = text;
   return n;
 };
-const state = { after: 0, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
+const state = { after: -1, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
                 images: [], maxUpload: 20 * 1024 * 1024, pending: [],
                 agents: [], names: "", title: "crewchat",
                 now: Date.now() / 1000, lastDay: "" };
@@ -3889,7 +3943,9 @@ async function loop() {
   for (;;) {
     try {
       const wait = state.version < 0 ? 0 : 25;
-      const res = await fetch("/api/poll?after=" + state.after + "&v=" + state.version + "&wait=" + wait, { cache: "no-store" });
+      // With more messages to catch up on, ask again at once (a version that never matches).
+      const res = await fetch("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait,
+                              { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
@@ -3897,6 +3953,7 @@ async function loop() {
       $("banner").classList.remove("show");
       const first = state.version < 0;
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
+      state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       if (data.project && data.project + " · crewchat" !== state.title) {
@@ -4148,6 +4205,11 @@ def build_parser():
     p.add_argument("--minutes", type=int, default=30)
     p.add_argument("--project")
     p.set_defaults(fn=cmd_listen)
+
+    p = sub.add_parser("hooks", help="switch this project's hooks off (its sessions stay out of the chat) or on")
+    p.add_argument("mode", choices=["on", "off", "status"])
+    p.add_argument("--project")
+    p.set_defaults(fn=cmd_hooks)
 
     p = sub.add_parser("rules", help="print a section about the chat for your AGENTS.md / CLAUDE.md")
     p.set_defaults(fn=cmd_rules)

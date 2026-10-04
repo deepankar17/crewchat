@@ -175,8 +175,12 @@ class Protocol(Base):
         ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
         for i in range(crewchat.FAIL_LIMIT):
             self.raw("/mcp", ping, {"Authorization": "Bearer bad%d" % i, "X-Forwarded-For": "6.6.6.6"})
+        locked = {"X-Forwarded-For": "6.6.6.6"}
+        self.assertEqual(self.raw("/mcp", ping, dict(locked, Authorization="Bearer bad"))[0], 429)
+        self.assertEqual(self.raw("/login?code=ABCDEFGH", headers=locked)[0], 429)
+        # A right token still works from there: a stale token in use must not shut everyone out.
         good = {"Authorization": "Bearer " + self.token}
-        self.assertEqual(self.raw("/mcp", ping, dict(good, **{"X-Forwarded-For": "6.6.6.6"}))[0], 429)
+        self.assertEqual(self.raw("/mcp", ping, dict(good, **locked))[0], 200)
         self.assertEqual(self.raw("/mcp", ping, good)[0], 200)
 
 
@@ -401,7 +405,7 @@ class Teams(Base):
         status, _, _ = self.raw("/api/role", json.dumps({"agent": dev_name, "role": "qa"}).encode(),
                                 {"Content-Type": "application/json", "Origin": self.base}, opener)
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
-        poll = json.loads(self.raw("/api/poll?after=0&v=-1&wait=0", opener=opener)[1])
+        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
         self.assertIn({"name": "qa", "title": "QA"}, poll["roles"])
 
     def test_there_is_one_lead(self):
@@ -468,7 +472,7 @@ class Teams(Base):
                                                           note="Starting: reading the backup code"))
         update = self.hub.history(1)[0]
         self.assertEqual((update["to"], update["text"]), ("Owner", "Starting: reading the backup code"))
-        self.assertIn("picked up, rather than hearing nothing", dev.hello["instructions"])
+        self.assertIn("first send hub_update on it\n  with in_progress", dev.hello["instructions"])
         self.role(lead_name, "none")
 
     def test_an_agent_takes_a_role_when_told_to_and_custom_roles(self):
@@ -545,6 +549,11 @@ class Files(Base):
         other, other_name = self.agent()
         shot = Path(tempfile.mkdtemp(dir=TMP)) / "bug.png"
         shot.write_bytes(PNG)
+        # Only from a folder on this machine: a path from another machine's folder would be read here.
+        far, far_token = self.join_place("laptop")
+        remote, _ = self.agent(token=far_token)
+        self.assertIn("another machine", remote.text("hub_send", to=name, text="x", files=[str(shot)]))
+        crewchat.remember(shot.parent, self.place)
         self.assertIn("with 1 file(s)", session.text("hub_send", to=other_name, text="See the bug", files=[str(shot)]))
         got = other.text("hub_inbox")
         fid = re.search(r"\[file (\w+): bug.png", got).group(1)
@@ -714,7 +723,7 @@ class Linking(Base):
         again = Session(self.base, self.token)
         stand_in = again.me  # used a tool before linking: it was given a name of its own
         self.assertNotEqual(stand_in, name)
-        self.assertEqual(self.hook("key-merge-00001"), {"link": True})  # the hook notices and asks
+        self.assertEqual(self.hook("key-merge-00001"), {"link": True, "again": True})  # the hook notices and asks
         again.call("hub_link", key="key-merge-00001")
         self.assertEqual(again.me, name)
         self.assertNotIn(stand_in, self.names())
@@ -727,7 +736,7 @@ class Linking(Base):
         name = mine.me
         time.sleep(0.05)
         neighbour = Session(self.base, self.token)
-        self.assertEqual(self.hook("key-neighbour-01"), {"link": True})
+        self.assertEqual(self.hook("key-neighbour-01"), {"link": True, "again": True})
         self.assertIn("agent", self.hook("key-neighbour-01"))  # asked once, then carries on
         mine.call("hub_link", key="key-neighbour-01")  # the no-op re-link changes nothing
         self.assertEqual(mine.me, name)
@@ -791,7 +800,7 @@ class ChatPage(Base):
         self.assertEqual(send({"to": "all", "text": "hello agents"}, {"Origin": self.base})[0], 200)
         for bad in ({"to": "Owner", "text": "x"}, {"to": "all", "text": " "}, {"to": "all"}, {"to": "ghost", "text": "x"}):
             self.assertEqual(send(bad)[0], 400, bad)
-        data = json.loads(self.raw("/api/poll?after=0&v=-1&wait=0", opener=opener)[1])
+        data = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
         self.assertEqual(data["project"], "Demo")
         row = next(a for a in data["agents"] if a["agent"] == name)
         self.assertEqual((row["client"], row["place"], row["online"]), ("cursor", self.place, True))
@@ -807,6 +816,26 @@ class ChatPage(Base):
         thread.join()
         self.assertLess(time.time() - start, 4)
         self.assertEqual(got["d"]["messages"][0]["text"], "a question")
+
+    def test_a_page_that_was_away_catches_up_on_everything(self):
+        opener, _ = self.owner_browser()
+        poll = lambda after, v=-1: json.loads(self.raw(  # noqa: E731
+            "/api/poll?after=%d&v=%d&wait=0" % (after, v), opener=opener)[1])
+        mark = poll(-1)
+        after = mark["messages"][-1]["seq"] if mark["messages"] else 0
+        for i in range(crewchat.PAGE_BATCH + 20):
+            self.say("all", "busy night %d" % i)
+        latest = poll(-1)  # a new page: the latest messages only
+        self.assertEqual(len(latest["messages"]), crewchat.PAGE_BATCH)
+        self.assertFalse(latest["more"])
+        seen = []
+        first = poll(after, mark["version"])  # the page that was open: everything, in order
+        self.assertTrue(first["more"])
+        seen += first["messages"]
+        rest = poll(seen[-1]["seq"], first["version"])
+        self.assertFalse(rest["more"])
+        seen += rest["messages"]
+        self.assertEqual([m["text"] for m in seen], ["busy night %d" % i for i in range(crewchat.PAGE_BATCH + 20)])
 
     def test_ui_print_gives_a_code(self):
         self.assertRegex(cli("ui", "--print"), r"Sign-in code .*: [A-Z2-9]{4}-[A-Z2-9]{4}")
@@ -956,9 +985,7 @@ class Hooks(Base):
         asked = self.hook("claude", "prompt", {"session_id": "L"})
         self.assertIn("Call the hub_link tool once with key", asked)
         key = re.search(r'key "([^"]+)"', asked).group(1)
-        # If the agent ignores it, the stop hook insists, but only a couple of times.
-        for _ in range(crewchat.MAX_LINK_ASKS - 1):
-            self.assertIn(key, json.loads(self.hook("claude", "stop", {"session_id": "L"}))["reason"])
+        # The stop hook does not insist: that would cost the agent a whole extra turn.
         self.assertEqual(self.hook("claude", "stop", {"session_id": "L"}), "")
         session.call("hub_link", key=key)
         self.say(session.me, "now it works")
@@ -967,9 +994,43 @@ class Hooks(Base):
     def test_a_session_that_never_links_is_left_alone(self):
         for _ in range(crewchat.MAX_LINK_PROMPTS):
             self.assertIn("Call the hub_link tool", self.hook("claude", "prompt", {"session_id": "N"}))
-            self.assertIn("hub_link", self.hook("claude", "stop", {"session_id": "N"}))
+            self.assertEqual(self.hook("claude", "stop", {"session_id": "N"}), "")
         self.assertEqual(self.hook("claude", "prompt", {"session_id": "N"}), "")
         self.assertEqual(self.hook("claude", "stop", {"session_id": "N"}), "")
+
+    def test_a_linked_session_that_loses_its_link_is_asked_by_the_stop_hook(self):
+        # A listening agent has no prompt coming: if a reconnect unlinks it, the stop hook asks.
+        session, name = self.linked("R")
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "R"}), "")
+        Session(self.base, self.token)  # a newer session in the same place, not linked yet
+        asked = json.loads(self.hook("claude", "stop", {"session_id": "R"}))["reason"]
+        self.assertIn("Call the hub_link tool", asked)
+        self.assertIn("Linked. You are %s" % name, session.text("hub_link", key=re.search(r'key "([^"]+)"', asked).group(1)))
+
+    def test_hooks_can_be_switched_off_for_a_folder_or_a_session(self):
+        folder = Path(tempfile.mkdtemp(prefix="quiet-", dir=TMP))
+        crewchat.install_claude(folder, self.base, self.token)
+        subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "hooks", "off", "--project", str(folder)],
+                       check=True, capture_output=True)
+        self.assertEqual(self.hook("claude", "prompt", {"session_id": "Q"}, project=folder), "")
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "Q"}, project=folder), "")
+        subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "hooks", "on", "--project", str(folder)],
+                       check=True, capture_output=True)
+        self.assertIn("hub_link", self.hook("claude", "prompt", {"session_id": "Q"}, project=folder))
+        os.environ["CREWCHAT_HOOKS"] = "off"
+        try:
+            self.assertEqual(self.hook("claude", "prompt", {"session_id": "Q2"}, project=folder), "")
+        finally:
+            del os.environ["CREWCHAT_HOOKS"]
+
+    def test_a_listening_agent_gets_messages_that_follow_closely_in_one_turn(self):
+        session, name = self.linked("B")
+        self.hook("claude", "stop", {"session_id": "B"})
+        threading.Timer(2, lambda: self.say(name, "first")).start()
+        threading.Timer(4, lambda: self.say(name, "second")).start()
+        out = json.loads(self.hook("claude", "stop", {"session_id": "B"}, listen="30"))["reason"]
+        self.assertIn("first", out)
+        self.assertIn("second", out)
 
     def test_two_sessions_in_one_folder_each_get_their_own_messages(self):
         (one, name1), (two, name2) = self.linked("S1"), self.linked("S2")
@@ -1038,6 +1099,14 @@ class Hooks(Base):
         reason = json.loads(self.hook("claude", "stop", {"session_id": "W"}))["reason"]
         self.assertIn("answer anything Owner wrote with hub_send", reason)
         self.assertIn("answer in the chat", session.hello["instructions"])
+        self.assertLess(len(reason), 1200)
+
+    def test_the_instructions_fit_what_claude_code_keeps(self):
+        # Claude Code keeps about the first 2,000 characters of a server's instructions.
+        session = Session(self.base, self.token)
+        text = session.hello["instructions"]
+        self.assertLess(len(text) + 60, 2000)
+        self.assertIn(crewchat.TRUST_NOTE, text)
 
     def test_cursor_is_asked_to_link_and_then_gets_followups(self):
         session = Session(self.base, self.token, "cursor")

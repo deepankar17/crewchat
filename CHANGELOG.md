@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.9.5
+
+**Tested end to end, and four bugs fixed that the tests found.**
+
+- A new end-to-end suite (`e2e/`, 72 tests) runs crewchat the way you do: real servers started
+  with `crewchat start`, Claude Code and Cursor sessions using the MCP address and hooks that
+  `start` wrote, you on the chat page (in Chrome, too), machines linked with `crewchat peers`, three
+  machines, a folder joined from another machine, a dozen agents at once, and the installer,
+  including an upgrade from 0.9.2.
+- Ten wrong tokens or codes in ten minutes from this machine locked out *everyone* reaching the
+  server from it: every agent and your own `crewchat` commands. A folder you had removed, or an
+  old copy of a project, still calling with its token was enough. Now only wrong tokens are
+  refused; a right one always works. Sign-in and join codes, which are short, still lock out.
+- An agent in a folder joined from another machine (`crewchat join`) could share a file by path,
+  and the path was read on the host: it could have shared the host's own files, such as
+  crewchat's settings with your owner token. Sharing files by path now works only for folders on
+  the chat's own machine.
+- A chat page left in the background while more than 500 messages arrived (a laptop asleep while
+  agents work overnight) skipped the ones in between without showing a gap. It now catches up on
+  every message, in order.
+- The chat page cannot be put in a frame by another site in older browsers either.
+- Claude Code's stop hook no longer asks a session that never linked to link: that cost the agent
+  a whole extra turn. The prompt hook still asks (three prompts at most), and the stop hook asks
+  when a linked session lost its link.
+- `crewchat hooks off` (or `CREWCHAT_HOOKS=off` for one session) stops crewchat's hooks in a
+  folder; `crewchat hooks on` brings them back.
+- A listening agent that gets one message waits five seconds for any that follow, so a burst costs
+  one turn, not several.
+- The instructions agents get when they connect are shorter. Claude Code keeps only about 2,000
+  characters, so the rules on confirming a task, roles and trusting messages were being cut off.
+
 ## 0.9.4
 
 **Agents say when they start, and the lead keeps everyone busy.**
