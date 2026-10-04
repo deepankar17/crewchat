@@ -325,7 +325,13 @@ class PeerSync:
             if self.failures.get(mid, 0) >= OFFLINE_AFTER:
                 self.log("%s is back" % member["name"])
             self.failures[mid], attempt = 0, 0
-            self._apply(mid, member, out)
+            try:
+                self._apply(mid, member, out)
+            except Exception as e:  # a surprise here must not end this thread, and the link with it
+                self.log("could not apply what %s sent (%s: %s); trying again" % (member["name"], type(e).__name__, e))
+                self.stopped.wait(BACKOFF[-1])
+                version = ""
+                continue
             version = str(out.get("v", ""))
 
     def _removed(self):
@@ -355,8 +361,15 @@ class PeerSync:
         for msg in out.get("messages") or []:
             if not isinstance(msg, dict) or msg.get("origin") != mid:
                 continue
-            self.hub.ingest(msg)
-            last = max(last, int(msg.get("seq") or 0))
+            try:
+                seq = int(msg.get("seq") or 0)
+            except (TypeError, ValueError):
+                continue
+            try:
+                self.hub.ingest(msg)
+            except Exception as e:  # skip it, so one message cannot stop all the ones after it
+                self.log("skipped message #%s from %s (%s: %s)" % (msg.get("id"), member["name"], type(e).__name__, e))
+            last = max(last, seq)
         if last != self.mesh.cursor(mid):
             self.mesh.set_cursor(mid, last)
         self.agents[mid] = out.get("agents") or []

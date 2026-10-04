@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.3
+
+**Linked machines keep syncing after a bad message.**
+
+- Over Tailscale, a machine stopped hearing from another for good if one message it pulled could
+  not be stored: the error ended its pull thread, with nothing on screen. Now that message is
+  skipped and logged in hub.log, and the messages after it still arrive. Cloud sync skips such a
+  message the same way instead of dropping the rest of its batch.
+- The docs' diagrams are animated, and the tutorial videos are on YouTube.
+
 ## 0.9.2
 
 **A logo.**

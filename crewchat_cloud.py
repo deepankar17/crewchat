@@ -922,7 +922,10 @@ class CloudSync:
                     self.log("dropped message %s: its content does not match its name" % doc_id)
                     continue
                 payload["origin"] = doc.get("dev", "")
-                self.hub.ingest(payload)
+                try:
+                    self.hub.ingest(payload)
+                except Exception as e:  # skip it, so one message cannot stop the rest of the batch
+                    self.log("skipped message %s (%s: %s)" % (doc_id, type(e).__name__, e))
             if created > float(self.marks.get("synced_to", 0)):
                 self.marks["synced_to"] = created
                 self._save_marks()

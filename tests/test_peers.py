@@ -238,6 +238,28 @@ class OfflineAndRemoval(unittest.TestCase):
             a.stop()
             b.stop()
 
+    def test_one_bad_message_does_not_stop_the_link(self):
+        a = Machine("sender").found()
+        b = Machine("receiver").join(a)
+        ingest = b.hub.ingest
+
+        def picky(msg):
+            if msg.get("text") == "poison":
+                raise ValueError("cannot store this one")
+            return ingest(msg)
+
+        b.hub.ingest = picky
+        try:
+            a.say("all", "poison")
+            a.say("all", "after the bad one")
+            eventually(lambda: b.has("after the bad one"), what="the next message to arrive anyway")
+            self.assertIsNone(b.has("poison"))
+            a.say("all", "and the one after")
+            eventually(lambda: b.has("and the one after"), what="the link to keep going")
+        finally:
+            a.stop()
+            b.stop()
+
     def test_taking_a_task_needs_the_machine_that_posted_it(self):
         a = Machine("poster").found()
         b = Machine("taker").join(a)
