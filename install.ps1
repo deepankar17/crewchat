@@ -36,9 +36,33 @@ if (-not $Uv) {
     if (-not (Test-Path $Uv)) { throw "uv did not install; see https://docs.astral.sh/uv/getting-started/installation/" }
 }
 
+# A running crewchat (the server, or an agent's hook waiting for messages) keeps its program
+# files open, and Windows cannot replace open files. Stop them, and start the server again after.
+$Running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ProcessId -ne $PID -and $_.CommandLine -and
+    ($_.CommandLine -match '\\uv\\tools\\crewchat\\' -or $_.CommandLine -match 'crewchat(\.exe)?"?\s+(serve|hook)\b')
+})
+$Restart = $false
+if ($Running.Count -gt 0) {
+    Write-Host "Stopping the running crewchat for the upgrade (agents waiting for messages pick up again on their next turn)..."
+    $Restart = [bool]($Running | Where-Object { $_.CommandLine -match '\bserve\b' })
+    schtasks /End /TN crewchat *> $null
+    $Running | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 2
+}
+
 Write-Host "Installing crewchat $Version..."
 & $Uv tool install --force --python 3.12 $Spec
 if ($LASTEXITCODE -ne 0) { throw "crewchat did not install (uv exit code $LASTEXITCODE)" }
+if ($Restart) {
+    schtasks /Query /TN crewchat *> $null
+    if ($LASTEXITCODE -eq 0) {
+        schtasks /Run /TN crewchat *> $null
+        Write-Host "Started the crewchat server again."
+    } else {
+        Write-Host "The crewchat server was stopped for the upgrade: start it again with crewchat start."
+    }
+}
 & $Uv tool update-shell *> $null
 
 $Bin = (& $Uv tool dir --bin).Trim()
