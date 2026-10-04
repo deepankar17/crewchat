@@ -336,7 +336,7 @@ SPECS["tailnet"] = {
     "groups": [{"label": "Your tailnet: only your devices", "icon": "mesh", "color": "green",
                 "x": 330, "y": 138, "w": 620, "h": 490}],
     "nodes": [
-        card("A", "macbook", 520, 180, 240, 84, "crewchat", SERVER, "crewchat"),
+        card("A", "macbook", 440, 180, 400, 84, "crewchat", SERVER, "crewchat"),
         card("B", "laptop", 370, 500, 240, 84, "crewchat", "purple", "crewchat"),
         card("C", "desktop", 670, 500, 240, 84, "crewchat", "teal", "crewchat"),
         card("a1", "Claude Code", 50, 186, 220, 72, "bot", AGENT),
@@ -344,7 +344,7 @@ SPECS["tailnet"] = {
         card("c1", "Claude Code", 1010, 506, 220, 72, "bot", AGENT),
     ],
     "edges": [
-        edge("A", "B", "", sides="lt", both=True), edge("A", "C", "", sides="rt", both=True),
+        edge("A", "B", "", sides="bt", fromAt=.125, both=True), edge("A", "C", "", sides="bt", fromAt=.875, both=True),
         edge("B", "C", "", sides="rl", both=True),
         edge("a1", "A", "MCP"), edge("b1", "B", "MCP"), edge("c1", "C", "MCP"),
     ],
@@ -636,17 +636,19 @@ SPECS["link-options"] = {
         {"label": "Firebase: through your project", "icon": "flame", "color": "orange", "x": 666, "y": 140, "w": 570, "h": 486},
     ],
     "nodes": [
-        card("la", "macbook", 209, 190, 240, 84, "crewchat", SERVER, "crewchat"),
+        card("la", "macbook", 150, 190, 360, 84, "crewchat", SERVER, "crewchat"),
         card("lb", "laptop", 74, 500, 240, 84, "crewchat", "purple", "crewchat"),
         card("lc", "desktop", 344, 500, 240, 84, "crewchat", "teal", "crewchat"),
-        card("fs", "Your Firestore", 820, 186, 260, 96, "db", "orange", "encrypted data only"),
+        card("fs", "Your Firestore", 760, 186, 380, 96, "db", "orange", "encrypted data only"),
         card("ra", "macbook", 696, 500, 240, 84, "crewchat", SERVER, "crewchat"),
         card("rb", "laptop", 966, 500, 240, 84, "crewchat", "purple", "crewchat"),
     ],
     "edges": [
-        edge("la", "lb", "", sides="lt", both=True), edge("la", "lc", "", sides="rt", both=True),
+        edge("la", "lb", "", sides="bt", fromAt=(194 - 150) / 360, both=True),
+        edge("la", "lc", "", sides="bt", fromAt=(464 - 150) / 360, both=True),
         edge("lb", "lc", "", sides="rl", both=True),
-        edge("ra", "fs", "encrypted", sides="tl"), edge("fs", "rb", "encrypted", sides="rt"),
+        edge("ra", "fs", "encrypted", sides="tb", toAt=(816 - 760) / 380),
+        edge("fs", "rb", "encrypted", sides="bt", fromAt=(1086 - 760) / 380),
     ],
     "steps": [
         go("la-lb", "la-lc", caption="Over Tailscale, machines talk directly: nothing leaves your devices", icon="lock"),

@@ -158,9 +158,10 @@ function drawNode(n, glow) {
 // Arrows
 // ---------------------------------------------------------------------------------------------
 function center(n) { return [n.x + n.w / 2, n.y + n.h / 2]; }
-function anchor(n, side) {
-  const [cx, cy] = center(n);
-  return {l: [n.x, cy], r: [n.x + n.w, cy], t: [cx, n.y], b: [cx, n.y + n.h]}[side];
+// A point on one side of a card; "at" is how far along that side (0 to 1, the middle by default).
+function anchor(n, side, at = .5) {
+  const x = n.x + n.w * at, y = n.y + n.h * at;
+  return {l: [n.x, y], r: [n.x + n.w, y], t: [x, n.y], b: [x, n.y + n.h]}[side];
 }
 function sides(a, b) {
   const [ax, ay] = center(a), [bx, by] = center(b);
@@ -172,7 +173,7 @@ function sides(a, b) {
 function route(e, nodes) {
   const a = nodes[e.from], b = nodes[e.to];
   let [sa, sb] = e.sides ? e.sides.split("") : sides(a, b);
-  const p0 = anchor(a, sa), p1 = anchor(b, sb);
+  const p0 = anchor(a, sa, e.fromAt), p1 = anchor(b, sb, e.toAt);
   if (e.offset) { // side by side arrows between the same two cards
     const h = "lr".includes(sa);
     if (h) { p0[1] += e.offset; p1[1] += e.offset; } else { p0[0] += e.offset; p1[0] += e.offset; }
