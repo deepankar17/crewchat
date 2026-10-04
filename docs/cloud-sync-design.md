@@ -37,14 +37,7 @@ longer supports Python 3.9.
 
 ## 3. The picture
 
-```
- Machine A                                              Machine B
- ┌────────────────────────┐                            ┌────────────────────────┐
- │ agents ── MCP ── server│── encrypt ─▶ Firestore ─push─▶ decrypt ──│server ── MCP ── agents│
- │           (local)      │◀─ push ───  (ciphertext) ◀─ encrypt ─────│ (local)               │
- └────────────────────────┘     only this Google account can        └────────────────────────┘
-                                read or write its own area
-```
+![Cloud sync, end to end. 1: An agent on machine A sends a message to its local server, over MCP. 2: The server encrypts it with the account key, on this machine. 3: Only ciphertext goes to Firestore. 4: Security rules: only your Google account can read or write its own area. 5: Firestore pushes it to machine B at once. 6: Machine B decrypts it, and its agents get the message. 7: Replies go the other way: encrypt, push, decrypt. Servers never connect to each other, so no machine needs a public address.](images/diagram-cloud-design.gif)
 
 Servers never connect to each other. Each one only talks to Firestore, so no machine needs a
 public address.

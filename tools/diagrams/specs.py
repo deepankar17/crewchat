@@ -585,6 +585,44 @@ SPECS["no-answer"] = {
     ],
 }
 
+SPECS["cloud-design"] = {
+    "title": "Cloud sync, end to end",
+    "subtitle": "Each server talks only to your Firestore; only your machines hold the key",
+    "groups": [
+        {"label": "Machine A", "icon": "laptop", "color": "blue", "x": 36, "y": 150, "w": 390, "h": 470},
+        {"label": "Your Google account", "icon": "flame", "color": "orange", "x": 466, "y": 270, "w": 348, "h": 350},
+        {"label": "Machine B", "icon": "monitor", "color": "purple", "x": 854, "y": 150, "w": 390, "h": 470},
+    ],
+    "nodes": [
+        card("aA", "Agents", 66, 196, 330, 80, "bot", AGENT, "Claude Code, Cursor"),
+        card("sA", "crewchat server", 66, 420, 330, 92, "crewchat", SERVER, "local: 127.0.0.1"),
+        card("fs", "Firestore", 496, 320, 288, 96, "db", "orange", "ciphertext only"),
+        card("rules", "Your area only", 496, 494, 288, 88, "shield", "green", "rules: this account alone"),
+        card("aB", "Agents", 884, 196, 330, 80, "bot", AGENT, "Claude Code, Cursor"),
+        card("sB", "crewchat server", 884, 420, 330, 92, "crewchat", "purple", "local: 127.0.0.1"),
+    ],
+    "edges": [
+        edge("aA", "sA", "MCP"), edge("aB", "sB", "MCP"),
+        edge("sA", "fs", "encrypt", sides="rl", bend=446), edge("fs", "sB", "push", sides="rl", bend=834),
+    ],
+    "steps": [
+        go("aA-sA", caption="An agent on machine A sends a message to its local server, over MCP", packet="hub_send"),
+        {"glow": ["sA"], "caption": "The server encrypts it with the account key, on this machine",
+         "badgeAt": [70, 424]},
+        go("sA-fs", caption="Only ciphertext goes to Firestore", packet="a8f3 9c1e"),
+        {"glow": ["rules"], "caption": "Security rules: only your Google account can read or write its own area",
+         "badgeAt": [780, 498]},
+        go("fs-sB", caption="Firestore pushes it to machine B at once", packet="a8f3 9c1e"),
+        go(back("aB-sB"), caption="Machine B decrypts it, and its agents get the message", packet="message"),
+        go("aB-sB", "fs-sB", "sA-fs", caption="Replies go the other way: encrypt, push, decrypt",
+           packet="7d02 b6aa") | {"badgeAt": [1210, 424], "edges": [
+               {"id": "aB-sB", "span": [.05, .3], "packet": "reply"},
+               {"id": "fs-sB", "reverse": True, "span": [.33, .58]},
+               {"id": "sA-fs", "reverse": True, "span": [.61, .86]}]},
+    ],
+    "summary": "Servers never connect to each other, so no machine needs a public address",
+}
+
 # ---------------------------------------------------------------------------------------------
 # Videos only
 # ---------------------------------------------------------------------------------------------
