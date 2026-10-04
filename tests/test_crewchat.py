@@ -441,6 +441,12 @@ class Teams(Base):
         qa.call("hub_send", to=dev_name, text="Bug: the switch resets on restart")
         self.assertIn("resets on restart", dev.text("hub_inbox"))
         self.assertIn("status must be one of", qa.call("hub_update", id=piece, status="sideways")["content"][0]["text"])
+        # Done: the lead is told the developer is free, to hand it the next piece.
+        dev.call("hub_update", id=piece, status="done", note="Merged")
+        done = lead.text("hub_inbox")
+        self.assertIn("[UPDATE on #%s: done] Merged" % piece, done)
+        self.assertIn("%s is free. Check the work, then give it its next task with hub_assign" % dev_name, done)
+        self.assertIn("give that agent its next task with hub_assign right away", crewchat.ROLES["lead"][1])
         for name in (lead_name, dev_name, qa_name):
             self.role(name, "none")
 
@@ -451,6 +457,19 @@ class Teams(Base):
         self.assertIn("the owner has been told", dev.text("hub_update", id=job, status="in_progress"))
         update = self.hub.history(1)[0]
         self.assertEqual((update["to"], update["kind"], update["text"]), ("Owner", "update", "in progress"))
+
+    def test_a_task_from_the_owner_is_confirmed_to_the_owner_even_with_a_lead(self):
+        (lead, lead_name), (dev, dev_name) = self.agent(), self.agent()
+        self.role(lead_name, "lead")
+        job = self.say(dev_name, "Work on T229", "task")
+        taken = dev.text("hub_take", id=job)
+        self.assertIn("Before any other work, send hub_update id=%s status=in_progress" % job, taken)
+        self.assertIn("the owner has been told", dev.text("hub_update", id=job, status="in_progress",
+                                                          note="Starting: reading the backup code"))
+        update = self.hub.history(1)[0]
+        self.assertEqual((update["to"], update["text"]), ("Owner", "Starting: reading the backup code"))
+        self.assertIn("picked up, rather than hearing nothing", dev.hello["instructions"])
+        self.role(lead_name, "none")
 
     def test_an_agent_takes_a_role_when_told_to_and_custom_roles(self):
         session, name = self.agent()

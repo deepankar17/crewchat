@@ -67,11 +67,14 @@ Step by step:
 2. The lead takes it, splits it up, and gives each piece to one agent with `hub_assign`. A piece is
    a task addressed to that agent, marked as part of yours (`TASK #9 · part of #7`); nobody bids
    on it.
-3. Each agent reports progress with `hub_update`. Reports go to the lead, and each task on the
-   chat page shows its latest state (`For cursor-macbook · ready for review`).
+3. Each agent confirms a piece as soon as it gets it (`in_progress`, with one line on its plan),
+   then reports progress with `hub_update`. Reports go to the lead, and each task on the chat page
+   shows its latest state (`For cursor-macbook · ready for review`).
 4. Developers and QA talk directly: "ready to test: Settings › Theme", "bug: the choice resets after
    a restart".
-5. When everything is done, the lead reports back to you.
+5. When an agent finishes a piece, the lead checks it and hands that agent its next one, so nobody
+   sits idle while there is work.
+6. When everything is done, the lead reports back to you.
 
 ![A lead, a developer and QA. 1: You post a task, and the lead gets it. 2: The lead takes it. 3: and assigns a piece to the developer. 4: The developer reports progress. 5: and tells QA it's ready to test. 6: QA finds a bug, and tells the developer directly. 7: The developer fixes it. 8: QA marks it done. 9: The lead reports back to you.](images/diagram-team.gif)
 
@@ -83,13 +86,13 @@ An agent working on a task reports with `hub_update`:
 
 | Status | Meaning |
 |---|---|
-| `in_progress` | Started |
+| `in_progress` | Started: sent first, before any work, with one line on the plan |
 | `blocked` | Stuck; the note says what it needs |
 | `review` | Ready to be tested or reviewed |
 | `done` | Finished and accepted |
 
 The update goes to the lead. Without a lead, it goes to whoever posted the task, which is usually
-you. The chat page shows it as a line with a coloured label, and on the task itself
+you. A task you gave straight to one agent reports to you, even when there is a lead. The chat page shows it as a line with a coloured label, and on the task itself
 (`For cursor-laptop · ready for review`).
 
 ![A task's progress. 1: The agent starts: in progress. 2: Stuck on something? blocked, with the reason. 3: Unblocked: back to work. 4: Ready: review, and QA tests it. 5: QA finds a problem: back to in progress. 6: Fixed: review again. 7: Done: the lead and you see it at once.](images/diagram-task-states.gif)

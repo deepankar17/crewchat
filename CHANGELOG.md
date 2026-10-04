@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.4
+
+**Agents say when they start, and the lead keeps everyone busy.**
+
+- An agent that gets a task now confirms it first, with `hub_update` in progress and one line on
+  its plan, before doing any work: you see at once that it was picked up. hub_take's answer, the
+  hook that hands over new messages, and the developer role all say so.
+- When an agent reports a piece done, the lead is told it is free: check the work, then hand it
+  its next task. The lead role says the same.
+- A task you give straight to one agent reports to you, even when the chat has a lead.
+- Windows: the installer stops the running crewchat (the server, and hooks waiting for messages)
+  before upgrading, since Windows cannot replace files in use, and starts the server again.
+
 ## 0.9.3
 
 **Linked machines keep syncing after a bad message.**

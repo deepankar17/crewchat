@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -101,6 +101,9 @@ You are the team lead. Your job is to plan and coordinate, not to write most of 
 - Match work to roles (hub_agents shows them): developers build, QA tests, reviewers review.
   Keep two agents from editing the same files at the same time.
 - Agents report to you with hub_update. Answer blocked agents quickly; reassign if needed.
+- When an agent reports a piece done (or ready for review), read what it did and check it, then
+  give that agent its next task with hub_assign right away: the next piece of the job, or of the
+  project's plan. Nobody should sit idle while there is work. If nothing is left, tell Owner.
 - When every piece is done (and tested, if there is QA), check the result and report to Owner
   with hub_send: what was done, what is left, anything the owner must decide.
 - Tell Owner early if something is unclear or risky. Do not invent requirements."""),
@@ -108,8 +111,9 @@ You are the team lead. Your job is to plan and coordinate, not to write most of 
 You are a developer.
 - Work on what is assigned to you (hub_assign from the lead, or a task from Owner). If the chat
   has no lead, bid for open tasks as usual.
-- Report with hub_update on the task: in_progress when you start, blocked (with what you need)
-  if you are stuck, review when it is ready to be tested or reviewed, done when it is accepted.
+- When you get a task, first send hub_update on it with in_progress and one line on your plan,
+  before any other work, so everyone sees it was picked up. Then report blocked (with what you
+  need) if you are stuck, review when it is ready to be tested or reviewed, done when accepted.
 - When something is ready, tell the QA agent (hub_agents shows who has the qa role) with
   hub_send: what changed, where, and how to test it. If there is a reviewer, tell them too.
 - Fix what QA or the reviewer reports, then tell them it is ready again. Ask them, or the lead,
@@ -170,7 +174,10 @@ their owner. The owner reads every message on a chat page and writes there as Ow
   hub_take if you bid yes and nobody better placed did. hub_take gives the task to the first
   caller and tells everyone; if it says someone else has it, stop. A task addressed only to you
   is yours: take it without bidding.
-- Report progress on a task you work on with hub_update (in_progress, blocked, review, done).
+- Before you start work on a task (one you took, or one assigned or addressed to you), first send
+  hub_update on it with in_progress and one line on your plan: the owner sees at once that it was
+  picked up, rather than hearing nothing until you finish. Then report blocked, review and done
+  with hub_update as you go.
 - Roles: hub_agents shows each agent's role ([lead], [developer], [qa], ...). If you get a role,
   follow its instructions; hub_role with no arguments shows them again. Take a role with
   hub_role only when your owner tells you to.
@@ -1015,7 +1022,8 @@ class Hub:
         with self.lock:
             task = self._task(mid)
             lead = self._lead()
-            if lead and lead != agent:
+            direct = task["from"] == OWNER and task["to"] == agent
+            if lead and lead != agent and not direct:
                 to = lead
             elif task["from"] not in (agent, SERVER_NAME) and task["from"] in self.names:
                 to = task["from"]
@@ -1242,11 +1250,16 @@ def fmt(msg, viewer=None):
             tag += "[%s: %s] " % (progress["by"], STATUSES.get(progress["status"], progress["status"]))
     elif msg["kind"] == "update":
         tag = "[UPDATE on #%s: %s] " % (msg.get("task"), STATUSES.get(msg.get("status"), msg.get("status")))
+    after = ""
+    if msg["kind"] == "update" and msg.get("status") == "done" and msg["to"] == viewer and viewer != OWNER:
+        # The one coordinating hears that an agent is free: keep it busy.
+        after = ("\n    -> %s is free. Check the work, then give it its next task with hub_assign (the next "
+                 "piece of this job, or of the plan); tell Owner when nothing is left." % msg["from"])
     elif msg["kind"] == "role":
         tag = "[ROLE] "
     files = "".join("\n    [file %s: %s, %s, %s; open it with hub_file]" % (
         f["id"], f["name"], f["type"], human_size(f["size"])) for f in msg.get("files") or [])
-    return "%s %s -> %s: %s%s%s" % (stamp, msg["from"], to, tag, msg["text"], files)
+    return "%s %s -> %s: %s%s%s%s" % (stamp, msg["from"], to, tag, msg["text"], files, after)
 
 
 def clean_filename(name):
@@ -1526,7 +1539,8 @@ def call_tool(hub, sid, name, args, owner=False):
             raise HubError("the owner posts tasks; agents take them")
         mid = clean_id(args.get("id"))
         hub.take(me, mid)
-        return "Task #%s is yours and everyone has been told. Set hub_status and start." % mid
+        return ("Task #%s is yours and everyone has been told. Before any other work, send hub_update "
+                "id=%s status=in_progress with one line on your plan; then start." % (mid, mid))
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -2894,7 +2908,8 @@ CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}
 HOOK_REASON = (
     "New messages on the crewchat:\n\n%s\n\n"
     "Handle what is addressed to you: act on Owner instructions, follow your role if you have one, "
-    "work on tasks assigned to you and report with hub_update, bid on an open [TASK] (unless the chat "
+    "for a task you will work on, first send hub_update in_progress with one line on your plan, then "
+    "do it and report with hub_update, bid on an open [TASK] (unless the chat "
     "has a lead) and take it if you are best placed, answer questions. The owner reads the chat page, not this session: "
     "answer anything Owner wrote with hub_send (to Owner or to all), even if it is one line. If "
     "nothing needs a reply or action from you, say so here in one line and stop. Do not reply to "
