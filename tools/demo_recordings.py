@@ -574,54 +574,10 @@ def scene_cloud_approve(r):
     return r.stop(2.8)
 
 
-FLOW = """<!doctype html><meta charset="utf-8"><style>
-body { margin: 0; height: 100vh; background: #f4f5f9; font-family: -apple-system, Helvetica, Arial, sans-serif; color: #1d1b18; }
-.row { position: absolute; top: 200px; left: 60px; right: 60px; display: flex; justify-content: space-between; }
-.box { width: 190px; height: 120px; border-radius: 18px; background: #fff; box-shadow: 0 10px 30px rgba(20,35,80,.12);
-  display: flex; flex-direction: column; align-items: center; justify-content: center; font-weight: 650; font-size: 22px; gap: 6px; border: 3px solid transparent; transition: border-color .3s, transform .3s; }
-.box small { font-weight: 500; font-size: 15px; color: #6a665e; }
-.box.on { border-color: #2b57c4; transform: translateY(-6px); }
-.dot { position: absolute; top: 396px; transform: translateX(-50%%); padding: 9px 20px; border-radius: 99px; background: #2b57c4; color: #fff;
-  font-size: 20px; font-weight: 650; white-space: nowrap; box-shadow: 0 8px 20px rgba(43,87,196,.3); transition: left .9s cubic-bezier(.5,0,.3,1); }
-.dot::before { content: "✉  message"; } .dot.back { background: #1f7a45; box-shadow: 0 8px 20px rgba(31,122,69,.3); }
-.dot.back::before { content: "↩  answer"; }
-.cap { position: absolute; top: 520px; left: 0; right: 0; text-align: center; font-size: 30px; font-weight: 600; }
-.title { position: absolute; top: 80px; left: 0; right: 0; text-align: center; font-size: 40px; font-weight: 750; letter-spacing: -.02em; }
-.line { position: absolute; top: 418px; left: 150px; right: 150px; height: 4px; background: repeating-linear-gradient(90deg, #c7d3f3 0 14px, transparent 14px 24px); }
-</style>
-<div class="title">How a message reaches an agent</div><div class="line"></div>
-<div class="row">%s</div><div class="dot" id="dot"></div><div class="cap" id="cap"></div>"""
-
-
-def scene_flow(r):
-    boxes = [("You", "chat page"), ("crewchat", "server"), ("Hook", "agent's stop hook"), ("Agent", "Claude Code")]
-    body = "".join('<div class="box" id="b%d">%s<small>%s</small></div>' % (i, a, b) for i, (a, b) in enumerate(boxes))
-    page = shots.TMP / "flow.html"
-    page.write_text(FLOW % body, encoding="utf-8")
-    r.size(1280, 720)
-    r.open(page.as_uri(), wait=0.5)
-    r.js("""window.flow = {
-      at(i, back) { const b = document.getElementById("b" + i).getBoundingClientRect(); const d = document.getElementById("dot");
-        d.className = "dot" + (back ? " back" : ""); d.style.left = (b.x + b.width / 2) + "px";
-        document.querySelectorAll(".box").forEach((x, j) => x.classList.toggle("on", j === i)); },
-      say(t) { document.getElementById("cap").textContent = t; } }; flow.at(0); flow.say("");""")
-    r.start()
-    steps = [(0, False, "1. You send a message from the chat page"),
-             (1, False, "2. crewchat stores it for the agent"),
-             (2, False, "3. The agent's hook, waiting since its last turn, gets it"),
-             (3, False, "4. The agent reads it and carries on"),
-             (1, True, "5. It answers with hub_send"),
-             (0, True, "6. The answer appears on your page")]
-    for i, back, text in steps:
-        r.js("flow.at(%d, %s); flow.say(%s)" % (i, "true" if back else "false", json.dumps(text)))
-        time.sleep(2.0)
-    return r.stop(1.2)
-
-
 SCENES = {
     "talk": (scene_talk, 960), "task": (scene_task, 960), "roles": (scene_roles, 960),
     "add-agent": (scene_add_agent, 960), "files": (scene_files, 960), "phone": (scene_phone, 360),
-    "start": (scene_start, 860), "peers": (scene_peers, 960), "flow": (scene_flow, 860),
+    "start": (scene_start, 860), "peers": (scene_peers, 960),
     "cloud-setup": (scene_cloud_setup, 860), "cloud-approve": (scene_cloud_approve, 960),
 }
 

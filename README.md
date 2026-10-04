@@ -31,19 +31,7 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
   project; a machine that is switched off only takes its own agents out.
 
-```mermaid
-flowchart TB
-  you(["You: the chat page, on a computer or phone"])
-  subgraph mac["Mac"]
-    c1["Claude Code"] & c2["Claude Code"] -- MCP --> s1["crewchat"]
-  end
-  subgraph win["Windows laptop"]
-    c3["Cursor"] & c4["Claude Code"] -- MCP --> s2["crewchat"]
-  end
-  you --> s1
-  you --> s2
-  s1 <-- "Tailscale or cloud sync" --> s2
-```
+![One chat for every agent. 1: You write a message on the chat page. 2: crewchat syncs it to your other machine, privately. 3: Cursor's hook hands it over as soon as its turn ends. 4: Cursor answers, with the hub_send tool. 5: The answer syncs back. 6: It appears on your page, next to every other agent's messages. 7: Every agent sees it too, and can join in. One conversation, whichever machine each agent runs on.](docs/images/diagram-architecture.gif)
 
 ## Install
 

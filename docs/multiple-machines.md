@@ -32,30 +32,14 @@ It explains the two ways, asks which you want, and sets it up.
 A machine uses one way at a time. **Tailscale is the simpler choice** if you already use it or
 are happy to install it. Cloud sync suits machines that cannot run Tailscale.
 
-```mermaid
-flowchart TD
-  Q1{"Can every machine run Tailscale?"} -- yes --> TS(["Tailscale: crewchat peers invite, then join"])
-  Q1 -- no --> Q2{"Happy to set up a Firebase project once?"}
-  Q2 -- yes --> CS(["Cloud sync: crewchat cloud setup, then login"])
-  Q2 -- no --> OH(["One host: the other machines' agents connect to it"])
-```
+![Which way to link your machines? 1: Every machine can run Tailscale? Link them directly: nothing leaves your devices. 2: If not: are you happy to set up a Firebase project once?. 3: Yes: cloud sync, end to end encrypted, from anywhere. 4: No: run one host, and connect the other machines' agents to it.](images/diagram-choose.gif)
 
 ## Over Tailscale
 
 Every machine runs its own crewchat, and the servers talk to each other directly inside your
 tailnet:
 
-```mermaid
-flowchart LR
-  subgraph tailnet["Your tailnet: only your devices"]
-    A["macbook: crewchat"] <--> B["laptop: crewchat"]
-    A <--> C["desktop: crewchat"]
-    B <--> C
-  end
-  a1["Claude Code"] --> A
-  b1["Cursor"] --> B
-  c1["Claude Code"] --> C
-```
+![Linked over Tailscale. 1: An agent on the macbook sends a message. 2: crewchat sends it straight to the other machines. 3: Cursor on the laptop gets it. 4: And answers. 5: The answer reaches every machine. No server in the middle: a machine that's off only takes its own agents out.](images/diagram-tailnet.gif)
 
 1. Install [Tailscale](https://tailscale.com/download) on every machine and sign in to the same
    account. It is free for personal use.
@@ -79,18 +63,7 @@ flowchart LR
 
    <img src="images/terminal-peers-join.png" width="720" alt="On the laptop: crewchat peers join with the address and code. The laptop joined, sharing the chat with macbook, and its messages are numbered B1, B2. Then crewchat peers status shows macbook, tag A, online.">
 
-```mermaid
-sequenceDiagram
-  participant M as macbook
-  participant L as laptop
-  M->>M: crewchat peers invite: a code for 10 minutes
-  L->>M: crewchat peers join with the address and code
-  M-->>L: the shared key, the members, tag B
-  loop from then on
-    L->>M: anything new? (waits until there is)
-    M->>L: anything new? (waits until there is)
-  end
-```
+![Linking two machines. 1: On the macbook: crewchat peers invite makes a code, for 10 minutes. 2: On the laptop: crewchat peers join, with the address and code. 3: The macbook sends back the shared key and the members. 4: From then on, each asks the other for anything new. 5: and waits until there is: messages arrive at once.](images/diagram-peers.gif)
 
 That is all: the agents on both machines now see each other. For a third machine, run
 `crewchat peers invite` on any linked machine; members tell each other about new members.
@@ -114,13 +87,7 @@ your own. It works from any network, without Tailscale.
 Each machine encrypts what it writes and pushes it through your own Firestore; the others are told
 at once and decrypt it:
 
-```mermaid
-flowchart LR
-  A["macbook: crewchat"] -- "encrypted messages and rosters" --> F[("Your Firestore")]
-  B["laptop: crewchat"] -- "encrypted messages and rosters" --> F
-  F -- "pushed in real time" --> A
-  F -- "pushed in real time" --> B
-```
+![Linked with cloud sync. 1: On the macbook, crewchat encrypts each message with your account key. 2: It writes the encrypted message to your Firestore. 3: Firestore pushes it to your other machines at once. 4: The laptop decrypts it: Google only ever stored ciphertext. 5: Answers travel back the same way.](images/diagram-cloud.gif)
 
 1. **Once:** set up the Firebase project, by hand or by handing a prompt to an agent:
    [Firebase setup](firebase-setup.md). You end up with two files: `firebase-web.json` and
@@ -158,15 +125,7 @@ A machine can also join without running crewchat's own server: its agents connec
 another machine's server. It is simpler, but when that host is off, everyone is cut off. The
 server only listens on its own machine, so this also needs a private network such as Tailscale.
 
-```mermaid
-flowchart LR
-  subgraph host["Host machine"]
-    S["crewchat"]
-    h1["Claude Code"] --> S
-  end
-  l1["Cursor on the laptop"] -- "over Tailscale" --> S
-  d1["Claude Code on the desktop"] -- "over Tailscale" --> S
-```
+![One host for every machine. 1: Agents on the host connect as usual. 2: Agents on other machines connect to it over Tailscale. 3: Each with its own folder's token. 4: The catch: when the host is off, everyone loses the chat.](images/diagram-one-host.gif)
 
 1. On the host:
 

@@ -59,17 +59,7 @@ the work it has.
 Without a lead, a task you post goes to a bidding round: every agent bids once and the best-placed
 one takes it. With a lead, the lead takes it and hands out the work:
 
-```mermaid
-flowchart TD
-  T(["You post a task"]) --> Q{"Does an agent have the Lead role?"}
-  Q -- yes --> L["The lead takes it and splits it up"]
-  L --> A["hub_assign: one piece to each agent, no bidding"]
-  A --> U["Agents report to the lead with hub_update"]
-  U --> R(["The lead reports back to you"])
-  Q -- no --> B["Every agent bids once"]
-  B --> K["The best-placed agent calls hub_take"]
-  K --> U2(["It reports back to you with hub_update"])
-```
+![Who takes a task? 1: You post a task. 2: With a lead: the lead takes it, and splits it up. 3: It hands out each piece with hub_assign: no bidding. 4: Agents report progress to the lead, which reports to you. 5: Without a lead: every agent bids once. 6: The best placed takes it, and reports back to you.](images/diagram-who-takes.gif)
 
 Step by step:
 
@@ -83,22 +73,7 @@ Step by step:
    a restart".
 5. When everything is done, the lead reports back to you.
 
-```mermaid
-sequenceDiagram
-  actor You
-  participant L as Lead
-  participant D as Developer
-  participant Q as QA
-  You->>L: task 9 add a dark theme
-  L->>L: hub_take 9
-  L->>D: hub_assign 11, part of 9
-  D->>L: hub_update 11 in progress
-  D->>Q: ready to test in Settings, Theme
-  Q->>D: bug: it resets after a restart
-  D->>Q: fixed, ready again
-  Q->>L: hub_update 11 done
-  L->>You: dark theme done, one question
-```
+![A lead, a developer and QA. 1: You post a task, and the lead gets it. 2: The lead takes it. 3: and assigns a piece to the developer. 4: The developer reports progress. 5: and tells QA it's ready to test. 6: QA finds a bug, and tells the developer directly. 7: The developer fixes it. 8: QA marks it done. 9: The lead reports back to you.](images/diagram-team.gif)
 
 Only the lead can assign work with `hub_assign`. Any agent can still message any other.
 
@@ -117,18 +92,7 @@ The update goes to the lead. Without a lead, it goes to whoever posted the task,
 you. The chat page shows it as a line with a coloured label, and on the task itself
 (`For cursor-laptop · ready for review`).
 
-```mermaid
-stateDiagram-v2
-  direction LR
-  [*] --> assigned
-  assigned --> in_progress
-  in_progress --> blocked
-  blocked --> in_progress
-  in_progress --> review
-  review --> in_progress: QA or the reviewer finds a problem
-  review --> done
-  done --> [*]
-```
+![A task's progress. 1: The agent starts: in progress. 2: Stuck on something? blocked, with the reason. 3: Unblocked: back to work. 4: Ready: review, and QA tests it. 5: QA finds a problem: back to in progress. 6: Fixed: review again. 7: Done: the lead and you see it at once.](images/diagram-task-states.gif)
 
 ## Add an agent from the chat page
 
@@ -147,19 +111,7 @@ stateDiagram-v2
 
 What happens when you press **Start**:
 
-```mermaid
-sequenceDiagram
-  actor You
-  participant P as Chat page
-  participant S as crewchat
-  participant T as New terminal window
-  You->>P: Add an agent: name, role, task
-  P->>S: launch
-  S->>T: open Claude Code in the folder, with a one-time key
-  T->>S: hub_link with the key
-  S-->>T: you are docs-writer, role Docs, your task is assigned
-  S-->>P: docs-writer joins the list
-```
+![Add an agent from the chat. 1: You click Add an agent, and fill in a name, role and task. 2: The page asks crewchat to launch it. 3: A terminal window opens Claude Code in the folder. 4: The new session links itself, with the one-time key. 5: It learns its name, role and first task. 6: And it appears on your list, ready to work.](images/diagram-add-agent.gif)
 
 From a terminal on the host:
 

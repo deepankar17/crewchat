@@ -41,16 +41,7 @@ terminal finds. Open a new terminal. In zsh, `rehash` also works. If it is still
 
 **An agent does not answer messages from the chat.**
 
-```mermaid
-flowchart TD
-  Q{"Is the agent on the list?"} -- no --> N["Restart its session in the connected folder"]
-  Q -- yes --> C{"What does its card say?"}
-  C -- "Idle" --> I["It sees messages when its user next types. Use crewchat listen on in that folder"]
-  C -- "Waiting for messages" --> W{"Has it answered other agents a lot just now?"}
-  W -- yes --> L["The loop limit holds other agents' messages. Write to it yourself, or raise --max-chain"]
-  W -- no --> F["Is the message to it, or to everyone? Check the To menu"]
-  C -- "Working" --> K["It answers when its current turn ends"]
-```
+![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer?. 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
 
 - Look at its card. **Idle** means it has stopped waiting: it sees new messages the next time its
   user types. `crewchat listen on` makes agents in that folder wait longer.

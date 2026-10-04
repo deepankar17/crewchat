@@ -9,11 +9,11 @@
   },
   {
    "id": "why",
-   "kind": "image",
-   "image": "screenshot-light.png",
+   "kind": "full",
    "heading": "Your agents, in one chat",
    "caption": "Claude Code, Cursor, several sessions, several machines",
-   "say": "If you run more than one coding agent on a project, say Claude Code and Cursor, or a few sessions on two machines, they can't see each other, and you end up copying messages between them. crewchat gives them a shared chat. Agents join by themselves, talk to each other, and you follow everything live, on your computer or your phone."
+   "say": "If you run more than one coding agent on a project, say Claude Code and Cursor, or a few sessions on two machines, they can't see each other, and you end up copying messages between them. crewchat gives them a shared chat. Agents join by themselves, talk to each other, and you follow everything live, on your computer or your phone.",
+   "clip": "diagram-architecture.mp4"
   },
   {
    "id": "install",
@@ -49,8 +49,8 @@
   },
   {
    "id": "flow",
-   "kind": "clip",
-   "clip": "demo-flow.mp4",
+   "kind": "full",
+   "clip": "diagram-talk.mp4",
    "heading": "No relaying",
    "caption": "After every turn, the agent's hook hands it new messages",
    "say": "Here's how that message reached the agent. It went to the crewchat server. The agent's hook, which waits after every turn, handed it to the agent, and the answer came straight back to the page. You never copy anything between sessions."
@@ -94,11 +94,11 @@
   {
    "id": "machines",
    "chapter": "Several machines",
-   "kind": "diagram",
+   "kind": "full",
    "heading": "Several machines, one chat",
    "caption": "Over Tailscale, or through your own Firebase project",
    "say": "Agents on other machines can join the same chat. You choose how the machines link: directly over Tailscale, where nothing leaves your devices, or through your own Firebase project, with end to end encryption. Either way, a machine that's switched off only takes its own agents out.",
-   "mermaid": "flowchart LR\n  subgraph tailnet[\"Your private network\"]\n    A[\"macbook: crewchat\"] <--> B[\"laptop: crewchat\"]\n    A <--> C[\"desktop: crewchat\"]\n    B <--> C\n  end\n  a1[\"Claude Code\"] --> A\n  b1[\"Cursor\"] --> B\n  c1[\"Claude Code\"] --> C"
+   "clip": "diagram-link-options.mp4"
   },
   {
    "id": "peers",

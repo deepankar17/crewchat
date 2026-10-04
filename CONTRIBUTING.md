@@ -44,9 +44,16 @@ python3 ~/code/crewchat/crewchat.py start --no-service --port 8799
 
 ## Documentation
 
-The guides are in `docs/`. Diagrams are [Mermaid](https://mermaid.js.org) blocks, which GitHub
-draws. In sequence diagrams, avoid `;` (it ends a line) and `#` (it starts a character code) in
-message text.
+The guides are in `docs/`. Their diagrams are animated GIFs, made from the specs in
+`tools/diagrams/specs.py`: cards and arrows placed on a 1280x720 canvas (or the columns of a
+sequence), and the numbered steps that play on them. Change a spec, then remake its GIF:
+
+```bash
+pip install websocket-client pillow
+python3 tools/diagrams/diagrams.py talk team     # or no names, for every diagram
+```
+
+Each image's alt text lists its steps, so keep it in step with the spec.
 
 The screenshots and terminal pictures in `docs/images` are made by a script, from real crewchat
 servers with demo data, so they can be remade after a change to the page:

@@ -87,7 +87,10 @@ def main():
             png = OUT / "work" / (name + ".png")
             job = {"background": str(png), "duration": seconds + PAD, "output": str(out / (name + ".mp4")),
                    "silence": str(silence), "lead": 0.4, "tail": 0.9}
-            if scene["kind"] == "clip":
+            if scene["kind"] == "full":  # an animated diagram: it has its own title and captions
+                mv.render(browser, mv.page(""), png)
+                job.update(clip=str(CLIPS / scene["clip"]), rect=[0, 0, 1920, 1080])
+            elif scene["kind"] == "clip":
                 clip = CLIPS / scene["clip"]
                 rect = fit(*clip_size(clip))
                 mv.render(browser, clip_slide(scene, chapter, rect), png)

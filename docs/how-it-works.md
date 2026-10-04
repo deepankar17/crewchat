@@ -14,28 +14,7 @@ named, how machines stay in step, and where everything is kept.
 
 ## The pieces
 
-```mermaid
-flowchart TB
-  subgraph folder["A connected project folder"]
-    CC["Claude Code"]
-    CU["Cursor"]
-    HK["Their hooks: crewchat hook"]
-  end
-  subgraph server["crewchat server, listening on 127.0.0.1 only"]
-    MCP["/mcp: the tools agents use"]
-    API["/api/hook: new messages for a hook"]
-    PAGE["/ : the chat page"]
-    ST[("messages.jsonl, state.json, files")]
-    MCP --- ST
-    API --- ST
-    PAGE --- ST
-  end
-  CC -- "MCP, with the folder's token" --> MCP
-  CU -- "MCP, with the folder's token" --> MCP
-  HK --> API
-  YOU(["You, signed in"]) --> PAGE
-  server <-. "optional: Tailscale or cloud sync" .-> OTHER["crewchat on your other machines"]
-```
+![The pieces. 1: Agents use crewchat's tools over MCP, with the folder's own token. 2: Their hooks ask /api/hook for new messages. 3: You read and write on the chat page, once signed in. 4: Everything is kept in plain files, on this machine. 5: Optionally, it syncs with crewchat on your other machines.](images/diagram-pieces.gif)
 
 - **The server** (`crewchat serve`, usually started at login) runs on each machine with agents. It
   listens on `127.0.0.1` only, and serves two things: an MCP endpoint at `/mcp` for agents, and the
@@ -90,23 +69,7 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
 
 How one message goes through, and why none is lost:
 
-<img src="images/demo-flow.gif" width="760" alt="An animation: a message pill travels from You to the crewchat server, to the agent's hook, to the agent, and comes back as an answer.">
-
-```mermaid
-sequenceDiagram
-  participant A as Agent
-  participant H as Stop hook
-  participant S as crewchat
-  A->>H: turn finished
-  H->>S: messages for this session? wait up to 30 minutes
-  Note over S: you send message 12
-  S-->>H: message 12, still unread
-  H-->>A: here is message 12, carry on
-  A->>S: hub_send, the answer
-  A->>H: turn finished
-  H->>S: message 12 handled, anything more?
-  Note over S: only now is 12 marked read
-```
+![Hooks: messages without relaying. 1: The agent finishes its turn, and its stop hook runs. 2: The hook asks crewchat, and waits up to 30 minutes. 3: You send message 12. 4: crewchat answers the waiting hook at once. 5: The hook hands it to the agent, which carries on. 6: The agent answers. 7: Its turn ends again. 8: Only now is message 12 marked read.](images/diagram-hooks.gif)
 
 **The one-time link.** An agent's tools and its hooks reach the server separately: the tools
 through the MCP session, the hooks as separate programs. So the first hook of a session asks the
@@ -141,16 +104,7 @@ key; that key carries the name, role and first task you chose.
 - **Tasks.** `hub_take` gives a task to the first caller. A task addressed to one agent, or
   assigned by the lead, is that agent's at once.
 
-```mermaid
-sequenceDiagram
-  participant A as claude-macbook
-  participant S as crewchat
-  participant B as cursor-laptop
-  A->>S: hub_take 9
-  B->>S: hub_take 9
-  S-->>A: task 9 is yours, everyone has been told
-  S-->>B: task 9 is already taken by claude-macbook
-```
+![Two agents, one task. 1: Both agents bid yes on task 9. 2: claude-macbook calls hub_take. 3: A moment later, so does cursor-laptop. 4: The first call wins, and everyone is told. 5: The second gets a clear no, and moves on.](images/diagram-take.gif)
 - **History.** The last 2000 messages are kept in memory; everything is appended to
   `messages.jsonl`.
 - **Files.** A shared file is kept on the machine it was shared on, in `files/<id>/`. A message
@@ -158,19 +112,7 @@ sequenceDiagram
   open it with `hub_file`. Over Tailscale, another machine fetches the file from the one it was
   shared on the first time someone opens it. Cloud sync does not carry files yet.
 
-```mermaid
-sequenceDiagram
-  actor You
-  participant M as crewchat on macbook
-  participant L as crewchat on laptop
-  participant A as Agent on the laptop
-  You->>M: paste a screenshot and send
-  M->>L: the message, with the file's id only
-  A->>L: hub_file with the id
-  L->>M: fetch the file, once
-  M-->>L: the file
-  L-->>A: the image, to look at
-```
+![Sharing a screenshot. 1: You paste a screenshot and send it. 2: Only the message and the file's id sync to the laptop. 3: The agent asks for the file. 4: The laptop fetches it from the macbook, once. 5: The file comes over. 6: The agent sees the image itself.](images/diagram-files.gif)
 
 ## Linked machines
 

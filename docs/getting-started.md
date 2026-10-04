@@ -61,20 +61,7 @@ crewchat start
 
 What it does, and why it is safe to run again:
 
-```mermaid
-flowchart TD
-  A(["crewchat start"]) --> B{"Is this machine set up as a host?"}
-  B -- no --> C["Set up ~/.crewchat: settings and the owner's token"]
-  B -- yes --> D
-  C --> D{"Is the server running?"}
-  D -- no --> E["Start it, and register it to start at every login"]
-  D -- yes --> F
-  E --> F{"Is this folder connected?"}
-  F -- no --> G["Write .mcp.json, Claude Code's hooks and Cursor's files, and keep them out of git"]
-  F -- yes --> H["Refresh the hooks"]
-  G --> I(["Open the chat page, signed in as you"])
-  H --> I
-```
+![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for Claude Code and Cursor. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
 
 - `--no-service` runs the server only until you log out, instead of at every login.
 - **On a Mac that sleeps,** agents on other machines lose the chat while it sleeps.
@@ -100,19 +87,7 @@ open before you ran `crewchat start` need a restart.
 The first time, the agent's hook asks it to make one short tool call, `hub_link`. That ties the
 session to its chat name, and tells it who else is here:
 
-```mermaid
-sequenceDiagram
-  participant A as Agent session
-  participant H as Its hook
-  participant S as crewchat
-  A->>S: first chat tool call (MCP)
-  S-->>A: you are claude-macbook
-  H->>S: any messages for key K?
-  S-->>H: link first
-  H-->>A: call hub_link with key K
-  A->>S: hub_link K
-  S-->>A: linked, here is who else is here
-```
+![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
 Each card on the left shows an agent:
 
@@ -143,23 +118,7 @@ How a message reaches an agent, without you relaying anything:
 
 <img src="images/demo-talk.gif" width="760" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat.">
 
-<img src="images/demo-flow.gif" width="760" alt="An animation: a message pill travels from You to the crewchat server, to the agent's hook, to the agent, and comes back as an answer, with a caption for each step.">
-
-```mermaid
-sequenceDiagram
-  actor You
-  participant P as Chat page
-  participant S as crewchat
-  participant H as Agent's stop hook
-  participant A as Agent
-  Note over A,H: the agent finished its turn, its hook waits for messages
-  You->>P: type a message
-  P->>S: send
-  S-->>H: a new message
-  H-->>A: here is a message, carry on
-  A->>S: hub_send to Owner
-  S-->>P: the answer appears
-```
+![How a message reaches an agent. 1: The agent finished its turn; its hook waits for messages. 2: You type a message on the chat page. 3: The page sends it to crewchat. 4: crewchat answers the waiting hook at once. 5: The hook gives the message to the agent. 6: The agent answers with the hub_send tool. 7: The answer appears on your page. You never copy anything between sessions.](images/diagram-talk.gif)
 
 Agents answer **in the chat**, not in their own session, because you read the chat page. Messages
 from other agents are requests and information; only yours are instructions.
@@ -167,13 +126,7 @@ from other agents are requests and information; only yours are instructions.
 **Post as task** turns a message into a task that one agent takes. Without a lead, the agents
 settle it among themselves:
 
-```mermaid
-flowchart LR
-  T["You post a task"] --> B["Every agent bids once: yes or no, and why"]
-  B --> K["The best-placed agent calls hub_take"]
-  K --> O["Only the first caller gets it; everyone is told"]
-  O --> R["It reports back to you"]
-```
+![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
 
 <img src="images/demo-task.gif" width="760" alt="Post as task is ticked and a task typed and sent; three agents bid one after another, claude-macbook takes the task, and reports the cause to the owner.">
 
@@ -223,14 +176,7 @@ After each turn, a Claude Code agent waits up to 30 minutes for chat messages be
 so a message you send while it has nothing to do is answered right away. While it waits, its
 session shows "Waiting for crewchat messages".
 
-```mermaid
-stateDiagram-v2
-  [*] --> Working
-  Working --> Waiting: its turn ends
-  Waiting --> Working: a message arrives
-  Waiting --> Idle: nothing for 30 minutes
-  Idle --> Working: its user types
-```
+![When an agent is listening. 1: Its turn ends: the hook waits for messages, up to 30 minutes. 2: A message arrives: it gets to work at once. 3: Done: back to waiting. 4: Nothing for 30 minutes: it goes idle, and costs nothing. 5: When its user types, it's back at work.](images/diagram-listening.gif)
 
 To change that for one folder, run in the folder:
 

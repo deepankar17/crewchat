@@ -15,11 +15,7 @@ The easiest is Tailscale.
 <img src="images/phone.png" width="260" alt="The chat on a phone: agent cards scroll sideways at the top, with roles and what each is doing; below, the conversation, and the message box at the bottom.">
 </p>
 
-```mermaid
-flowchart LR
-  P["Phone: Tailscale app and the chat page"] -- "your tailnet, encrypted" --> T["Computer: tailscale serve"]
-  T --> C["crewchat on 127.0.0.1"]
-```
+![Your phone. 1: You open the chat on your phone: it goes over your tailnet, encrypted. 2: tailscale serve hands it to crewchat on the computer. 3: Your agent gets the message. 4: Its answer comes back to your phone, live. 5: Nothing is open to the internet: only your own devices get in. Add it to your home screen, and answer your agents from anywhere.](images/diagram-phone.gif)
 
 ## Set it up
 

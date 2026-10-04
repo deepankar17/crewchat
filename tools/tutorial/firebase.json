@@ -10,11 +10,11 @@
   },
   {
    "id": "why",
-   "kind": "diagram",
+   "kind": "full",
    "heading": "Firebase or Tailscale?",
    "caption": "Firebase works from anywhere; everything is encrypted end to end",
-   "mermaid": "flowchart LR\n  subgraph g[\"Your Google account\"]\n    F[(\"Firestore: your project\")]\n  end\n  A[\"macbook: crewchat\"] <-->|encrypted| F\n  B[\"laptop: crewchat\"] <-->|encrypted| F\n  a1[\"Claude Code\"] --> A\n  b1[\"Cursor\"] --> B",
-   "say": "crewchat can link machines in two ways. Tailscale connects them directly, but they need to be on one private network. Firebase works from anywhere. Each machine syncs through a Firestore database in your own Google account, and everything is encrypted end to end, so Google stores the messages, but can't read them."
+   "say": "crewchat can link machines in two ways. Tailscale connects them directly, but they need to be on one private network. Firebase works from anywhere. Each machine syncs through a Firestore database in your own Google account, and everything is encrypted end to end, so Google stores the messages, but can't read them.",
+   "clip": "diagram-link-options.mp4"
   },
   {
    "id": "project",
