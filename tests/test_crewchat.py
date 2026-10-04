@@ -945,6 +945,13 @@ class Hooks(Base):
         self.say(session.me, "now it works")
         self.assertIn("now it works", self.hook("claude", "stop", {"session_id": "L"}))
 
+    def test_a_session_that_never_links_is_left_alone(self):
+        for _ in range(crewchat.MAX_LINK_PROMPTS):
+            self.assertIn("Call the hub_link tool", self.hook("claude", "prompt", {"session_id": "N"}))
+            self.assertIn("hub_link", self.hook("claude", "stop", {"session_id": "N"}))
+        self.assertEqual(self.hook("claude", "prompt", {"session_id": "N"}), "")
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "N"}), "")
+
     def test_two_sessions_in_one_folder_each_get_their_own_messages(self):
         (one, name1), (two, name2) = self.linked("S1"), self.linked("S2")
         self.assertNotEqual(name1, name2)

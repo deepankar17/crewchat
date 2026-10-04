@@ -8,6 +8,8 @@
   not be stored: the error ended its pull thread, with nothing on screen. Now that message is
   skipped and logged in hub.log, and the messages after it still arrive. Cloud sync skips such a
   message the same way instead of dropping the rest of its batch.
+- A session that is asked to link at three prompts and never does (one without crewchat's tools,
+  or one you keep out of the chat) is no longer asked again; it can still link any time.
 - The docs' diagrams are animated, and the tutorial videos are on YouTube.
 
 ## 0.9.2

@@ -2906,6 +2906,7 @@ HOOK_LINK = (
     "Then carry on with what you were doing."
 )
 MAX_LINK_ASKS = 2  # times a hook insists on hub_link before leaving the agent alone
+MAX_LINK_PROMPTS = 3  # user prompts a session is asked at; after that it is not joining, so hooks stay quiet
 
 
 def read_json(path):
@@ -3154,10 +3155,12 @@ def run_hook(client, event):
     # that call proves the agent had a turn with them. A turn that is interrupted, or a session
     # that dies, never confirms, so the messages are delivered again.
     pending = int(state.get("pending", 0))
+    ignored = int(state.get("ignored", 0))  # prompts at which it was asked to link and did not
 
     def save(chain, pending, asks):
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks}))
+        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
+                                          "ignored": ignored}))
 
     if event == "prompt":
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
@@ -3165,6 +3168,12 @@ def run_hook(client, event):
         # so one handed over just before an interrupted turn is shown again.
         kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt")
         if kind == "link":
+            if ignored >= MAX_LINK_PROMPTS:
+                # Asked at several prompts and never linked: this session is not joining (or has no
+                # crewchat tools). Leave it alone; it can still link with the same key any time.
+                save(0, pending, MAX_LINK_ASKS)
+                return
+            ignored += 1
             save(0, pending, 1)
             if client == "claude":
                 print(HOOK_LINK % key)
