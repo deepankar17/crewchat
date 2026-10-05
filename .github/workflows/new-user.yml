@@ -7,8 +7,6 @@ on:
   workflow_dispatch:
   release:
     types: [published]
-  push:
-    branches: [ci/new-user]
   schedule:
     - cron: "17 6 * * *"
 
