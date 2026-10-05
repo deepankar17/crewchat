@@ -1,5 +1,11 @@
 # Changelog
 
+## Not released yet
+
+- `crewchat peers leave` and `crewchat peers remove`, typed in a terminal, now say which machine
+  they unlink and ask first (`--yes` skips the question; scripts and agents are not asked). Steps
+  meant for one machine, run on another, unlinked the wrong one.
+
 ## 0.9.6
 
 **Clearer tools for agents, and a sturdier start on Windows.**

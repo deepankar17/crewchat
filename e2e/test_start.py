@@ -1,5 +1,8 @@
 """Starting up when something is in the way: a server that cannot start, a join before the server runs."""
+import os
+import pty
 import socket
+import subprocess
 import unittest
 
 import harness as H
@@ -42,6 +45,44 @@ class Start(unittest.TestCase):
             b.cli("peers", "join", target, code, "--url", b.url, "--name", b.name)
             H.eventually(lambda: "online" in a.peers_status() and b.name in a.peers_status(), timeout=30,
                          what="the desk to see the laptop")
+        finally:
+            a.stop()
+            b.stop()
+
+
+def at_a_terminal(machine, args, answer):
+    """Run a crewchat command as a person would in a terminal, typing `answer` when it asks."""
+    leader, follower = pty.openpty()
+    try:
+        proc = subprocess.Popen(H.crewchat_command() + args, cwd=str(machine.folder), env=machine.env,
+                                stdin=follower, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        os.write(leader, (answer + "\n").encode())
+        out, _ = proc.communicate(timeout=60)
+        return out.decode()
+    finally:
+        os.close(leader)
+        os.close(follower)
+
+
+class Unlinking(unittest.TestCase):
+    def test_leaving_at_a_terminal_asks_first_and_names_the_machine(self):
+        a, b = H.Machine("desk4"), H.Machine("laptop4")
+        try:
+            a.start()
+            b.start()
+            b.link_to(a)
+            H.eventually(lambda: b.name in a.peers_status(), what="the link")
+            out = at_a_terminal(b, ["peers", "leave"], "n")
+            self.assertIn("This takes THIS machine, %s, out of the chat it shares with %s" % (b.name, a.name), out)
+            self.assertIn("Nothing changed.", out)
+            self.assertTrue((b.home / "peers.json").exists())
+            out = at_a_terminal(a, ["peers", "remove", b.name], "")  # Enter alone means no
+            self.assertIn("Nothing changed.", out)
+            self.assertIn(b.name, a.peers_status())
+            out = at_a_terminal(b, ["peers", "leave"], "y")
+            self.assertIn("This machine left", out)
+            self.assertFalse((b.home / "peers.json").exists())
+            H.eventually(lambda: b.name not in a.peers_status(), timeout=30, what="the desk to forget it")
         finally:
             a.stop()
             b.stop()

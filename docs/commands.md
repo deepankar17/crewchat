@@ -115,8 +115,8 @@ Claude Desktop. `--url URL --token TOKEN` (or `CREWCHAT_TOKEN`) names the chat d
 | `crewchat peers invite` | Print a join command for another machine (sets up this machine's tailnet address the first time) |
 | `crewchat peers join URL CODE` | Link this machine, with the command from an invite |
 | `crewchat peers status` | Linked machines, and which are reachable |
-| `crewchat peers remove NAME` | Drop a machine and change the shared key |
-| `crewchat peers leave` | Unlink this machine |
+| `crewchat peers remove NAME` | Drop a machine and change the shared key (asks first; `--yes` does not) |
+| `crewchat peers leave` | Unlink this machine (asks first, naming it; `--yes` does not) |
 
 Options: `--name NAME` (this machine's name, default its host name), `--url URL` (this machine's
 address for the others, instead of setting up Tailscale).

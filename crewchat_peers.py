@@ -728,6 +728,11 @@ def _cmd_peers(args):
         if mid is None:
             raise PeerError("usage: crewchat peers remove NAME, where NAME is one of: %s"
                             % (", ".join(m["name"] for m in mesh.members().values()) or "(no other machines)"))
+        name = mesh.members()[mid]["name"]
+        if not confirm(args, "This removes %s from the machines linked with this one (%s): its agents stop sharing "
+                       "this chat. Remove %s?" % (name, mesh.me["name"], name)):
+            print("Nothing changed.")
+            return
         out = server_call("peer-remove", id=mid)
         print("Removed %s and changed the shared key." % args.target)
         if out.get("missed"):
@@ -736,6 +741,11 @@ def _cmd_peers(args):
     elif action == "leave":
         if not mesh.exists:
             print("This machine is not linked to other machines.")
+            return
+        others = ", ".join(m["name"] for m in mesh.members().values()) or "no other machines"
+        if not confirm(args, "This takes THIS machine, %s, out of the chat it shares with %s. Run it on the "
+                       "machine you mean to unlink. Leave?" % (mesh.me["name"], others)):
+            print("Nothing changed.")
             return
         if crewchat.server_up(config):
             out = server_call("peer-leave")
@@ -749,6 +759,16 @@ def _cmd_peers(args):
               "`crewchat service restart` (or restart `crewchat serve`).")
 
 
+def confirm(args, question):
+    """Ask before unlinking, when a person is at the terminal (not for scripts and agents, nor with --yes)."""
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        return True
+    try:
+        return input(question + " [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
 def add_parser(sub):
     p = sub.add_parser("peers", help="link this machine's crewchat with your other machines over Tailscale",
                        description="Each machine runs its own crewchat; linked machines share one chat over a "
@@ -759,4 +779,5 @@ def add_parser(sub):
     p.add_argument("code", nargs="?", help="join: the code from the invite")
     p.add_argument("--name", help="this machine's name in the chat (default: its host name)")
     p.add_argument("--url", help="this machine's address for the others (default: set up with Tailscale)")
+    p.add_argument("--yes", action="store_true", help="leave, remove: do not ask first")
     p.set_defaults(fn=cmd_peers)
