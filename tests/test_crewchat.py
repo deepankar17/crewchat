@@ -1101,6 +1101,21 @@ class Hooks(Base):
         self.assertIn("answer in the chat", session.hello["instructions"])
         self.assertLess(len(reason), 1200)
 
+    def test_every_tool_says_what_it_changes_and_what_its_parameters_mean(self):
+        # MCP clients and catalogues (Glama's tool rating) read these: annotations, and a description
+        # for every parameter.
+        for tool in crewchat.TOOLS:
+            notes = tool["annotations"]
+            self.assertIn("readOnlyHint", notes, tool["name"])
+            self.assertFalse(notes["openWorldHint"], tool["name"])
+            for name, spec in tool["inputSchema"]["properties"].items():
+                self.assertTrue(spec.get("description"), "%s.%s" % (tool["name"], name))
+        reads = {t["name"] for t in crewchat.TOOLS if t["annotations"]["readOnlyHint"]}
+        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file"})
+        session = Session(self.base, self.token)
+        listed = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
+        self.assertEqual(listed[0]["annotations"], crewchat.TOOLS[0]["annotations"])
+
     def test_the_instructions_fit_what_claude_code_keeps(self):
         # Claude Code keeps about the first 2,000 characters of a server's instructions.
         session = Session(self.base, self.token)

@@ -6,14 +6,14 @@
 # own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   $env:CREWCHAT_VERSION = "0.9.5"   install this release ("main" for the latest code)
+#   $env:CREWCHAT_VERSION = "0.9.6"   install this release ("main" for the latest code)
 #   $env:CREWCHAT_LEAN = "1"          leave out cloud sync (about 70 MB of libraries)
 #   $env:CREWCHAT_SOURCE = "PATH"     install from a local checkout (for testing this script)
 # Native programs report failure through $LASTEXITCODE, checked after each one. ("Stop" would
 # also turn uv's progress output into errors in Windows PowerShell 5.1.)
 $ErrorActionPreference = "Continue"
 
-$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.5" }
+$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.6" }
 $Repo = "https://github.com/deepankar17/crewchat"
 
 if ($env:CREWCHAT_SOURCE) { $Source = $env:CREWCHAT_SOURCE }

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.6
+
+**Clearer tools for agents, and a sturdier start on Windows.**
+
+- Every tool now says when to use it rather than a similar one, what it changes, and when it
+  fails, and every parameter is described. Tools also carry MCP annotations (which only read,
+  which are safe to repeat), so clients and catalogues such as Glama can tell.
+- `crewchat start`: when the server does not start, it shows the end of the server's log, and
+  anything the server says before it opens its log (a broken install, say) now lands there. On
+  Windows the server also starts when the command runs inside a tool that ends its processes
+  afterwards (Claude Code, CI), instead of failing without a word.
+- `crewchat peers join` checks that this machine's server is running before using the code. Before,
+  the other machine counted this one in, then the command stopped with an error, and running it
+  again said "already linked".
+
 ## 0.9.5
 
 **Tested end to end, and four bugs fixed that the tests found.**

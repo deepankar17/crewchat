@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1348,17 +1348,23 @@ def roster_text(rows, me=None):
 # --------------------------------------------------------------------------------------------
 # MCP tools
 # --------------------------------------------------------------------------------------------
+# What a tool does to the chat, for MCP clients (annotations): a read, or a write that is safe to repeat.
+READ = {"readOnlyHint": True, "openWorldHint": False}
+WRITE = {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False}
+SETTING = dict(WRITE, idempotentHint=True)
+
 TOOLS = [
     {
         "name": "hub_send",
-        "description": "Send a message to another agent on this project (by the name hub_agents "
-        "shows), to the owner ('Owner'), or to 'all'. Use it to hand over context, ask a question, "
-        "warn about a file you are about to change, bid on a task, or report something that affects "
-        "someone's work. The owner reads everything on the chat page.",
+        "description": "Send a message to one agent, to the owner ('Owner') or to 'all'. Use it to hand over "
+        "context, ask a question, warn about a file you are about to change, bid on a task, or report "
+        "something that affects someone's work; the owner reads everything on the chat page. To report "
+        "on a task, use hub_update; to read messages, hub_inbox. Fails if nobody has that name.",
+        "annotations": WRITE,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "to": {"type": "string", "description": "An agent's name, 'Owner', or 'all'."},
+                "to": {"type": "string", "description": "An agent's name as hub_agents shows it, 'Owner', or 'all'."},
                 "text": {"type": "string", "maxLength": MAX_TEXT, "description": "The message."},
                 "files": {"type": "array", "items": {"type": "string"}, "maxItems": MAX_FILES,
                           "description": "Absolute paths of files on this machine to share with the message: "
@@ -1370,22 +1376,28 @@ TOOLS = [
     },
     {
         "name": "hub_inbox",
-        "description": "Read your unread messages (addressed to you or to all) and mark them read. "
-        "Call it when you start work, before taking on a task, after finishing one, and whenever "
-        "you are about to go idle. wait_seconds > 0 waits that long for a message.",
+        "description": "Read your unread messages (to you or to all) and mark them read; 'No new messages.' "
+        "if there are none. Call it when you start work, before taking on a task, after finishing one, and "
+        "before you go idle. For messages you have already read, or ones between others, use hub_history.",
+        "annotations": WRITE,
         "inputSchema": {
             "type": "object",
             "properties": {
-                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0},
-                "peek": {"type": "boolean", "default": False, "description": "Do not mark as read."},
+                "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0,
+                                 "description": "If nothing is waiting, wait up to this many seconds for a "
+                                 "message (0 answers at once)."},
+                "peek": {"type": "boolean", "default": False, "description": "Show them without marking them read."},
             },
             "additionalProperties": False,
         },
     },
     {
         "name": "hub_take",
-        "description": "Take a [TASK] the owner posted. Only the first agent to call this gets it, "
-        "on every machine, and everyone is told. Call it only after reading the other agents' bids.",
+        "description": "Take an open [TASK] the owner posted, after reading the other agents' bids. The "
+        "first agent to call it gets the task, on every machine, and everyone is told; if someone already "
+        "has it you get an error naming them, so stop. Then send hub_update in_progress before any work. "
+        "Not needed for work assigned to you (hub_assign) or addressed only to you: that is already yours.",
+        "annotations": SETTING,
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": ["string", "integer"],
@@ -1396,38 +1408,48 @@ TOOLS = [
     },
     {
         "name": "hub_agents",
-        "description": "Who is in the chat: every agent's name, tool, place, whether it is online, "
-        "its status line and unread count. Your own row is marked (you).",
+        "description": "Who is in the chat: each agent's name, tool, place, role (the lead is marked "
+        "[lead]), whether it is online, its status line and unread count. Your own row is marked (you). "
+        "Use it for the names hub_send and hub_assign need. Changes nothing.",
+        "annotations": READ,
         "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
     },
     {
         "name": "hub_status",
-        "description": "Set your one-line status (what you are doing right now), shown by "
-        "hub_agents and on the owner's chat page.",
+        "description": "Set your one-line status: what you are doing right now. It replaces your previous "
+        "status and shows in hub_agents and on the owner's chat page. Progress on a task goes in "
+        "hub_update instead.",
+        "annotations": SETTING,
         "inputSchema": {
             "type": "object",
-            "properties": {"text": {"type": "string", "maxLength": MAX_STATUS}},
+            "properties": {"text": {"type": "string", "maxLength": MAX_STATUS,
+                                    "description": "One line, e.g. 'fixing the login crash (#12)'."}},
             "required": ["text"],
             "additionalProperties": False,
         },
     },
     {
         "name": "hub_history",
-        "description": "The most recent messages in the chat, including ones not addressed to you "
-        "and lines about who joined, left or was renamed.",
+        "description": "The chat's latest messages, oldest first: including ones between others and "
+        "lines about who joined, left or was renamed. Marks nothing read; for what is new for you, use "
+        "hub_inbox.",
+        "annotations": READ,
         "inputSchema": {
             "type": "object",
-            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20}},
+            "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20,
+                                     "description": "How many of the latest messages to show."}},
             "additionalProperties": False,
         },
     },
     {
         "name": "hub_rename",
-        "description": "Change your own name in the chat, for example when your owner tells you "
-        "what to call yourself. Everyone is told. Letters, digits, - _ . ; 32 characters at most.",
+        "description": "Change your own name in the chat, for example when your owner tells you what to "
+        "call yourself. Everyone is told. Fails if another agent has the name.",
+        "annotations": SETTING,
         "inputSchema": {
             "type": "object",
-            "properties": {"name": {"type": "string", "maxLength": 32}},
+            "properties": {"name": {"type": "string", "maxLength": 32,
+                                    "description": "Letters, digits and - _ . ; starting with a letter."}},
             "required": ["name"],
             "additionalProperties": False,
         },
@@ -1436,7 +1458,9 @@ TOOLS = [
         "name": "hub_file",
         "description": "Open a file shared in the chat (messages show it as [file ID: name ...]). An "
         "image comes back so you can see it, a text file with its contents; for anything else you get "
-        "its path on this machine, to open with your own tools.",
+        "its path on this machine, to open with your own tools. A file shared on another machine is "
+        "fetched from it first. Fails if the id is unknown.",
+        "annotations": READ,
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "string", "description": "The file's id from the message."}},
@@ -1446,25 +1470,33 @@ TOOLS = [
     },
     {
         "name": "hub_role",
-        "description": "Take a role in this team, when your owner tells you to (lead, developer, qa, "
-        "reviewer, or one your owner defined). You get the role's instructions back; everyone sees "
-        "your role in hub_agents. Call it with no role to see your current role's instructions.",
+        "description": "Take a role in this team when your owner tells you to; leave out the role to see "
+        "your current role's instructions again. You get the role's instructions back, and everyone sees "
+        "your role in hub_agents. It replaces the role you had; there is one lead at a time, so taking "
+        "lead moves it from the current lead.",
+        "annotations": SETTING,
         "inputSchema": {
             "type": "object",
-            "properties": {"role": {"type": "string", "description": "The role's name, or 'none'."}},
+            "properties": {"role": {"type": "string", "description": "lead, developer, qa, docs, reviewer, a "
+                                    "role your owner defined, or 'none' to drop yours."}},
             "additionalProperties": False,
         },
     },
     {
         "name": "hub_assign",
-        "description": "Lead only: give one agent a piece of work. It becomes a task that is theirs "
-        "at once (no bidding); they report back to you with hub_update. Say what done looks like.",
+        "description": "Lead only: give one agent a piece of work. It becomes a task that is theirs at "
+        "once (no bidding), and they report back to you with hub_update. Not the lead? Ask the lead, or "
+        "message the agent with hub_send. Fails if you are not the lead or nobody has that name.",
+        "annotations": WRITE,
         "inputSchema": {
             "type": "object",
             "properties": {
                 "to": {"type": "string", "description": "The agent's name."},
-                "text": {"type": "string", "maxLength": MAX_TEXT, "description": "The work."},
-                "task": {"type": ["string", "integer"], "description": "The owner's task this is part of, if any."},
+                "text": {"type": "string", "maxLength": MAX_TEXT,
+                         "description": "The work, and what done looks like."},
+                "task": {"type": ["string", "integer"],
+                         "description": "The owner's task this piece belongs to, if any: its progress then "
+                         "shows there too."},
             },
             "required": ["to", "text"],
             "additionalProperties": False,
@@ -1472,14 +1504,18 @@ TOOLS = [
     },
     {
         "name": "hub_update",
-        "description": "Report progress on a task you work on: in_progress, blocked, review (ready to "
-        "be tested or reviewed) or done, with a short note. It goes to the lead, or to whoever "
-        "posted the task if there is no lead, and shows on the task in the chat.",
+        "description": "Report on a task you work on, with a short note: first in_progress with your plan, "
+        "then blocked, review or done. It goes to whoever coordinates the task (the lead, or else whoever posted "
+        "it; the owner for a task the owner gave you directly) and shows on the task in the chat. For a line about what you "
+        "are doing in general, use hub_status. Fails if the number is not a task.",
+        "annotations": WRITE,
         "inputSchema": {
             "type": "object",
             "properties": {
                 "id": {"type": ["string", "integer"], "description": "The task's number."},
-                "status": {"type": "string", "enum": list(STATUSES)},
+                "status": {"type": "string", "enum": list(STATUSES),
+                           "description": "in_progress (started), blocked (you need something), review (ready "
+                           "to be tested or reviewed) or done."},
                 "note": {"type": "string", "maxLength": MAX_TEXT, "description": "What happened, what you need."},
             },
             "required": ["id", "status"],
@@ -1488,11 +1524,13 @@ TOOLS = [
     },
     {
         "name": "hub_link",
-        "description": "Tie this session to the key a crewchat hook gave you, so the hooks can "
-        "deliver your messages. Call it once when a hook asks you to, with exactly that key.",
+        "description": "Tie this session to the key a crewchat hook gave you, so the hooks can deliver "
+        "your messages. Call it once when a hook asks you to, with exactly that key. A resumed session "
+        "that links with its old key gets its old name back.",
+        "annotations": SETTING,
         "inputSchema": {
             "type": "object",
-            "properties": {"key": {"type": "string", "description": "The key from the hook's message."}},
+            "properties": {"key": {"type": "string", "description": "The key from the hook's message, exactly."}},
             "required": ["key"],
             "additionalProperties": False,
         },
@@ -2439,15 +2477,38 @@ def server_up(config=None):
 def start_background():
     """Run the server detached from this terminal, until log out or restart."""
     python, script = self_command()
+    log = home() / "hub.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
     flags = {}
     if os.name == "nt":
         if Path(python).name.lower() == "python.exe" and Path(python).with_name("pythonw.exe").exists():
             python = str(Path(python).with_name("pythonw.exe"))
-        flags["creationflags"] = 0x00000008 | 0x08000000  # DETACHED_PROCESS | CREATE_NO_WINDOW
+        # DETACHED_PROCESS | CREATE_NO_WINDOW, and CREATE_BREAKAWAY_FROM_JOB: tools that run commands
+        # in a job (Claude Code, CI runners) end the job's processes when the command ends.
+        flags["creationflags"] = 0x00000008 | 0x08000000 | 0x01000000
     else:
         flags["start_new_session"] = True
-    subprocess.Popen([python, script, "serve", "--log", str(home() / "hub.log")], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, **flags)
+    command = [python, script, "serve", "--log", str(log)]
+    # Anything it says before it opens its own log (a broken install, say) goes to the log too.
+    with open(log, "a", encoding="utf-8") as err:
+        try:
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                             close_fds=True, **flags)
+        except OSError:
+            if os.name != "nt":
+                raise
+            flags["creationflags"] &= ~0x01000000  # a job that may not be left: start inside it
+            subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
+                             close_fds=True, **flags)
+
+
+def log_tail(lines=6):
+    """The last lines of the server log, to show when the server does not start."""
+    try:
+        text = (home() / "hub.log").read_text(encoding="utf-8", errors="replace").strip().splitlines()
+    except OSError:
+        return ""
+    return "\n".join("  " + line for line in text[-lines:])
 
 
 def joined_place(project, config=None, root=None):
@@ -2590,7 +2651,9 @@ def cmd_start(args):
                 break
             time.sleep(0.25)
         else:
-            die("the server did not start. See %s, or run `crewchat serve` to see why." % (home() / "hub.log"))
+            tail = log_tail()
+            die("the server did not start.%s\nSee %s, or run `crewchat serve` to see why."
+                % ("\nThe end of its log:\n" + tail if tail else "", home() / "hub.log"))
         print("- Started the server at %s%s." % (local_url(config), "" if started else
                                                   " (until you log out; `crewchat service install` "
                                                   "starts it at login)"))

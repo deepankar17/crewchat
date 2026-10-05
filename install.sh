@@ -8,12 +8,12 @@
 # Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   CREWCHAT_VERSION=0.9.5   install this release instead of the one below ("main" for the latest code)
+#   CREWCHAT_VERSION=0.9.6   install this release instead of the one below ("main" for the latest code)
 #   CREWCHAT_LEAN=1          leave out cloud sync (about 70 MB of libraries); the chat works the same
 #   CREWCHAT_SOURCE=PATH     install from a local checkout (for testing this script)
 set -eu
 
-VERSION="${CREWCHAT_VERSION:-0.9.5}"
+VERSION="${CREWCHAT_VERSION:-0.9.6}"
 REPO="https://github.com/deepankar17/crewchat"
 
 say() { printf '%s\n' "$*"; }

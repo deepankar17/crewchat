@@ -680,6 +680,10 @@ def _cmd_peers(args):
         if config.get("cloud"):
             raise PeerError("this machine uses cloud sync; a machine syncs one way. Turn it off first with "
                             "`crewchat cloud logout`")
+        if not crewchat.server_up(config):
+            # Before the code is used: the other machine would count this one in, and it could not start.
+            raise PeerError("the server is not running here. Start it with `crewchat start` in your project "
+                            "folder, then run this again; the code still works.")
         url = my_address(config, args.url)
         target = clean_url(args.target)
         body = json.dumps({"code": args.code, "device": {"name": args.name or machine_name(), "url": url}})
