@@ -1,6 +1,6 @@
 # crewchat installer for Windows (PowerShell 5.1 or later).
 #
-#   powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+#   powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
 #
 # Installs uv (Astral's Python installer) if it is missing, then crewchat with cloud sync, in its
 # own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.

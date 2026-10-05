@@ -23,15 +23,15 @@ jobs:
       - name: The README's command, typed in powershell
         if: matrix.shell == 'powershell'
         shell: powershell
-        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
       - name: The README's command, typed in pwsh
         if: matrix.shell == 'pwsh'
         shell: pwsh
-        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
       - name: The README's command, typed in cmd
         if: matrix.shell == 'cmd'
         shell: cmd
-        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
       - name: A first chat
         shell: powershell
         run: |

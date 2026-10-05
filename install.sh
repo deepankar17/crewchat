@@ -21,7 +21,7 @@ fail() { printf 'crewchat installer: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
-  *) fail "this script is for macOS and Linux. On Windows, run in PowerShell: irm $REPO/raw/main/install.ps1 | iex" ;;
+  *) fail "this script is for macOS and Linux. On Windows, run in PowerShell: powershell -NoProfile -ExecutionPolicy ByPass -c \"irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex\"" ;;
 esac
 
 if [ -n "${CREWCHAT_SOURCE:-}" ]; then

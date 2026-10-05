@@ -24,7 +24,7 @@ curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.s
 **Windows** (PowerShell):
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
 ```
 
 The installer:
