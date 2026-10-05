@@ -3269,6 +3269,112 @@ def cmd_hook(args):
         pass
 
 
+class StdioRelay:
+    """`crewchat stdio`: MCP over stdin and stdout, relayed to a chat's server over HTTP, for
+    clients that only start local (stdio) servers, such as Claude Desktop. One JSON-RPC message per
+    line each way. Requests run side by side, so a hub_inbox that waits does not hold up the rest."""
+
+    def __init__(self, url, token):
+        self.url, self.token = url, token
+        self.session = None  # the server's Mcp-Session-Id
+        self.hello = None  # the client's initialize, to open a new session if the server restarted
+        self.out = threading.Lock()
+
+    def write(self, message):
+        data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        with self.out:
+            sys.stdout.buffer.write(data)
+            sys.stdout.buffer.flush()
+
+    def post(self, payload):
+        headers = {"Mcp-Session-Id": self.session} if self.session else None
+        data, answer = post_json(self.url, self.token, payload, timeout=MAX_WAIT + 30, headers=headers,
+                                 want_headers=True)
+        if answer.get("Mcp-Session-Id"):
+            self.session = answer["Mcp-Session-Id"]
+        return data
+
+    def fail(self, payload, message):
+        """Answer each request in payload with an error (notifications get no answer)."""
+        items = payload if isinstance(payload, list) else [payload]
+        out = [{"jsonrpc": "2.0", "id": m["id"], "error": {"code": -32000, "message": message}}
+               for m in items if isinstance(m, dict) and "id" in m and "method" in m]
+        if out:
+            self.write(out if isinstance(payload, list) else out[0])
+
+    def send(self, payload):
+        for attempt in (1, 2):
+            try:
+                data = self.post(payload)
+            except urllib.error.HTTPError as e:
+                if e.code == 404 and attempt == 1 and self.hello is not None:
+                    # The server restarted and forgot this session: open a new one and try again.
+                    sys.stderr.write("crewchat: the server restarted; reconnecting\n")
+                    try:
+                        self.session = None
+                        self.post(self.hello)
+                        self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+                        continue
+                    except (urllib.error.URLError, OSError, ValueError):
+                        pass
+                reason = "a wrong token" if e.code == 401 else "HTTP %d" % e.code
+                return self.fail(payload, "the crewchat server refused this (%s)" % reason)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                return self.fail(payload, "cannot reach the crewchat server at %s (%s). Is it running? "
+                                          "`crewchat start` starts it." % (self.url, getattr(e, "reason", e)))
+            if data is not None:
+                self.write(data)
+            return
+
+    def run(self):
+        workers = []
+        for line in iter(sys.stdin.buffer.readline, b""):
+            if not line.strip():
+                continue
+            try:
+                payload = json.loads(line.decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                self.write({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                continue
+            first = payload[0] if isinstance(payload, list) and payload else payload
+            method = first.get("method") if isinstance(first, dict) else None
+            if method == "initialize":
+                self.hello, self.session = first, None
+            if method == "initialize" or (isinstance(first, dict) and "id" not in first):
+                self.send(payload)  # in order: what follows needs the session, or comes after it
+            else:
+                worker = threading.Thread(target=self.send, args=(payload,), daemon=True)
+                worker.start()
+                workers.append(worker)
+                workers = [w for w in workers if w.is_alive()]
+        for worker in workers:
+            worker.join()
+        if self.session:  # the client is gone: end its session, so its agent shows as gone at once
+            try:
+                req = urllib.request.Request(self.url, method="DELETE", headers={
+                    "Authorization": "Bearer " + self.token, "Mcp-Session-Id": self.session})
+                urllib.request.urlopen(req, timeout=5).close()
+            except (urllib.error.URLError, OSError):
+                pass
+
+
+def cmd_stdio(args):
+    if args.url:
+        base = args.url.rstrip("/")
+        token = args.token or os.environ.get("CREWCHAT_TOKEN", "")
+        if not token:
+            die("--url needs the folder's token too: --token, or CREWCHAT_TOKEN")
+    else:
+        start = Path(args.project or ".").resolve()
+        config = next((client_config(folder, client) for folder in [start] + list(start.parents)
+                       for client in CLIENT_FILES if client_config(folder, client)), None)
+        if config is None:
+            die("%s is not connected to a crewchat. Run `crewchat start` there first, or pass --url and "
+                "--token." % start)
+        base, token = config
+    StdioRelay((base if base.endswith("/mcp") else base + "/mcp"), token).run()
+
+
 def cmd_hooks(args):
     project = Path(args.project or ".").resolve()
     path = project / ".crewchat-hooks"
@@ -4233,6 +4339,13 @@ def build_parser():
     p = sub.add_parser("connect", help="share this chat with your other machines: choose Tailscale or cloud sync")
     p.add_argument("way", nargs="?", choices=["tailscale", "cloud"])
     p.set_defaults(fn=cmd_connect)
+
+    p = sub.add_parser("stdio", help="MCP over stdin/stdout, for clients that only start local servers "
+                                     "(Claude Desktop)")
+    p.add_argument("--project", help="a folder connected with `crewchat start` (default: this folder)")
+    p.add_argument("--url", help="the chat's address instead, with --token")
+    p.add_argument("--token", help="with --url: the folder's token (or set CREWCHAT_TOKEN)")
+    p.set_defaults(fn=cmd_stdio)
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])

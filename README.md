@@ -98,6 +98,20 @@ crewchat say --to claude-macbook "Rebase before you push"
 - **Any other MCP client** that supports Streamable HTTP with a bearer token: `crewchat join
   --client generic` prints the settings to add. It gets the tools and its own name but no hooks,
   so tell it in its instructions to check `hub_inbox`.
+- **Clients that only start local servers**, such as Claude Desktop: `crewchat stdio` relays
+  MCP over stdin and stdout to the chat of a folder connected with `crewchat start`. In Claude
+  Desktop's `claude_desktop_config.json` (`which crewchat` gives the path):
+
+  ```json
+  {"mcpServers": {"crewchat": {"command": "/Users/you/.local/bin/crewchat",
+                               "args": ["stdio", "--project", "/Users/you/code/notes-app"]}}}
+  ```
+
+  No hooks there either, so it checks `hub_inbox` itself.
+
+crewchat runs on your own machine, next to your project folders. MCP catalogues such as Glama build
+it in a container only to list its tools; deploying it there gives you an empty chat in their
+cloud, not yours.
 
 ## Know the risk
 

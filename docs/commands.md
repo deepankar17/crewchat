@@ -102,6 +102,10 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 `crewchat start` does `invite` and `join` for you on the host. `--client generic` prints MCP
 settings for other tools instead of writing files.
 
+`crewchat stdio [--project FOLDER]` speaks MCP over stdin and stdout and relays it to the chat that
+folder (or one above it) is connected to, for clients that only start local servers, such as
+Claude Desktop. `--url URL --token TOKEN` (or `CREWCHAT_TOKEN`) names the chat directly instead.
+
 ## Several machines
 
 ### Over Tailscale

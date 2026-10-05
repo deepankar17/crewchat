@@ -4,7 +4,7 @@
 
 **Tested end to end, and four bugs fixed that the tests found.**
 
-- A new end-to-end suite (`e2e/`, 72 tests) runs crewchat the way you do: real servers started
+- A new end-to-end suite (`e2e/`, 80 tests) runs crewchat the way you do: real servers started
   with `crewchat start`, Claude Code and Cursor sessions using the MCP address and hooks that
   `start` wrote, you on the chat page (in Chrome, too), machines linked with `crewchat peers`, three
   machines, a folder joined from another machine, a dozen agents at once, and the installer,
@@ -28,6 +28,11 @@
   folder; `crewchat hooks on` brings them back.
 - A listening agent that gets one message waits five seconds for any that follow, so a burst costs
   one turn, not several.
+- `crewchat stdio`: MCP over stdin and stdout, relayed to your chat, for clients that only start
+  local servers, such as Claude Desktop (see the README). It reconnects by itself when the server
+  restarts.
+- crewchat is listed in Glama's MCP catalogue, with `glama.json` and a build just for it
+  (`glama/Dockerfile`).
 - The instructions agents get when they connect are shorter. Claude Code keeps only about 2,000
   characters, so the rules on confirming a task, roles and trusting messages were being cut off.
 
