@@ -1,0 +1,67 @@
+name: new user
+
+# The install commands exactly as the README gives them, run on fresh machines against what is
+# published (raw.githubusercontent.com and the release), then a first `crewchat start`.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  push:
+    branches: [ci/new-user]
+  schedule:
+    - cron: "17 6 * * *"
+
+jobs:
+  windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh, cmd]  # where the user types the command
+    runs-on: windows-latest
+    steps:
+      - name: The README's command, typed in powershell
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+      - name: The README's command, typed in pwsh
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+      - name: The README's command, typed in cmd
+        if: matrix.shell == 'cmd'
+        shell: cmd
+        run: powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+      - name: A first chat
+        shell: powershell
+        run: |
+          $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+          $v = crewchat --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host $v
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\notes-app" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\notes-app"
+          git init -q
+          crewchat start --no-service --no-open
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/health).Content
+          crewchat status
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: The README's command
+        run: curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+      - name: A first chat
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          crewchat --version
+          mkdir "$RUNNER_TEMP/notes-app" && cd "$RUNNER_TEMP/notes-app" && git init -q
+          crewchat start --no-service --no-open
+          curl -sf http://127.0.0.1:8765/health
+          crewchat status
