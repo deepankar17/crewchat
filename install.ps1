@@ -16,10 +16,16 @@ $ErrorActionPreference = "Continue"
 $Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.7" }
 $Repo = "https://github.com/deepankar17/crewchat"
 
+$Fallback = $null
 if ($env:CREWCHAT_SOURCE) { $Source = $env:CREWCHAT_SOURCE }
 elseif ($Version -eq "main") { $Source = "$Repo/archive/refs/heads/main.zip" }
-else { $Source = "$Repo/archive/refs/tags/v$Version.zip" }
-$Spec = if ($env:CREWCHAT_LEAN) { "crewchat @ $Source" } else { "crewchat[cloud] @ $Source" }
+else {
+    # The release's own package file: GitHub counts its downloads (nothing about you is sent).
+    # Releases before 0.9.7 have none, and install from their source archive instead.
+    $Source = "$Repo/releases/download/v$Version/crewchat-$Version-py3-none-any.whl"
+    $Fallback = "$Repo/archive/refs/tags/v$Version.zip"
+}
+function Spec([string]$From) { if ($env:CREWCHAT_LEAN) { "crewchat @ $From" } else { "crewchat[cloud] @ $From" } }
 
 $Uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
 if (-not $Uv) {
@@ -52,7 +58,11 @@ if ($Running.Count -gt 0) {
 }
 
 Write-Host "Installing crewchat $Version..."
-& $Uv tool install --force --python 3.12 $Spec
+& $Uv tool install --force --python 3.12 (Spec $Source)
+if ($LASTEXITCODE -ne 0 -and $Fallback) {
+    Write-Host "Release $Version has no package file; installing it from its source instead..."
+    & $Uv tool install --force --python 3.12 (Spec $Fallback)
+}
 if ($LASTEXITCODE -ne 0) { throw "crewchat did not install (uv exit code $LASTEXITCODE)" }
 if ($Restart) {
     schtasks /Query /TN crewchat *> $null

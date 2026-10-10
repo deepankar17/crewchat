@@ -24,18 +24,23 @@ case "$(uname -s)" in
   *) fail "this script is for macOS and Linux. On Windows, run in PowerShell: powershell -NoProfile -ExecutionPolicy ByPass -c \"irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex\"" ;;
 esac
 
+FALLBACK=""
 if [ -n "${CREWCHAT_SOURCE:-}" ]; then
   SOURCE="$CREWCHAT_SOURCE"
 elif [ "$VERSION" = "main" ]; then
   SOURCE="$REPO/archive/refs/heads/main.tar.gz"
 else
-  SOURCE="$REPO/archive/refs/tags/v$VERSION.tar.gz"
+  # The release's own package file: GitHub counts its downloads (nothing about you is sent).
+  # Releases before 0.9.7 have none, and install from their source archive instead.
+  SOURCE="$REPO/releases/download/v$VERSION/crewchat-$VERSION-py3-none-any.whl"
+  FALLBACK="$REPO/archive/refs/tags/v$VERSION.tar.gz"
 fi
-if [ -n "${CREWCHAT_LEAN:-}" ]; then
-  SPEC="crewchat @ $SOURCE"
-else
-  SPEC="crewchat[cloud] @ $SOURCE"
-fi
+spec() {
+  if [ -n "${CREWCHAT_LEAN:-}" ]; then echo "crewchat @ $1"; else echo "crewchat[cloud] @ $1"; fi
+}
+install_from() {
+  "$UV" tool install --force --python 3.12 "$(spec "$1")"
+}
 
 UV="$(command -v uv 2>/dev/null || true)"
 if [ -z "$UV" ]; then
@@ -57,7 +62,13 @@ if [ -z "$UV" ]; then
 fi
 
 say "Installing crewchat $VERSION..."
-"$UV" tool install --force --python 3.12 "$SPEC" >/dev/null 2>&1 || "$UV" tool install --force --python 3.12 "$SPEC"
+if install_from "$SOURCE" >/dev/null 2>&1; then
+  :
+elif [ -n "$FALLBACK" ] && install_from "$FALLBACK" >/dev/null 2>&1; then
+  :
+else
+  install_from "${FALLBACK:-$SOURCE}" || fail "crewchat did not install (see uv's message above)"
+fi
 "$UV" tool update-shell >/dev/null 2>&1 || true
 
 BIN="$("$UV" tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"

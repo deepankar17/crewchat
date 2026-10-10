@@ -20,6 +20,9 @@
   the server log says so, and `crewchat start` and `crewchat status` mention it. The server asks
   GitHub for the latest release once a day, sending nothing about you or your chat;
   `CREWCHAT_NO_UPDATE_CHECK=1` turns it off.
+- Each release now carries crewchat's package file, and the installers install it, so GitHub
+  counts installs (the README shows the total). Older releases install from their source as
+  before. Nothing about you is sent.
 
 ## Not released yet
 

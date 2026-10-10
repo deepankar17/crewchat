@@ -8,10 +8,28 @@ on:
   release:
     types: [published]
   schedule:
-    - cron: "17 6 * * *"
+    - cron: "17 6 * * 1"  # weekly: each run downloads the release from 5 machines, and GitHub counts them
 
 jobs:
+  # A release's package is attached by release-assets.yml just after it is published: wait for it,
+  # so a new release is tested as people will install it.
+  package:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - run: |
+          for i in $(seq 60); do
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -q '\.whl$' && exit 0
+            sleep 10
+          done
+          echo "no package on $TAG after 10 minutes"; exit 1
+
   windows:
+    needs: package
+    if: ${{ !failure() && !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +65,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
   unix:
+    needs: package
+    if: ${{ !failure() && !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
