@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -483,6 +483,7 @@ class Projects:
         self.others = {}
         self._stamp = None
         self.lock = threading.Lock()
+        self.on_change = None  # called after projects appear or go (cmd_serve: their links follow)
         self.refresh()
 
     def refresh(self):
@@ -503,6 +504,8 @@ class Projects:
             for gone in [k for k in self.others if k not in names]:
                 del self.others[gone]  # its folder was removed: its tokens stop working
             self._stamp = stamp
+        if self.on_change is not None:
+            self.on_change(self)
 
     def all(self):
         self.refresh()
@@ -2707,7 +2710,8 @@ class Handler(BaseHTTPRequestHandler):
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
-            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(),
+                                 "linked": p.hub.sync is not None and getattr(p.hub.sync, "shared", True)}
                                 for p in self.projects.all()]
             self._json(200, data)
         else:
@@ -2811,7 +2815,11 @@ class Handler(BaseHTTPRequestHandler):
             if str(op).startswith("peer"):
                 import crewchat_peers
                 try:
-                    result = crewchat_peers.admin(self.hub, self.roster.root, op, data)
+                    first = self.projects.primary
+                    result = crewchat_peers.admin(first.hub, first.roster.root, op, data)
+                    if op == "peers-start":
+                        share_projects(self.projects)
+                        self.projects.on_change = share_projects
                 except crewchat_peers.PeerError as e:
                     raise HubError(str(e))
             elif op == "rename":
@@ -2868,10 +2876,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def _peer(self, path, raw):
         """A request from another of the owner's machines (crewchat_peers)."""
-        handler = getattr(self.hub.sync, "peer_request", None)
+        link = self.projects.primary.hub.sync
+        handler = getattr(link, "peer_request", None)
         if handler is None:
             self._json(404, {"error": "this machine is not linked to other machines"})
             return
+        chat = str(self._object(raw).get("chat") or "").strip().lower() if path != "/peer/join" else ""
+        if chat:
+            # Another project: its own link answers. One this machine lacks is not an error, but it is
+            # said only to a member (the key is checked first).
+            target = next((p.hub.sync for p in self.projects.all()[1:]
+                           if getattr(p.hub.sync, "chat", None) == chat), None)
+            if target is not None:
+                handler = target.peer_request
+            else:
+                header = self.headers.get("Authorization", "")
+                if link.mesh.key_ok(header[7:].strip() if header.startswith("Bearer ") else ""):
+                    self._json(404, {"error": "no project called %s here" % chat, "missing": True})
+                    return
         # Joining takes a short code, so a locked-out address may not try one. Other requests carry
         # the group's long key, and a right key always works (as tokens do in _bearer).
         if path == "/peer/join" and self._locked():
@@ -3458,6 +3480,26 @@ def cmd_start(args):
         print("Agents on your other machines too? Run `crewchat start` there, then `crewchat connect`.")
 
 
+def share_projects(projects):
+    """Over Tailscale, link every project besides the first with the same-named project on the
+    other machines (the first projects are linked with each other, whatever their names)."""
+    link = projects.primary.hub.sync
+    if not hasattr(link, "share"):
+        return
+    first = projects.primary.name.strip().lower()
+    wanted = {}
+    for project in list(projects.others.values()):
+        name = project.name.strip().lower()
+        if name and name != first and name not in wanted:
+            wanted[name] = project
+    for name, project in wanted.items():
+        if project.hub.sync is None:
+            link.share(project.hub, name)
+    for name in list(link.projects):
+        if name not in wanted:
+            link.unshare(name)
+
+
 def cmd_serve(args):
     if getattr(args, "log", None) or sys.stderr is None:
         path = Path(getattr(args, "log", None) or (home() / "hub.log"))
@@ -3481,6 +3523,9 @@ def cmd_serve(args):
         try:
             import crewchat_peers
             crewchat_peers.start(server.RequestHandlerClass.hub)
+            projects = server.RequestHandlerClass.projects
+            share_projects(projects)
+            projects.on_change = share_projects  # a project made later is linked at once
         except Exception as e:  # the local chat keeps working on its own
             sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
@@ -4751,9 +4796,14 @@ def windows_update_script(uv, specs, crewchat_exe, folder, pid):
         "Start-Sleep -Seconds 2",
         "$done = $false",
     ]
-    for spec in specs:
-        lines.append("if (-not $done) { & %s tool install --force --refresh-package crewchat --python 3.12 %s; "
-                     "$done = $LASTEXITCODE -eq 0 }" % (quote(uv), quote(spec)))
+    for i, spec in enumerate(specs):
+        if i < len(specs) - 1:  # quietly: PyPI may not have a release minutes old yet
+            lines.append("if (-not $done) { & %s tool install --force --refresh-package crewchat --python 3.12 %s *> $null; "
+                         "$done = $LASTEXITCODE -eq 0; if (-not $done) { Write-Host 'Not on PyPI yet; installing it "
+                         "from its GitHub release.' } }" % (quote(uv), quote(spec)))
+        else:
+            lines.append("if (-not $done) { & %s tool install --force --refresh-package crewchat --python 3.12 %s; "
+                         "$done = $LASTEXITCODE -eq 0 }" % (quote(uv), quote(spec)))
     lines += [
         "if ($done) { & %s resume; Write-Host ''; & %s --version }" % (quote(crewchat_exe), quote(crewchat_exe)),
         "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
@@ -4782,9 +4832,16 @@ def cmd_update(args):
         print("Updating crewchat in a new window; this crewchat stops while it does.")
         return
     if uv and not local:
-        for spec in update_specs(version):
-            if subprocess.run([uv, "tool", "install", "--force", "--refresh-package", "crewchat", "--python", "3.12",
-                               spec], env=env).returncode == 0:
+        specs = update_specs(version)
+        for i, spec in enumerate(specs):
+            command = [uv, "tool", "install", "--force", "--refresh-package", "crewchat", "--python", "3.12", spec]
+            if i < len(specs) - 1:
+                # Quietly: PyPI may not have a release minutes old yet; the next source is no failure.
+                if subprocess.run(command, env=env, capture_output=True, text=True).returncode == 0:
+                    print("Installed crewchat %s." % (version or "(the latest)"))
+                    break
+                print("crewchat %s is not on PyPI yet; installing it from its GitHub release." % version)
+            elif subprocess.run(command, env=env).returncode == 0:
                 break
         else:
             die("the update did not install; crewchat %s is still in place." % __version__)

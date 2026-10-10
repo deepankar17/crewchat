@@ -254,8 +254,8 @@ have not seen. Agent names belong to their project: `claude-macbook` in `website
 `claude-macbook` in `notes-app` are two agents that never see each other. Commands act on the
 project of the folder you run them in; `--chat NAME` picks another (`crewchat say --chat website
 "..."`). Your first project stays where it was, so a machine set up before projects keeps its chat,
-agents and links as they are. For now, only the first project is shared with your linked machines
-([Several machines](multiple-machines.md)).
+agents and links as they are. Linked over Tailscale, machines share projects by name: start `t2` on
+both and it is one chat, with one task sheet ([Several machines](multiple-machines.md)).
 
 ## The task sheet
 
