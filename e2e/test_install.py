@@ -148,7 +148,8 @@ class Install(unittest.TestCase):
             self.assertFalse(self.exe.exists())
             self.assertNotIn("crewchat", subprocess.run([UV, "tool", "list"], env=self.env, capture_output=True,
                                                         text=True).stdout)
-            for rel in (".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json"):
+            for rel in (".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json",
+                        ".claude/skills/crewchat", ".cursor/rules/crewchat.mdc"):
                 self.assertFalse((m.folder / rel).exists(), rel)
             self.assertEqual((m.folder / "notes.md").read_text(), "mine")
             self.assertEqual((m.home / "config.json").exists(), not purge)

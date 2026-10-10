@@ -89,6 +89,23 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat roles add NAME --file FILE` | The same, reading the instructions from a file |
 | `crewchat roles remove NAME` | Remove one of your roles |
 
+## Projects, rules, skills and the task sheet
+
+| Command | |
+|---|---|
+| `crewchat projects` | This machine's projects and their folders |
+| `crewchat start --chat NAME` | Put this folder in the project NAME (made if there is none); without it, a new folder starts a project named after itself |
+| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `tasks`: act on that project, not the one of the folder you are in |
+| `crewchat rules` | Print the project's guide for its agents |
+| `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
+| `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
+| `crewchat tasks` | The task sheet |
+| `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks assign ID AGENT` | Give a task to an agent |
+| `crewchat tasks move ID up\|down\|top` | Reorder |
+| `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |
+| `crewchat tasks remove ID` | Take a task off the sheet |
+
 ## Project folders
 
 | Command | |
@@ -102,7 +119,6 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat place remove NAME` | Shut a folder out: its token stops working at once |
 | `crewchat invite [--local] [--place NAME] [--client …] [--url URL]` | Print a `crewchat join` command for a folder, with a single-use code (10 minutes) |
 | `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|generic`, `--project FOLDER`) |
-| `crewchat rules` | Print a section about the chat for your `AGENTS.md` or `CLAUDE.md` |
 
 `crewchat start` does `invite` and `join` for you on the host. `--client generic` prints MCP
 settings for other tools instead of writing files.

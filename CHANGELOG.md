@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.10.0
+
+**Projects, a task sheet, and rules and skills that reach every agent.**
+
+- Each folder is its own project: its own chat, agents, tasks, roles, files and rules. `crewchat
+  start` in a new folder starts a project named after it; `--chat NAME` puts a folder in an
+  existing one. The chat page has a menu to switch, marking projects with new messages;
+  `crewchat projects` lists them, and commands act on the project of the folder you are in (or
+  `--chat`). Agent names belong to their project. An agent's token reaches its own project only.
+  A machine set up before keeps its chat, agents and links as its first project.
+- The task sheet: every task of a project in order, with who holds it, what it waits for, the
+  files it touches and the machine it needs. Agents take the top task they may (`hub_tasks`, then
+  `hub_take`), add the work they find (`hub_task_add`), give a task back (`hub_update` todo); the
+  lead hands out tasks already on the sheet (`hub_assign` with the task). The page's **Task sheet**
+  and `crewchat tasks` add, assign, reorder and settle tasks.
+- What agents learn: every folder of a project gets crewchat's guide as a Claude Code skill, a
+  Cursor rule and a section of an existing `AGENTS.md`, kept out of git, with the owner's rules for
+  the project (`crewchat rules set`, or the page) and its shared skills (`crewchat skills add`, or
+  the page). Agents get new rules and skills as a message at once.
+- Add an agent lists a tool that is not installed, with how to get it (Cursor's app alone has no
+  command-line agent).
+- For now, only each machine's first project is shared with linked machines.
+
 ## 0.9.10
 
 **On PyPI, so Windows installs without a downloaded script; agents started from the chat page get

@@ -164,6 +164,24 @@ class TwoMachines(unittest.TestCase):
             for m in (self.mac, self.win):
                 eventually(lambda: m.owner.poll()["taken"].get(tid) == winners[0], what="both to agree")
 
+    def test_a_task_given_back_can_be_taken_on_the_other_machine(self):
+        tid = self.mac.owner.task("all", "a task that changes hands")
+        for agent in (self.lead, self.dev):
+            eventually(lambda: tid in agent.call("hub_history", limit=50), what="the task on both machines")
+        self.dev.call("hub_take", id=tid)
+        self.dev.call("hub_update", id=tid, status="todo", note="giving it back")
+        eventually(lambda: tid not in self.mac.owner.poll()["taken"], what="the give-back on the Mac")
+        self.lead.call("hub_take", id=tid)  # was refused before: the first claim never released
+        for m in (self.mac, self.win):
+            eventually(lambda: m.owner.poll()["taken"].get(tid) == self.lead.name, what="both to agree")
+        # The owner puts it back too, and it can be taken afresh, from the other machine.
+        self.win.owner.post("/api/task", {"op": "status", "task": tid, "status": "todo"})
+        eventually(lambda: tid not in self.win.owner.poll()["taken"], what="the owner's give-back")
+        eventually(lambda: tid not in self.mac.owner.poll()["taken"], what="the owner's give-back on the Mac")
+        self.dev.call("hub_take", id=tid)
+        for m in (self.mac, self.win):
+            eventually(lambda: m.owner.poll()["taken"].get(tid) == self.dev.name, what="both to agree again")
+
     def test_files_travel_between_machines(self):
         report = self.win.folder / "crash.txt"
         report.write_text("stack trace here\n")

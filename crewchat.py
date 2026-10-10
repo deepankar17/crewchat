@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.10"
+__version__ = "0.10.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -69,6 +69,7 @@ INLINE_IMAGES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
               "application/javascript", "application/x-sh", "application/sql")
 MAX_TEXT = 4000
+PROJECTS_DIR = "projects"  # projects other than the first, in the crewchat home folder
 PAGE_BATCH = 500  # messages the chat page gets in one answer
 MAX_STATUS = 200
 MAX_WAIT = 50
@@ -91,8 +92,9 @@ REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offlin
 REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
-EXTRA_FIELDS = ("task", "role", "status")  # optional message fields, kept when messages travel between machines
-STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done"}
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order")  # optional message fields, kept when messages travel between machines
+STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
+            "todo": "given back"}
 ROLES = {
     "lead": ("Lead", """\
 You are the team lead. Your job is to plan and coordinate, not to write most of the code yourself.
@@ -169,6 +171,8 @@ their owner, who reads it on a chat page and writes as Owner.
   out work with hub_assign. Otherwise reply to all "BID #<id>: yes" or "no" with one line of why,
   read the other bids, and hub_take it if you are best placed; if someone has it, stop. A task
   addressed only to you is yours.
+- Nothing to do? hub_tasks lists what you may take now: hub_take the top one. Work you find goes
+  on the task sheet with hub_task_add.
 - If you get a role, follow it (hub_role shows it again); take one only when the owner says so.
 - Hooks hand you new messages after each turn; also check hub_inbox when you start and finish.
 - Use hub_send when someone needs to know: you will touch their files, you changed what they
@@ -366,7 +370,7 @@ class Roster:
         except (TypeError, ValueError):
             self.forget = FORGET_HOURS * 3600
         self.tokens = {}
-        owner = read_token(OWNER, self.root)
+        owner = read_token(OWNER, self.root) or read_token(OWNER)  # projects/<id> use the machine's
         if owner:
             self.tokens[sha(owner)] = ("owner", None)
         for place in list_places(self.root):
@@ -385,6 +389,138 @@ class Roster:
             return max(1, min(MAX_CHAIN_LIMIT, int(self.config.get("max_chain", MAX_CHAIN))))
         except (TypeError, ValueError):
             return MAX_CHAIN
+
+
+def list_projects(base=None):
+    """Every project on this machine, first one first: [{id, name, root, chat}], where chat is
+    the key folders are filed under ("" for the first project, else its id)."""
+    base = Path(base) if base else home()
+    out = []
+    if (base / "config.json").exists():
+        name = str(load_config(base)["project"])
+        out.append({"id": project_id(name), "name": name, "root": base, "chat": ""})
+    folder = base / PROJECTS_DIR
+    for path in sorted(folder.iterdir()) if folder.is_dir() else []:
+        if (path / "config.json").exists():
+            out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
+    return out
+
+
+def find_chat(text, base=None):
+    """A project by id or name (any case), or None."""
+    want = str(text or "").strip().lower()
+    return next((p for p in list_projects(base) if want in (p["id"], p["name"].lower())), None)
+
+
+def create_project(name, base=None):
+    """A new, empty project called name, in projects/<id>/. Returns its list_projects() entry."""
+    base = Path(base) if base else home()
+    taken = {p["id"] for p in list_projects(base)}
+    pid, number = project_id(name), 2
+    while pid in taken:
+        pid, number = "%s-%d" % (project_id(name)[:36], number), number + 1
+    folder = base / PROJECTS_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    # Built under another name and moved in whole: a running server sees it complete or not at all.
+    temp = Path(tempfile.mkdtemp(prefix=".new-", dir=str(folder)))
+    (temp / "tokens").mkdir()
+    save_config({"project": str(name), "forget_hours": FORGET_HOURS}, temp)
+    if os.name != "nt":
+        os.chmod(temp, 0o700)
+        os.chmod(temp / "tokens", 0o700)
+    os.replace(str(temp), str(folder / pid))
+    return next(p for p in list_projects(base) if p["id"] == pid)
+
+
+def split_list(text):
+    """A comma-separated list (task ids, areas) as a clean list."""
+    if isinstance(text, (list, tuple)):
+        text = ",".join(str(t) for t in text)
+    return [part.strip().lstrip("#") for part in str(text or "").split(",") if part.strip() and part.strip() != "-"]
+
+
+def areas_overlap(a, b):
+    """Do two tasks touch the same files? Areas are path prefixes; one inside another overlaps."""
+    def norm(area):
+        return area.strip().strip("/").lower() + "/"
+    return any(norm(x).startswith(norm(y)) or norm(y).startswith(norm(x)) for x in a for y in b)
+
+
+def project_id(name):
+    """The id of a project in URLs, commands and folder names: its name, made safe."""
+    return slug(name, 40, "project")
+
+
+class Project:
+    """One project's chat: its settings and tokens (a Roster) and its messages and agents (a Hub)."""
+
+    def __init__(self, root, primary=False):
+        self.root = Path(root)
+        self.primary = primary
+        self.roster = Roster(self.root)
+        self.hub = Hub(self.roster)
+        self.hub.chat_key = "" if primary else self.root.name  # how this machine files its folders
+        self.hub.machine_root = self.root if primary else self.root.parent.parent
+
+    @property
+    def id(self):
+        return self.root.name if not self.primary else project_id(self.roster.project)
+
+    @property
+    def name(self):
+        return self.roster.project
+
+
+class Projects:
+    """Every project on this machine. The first lives in the crewchat home folder itself (so a
+    machine set up before projects keeps its chat as it is); each other one in projects/<id>/,
+    laid out the same way, and is picked up as soon as its folder appears."""
+
+    def __init__(self, root=None):
+        self.base = Path(root) if root else home()
+        self.primary = Project(self.base, primary=True)
+        self.others = {}
+        self._stamp = None
+        self.lock = threading.Lock()
+        self.refresh()
+
+    def refresh(self):
+        folder = self.base / PROJECTS_DIR
+        try:
+            stamp = folder.stat().st_mtime_ns
+        except OSError:
+            stamp = 0
+        if stamp == self._stamp:
+            return
+        with self.lock:
+            found = sorted(p for p in folder.iterdir() if (p / "config.json").exists()) if stamp else []
+            found = [p for p in found if not p.name.startswith(".")]
+            for path in found:
+                if path.name not in self.others and not path.name.startswith("."):
+                    self.others[path.name] = Project(path)
+            names = {p.name for p in found}
+            for gone in [k for k in self.others if k not in names]:
+                del self.others[gone]  # its folder was removed: its tokens stop working
+            self._stamp = stamp
+
+    def all(self):
+        self.refresh()
+        return [self.primary] + [self.others[k] for k in sorted(self.others)]
+
+    def get(self, pid):
+        """The project with this id (the first one for None or ""), or None."""
+        if not pid:
+            return self.primary
+        return next((p for p in self.all() if p.id == pid), None)
+
+    def by_token(self, digest):
+        """(project, who) for a token's sha256, or (None, None)."""
+        for project in self.all():
+            project.roster.refresh()
+            who = project.roster.tokens.get(digest)
+            if who is not None:
+                return project, who
+        return None, None
 
 
 # --------------------------------------------------------------------------------------------
@@ -421,6 +557,8 @@ class Hub:
         self.links = {}  # hook link key -> agent name
         self.taken = {}  # task message id -> agent
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
+        self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
+        self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
@@ -428,6 +566,8 @@ class Hub:
         self.starts = {}  # start key -> {name, role, task, expires}: agents being launched (memory only)
         self.remote = {}  # device id -> {"device": name, "agents": [rows], "updated": time} (cloud sync)
         self.sync = None  # set by crewchat_cloud when cloud sync is on
+        self.chat_key = ""  # the project's key for this machine's folders ("" for the first project)
+        self.machine_root = None  # where this machine's settings are, if not in this project's folder
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
@@ -478,6 +618,8 @@ class Hub:
         self.links = {str(k): str(v) for k, v in data.get("links", {}).items() if v in self.agents}
         self.taken = {str(k): str(v) for k, v in data.get("taken", {}).items()}
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
+        self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
+        self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
@@ -485,7 +627,7 @@ class Hub:
     def _save(self):
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
-            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web,
+            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -501,20 +643,22 @@ class Hub:
         if len(self.messages) > KEEP_MESSAGES:
             for old in self.messages[:-KEEP_MESSAGES]:
                 self.ids.pop(old["id"], None)
-                self.progress.pop(old["id"], None)
+                if old["id"] not in self.sheet:  # a task on the sheet keeps its state
+                    self.progress.pop(old["id"], None)
             del self.messages[:-KEEP_MESSAGES]
         with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-    def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None):
+    def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None, **extra):
         """A message written on this machine: stored, and published when cloud sync is on."""
         seq = self.next_seq
         self.next_seq += 1
         msg = {"id": "%s%d" % (self.prefix, seq), "seq": seq, "ts": time.time(),
                "from": sender, "to": to, "text": text, "kind": kind}
-        for field, value in zip(EXTRA_FIELDS, (task, role, status)):
-            if value is not None:
-                msg[field] = value
+        fields = dict(extra, task=task, role=role, status=status)
+        for field in EXTRA_FIELDS:
+            if fields.get(field) not in (None, ""):
+                msg[field] = str(fields[field])
         if files:
             msg["files"] = files
         if self.sync is not None:
@@ -562,6 +706,30 @@ class Hub:
             self._save()
         elif kind == "update" and msg.get("task") and msg.get("status") in STATUSES:
             self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
+            if msg["status"] == "todo":
+                # Given back: on the sheet for anyone again. Every machine counts the same messages,
+                # so all of them settle the next claim under the same new key.
+                self.claim_gen[msg["task"]] = self.claim_gen.get(msg["task"], 0) + 1
+                if self.taken.get(msg["task"]) in (msg["from"], None) or msg["from"] == OWNER:
+                    self.taken.pop(msg["task"], None)
+            self._save()
+        elif kind == "assign" and msg.get("task") in self.sheet:
+            self.taken.setdefault(msg["task"], msg["to"])
+            self._save()
+        elif kind == "plan" and msg.get("task") in self.sheet:
+            row = self.sheet[msg["task"]]
+            if msg.get("order"):
+                row["order"] = float(msg["order"])
+            if msg.get("status") == "removed":
+                row["removed"] = True
+            self._save()
+        if kind == "task" and msg["id"] not in self.sheet:
+            title = " ".join(str(msg["text"]).split())
+            self.sheet[msg["id"]] = {
+                "title": title[:300], "from": msg["from"], "to": msg["to"], "ts": msg["ts"],
+                "depends": split_list(msg.get("depends")), "areas": split_list(msg.get("areas")),
+                "where": str(msg.get("where") or ""), "order": float(msg.get("order") or msg["ts"]),
+                "parent": msg.get("task") or "", "origin": msg.get("origin") or ""}
             self._save()
 
     def _event(self, text):
@@ -711,14 +879,15 @@ class Hub:
                 self.agents[owner]["checked"] = time.time()
                 self._save()
                 self._changed()
-                return owner, "Linked. This session is %s again." % owner
+                return owner, "Linked. This session is %s again, in the project %s.%s" % (
+                    owner, self.roster.project, self.rules_note())
             if mine is None:
                 mine = row["agent"] = self._new_agent(row["place"], row["client"])
             self.links[key] = mine
             self.agents[mine]["checked"] = time.time()
             self._save()
             self._changed()
-            return mine, "Linked. You are %s." % mine
+            return mine, "Linked. You are %s, in the project %s.%s" % (mine, self.roster.project, self.rules_note())
 
     def _remote_device_of(self, name):
         for dev in self.remote.values():
@@ -847,7 +1016,7 @@ class Hub:
         cur = self._cursor(name)
         return [
             m for m in self.messages
-            if m["seq"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
+            if m["seq"] > cur and m["kind"] not in ("event", "plan") and m["from"] != name and m["to"] in (name, "all")
         ]
 
     def send(self, sender, to, text, kind="msg", files=None):
@@ -946,7 +1115,7 @@ class Hub:
         start key and gets this name, role and first task."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
-        if folder not in [f["path"] for f in launch_folders(self.roster.config, self.home)]:
+        if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("that folder is not connected to this chat on this machine")
         key = self.new_start(name, role, task)
         try:
@@ -983,7 +1152,8 @@ class Hub:
             self.set_role(OWNER, name, spec["role"])
         if spec["task"]:
             self.assign(OWNER, name, spec["task"])
-        notes.insert(0, "You are %s, started from the crewchat by the owner." % name)
+        notes.insert(0, "You are %s, in the project %s, started from the crewchat by the owner."
+                     % (name, self.roster.project))
         waiting = [x for x, on in (("your role's instructions", spec["role"]), ("your first task", spec["task"])) if on]
         if waiting:
             notes.append("%s %s in hub_inbox: read it now and start." % (" and ".join(waiting).capitalize(),
@@ -1007,7 +1177,14 @@ class Hub:
         here), rather than one connected from another machine?"""
         with self.lock:
             place = (self.agents.get(agent) or {}).get("place")
-        return place is not None and place in (self.roster.config.get("folders") or {}).values()
+        config = self.machine_config()
+        return place is not None and any(p == place and folder_chat(config, path) == self.chat_key
+                                         for path, p in (config.get("folders") or {}).items())
+
+    def machine_config(self):
+        """This machine's settings (its folders, tools, port), wherever this project is kept."""
+        root = getattr(self, "machine_root", None)
+        return self.roster.config if root is None or Path(root) == Path(self.roster.root) else load_config(root)
 
     def _check_recipient(self, to, everyone=False):
         """An agent's name, or with `everyone` also "all" and Owner. Caller holds the lock."""
@@ -1017,6 +1194,9 @@ class Hub:
     def _task(self, mid):
         """The task message with this id. Caller holds the lock."""
         task = next((m for m in reversed(self.messages) if m["id"] == mid), None)
+        if task is None and mid in self.sheet:
+            row = self.sheet[mid]
+            task = {"id": mid, "from": row["from"], "to": row["to"], "text": row["title"], "kind": "task"}
         if task is None or task["kind"] != "task":
             raise HubError("#%s is not a task" % mid)
         return task
@@ -1065,6 +1245,11 @@ class Hub:
             raise HubError("status must be one of: %s" % ", ".join(STATUSES))
         with self.lock:
             task = self._task(mid)
+            if status == "todo" and agent != OWNER and self.taken.get(mid) != agent:
+                # Only a release by its holder (or the owner) is real: a stray one would move the
+                # task's claim key on every machine while someone still holds it.
+                raise HubError("you do not hold task #%s, so you cannot give it back%s" % (
+                    mid, " (%s holds it)" % self.taken[mid] if self.taken.get(mid) else ""))
             lead = self._lead()
             direct = task["from"] == OWNER and task["to"] == agent
             if lead and lead != agent and not direct:
@@ -1096,11 +1281,16 @@ class Hub:
                 return task
             if holder is not None:
                 raise HubError("task #%s is already taken by %s" % (mid, holder))
+            why = self._not_yet(agent, mid)
+            if why:
+                raise HubError("task #%s cannot be taken yet: %s. hub_tasks lists what you can take" % (mid, why))
             if self.sync is None:
                 self._record_take(agent, mid, task)
                 return task
-        # Several machines: Firestore decides who was first. Network, so outside the lock.
-        holder = self.sync.claim_task(mid, agent)
+            key = self.claim_key(mid)
+        # Several machines: the machine it was posted on (or Firestore) decides who was first.
+        # Network, so outside the lock.
+        holder = self.sync.claim_task(mid, agent, key=key)
         with self.lock:
             if self.taken.get(mid) == agent:
                 return task
@@ -1150,6 +1340,248 @@ class Hub:
         with self.lock:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
                     for m in self.messages[-limit:]]
+
+    def project_folders(self):
+        """This project's connected folders on this machine."""
+        config = self.machine_config()
+        return [Path(path) for path, place in sorted((config.get("folders") or {}).items())
+                if folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
+
+    def refresh_guides(self):
+        """Rewrite the guide and skills in every folder of the project on this machine."""
+        done = 0
+        for folder in self.project_folders():
+            try:
+                write_guides(folder, self.roster.root)
+                done += 1
+            except OSError as e:
+                sys.stderr.write("%s could not update crewchat's guide in %s: %s\n" % (now_iso(), folder, e))
+        return done
+
+    def set_rules(self, text):
+        """The owner's rules for the project: saved, written into its folders, and sent to its agents."""
+        text = str(text or "").strip()
+        if len(text) > MAX_TEXT * 4:
+            raise HubError("the rules are too long: %d characters at most" % (MAX_TEXT * 4))
+        config = load_config(self.roster.root)
+        if text:
+            config["rules"] = text
+        else:
+            config.pop("rules", None)
+        save_config(config, self.roster.root)
+        self.roster.refresh()
+        folders = self.refresh_guides()
+        with self.lock:
+            note = ("New rules for this project. Follow them from now on:\n\n%s" % text if text
+                    else "This project's rules are cleared.")
+            self._append(OWNER, "all", note, "msg")
+            self._changed()
+        return folders
+
+    def add_skill(self, name, files):
+        name = str(name or "").strip().lower()
+        if not SKILL_NAME_RE.match(name) or name == "crewchat":
+            raise HubError("a skill's name is lowercase letters, digits and -, and not crewchat")
+        if not isinstance(files, dict) or not isinstance(files.get("SKILL.md"), str):
+            raise HubError("a skill needs a SKILL.md")
+        total = 0
+        for rel, text in files.items():
+            parts = Path(str(rel)).parts
+            if (not isinstance(text, str) or Path(str(rel)).is_absolute() or ".." in parts or not parts
+                    or any(":" in part or "\\" in part for part in parts)):
+                raise HubError("bad file in the skill: %s" % rel)
+            total += len(text.encode("utf-8"))
+        if total > MAX_SKILL:
+            raise HubError("the skill is too big: %d KB at most" % (MAX_SKILL // 1024))
+        target = Path(os.path.abspath(str(Path(self.roster.root) / "skills" / name)))
+        for rel in files:
+            if Path(os.path.abspath(str(target / rel))).parts[:len(target.parts)] != target.parts:
+                raise HubError("bad file in the skill: %s" % rel)
+        shutil.rmtree(target, ignore_errors=True)
+        for rel, text in files.items():
+            (target / rel).parent.mkdir(parents=True, exist_ok=True)
+            (target / rel).write_text(text, encoding="utf-8")
+        folders = self.refresh_guides()
+        with self.lock:
+            self._append(OWNER, "all", "Shared the skill %s with this project: it is in .claude/skills/%s/ in "
+                         "your folder. Read it when it applies." % (name, name), "msg")
+            self._changed()
+        return folders
+
+    def remove_skill(self, name):
+        target = Path(self.roster.root) / "skills" / str(name or "")
+        if str(name or "") not in project_skills(self.roster.root):
+            raise HubError("this project has no skill called %s" % name)
+        shutil.rmtree(target, ignore_errors=True)
+        folders = self.refresh_guides()
+        with self.lock:
+            self._changed()
+        return folders
+
+    def rules_note(self):
+        rules = project_rules(self.roster.root)
+        return ("\n\nThe owner's rules for this project (follow them):\n%s" % rules) if rules else ""
+
+    # The task sheet ----------------------------------------------------------------------------
+    # Every task is a row: what the owner posts, what the lead hands out, what agents add. An agent
+    # with nothing to do takes the top row it may (hub_tasks, then hub_take). A row waits for the
+    # rows it depends on, never runs at once with another row over the same files (areas), and may
+    # need one machine (where).
+    def claim_key(self, mid):
+        """The key a task's claim is settled under across machines: its id, then a new one each time
+        it is given back (old claims stay recorded; they never release)."""
+        gen = self.claim_gen.get(mid, 0)
+        return mid if not gen else "%s@%d" % (mid, gen)
+
+    def _row_status(self, mid):
+        row = self.sheet[mid]
+        if row.get("removed"):
+            return "removed"
+        done = (self.progress.get(mid) or {}).get("status")
+        if done in ("done", "blocked", "review"):
+            return done
+        return "doing" if self.taken.get(mid) else "todo"
+
+    def _row_machine_ok(self, agent, row):
+        where = str(row.get("where") or "").strip().lower()
+        if where in ("", "any"):
+            return True
+        info = next((r for r in self._rows() if r["agent"] == agent), {})
+        return where in {str(info.get("place", "")).lower(), str(info.get("device", "")).lower(), agent.lower()}
+
+    def _not_yet(self, agent, mid):
+        """Why an agent may not take a row now, or ''. Caller holds the lock."""
+        row = self.sheet.get(mid)
+        if row is None:
+            return ""
+        if row.get("removed"):
+            return "it was taken off the sheet"
+        waiting = [d for d in row["depends"] if d in self.sheet and self._row_status(d) != "done"]
+        if waiting:
+            return "it waits for %s" % ", ".join("#" + d for d in waiting)
+        for other, holder in self.taken.items():
+            if other == mid or holder == agent or other not in self.sheet:
+                continue
+            if self._row_status(other) in ("doing", "review") and areas_overlap(row["areas"], self.sheet[other]["areas"]):
+                return "its files overlap #%s, which %s is working on" % (other, holder)
+        if not self._row_machine_ok(agent, row):
+            return "it needs the machine %s" % row["where"]
+        return ""
+
+    def sheet_rows(self, agent=None, view="all"):
+        """The sheet, in order: dicts with id, title, status, holder, ... For view "next", only the
+        rows agent may take now; "mine", the ones it holds."""
+        with self.lock:
+            rows = []
+            for mid, row in sorted(self.sheet.items(), key=lambda kv: kv[1]["order"]):
+                status = self._row_status(mid)
+                if status == "removed":
+                    continue
+                if view == "next" and (status != "todo" or row["to"] not in ("all", agent) or self._not_yet(agent, mid)):
+                    continue
+                if view == "mine" and self.taken.get(mid) != agent:
+                    continue
+                if view == "open" and status == "done":
+                    continue
+                if status == "todo" and any(d in self.sheet and self._row_status(d) != "done" for d in row["depends"]):
+                    status = "waiting"  # shown so: it cannot start before what it waits for is done
+                rows.append(dict(row, id=mid, status=status, holder=self.taken.get(mid) or "",
+                                 note=(self.progress.get(mid) or {}).get("by", "")))
+            return rows
+
+    def add_row(self, sender, title, depends="", areas="", where="", to="all"):
+        """A new row on the sheet, as a task message (agents add work they find; the owner and the
+        lead add work too)."""
+        title = " ".join(str(title or "").split())
+        if not title or len(title) > MAX_TEXT:
+            raise HubError("a task needs a title of at most %d characters" % MAX_TEXT)
+        with self.lock:
+            if to != "all":
+                self._check_recipient(to)
+            deps = split_list(depends)
+            unknown = [d for d in deps if d not in self.sheet]
+            if unknown:
+                raise HubError("no task %s on the sheet" % ", ".join("#" + d for d in unknown))
+            msg = self._append(sender, to, title, "task", depends=",".join(deps),
+                               areas=",".join(split_list(areas)), where=str(where or "").strip())
+            self._changed()
+            return msg
+
+    def assign_row(self, lead, to, mid):
+        """The lead (or the owner) gives an open row on the sheet to one agent."""
+        mid = clean_id(mid)
+        with self.lock:
+            if lead != OWNER and (self.agents.get(lead) or {}).get("role") != "lead":
+                raise HubError("only the lead assigns work; take a task yourself with hub_take")
+            self._check_recipient(to)
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            holder = self.taken.get(mid)
+            if holder and holder != to:
+                raise HubError("task #%s is held by %s; they give it back with hub_update todo" % (mid, holder))
+            key = self.claim_key(mid)
+        if self.sync is not None and not holder:
+            # As with hub_take: two machines assigning the same task at once must agree on one.
+            settled = self.sync.claim_task(mid, to, key=key)
+            if settled != to:
+                with self.lock:
+                    self.taken[mid] = settled
+                    self._save()
+                    self._changed()
+                raise HubError("task #%s was just taken by %s" % (mid, settled))
+        with self.lock:
+            msg = self._append(lead, to, "Task #%s is yours: %s" % (mid, self.sheet[mid]["title"]), "assign", task=mid)
+            self._changed()
+            return msg
+
+    def plan_change(self, mid, order=None, status=None):
+        """The owner reorders a row or takes it off the sheet."""
+        mid = clean_id(mid)
+        with self.lock:
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            self._append(OWNER, "all", "", "plan", task=mid, order=order, status=status)
+            self._changed()
+
+    def move_row(self, mid, where):
+        """Up, down or top: a new order between its neighbours."""
+        mid = clean_id(mid)
+        with self.lock:
+            rows = [k for k, _ in sorted(((k, v) for k, v in self.sheet.items() if not v.get("removed")),
+                                          key=lambda kv: kv[1]["order"])]
+            if mid not in rows:
+                raise HubError("#%s is not on the task sheet" % mid)
+            i = rows.index(mid)
+            order = lambda k: self.sheet[k]["order"]  # noqa: E731
+            if where == "top":
+                new = order(rows[0]) - 1 if i else None
+            elif where == "up":
+                new = (order(rows[i - 2]) + order(rows[i - 1])) / 2 if i >= 2 else (order(rows[0]) - 1 if i else None)
+            elif where == "down":
+                new = ((order(rows[i + 1]) + order(rows[i + 2])) / 2 if i + 2 < len(rows)
+                       else (order(rows[-1]) + 1 if i + 1 < len(rows) else None))
+            else:
+                raise HubError("move a task up, down or to the top")
+        if new is not None:
+            self.plan_change(mid, order=repr(new))
+
+    def owner_status(self, mid, status, note=""):
+        """The owner settles a row: back to todo (unblock, or take it from its holder), or done."""
+        mid = clean_id(mid)
+        if status not in ("todo", "done", "blocked"):
+            raise HubError("set a task to todo, done or blocked")
+        with self.lock:
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            to = self.taken.get(mid) or "all"
+            self._append(OWNER, to, note or {"todo": "Back on the sheet.", "done": "Done.", "blocked": "Blocked."}[status],
+                         "update", task=mid, status=status)
+            self._changed()
+
+    def last_seq(self):
+        """The newest message's seq, for the page's "new in other projects" marks."""
+        with self.lock:
+            return self.messages[-1]["seq"] if self.messages else 0
 
     def set_update(self, newer):
         """A newer crewchat to tell the owner about on the chat page ('' for none)."""
@@ -1540,10 +1972,44 @@ TOOLS = [
         },
     },
     {
+        "name": "hub_tasks",
+        "description": "The project's task sheet. With nothing to do, call it (view next) and hub_take the top task "
+        "it lists: that is the work you may start now (what it waits for is done, nobody is in its files, and it "
+        "suits your machine). view all shows the whole sheet with who holds what; mine, your tasks.",
+        "annotations": READ,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"view": {"type": "string", "enum": ["next", "mine", "all"], "default": "next",
+                                    "description": "next: what you may take now; mine: your tasks; all: the sheet."}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "hub_task_add",
+        "description": "Put a task on the project's task sheet: work you found that someone (maybe you) should "
+        "do, such as a bug, a follow-up or a missing piece. Give what it waits for (depends), the files it "
+        "touches (areas) and the machine it needs (where), so it is only taken when it can be done. With "
+        "take, it is yours at once. Not for chatting: use hub_send.",
+        "annotations": WRITE,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "maxLength": MAX_TEXT, "description": "The work, and what done looks like."},
+                "depends": {"type": "string", "description": "Task numbers it waits for, comma-separated: A12,A14."},
+                "areas": {"type": "string", "description": "Path prefixes it changes, comma-separated: app/login/,docs/."},
+                "where": {"type": "string", "description": "A machine or place name it needs, if any (else any)."},
+                "take": {"type": "boolean", "default": False, "description": "Take it yourself now."},
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "hub_assign",
-        "description": "Lead only: give one agent a piece of work. It becomes a task that is theirs at "
-        "once (no bidding), and they report back to you with hub_update. Not the lead? Ask the lead, or "
-        "message the agent with hub_send. Fails if you are not the lead or nobody has that name.",
+        "description": "Lead only: give one agent a piece of work. With text, a new task that is theirs at "
+        "once (no bidding); with only task, a task already on the sheet. They report back to you with "
+        "hub_update. Not the lead? Ask the lead, or message the agent with hub_send. Fails if you are not the "
+        "lead or nobody has that name.",
         "annotations": WRITE,
         "inputSchema": {
             "type": "object",
@@ -1552,10 +2018,10 @@ TOOLS = [
                 "text": {"type": "string", "maxLength": MAX_TEXT,
                          "description": "The work, and what done looks like."},
                 "task": {"type": ["string", "integer"],
-                         "description": "The owner's task this piece belongs to, if any: its progress then "
-                         "shows there too."},
+                         "description": "With text: the owner's task this piece belongs to. Without text: the "
+                         "task on the sheet to give them."},
             },
-            "required": ["to", "text"],
+            "required": ["to"],
             "additionalProperties": False,
         },
     },
@@ -1572,7 +2038,7 @@ TOOLS = [
                 "id": {"type": ["string", "integer"], "description": "The task's number."},
                 "status": {"type": "string", "enum": list(STATUSES),
                            "description": "in_progress (started), blocked (you need something), review (ready "
-                           "to be tested or reviewed) or done."},
+                           "to be tested or reviewed), done, or todo (give it back to the sheet, for someone else)."},
                 "note": {"type": "string", "maxLength": MAX_TEXT, "description": "What happened, what you need."},
             },
             "required": ["id", "status"],
@@ -1650,8 +2116,29 @@ def call_tool(hub, sid, name, args, owner=False):
         return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in rows)
     if name == "hub_assign":
         to, text = args.get("to"), args.get("text")
+        if not text and args.get("task"):
+            hub.assign_row(me, to, args.get("task"))
+            return "Gave task #%s to %s. They report back to you with hub_update." % (clean_id(args["task"]), to)
         msg = hub.assign(me, to, clean_text(to, text, me), args.get("task"))
         return "Assigned task #%s to %s. They report back to you with hub_update." % (msg["id"], to)
+    if name == "hub_tasks":
+        view = args.get("view") or "next"
+        if view not in ("next", "mine", "all"):
+            raise HubError("view is next, mine or all")
+        rows = hub.sheet_rows(me, view if not owner else "all")
+        if not rows:
+            return {"next": "Nothing on the sheet you can take now. Ask the lead or Owner, or find work and add it "
+                    "with hub_task_add.", "mine": "You hold no task.", "all": "The task sheet is empty."}[view]
+        head = {"next": "Tasks you may take now, top first (hub_take the first one):",
+                "mine": "Your tasks:", "all": "The task sheet, in order:"}[view]
+        return head + "\n" + "\n".join(sheet_line(r) for r in rows)
+    if name == "hub_task_add":
+        msg = hub.add_row(me, args.get("title"), args.get("depends", ""), args.get("areas", ""), args.get("where", ""))
+        if args.get("take") and not owner:
+            hub.take(me, msg["id"])
+            return ("Task #%s is on the sheet and yours. Send hub_update id=%s status=in_progress with your plan, "
+                    "then start." % (msg["id"], msg["id"]))
+        return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if owner:
         raise HubError("only agents have a status and a name")
     if name == "hub_status":
@@ -1683,6 +2170,22 @@ def call_tool(hub, sid, name, args, owner=False):
     new = args.get("name")
     hub.rename(me, new)
     return "You are now %s. Everyone has been told." % new
+
+
+def sheet_line(row):
+    """One task on the sheet, as agents and the command line see it."""
+    extra = ["from %s" % row["from"]]
+    if row["holder"]:
+        extra.append("held by %s" % row["holder"])
+    if row["depends"]:
+        extra.append("waits for " + ", ".join("#" + d for d in row["depends"]))
+    if row["areas"]:
+        extra.append("files " + ", ".join(row["areas"]))
+    if row["where"]:
+        extra.append("on " + row["where"])
+    if row["to"] != "all":
+        extra.append("for " + row["to"])
+    return "#%s [%s] %s (%s)" % (row["id"], row["status"], row["title"], "; ".join(extra))
 
 
 def share_file(hub, path):
@@ -1773,7 +2276,7 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -1950,6 +2453,31 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     hub = None
     roster = None
+    projects = None
+    project = None
+
+    # Projects: an agent's requests go to the project its token belongs to, and nowhere else. The
+    # owner picks one (the page's ?chat=, or X-Crewchat-Chat from the command line); sign-in and
+    # sign-in codes belong to the machine, so they live in the first project.
+    def _use(self, project):
+        self.project, self.hub, self.roster = project, project.hub, project.roster
+        self.roster.refresh()
+
+    def _asked_project(self):
+        """The project id the request names, or ''."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        return (self.headers.get("X-Crewchat-Chat") or query.get("chat", [""])[0] or "").strip()
+
+    def _use_asked(self):
+        """For the owner: switch to the project the request names. False (after replying) if
+        there is no such project."""
+        asked = self._asked_project()
+        project = self.projects.get(asked)
+        if project is None:
+            self._json(404, {"error": "no project called %s here; `crewchat projects` lists them" % asked})
+            return False
+        self._use(project)
+        return True
     failures = {}  # address -> [timestamps]
     fail_lock = threading.Lock()
 
@@ -2004,7 +2532,18 @@ class Handler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         if quiet and not header:
             return None
-        who = self.roster.tokens.get(sha(header[7:].strip())) if header.startswith("Bearer ") else None
+        project, who = (self.projects.by_token(sha(header[7:].strip())) if header.startswith("Bearer ")
+                        else (None, None))
+        if who is not None:
+            if who[0] == "place":
+                asked = self._asked_project()
+                if asked and asked != project.id:
+                    self._json(403, {"error": "this token belongs to the project %s" % project.id})
+                    return None
+                self._use(project)
+            elif not self._use_asked():
+                return None
+            return who
         if who is None:
             # Only wrong tokens are locked out. A right one always works: tokens are far too long to
             # guess, and a stale token still in use (a removed folder, an old copy of a project) must
@@ -2019,7 +2558,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _owner_session(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
-        return self.hub.session_ok(cookie[COOKIE].value if COOKIE in cookie else "")
+        return self.projects.primary.hub.session_ok(cookie[COOKIE].value if COOKIE in cookie else "")
 
     def _same_origin(self):
         """Browser writes must come from the chat page itself, not another site."""
@@ -2040,6 +2579,8 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             if not self._same_origin():
                 self._json(403, {"error": "wrong origin"})
+                return False
+            if not self._use_asked():
                 return False
         elif who[0] != "owner":
             self._json(403, {"error": "only the owner can do this"})
@@ -2079,7 +2620,7 @@ class Handler(BaseHTTPRequestHandler):
         note = '<p class="err">%s</p>' % error if error else ""
         self._html(code, LOGIN_PAGE.replace("__ERROR__", note))
 
-    def _sign_in(self, code):
+    def _sign_in(self, code, chat=""):
         if self._locked():
             self._login_page(429, "Too many wrong codes. Try again later.")
             return
@@ -2090,11 +2631,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
         cookie = "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict%s" % (COOKIE, sid, SESSION_TTL, secure)
-        self._reply(303, b"", extra={"Location": "/", "Set-Cookie": cookie, "Cache-Control": "no-store"})
+        where = "/?chat=" + urllib.parse.quote(chat) if chat and self.projects.get(chat) else "/"
+        self._reply(303, b"", extra={"Location": where, "Set-Cookie": cookie, "Cache-Control": "no-store"})
 
     # Routes ----------------------------------------------------------------------------------
     def do_GET(self):
-        self.roster.refresh()
+        self._use(self.projects.primary)
         url = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(url.query)
         if url.path == "/health":
@@ -2118,7 +2660,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/login":
             if "code" in query:
-                self._sign_in(query["code"][0])
+                self._sign_in(query["code"][0], query.get("chat", [""])[0])
             else:
                 self._login_page(200)
         elif url.path.startswith("/files/"):
@@ -2127,10 +2669,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
                 return
-            self._json(200, launch_options(self.roster.config, self.roster.root))
+            if not self._use_asked():
+                return
+            self._json(200, launch_options(self.hub.machine_config(), self.roster.root, self.hub.chat_key))
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
+                return
+            if not self._use_asked():
                 return
             try:
                 after = int(query.get("after", ["-1"])[0])
@@ -2139,13 +2685,20 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "bad query"})
                 return
-            self._json(200, self.hub.poll(after, version, wait))
+            data = self.hub.poll(after, version, wait)
+            data["chat"] = self.project.id
+            data["rules"] = project_rules(self.roster.root)
+            data["sheet"] = self.hub.sheet_rows()
+            data["skills"] = project_skills(self.roster.root)
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
+                                for p in self.projects.all()]
+            self._json(200, data)
         else:
             self._reply(404, b"")
 
     def do_DELETE(self):
         """An MCP client ending its session."""
-        self.roster.refresh()
+        self._use(self.projects.primary)
         if urllib.parse.urlsplit(self.path).path != "/mcp":
             self._reply(404, b"")
             return
@@ -2163,7 +2716,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(429, {"error": "too many wrong codes; try again later"})
             return
         data = self._object(raw)
-        fixed = self.hub.redeem_invite(data.get("code", "")) if data.get("code") else None
+        fixed = None
+        for project in self.projects.all() if data.get("code") else []:
+            fixed = project.hub.redeem_invite(data.get("code", ""))
+            if fixed is not None:
+                self._use(project)
+                break
         if fixed is None:
             self._fail()
             self._json(401, {"error": "that code is wrong or has expired"})
@@ -2175,7 +2733,8 @@ class Handler(BaseHTTPRequestHandler):
             place, number = "%s-%d" % (base[:13], number), number + 1
         ensure_token(place, root)
         self.roster.refresh()
-        self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project})
+        self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project,
+                         "chat": self.hub.chat_key})
 
     # The owner's actions, from the chat page or the command line: each takes the request body and
     # returns the answer, or raises HubError for a 400.
@@ -2184,6 +2743,39 @@ class Handler(BaseHTTPRequestHandler):
         kind = "task" if data.get("kind") == "task" else "msg"
         files = self.hub.attach(data.get("files") or [])
         return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
+
+    def _task_op(self, data):
+        """The owner on the task sheet: add, assign, move, settle (todo, done, blocked) or remove a task."""
+        op, task = data.get("op"), data.get("task")
+        if op == "add":
+            to = data.get("to") or "all"
+            msg = self.hub.add_row(OWNER, data.get("title"), data.get("depends", ""), data.get("areas", ""),
+                                   data.get("where", ""), to)
+            return {"id": msg["id"]}
+        if op == "assign":
+            self.hub.assign_row(OWNER, data.get("agent"), task)
+        elif op == "move":
+            self.hub.move_row(task, data.get("where"))
+        elif op == "status":
+            self.hub.owner_status(task, data.get("status"), str(data.get("note") or ""))
+        elif op == "remove":
+            self.hub.plan_change(task, status="removed")
+        else:
+            raise HubError("op is add, assign, move, status or remove")
+        return {"ok": True}
+
+    def _rules(self, data):
+        return {"project": self.roster.project, "folders": self.hub.set_rules(data.get("rules"))}
+
+    def _skills(self, data):
+        name = str(data.get("name") or "").strip().lower()
+        if data.get("op") == "add":
+            folders = self.hub.add_skill(name, data.get("files"))
+        elif data.get("op") == "remove":
+            folders = self.hub.remove_skill(name)
+        else:
+            raise HubError("op must be add or remove")
+        return {"project": self.roster.project, "name": name, "folders": folders}
 
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
@@ -2234,6 +2826,12 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(401, b"", ctype="text/plain")
             return
         fid = path.split("/")[2] if path.count("/") >= 2 else ""
+        holder = next((p for p in self.projects.all() if p.hub.file(fid)[0] is not None), None)
+        if holder is None and self._use_asked():  # one shared on another machine: its project's
+            holder = self.project
+        if holder is None:
+            return
+        self._use(holder)
         try:
             meta, local = self.hub.open_file(fid)
         except HubError as e:
@@ -2320,7 +2918,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, out, extra=extra)
 
     def do_POST(self):
-        self.roster.refresh()
+        self._use(self.projects.primary)
         path = urllib.parse.urlsplit(self.path).path
         if path not in POST_PATHS and path not in PEER_PATHS:
             self._reply(404, b"")
@@ -2352,12 +2950,14 @@ class Handler(BaseHTTPRequestHandler):
             self._join(raw)
             return
         if path in PEER_PATHS:
+            self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
             return
-        if path in ("/api/send", "/api/role", "/api/launch"):
+        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
             if not self._owner_request():
                 return
-            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch}[path]
+            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch,
+                      "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}[path]
             try:
                 self._json(200, action(self._object(raw)))
             except HubError as e:
@@ -2388,7 +2988,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "only the owner token can do this"})
                 return
             if path == "/api/login-code":
-                self._json(200, {"code": self.hub.new_code(), "ttl": CODE_TTL})
+                self._json(200, {"code": self.projects.primary.hub.new_code(), "ttl": CODE_TTL})
             elif path == "/api/invite":
                 place = self._object(raw).get("place") or ""
                 self._json(200, {"code": self.hub.new_invite(place_label(place) if place else ""), "ttl": INVITE_TTL})
@@ -2410,8 +3010,10 @@ class Server(ThreadingHTTPServer):
 
 def make_server(port, root=None):
     """A ready server (not yet serving). Port 0 picks a free one; see server.server_address."""
-    roster = Roster(root)
-    handler = type("BoundHandler", (Handler,), {"roster": roster, "hub": Hub(roster), "failures": {}})
+    projects = Projects(root)
+    first = projects.primary
+    handler = type("BoundHandler", (Handler,), {"projects": projects, "project": first, "roster": first.roster,
+                                                "hub": first.hub, "failures": {}})
     return Server((BIND, port), handler)
 
 
@@ -2448,9 +3050,13 @@ def owner_token():
     return token
 
 
-def owner_call(path, body):
+CURRENT_CHAT = None  # the project owner commands act on: --chat, or the one of the folder they run in
+
+
+def owner_call(path, body, chat=None):
+    chat = chat or CURRENT_CHAT
     try:
-        return post_json(local_url() + path, owner_token(), body)
+        return post_json(local_url() + path, owner_token(), body, headers={"X-Crewchat-Chat": chat} if chat else None)
     except urllib.error.HTTPError as e:
         try:
             die(json.loads(e.read().decode("utf-8")).get("error", "HTTP %d" % e.code))
@@ -2572,6 +3178,32 @@ def log_tail(lines=6):
     return "\n".join("  " + line for line in text[-lines:])
 
 
+def connected_project(folder, config=None):
+    """(place, token, clients, project) for a folder connected to any project on this machine,
+    else (None, None, [], None)."""
+    config = config or load_config()
+    for entry in list_projects():
+        place, token, clients = joined_place(folder, config, entry["root"])
+        if place:
+            return place, token, clients, entry
+    return None, None, [], None
+
+
+def chat_of_folder(folder):
+    """The project id of the connected folder this is in (or below), or None."""
+    try:
+        config = load_config()
+    except SystemExit:
+        return None
+    folder = Path(folder).resolve()
+    for candidate in [folder] + list(folder.parents):
+        if str(candidate) in (config.get("folders") or {}):
+            chat = folder_chat(config, candidate)
+            projects = list_projects()
+            return chat or (projects[0]["id"] if projects else None)
+    return None
+
+
 def joined_place(project, config=None, root=None):
     """The place this folder joined this machine's chat as, with its token and the clients set
     up for it, or (None, None, [])."""
@@ -2596,16 +3228,23 @@ LAUNCH_PROMPT = ("You were started from the crewchat by your owner. Call the cre
                  "%s now: it tells you your name, your role and your first task.")
 
 
-def remember(project, place, root=None):
-    """Note a folder connected to this machine's chat, and where Claude Code and Cursor's agent
-    are (as found in the user's own shell), so the chat page can start agents there."""
+def remember(project, place, root=None, chat=""):
+    """Note a folder connected to this machine's chat, and which project it is in (chat: "" for
+    the first), and where Claude Code and Cursor's agent are (as found in the user's own shell),
+    so the chat page can start agents there."""
     config = load_config(root)
     folders = dict(config.get("folders") or {}, **{str(project): place})
+    chats = {k: v for k, v in dict(config.get("folder_chats") or {}, **{str(project): chat}).items() if v}
     tools = dict(config.get("tools") or {})
     tools.update({t: path for t, path in ((t, shutil.which(exe)) for t, (_, exe) in LAUNCH_TOOLS.items()) if path})
-    if folders != config.get("folders") or tools != (config.get("tools") or {}):
-        config["folders"], config["tools"] = folders, tools
+    if (folders, chats, tools) != (config.get("folders"), config.get("folder_chats") or {}, config.get("tools") or {}):
+        config["folders"], config["folder_chats"], config["tools"] = folders, chats, tools
         save_config(config, root)
+
+
+def folder_chat(config, path):
+    """The project a connected folder is in ("" for the first)."""
+    return (config.get("folder_chats") or {}).get(str(path), "")
 
 
 def find_tool(tool, config):
@@ -2624,19 +3263,26 @@ def find_tool(tool, config):
     return None
 
 
-def launch_folders(config, root=None):
-    """The project folders on this machine still connected to its chat, as `crewchat start` noted."""
+def launch_folders(config, root=None, chat=""):
+    """The folders on this machine still connected to one project's chat (chat: "" for the
+    first), as `crewchat start` noted. config is the machine's; root the project's folder."""
     folders = []
     for path, place in sorted((config.get("folders") or {}).items()):
-        if Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
+        if folder_chat(config, path) == chat and Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
             folders.append({"path": path, "name": Path(path).name, "place": place})
     return folders
 
 
-def launch_options(config, root=None):
-    """What the chat page's "Add an agent" offers on this machine."""
-    tools = [{"id": t, "label": label} for t, (label, _) in LAUNCH_TOOLS.items() if find_tool(t, config)]
-    return {"tools": tools, "folders": launch_folders(config, root)}
+TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
+              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash"}
+
+
+def launch_options(config, root=None, chat=""):
+    """What the chat page's "Add an agent" offers on this machine, for one project. A tool that
+    is not installed is listed with how to get it (Cursor's app alone has no command-line agent)."""
+    tools = [{"id": t, "label": label} if find_tool(t, config) else {"id": t, "label": label, "missing": TOOL_HINTS[t]}
+             for t, (label, _) in LAUNCH_TOOLS.items()]
+    return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
 def launch_command(exe, tool, key, accept_edits=False):
@@ -2731,32 +3377,53 @@ def cmd_start(args):
     print()
     first = not (home() / "config.json").exists()
     if first:
-        config = setup_host(args.project or project.name, args.port)
+        config = setup_host(args.chat or args.project or project.name, args.port)
         print("- Set up this machine as the chat's host (%s), for \"%s\"." % (home(), config["project"]))
     config = load_config()
 
     ensure_server(config, args)
 
-    place, token, clients = joined_place(project, config)
-    if place:
+    place, token, clients, chosen = connected_project(project, config)
+    if place and (not args.chat or find_chat(args.chat) == chosen):
         # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
         for client in clients:
             {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
-        remember(project, place)
-        print("- %s is connected, as \"%s\"." % (project, place))
+        remember(project, place, chat=chosen["chat"])
+        print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
     else:
-        # This machine has one chat. A further folder joins it, and is named after itself, so its
-        # agents are told apart from the first folder's (claude-notes-app, not claude-macbook-2).
-        others = [f for f in launch_folders(config) if Path(f["path"]) != project]
+        if place:
+            die("%s is in the project \"%s\". To move it, take it out first: `crewchat place remove %s "
+                "--chat %s`, then `crewchat start --chat %s`." % (project, chosen["name"], place, chosen["id"], args.chat))
+        # Each project is its own chat. A new folder starts a project named after itself, unless
+        # one by that name is here already (its folder on another machine, or a second folder) or
+        # --chat names one.
+        wanted = args.chat or args.project or project.name
+        chosen = list_projects()[0] if first else find_chat(wanted)
+        created = chosen is None
+        if created:
+            chosen = create_project(wanted)
+        # The first folder of a project on a machine is named after the machine (claude-macbook),
+        # others after themselves (claude-website, not claude-macbook-2).
+        others = [f for f in launch_folders(config, chosen["root"], chosen["chat"]) if Path(f["path"]) != project]
         label = args.place or (place_label(project.name) if others else "")
-        code = owner_call("/api/invite", {"place": label})["code"]
+        code = owner_call("/api/invite", {"place": label}, chat=chosen["id"])["code"]
         place = join_folder(local_url(config), code, project, label or None, args.client, quiet=True)
-        if others and not first:
-            print("- Added %s to this machine's chat, \"%s\", as \"%s\"." % (project, config["project"], place))
-            print("  A machine has one chat, and every folder you run `crewchat start` in joins it.")
-            print("  `crewchat places` lists them; `crewchat place remove %s` takes this one out." % place)
+        if created:
+            print("- Created the project \"%s\": its own chat, apart from your other projects (switch on the "
+                  "chat page, top left)." % chosen["name"])
+        if others:
+            print("- Added %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+            print("  `crewchat places` lists its folders; `crewchat place remove %s` takes this one out." % place)
         else:
-            print("- Connected %s, as \"%s\"." % (project, place))
+            print("- Connected %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+    global CURRENT_CHAT
+    CURRENT_CHAT = chosen["id"]
+    try:
+        if write_guides(project, chosen["root"]):
+            print("- Wrote the project's guide for its agents (a Claude Code skill, a Cursor rule%s), kept out "
+                  "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
+    except OSError as e:
+        print("- Could not write the project's guide for its agents (%s)." % e)
 
     if newer_version():
         print("- crewchat %s is available (this is %s): run `crewchat update`." % (newer_version(), __version__))
@@ -2800,7 +3467,7 @@ def cmd_serve(args):
         except Exception as e:  # the local chat keeps working on its own
             sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
-        threading.Thread(target=update_checks, args=(server.RequestHandlerClass.hub,), daemon=True).start()
+        threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2890,10 +3557,33 @@ def cmd_agent(args):
               "to shut a folder out, use `crewchat place remove`." % args.name)
 
 
+def project_root():
+    """The folder of the project owner commands act on (CURRENT_CHAT), else the first project's."""
+    found = find_chat(CURRENT_CHAT) if CURRENT_CHAT else None
+    return found["root"] if found else home()
+
+
 def cmd_places(_args):
     load_config()
-    names = list_places()
+    names = list_places(project_root())
     print("\n".join(names) if names else "No folder has joined yet. Start with `crewchat invite`.")
+
+
+def cmd_projects(_args):
+    config = load_config()
+    projects = list_projects()
+    shared = config.get("peers") or config.get("cloud")
+    for entry in projects:
+        folders = sorted(path for path in (config.get("folders") or {}) if folder_chat(config, path) == entry["chat"])
+        mark = " (here)" if entry["id"] == CURRENT_CHAT else ""
+        link = ", shared with your linked machines" if shared and entry is projects[0] else ""
+        print("%s%s  [--chat %s]%s" % (entry["name"], mark, entry["id"], link))
+        for folder in folders:
+            print("    %s" % folder)
+        if not folders:
+            print("    (no folder on this machine)")
+    print("\nA new project: `crewchat start` in a new folder. A folder into an existing project: "
+          "`crewchat start --chat NAME`.")
 
 
 def cmd_place(args):
@@ -2907,7 +3597,7 @@ def cmd_ui(args):
         print("Sign-in code (works once, for two minutes): %s-%s" % (code[:4], code[4:]))
         print("Open the chat's address on your other device and type it in.")
         return
-    webbrowser.open(local_url() + "/login?code=" + code)
+    webbrowser.open(local_url() + "/login?code=" + code + ("&chat=" + CURRENT_CHAT if CURRENT_CHAT else ""))
     print("Opened the chat in your browser.")
 
 
@@ -2976,7 +3666,8 @@ def cmd_role(args):
 
 
 def cmd_roles(args):
-    config = load_config()
+    root = project_root()
+    config = load_config(root)
     custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
     roles = all_roles(config)
     if args.action == "list":
@@ -2999,7 +3690,7 @@ def cmd_roles(args):
             die("give the role's instructions with --prompt \"...\" or --file FILE")
         custom[name] = {"title": args.title or name.replace("-", " ").capitalize(), "prompt": prompt.strip()}
         config["roles"] = custom
-        save_config(config)
+        save_config(config, root)
         print("Role %s saved%s. Give it to an agent with: crewchat role AGENT %s" % (
             name, " (it replaces the built-in one)" if name in ROLES else "", name))
     else:
@@ -3007,7 +3698,7 @@ def cmd_roles(args):
             die("no custom role called %s%s" % (name, " (built-in roles cannot be removed)" if name in ROLES else ""))
         del custom[name]
         config["roles"] = custom
-        save_config(config)
+        save_config(config, root)
         print("Role %s removed. Agents that had it keep it until you change their role." % name)
 
 
@@ -3226,7 +3917,7 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
         written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
     if (home() / "config.json").exists() and url == local_url():
-        remember(project, place)
+        remember(project, place, chat=answer.get("chat", ""))
     if quiet:
         if not ignored:
             print("- %s hold a secret token: do not commit them." % ", ".join(written))
@@ -3843,7 +4534,7 @@ def check_for_update():
     return newer_version()
 
 
-def update_checks(hub):
+def update_checks(projects):
     """The server's daily check for a newer crewchat: logged once per version, and shown on the
     chat page. CREWCHAT_NO_UPDATE_CHECK=1 turns it off."""
     told = ""
@@ -3856,7 +4547,8 @@ def update_checks(hub):
             sys.stderr.write("%s crewchat %s is available (this is %s): run `crewchat update`. %s\n"
                              % (now_iso(), newer, __version__, RELEASES))
             told = newer
-        hub.set_update(newer)
+        for project in projects.all():  # every project's page shows the notice
+            project.hub.set_update(newer)
         time.sleep(UPDATE_EVERY)
 
 
@@ -4147,6 +4839,7 @@ def disconnect_folder(project):
         if not hooks:
             data.pop("hooks", None)
 
+    changed += remove_guides(project)
     edit(".mcp.json", servers)
     edit(".claude/settings.local.json", claude_settings)
     edit(".cursor/mcp.json", servers)
@@ -4229,8 +4922,8 @@ RULES = """\
 ## The crewchat: talking to each other
 
 This project's AI agents and the owner share a chat (crewchat). If your tool list has `hub_send`,
-`hub_inbox`, `hub_take`, `hub_agents`, `hub_status`, `hub_history`, `hub_rename`, `hub_role`,
-`hub_assign`, `hub_update` and `hub_link`, you are connected.
+`hub_inbox`, `hub_take`, `hub_tasks`, `hub_task_add`, `hub_agents`, `hub_status`, `hub_history`,
+`hub_rename`, `hub_role`, `hub_assign`, `hub_update` and `hub_link`, you are connected.
 
 - **Know who is who.** `hub_agents` lists every agent with its name, tool, place and status; your
   row is marked `(you)`. You are named automatically; if the owner gives you a name, take it with
@@ -4253,6 +4946,13 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   with `BID #<id>: yes` or `no` and one line of why. Read the other bids, then call `hub_take` if
   you bid yes and nobody better placed did. `hub_take` gives the task to the first caller and
   tells everyone. A task addressed only to you is yours: take it without bidding.
+- **The task sheet.** Every task is a row on the project's sheet (`hub_tasks` with view `all`).
+  With nothing to do, call `hub_tasks` and `hub_take` the top task it lists: what it waits for is
+  done, nobody else is in its files, and it suits your machine. Work you find (a bug, a follow-up,
+  a missing piece) goes on the sheet with `hub_task_add`, with what it waits for (`depends`), the
+  files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
+  finish a task? Give it back with `hub_update` status `todo` and a note. The lead hands out tasks
+  already on the sheet with `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_update`.
@@ -4260,8 +4960,232 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
 """
 
 
-def cmd_rules(_args):
-    print(RULES, end="")
+# Each project teaches its agents: crewchat writes a guide into every folder of the project on
+# this machine, in the form each tool loads by itself (a Claude Code skill, a Cursor rule, a
+# section of an AGENTS.md the folder already has), with the owner's rules for that project, and
+# installs the project's shared skills. All of it is kept out of git, and rewritten when the
+# rules or skills change.
+GUIDE_SKILL = ".claude/skills/crewchat/SKILL.md"
+GUIDE_RULE = ".cursor/rules/crewchat.mdc"
+GUIDE_BEGIN = "<!-- crewchat: begin (written by crewchat; edit the rules with `crewchat rules set`) -->"
+GUIDE_END = "<!-- crewchat: end -->"
+SKILL_MARK = ".crewchat-skill"  # in a skill folder crewchat installed, and so may replace or remove
+MAX_SKILL = 200 * 1024
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+
+
+def project_rules(root):
+    return str(load_config(root).get("rules") or "").strip()
+
+
+def project_skills(root):
+    folder = Path(root) / "skills"
+    return sorted(p.name for p in folder.iterdir() if (p / "SKILL.md").is_file()) if folder.is_dir() else []
+
+
+def project_guide(root):
+    """What every agent in the project should know: how the chat works, the owner's rules for
+    the project, and its shared skills."""
+    config = load_config(root)
+    rules, skills = project_rules(root), project_skills(root)
+    parts = ["# crewchat: the project %s\n\nYou are in the project **%s**: its agents and the owner share a "
+             "chat (crewchat). Agents in other projects do not see it.\n\n" % (config["project"], config["project"]),
+             RULES.replace("## The crewchat: talking to each other\n\n", "## How the chat works\n\n", 1)]
+    parts.append("\n## The owner's rules for this project\n\n%s\n" % (
+        rules or "None yet. The owner sets them on the chat page, or with `crewchat rules set`."))
+    if skills:
+        parts.append("\n## Skills shared in this project\n\n%s\n" % "\n".join(
+            "- `%s`: in `.claude/skills/%s/SKILL.md`" % (n, n) for n in skills))
+    return "".join(parts)
+
+
+def _write_if_changed(path, text):
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def write_guides(folder, root):
+    """Write the project's guide and skills into one connected folder. Returns what changed."""
+    folder, root = Path(folder), Path(root)
+    guide, changed = project_guide(root), []
+    name = load_config(root)["project"]
+    skill = ("---\nname: crewchat\ndescription: How to work in the project %s's crewchat, the group chat "
+             "between its AI agents and their owner, and the owner's rules for the project. Use it whenever a "
+             "crewchat message arrives, when Owner gives an instruction or a task, before taking or reporting "
+             "on a task, and before messaging another agent.\n---\n\n" % name) + guide
+    if _write_if_changed(folder / GUIDE_SKILL, skill):
+        changed.append(GUIDE_SKILL)
+    rule = ("---\ndescription: The crewchat of the project %s: how to work with the other agents and the owner, "
+            "and the owner's rules\nalwaysApply: true\n---\n\n" % name) + guide
+    if _write_if_changed(folder / GUIDE_RULE, rule):
+        changed.append(GUIDE_RULE)
+    agents = folder / "AGENTS.md"
+    if agents.is_file():  # only one the folder already has
+        text = agents.read_text(encoding="utf-8")
+        block = "%s\n%s\n%s" % (GUIDE_BEGIN, guide.strip(), GUIDE_END)
+        if GUIDE_BEGIN in text and GUIDE_END in text:
+            new = text[:text.index(GUIDE_BEGIN)] + block + text[text.index(GUIDE_END) + len(GUIDE_END):]
+        else:
+            new = text.rstrip("\n") + "\n\n" + block + "\n"
+        if new != text:
+            agents.write_text(new, encoding="utf-8")
+            changed.append("AGENTS.md")
+    # The project's shared skills, as Claude Code skills; ones it no longer has are removed.
+    wanted = project_skills(root)
+    skills_dir = folder / ".claude" / "skills"
+    for n in wanted:
+        target = skills_dir / n
+        if target.exists() and not (target / SKILL_MARK).exists():
+            continue  # a skill of the folder's own by that name: left alone
+        source = root / "skills" / n
+        files = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+        current = ({p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()
+                    and p.name != SKILL_MARK} if target.exists() else {})
+        if current != files:
+            shutil.rmtree(target, ignore_errors=True)
+            for rel, data in files.items():
+                (target / rel).parent.mkdir(parents=True, exist_ok=True)
+                (target / rel).write_bytes(data)
+            (target / SKILL_MARK).write_text("installed by crewchat for the project %s\n" % name, encoding="utf-8")
+            changed.append(".claude/skills/%s/" % n)
+    for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
+        if old.name not in wanted and old.name != "crewchat" and (old / SKILL_MARK).exists():
+            shutil.rmtree(old, ignore_errors=True)
+            changed.append(".claude/skills/%s/ (removed)" % old.name)
+    git_exclude(folder, [".claude/skills/crewchat/", GUIDE_RULE] + [".claude/skills/%s/" % n for n in wanted])
+    return changed
+
+
+def remove_guides(folder):
+    """Take the guide and the skills crewchat installed out of a folder (uninstall)."""
+    folder, removed = Path(folder), []
+    for rel in (".claude/skills/crewchat", GUIDE_RULE):
+        path = folder / rel
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(rel)
+        elif path.exists():
+            path.unlink()
+            removed.append(rel)
+    skills_dir = folder / ".claude" / "skills"
+    for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
+        if (old / SKILL_MARK).exists():
+            shutil.rmtree(old, ignore_errors=True)
+            removed.append(".claude/skills/%s" % old.name)
+    agents = folder / "AGENTS.md"
+    if agents.is_file():
+        text = agents.read_text(encoding="utf-8")
+        if GUIDE_BEGIN in text and GUIDE_END in text:
+            new = (text[:text.index(GUIDE_BEGIN)].rstrip("\n") + "\n"
+                   + text[text.index(GUIDE_END) + len(GUIDE_END):].lstrip("\n"))
+            agents.write_text(new if new.strip() else "", encoding="utf-8")
+            removed.append("AGENTS.md (crewchat's section)")
+    return removed
+
+
+def skill_files(path):
+    """A skill to share, from a folder holding SKILL.md or from one Markdown file: {relative path:
+    text}."""
+    path = Path(path).expanduser()
+    if path.is_file():
+        return {"SKILL.md": path.read_text(encoding="utf-8")}
+    if not (path / "SKILL.md").is_file():
+        die("%s is neither a SKILL.md file nor a folder holding one" % path)
+    files, total = {}, 0
+    for p in sorted(path.rglob("*")):
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(path).parts):
+            try:
+                text = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                die("%s is not a text file; a shared skill holds text files only" % p)
+            total += len(text.encode("utf-8"))
+            files[p.relative_to(path).as_posix()] = text
+    if total > MAX_SKILL:
+        die("the skill is too big to share: %d KB at most" % (MAX_SKILL // 1024))
+    return files
+
+
+def cmd_rules(args):
+    action = getattr(args, "action", None) or "print"
+    if action == "print":
+        root = project_root() if (home() / "config.json").exists() else None
+        print(project_guide(root) if root else RULES, end="")
+        return
+    if action == "show":
+        print(project_rules(project_root()) or "This project has no rules yet. Set them with "
+              "`crewchat rules set \"...\"` or `crewchat rules set --file RULES.md`.")
+        return
+    if action == "clear":
+        text = ""
+    elif args.file:
+        text = Path(args.file).expanduser().read_text(encoding="utf-8")
+    else:
+        text = " ".join(args.text)
+    if action == "set" and not text.strip():
+        die('give the rules: crewchat rules set "..." or crewchat rules set --file RULES.md')
+    out = owner_call("/api/rules", {"rules": text})
+    print("%s the rules of the project %s. Its agents got them as a message, and every folder of the project "
+          "on this machine has them (updated: %d)." % ("Set" if text.strip() else "Cleared", out["project"],
+                                                       out["folders"]))
+
+
+def cmd_tasks(args):
+    if args.action == "list":
+        out = owner_tool("hub_tasks", view="all")
+        print(out)
+        return
+    if args.action == "add":
+        if not args.rest:
+            die('usage: crewchat tasks add "the work" [--depends A12] [--areas app/] [--where win] [--to AGENT]')
+        out = owner_call("/api/task", {"op": "add", "title": " ".join(args.rest), "depends": args.depends or "",
+                                       "areas": args.areas or "", "where": args.where or "", "to": args.to or "all"})
+        print("Task #%s is on the sheet." % out["id"])
+        return
+    if not args.rest:
+        die("usage: crewchat tasks %s ID%s" % (args.action, " AGENT" if args.action == "assign" else
+                                              " up|down|top" if args.action == "move" else ""))
+    task = args.rest[0]
+    if args.action == "assign":
+        if len(args.rest) < 2:
+            die("usage: crewchat tasks assign ID AGENT")
+        owner_call("/api/task", {"op": "assign", "task": task, "agent": args.rest[1]})
+        print("Gave task #%s to %s." % (task.lstrip("#"), args.rest[1]))
+    elif args.action == "move":
+        owner_call("/api/task", {"op": "move", "task": task, "where": (args.rest[1:] or ["up"])[0]})
+        print("Moved task #%s." % task.lstrip("#"))
+    elif args.action in ("done", "todo", "blocked"):
+        owner_call("/api/task", {"op": "status", "task": task, "status": args.action, "note": " ".join(args.rest[1:])})
+        print("Task #%s is %s." % (task.lstrip("#"), {"todo": "back on the sheet", "done": "done",
+                                                       "blocked": "blocked"}[args.action]))
+    else:
+        owner_call("/api/task", {"op": "remove", "task": task})
+        print("Took task #%s off the sheet." % task.lstrip("#"))
+
+
+def cmd_skills(args):
+    if args.action == "list":
+        names = project_skills(project_root())
+        print("\n".join(names) if names else "No skills shared in this project. Add one: crewchat skills add PATH")
+        return
+    if args.action == "add":
+        if not args.path:
+            die("usage: crewchat skills add PATH (a folder with SKILL.md, or a .md file)")
+        files = skill_files(args.path)
+        name = (args.name or Path(args.path).expanduser().resolve().name.rsplit(".md", 1)[0]).lower()
+        out = owner_call("/api/skills", {"op": "add", "name": name, "files": files})
+    else:
+        if not args.path:
+            die("usage: crewchat skills remove NAME")
+        out = owner_call("/api/skills", {"op": "remove", "name": args.path.lower()})
+    print("%s the skill %s %s the project %s (folders updated: %d)." % (
+        "Shared" if args.action == "add" else "Removed", out["name"], "in" if args.action == "add" else "from",
+        out["project"], out["folders"]))
 
 
 # --------------------------------------------------------------------------------------------
@@ -4321,6 +5245,8 @@ body {
 aside { border-right: 1px solid var(--line); padding: 20px 16px; overflow-y: auto; }
 h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywhere; display: flex; align-items: center; gap: 9px; }
 .logo { width: 30px; height: 30px; flex: none; }
+#projects { font: inherit; font-weight: 700; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 3px 6px; max-width: 100%; min-width: 0; cursor: pointer; }
 .sub { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
 .agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
 .agent .top { display: flex; align-items: center; gap: 8px; }
@@ -4390,6 +5316,28 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 .chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
 .chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
 #form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#views { display: flex; gap: 4px; padding: 10px max(16px, calc((100% - 820px) / 2)) 0; border-bottom: 1px solid var(--line); }
+#views button { background: none; color: var(--muted); border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 6px 10px; font-weight: 600; }
+#views button.on { color: var(--ink); border-bottom-color: var(--accent); }
+#tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
+#tasks[hidden], #log[hidden] { display: none; }
+.tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.task-form input { flex: 1 1 120px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 9px; color: var(--ink); font: inherit; font-size: 13.5px; }
+.task-form #t-title { flex: 3 1 260px; }
+#sheet { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+#sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+#sheet td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+#sheet td.meta { font-size: 12px; color: var(--muted); }
+#sheet tr.done td { opacity: .55; }
+#sheet .st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 8px; background: var(--line); white-space: nowrap; }
+#sheet .st.doing, #sheet .st.review { background: var(--accent); color: var(--on-accent); }
+#sheet .st.done { background: var(--ok); color: var(--panel); } #sheet .st.blocked { background: var(--err); color: var(--panel); }
+#sheet .acts { white-space: nowrap; text-align: right; }
+#sheet .acts button, #sheet .acts select { font-size: 12px; padding: 2px 6px; margin-left: 3px; background: transparent;
+  color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
 .msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
 .msg .body > .files:first-child { margin-top: 0; }
 .msg .file { display: inline-flex; gap: 6px; align-items: baseline; color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; text-decoration: none; background: var(--bg); color: var(--ink); }
@@ -4402,9 +5350,21 @@ button:disabled { opacity: 0.5; cursor: default; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #error { color: var(--err); font-size: 13px; margin-top: 6px; min-height: 0; }
 .add-agent { width: 100%; margin: 0 0 10px; background: transparent; color: var(--accent); border: 1px dashed var(--line); }
-dialog#launch { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
-dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
-#launch h2 { font-size: 17px; margin: 0 0 4px; } #launch p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+dialog#launch, dialog#rules-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
+dialog#launch::backdrop, dialog#rules-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+#launch h2, #rules-dialog h2 { font-size: 17px; margin: 0 0 4px; }
+#launch p, #rules-dialog p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+#rules-input { width: 100%; box-sizing: border-box; min-height: 160px; resize: vertical; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--ink); font: inherit; }
+#rules-dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#rules-dialog .buttons .secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+#rules-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
+#setup { margin-top: 14px; }
+#setup h3 { font-size: 13px; margin: 12px 0 4px; display: flex; justify-content: space-between; align-items: center; }
+#setup .rules { font-size: 12.5px; white-space: pre-wrap; margin: 0; color: var(--muted); max-height: 7.5em; overflow: hidden; }
+#setup ul { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+#setup li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+button.link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
 #launch label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
 #launch label.check { font-weight: 400; display: flex; gap: 8px; align-items: center; }
 #launch select, #launch input[type=text], #launch textarea { width: 100%; box-sizing: border-box; max-width: none; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
@@ -4428,10 +5388,17 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
 </head>
 <body>
 <aside>
-  <h1>__LOGO__<span id="project">crewchat</span></h1>
+  <h1>__LOGO__<span id="project">crewchat</span><select id="projects" aria-label="Project" hidden></select></h1>
   <p class="sub">Everything your agents say to each other, live.</p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
+  <section id="setup" aria-label="What this project's agents learn">
+    <h3>Project rules <button type="button" class="link" id="rules-edit">Edit</button></h3>
+    <p id="rules-text" class="rules"></p>
+    <h3>Shared skills <button type="button" class="link" id="skill-add">Add</button></h3>
+    <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
+    <ul id="skills-list"></ul>
+  </section>
   <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent has the <b>Lead</b> role, it takes your tasks and hands out the work instead. Give agents roles with the menu on their cards.</p>
   <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types (<code>crewchat listen</code> changes how long agents wait). Grey means it has not been heard from lately.</p>
 </aside>
@@ -4451,12 +5418,38 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
     <div class="buttons"><button type="button" class="secondary" id="l-cancel">Cancel</button><button type="submit" id="l-start">Start</button></div>
   </form>
 </dialog>
+<dialog id="rules-dialog" aria-labelledby="rules-title">
+  <form id="rules-form" method="dialog">
+    <h2 id="rules-title">Project rules</h2>
+    <p>What every agent in this project should follow: who does what, how to test, what never to do. They get them as a message now, and new sessions read them from the project's guide.</p>
+    <textarea id="rules-input" maxlength="16000" placeholder="For example: The Mac agent does Apple work, the laptop agent Windows. Run the tests before reporting done. Never push to main."></textarea>
+    <div id="rules-note" role="status"></div>
+    <div class="buttons"><button type="button" class="secondary" id="rules-cancel">Cancel</button><button type="submit" id="rules-save">Save</button></div>
+  </form>
+</dialog>
 <main>
   <div id="update" role="status"><span>A newer crewchat, <b id="update-version"></b>, is available. Run
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <nav id="views" aria-label="View">
+    <button type="button" id="view-chat" class="on" aria-pressed="true">Chat</button>
+    <button type="button" id="view-tasks" aria-pressed="false">Task sheet <span id="tasks-count"></span></button>
+  </nav>
   <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
+  <section id="tasks" hidden aria-label="Task sheet">
+    <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
+      what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
+      the lead hands tasks out.</p>
+    <form id="task-form" class="task-form">
+      <input id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
+      <input id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
+      <input id="t-areas" placeholder="files (app/login/)" aria-label="Files">
+      <input id="t-where" placeholder="machine" aria-label="Machine">
+      <button id="t-add">Add</button>
+    </form>
+    <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
   <form id="form">
     <div class="row">
       <label for="to">To</label>
@@ -4503,23 +5496,180 @@ function ago(seen, now) {
 }
 
 // POST to the chat server. Sends the page to sign-in on 401; throws the server's error otherwise.
+// The project this page shows (?chat=, or the first one): every request names it.
+const CHAT = new URLSearchParams(location.search).get("chat") || "";
+function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "chat=" + encodeURIComponent(CHAT) : path; }
+
+// Several projects: a menu to switch, marking the ones with messages since you last looked there.
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.id === "projects") location.href = "/?chat=" + encodeURIComponent(e.target.value);
+});
+function seen(id, last) {
+  try {
+    if (last === undefined) return Number(localStorage.getItem("crewchat-seen-" + id) || 0);
+    localStorage.setItem("crewchat-seen-" + id, String(last));
+  } catch (e) {}
+  return 0;
+}
+function renderProjects(list, current) {
+  const menu = $("projects");
+  if (!list || list.length < 2) { menu.hidden = true; $("project").hidden = false; return; }
+  const mine = list.find((p) => p.id === current);
+  if (mine) seen(mine.id, mine.last);
+  if (menu === document.activeElement) return;  // open: do not rebuild it under the pointer
+  menu.replaceChildren(...list.map((p) => {
+    const fresh = p.id !== current && p.last > seen(p.id);
+    // \u21c4: shared with your other machines (stage 1: the first project only).
+    const option = new Option(p.name + (p.linked ? " \u21c4" : "") + (fresh ? "  \u2022 new" : ""), p.id);
+    option.selected = p.id === current;
+    return option;
+  }));
+  menu.hidden = false;
+  $("project").hidden = true;
+}
+
 async function postJSON(path, body) {
-  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+  const res = await fetch(api(path), { method: "POST", headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify(body) });
   if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
   return res.json();
 }
 
+// The task sheet: every task of the project, in order, with who holds it.
+function showView(tasks) {
+  $("log").hidden = tasks; $("tasks").hidden = !tasks; $("form").hidden = tasks;
+  $("view-chat").classList.toggle("on", !tasks); $("view-tasks").classList.toggle("on", tasks);
+  $("view-chat").setAttribute("aria-pressed", String(!tasks)); $("view-tasks").setAttribute("aria-pressed", String(tasks));
+  try { sessionStorage.setItem("crewchat-view", tasks ? "tasks" : "chat"); } catch (e) {}
+}
+$("view-chat").addEventListener("click", () => showView(false));
+$("view-tasks").addEventListener("click", () => showView(true));
+async function taskOp(body) {
+  try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
+}
+function renderSheet(rows) {
+  const open = rows.filter((r) => r.status !== "done").length;
+  $("tasks-count").textContent = open ? "(" + open + ")" : "";
+  const body = $("sheet").tBodies[0];
+  if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  if (!rows.length) {
+    const row = body.insertRow(); body.replaceChildren(row);
+    const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
+    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
+    return;
+  }
+  body.replaceChildren(...rows.map((r) => {
+    const tr = el("tr", r.status);
+    tr.append(el("td", "meta", "#" + r.id));
+    const what = el("td");
+    what.append(el("div", "", r.title));
+    const meta = [];
+    if (r.depends.length) meta.push("waits for " + r.depends.map((d) => "#" + d).join(", "));
+    if (r.areas.length) meta.push("files " + r.areas.join(", "));
+    if (r.where) meta.push("on " + r.where);
+    if (r.to !== "all") meta.push("for " + r.to);
+    meta.push("from " + (r.from === "Owner" ? "you" : r.from));
+    what.append(el("div", "meta", meta.join(" · ")));
+    tr.append(what);
+    const st = el("td"); st.append(el("span", "st " + r.status, r.status)); tr.append(st);
+    tr.append(el("td", "meta", r.holder || ""));
+    const acts = el("td", "acts");
+    if (r.status === "todo" || r.status === "waiting") {
+      const pick = el("select");
+      pick.setAttribute("aria-label", "Give task " + r.id + " to");
+      pick.append(new Option("Give to…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+      pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
+      acts.append(pick);
+    }
+    const button = (label, title, body) => {
+      const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
+      b.addEventListener("click", () => taskOp(body)); acts.append(b);
+    };
+    button("\u2191", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
+    button("\u2193", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
+    if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
+    if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
+      button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
+    button("\u00d7", "Take task " + r.id + " off the sheet", { op: "remove", task: r.id });
+    tr.append(acts);
+    return tr;
+  }));
+}
+$("task-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const title = $("t-title").value.trim();
+  if (!title) return;
+  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
+  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+});
+try { if (sessionStorage.getItem("crewchat-view") === "tasks") showView(true); } catch (e) {}
+
+// The project's rules and shared skills: what its agents learn by themselves.
+function renderSetup(rules, skills) {
+  const text = $("rules-text");
+  text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
+  state.rules = rules || "";
+  const list = $("skills-list");
+  list.replaceChildren(...(skills || []).map((name) => {
+    const item = el("li");
+    const remove = el("button", "link", "Remove");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "Remove the skill " + name);
+    remove.addEventListener("click", async () => {
+      if (!confirm("Remove the skill " + name + " from every folder of this project?")) return;
+      try { await postJSON("/api/skills", { op: "remove", name }); } catch (e) { alert(e.message); }
+    });
+    item.append(el("span", "", name), remove);
+    return item;
+  }));
+  if (!(skills || []).length) list.append(el("li", "", "None yet: Add shares a SKILL.md with every agent."));
+}
+$("rules-edit").addEventListener("click", () => {
+  $("rules-input").value = state.rules || "";
+  $("rules-note").textContent = "";
+  $("rules-dialog").showModal();
+});
+$("rules-cancel").addEventListener("click", () => $("rules-dialog").close());
+$("rules-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("rules-note").textContent = "Saving…";
+  try {
+    await postJSON("/api/rules", { rules: $("rules-input").value });
+    $("rules-dialog").close();
+  } catch (e) {
+    $("rules-note").textContent = e.message;
+  }
+});
+$("skill-add").addEventListener("click", () => $("skill-file").click());
+$("skill-file").addEventListener("change", async () => {
+  const file = $("skill-file").files[0];
+  $("skill-file").value = "";
+  if (!file) return;
+  const suggested = file.name.toLowerCase().replace(/\.md$/, "").replace(/^skill$/, "").replace(/[^a-z0-9-]+/g, "-");
+  const name = prompt("A name for the skill (lowercase letters, digits and -):", suggested);
+  if (!name) return;
+  try {
+    await postJSON("/api/skills", { op: "add", name, files: { "SKILL.md": await file.text() } });
+  } catch (e) { alert(e.message); }
+});
+
 async function openLaunch() {
   const dialog = $("launch"), note = $("launch-note");
   note.textContent = ""; $("l-start").disabled = false;
   dialog.showModal();
   try {
-    const res = await fetch("/api/launch", { cache: "no-store" });
+    const res = await fetch(api("/api/launch"), { cache: "no-store" });
     if (res.status === 401) { location.href = "/login"; return; }
     const opts = await res.json();
-    $("l-tool").replaceChildren(...opts.tools.map((t) => new Option(t.label, t.id)));
+    $("l-tool").replaceChildren(...opts.tools.map((t) => {
+      const option = new Option(t.missing ? t.label + " (not installed)" : t.label, t.id);
+      option.disabled = !!t.missing;
+      option.title = t.missing || "";
+      return option;
+    }));
+    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
+    opts.tools = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
     $("l-role").replaceChildren(new Option("No role", ""), ...state.roles.map((r) => new Option(r.title, r.name)));
     if (!opts.tools.length || !opts.folders.length) {
@@ -4527,6 +5677,8 @@ async function openLaunch() {
         ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
         : "No project folder on this machine is connected yet. Run `crewchat start` in one first.";
       $("l-start").disabled = true;
+    } else if (missing) {
+      note.textContent = missing;
     }
   } catch (err) {
     note.textContent = "Could not load the options: " + err.message;
@@ -4705,6 +5857,7 @@ function addMessages(list, first) {
   const log = $("log");
   $("empty")?.remove();
   for (const m of list) {
+    if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
     if (day !== state.lastDay) { log.append(el("p", "day", day)); state.lastDay = day; }
     const node = buildMessage(m);
@@ -4742,7 +5895,7 @@ async function loop() {
     try {
       const wait = state.version < 0 ? 0 : 25;
       // With more messages to catch up on, ask again at once (a version that never matches).
-      const res = await fetch("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait,
+      const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
                               { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -4760,6 +5913,9 @@ async function loop() {
         $("project").textContent = data.project;
         if (!state.missed) document.title = state.title;
       }
+      renderProjects(data.projects, data.chat);
+      renderSetup(data.rules, data.skills);
+      renderSheet(data.sheet || []);
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
@@ -4814,7 +5970,7 @@ function renderPending() {
 }
 
 async function uploadFile(file) {
-  const res = await fetch("/api/upload", { method: "POST", body: file,
+  const res = await fetch(api("/api/upload"), { method: "POST", body: file,
     headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } });
   if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
@@ -5029,8 +6185,28 @@ def build_parser():
     p.add_argument("--project")
     p.set_defaults(fn=cmd_hooks)
 
-    p = sub.add_parser("rules", help="print a section about the chat for your AGENTS.md / CLAUDE.md")
+    p = sub.add_parser("rules", help="the project's rules for its agents: print the guide, or show, set or clear "
+                       "the owner's rules")
+    p.add_argument("action", nargs="?", default="print", choices=["print", "show", "set", "clear"])
+    p.add_argument("text", nargs="*", help="set: the rules")
+    p.add_argument("--file", help="set: read the rules from this file")
     p.set_defaults(fn=cmd_rules)
+
+    p = sub.add_parser("tasks", help="the project's task sheet: list, add, assign, move, done, todo, blocked, remove")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "add", "assign", "move", "done", "todo", "blocked", "remove"])
+    p.add_argument("rest", nargs="*", help="add: the work; assign: ID AGENT; move: ID up|down|top; others: ID [note]")
+    p.add_argument("--depends", help="add: task numbers it waits for (A12,A14)")
+    p.add_argument("--areas", help="add: path prefixes it changes (app/login/,docs/)")
+    p.add_argument("--where", help="add: the machine or place it needs")
+    p.add_argument("--to", help="add: for one agent only")
+    p.set_defaults(fn=cmd_tasks)
+
+    p = sub.add_parser("skills", help="skills shared with every agent of the project: list, add or remove")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
+    p.add_argument("path", nargs="?", help="add: a folder with SKILL.md, or a .md file; remove: the skill's name")
+    p.add_argument("--name", help="add: the skill's name (default: the folder's or file's name)")
+    p.set_defaults(fn=cmd_skills)
 
     try:
         import crewchat_cloud
@@ -5059,6 +6235,16 @@ def build_parser():
     p.add_argument("--token", help="with --url: the folder's token (or set CREWCHAT_TOKEN)")
     p.set_defaults(fn=cmd_stdio)
 
+    p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
+    p.set_defaults(fn=cmd_projects)
+
+    for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
+                 "rules", "skills", "tasks"):
+        sub.choices[name].add_argument("--chat", metavar="PROJECT",
+                                       help="the project (default: the one of the folder you are in)"
+                                       if name != "start" else "put this folder in this project (a new one if "
+                                       "none is called that); default: a project named after the folder")
+
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])
     p.add_argument("event", choices=["prompt", "stop"])
@@ -5075,6 +6261,15 @@ def main(argv=None):
     if not getattr(args, "fn", None):
         parser.print_help()
         return
+    global CURRENT_CHAT
+    CURRENT_CHAT = None
+    if getattr(args, "chat", None) and args.fn is not cmd_start:
+        found = find_chat(args.chat) if (home() / "config.json").exists() else None
+        if found is None:
+            die("no project called %s here; `crewchat projects` lists them" % args.chat)
+        CURRENT_CHAT = found["id"]
+    elif args.fn not in (cmd_start, cmd_hook):
+        CURRENT_CHAT = chat_of_folder(Path.cwd())
     args.fn(args)
 
 

@@ -144,6 +144,18 @@ server only listens on its own machine, so this also needs a private network suc
    crewchat join --url https://host.your-tailnet.ts.net --code ABCD-EFGH
    ```
 
+## Projects and linked machines
+
+A task given back on the [task sheet](getting-started.md#the-task-sheet) can be taken again from any
+linked machine. Over Tailscale the machine the task was posted on settles who takes it. With cloud
+sync, a machine that joined later than a task's give-backs may disagree about an old task's
+holder; take it from a machine that was there, or post it again.
+
+A machine can hold several [projects](getting-started.md#projects). For now, linked machines share
+the **first** project of each (the one set up first); the others stay on their own machine. The
+chat page marks the shared one with ⇄. Sharing every project by name between linked machines is
+the next step.
+
 ## What changes across machines
 
 - **The roster** shows agents everywhere. In `hub_agents`, an agent elsewhere reads

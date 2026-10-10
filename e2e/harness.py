@@ -348,8 +348,11 @@ class Owner:
             raise AssertionError("upload failed: HTTP %d %s" % (status, raw[:200]))
         return json.loads(raw)
 
+    chat = ""  # the project this owner looks at ("": the first)
+
     def poll(self, after=-1):
-        status, raw, _ = request(self.machine.url + "/api/poll?after=%d&v=-1&wait=0" % after, opener=self.opener)
+        url = self.machine.url + "/api/poll?after=%d&v=-1&wait=0" % after + ("&chat=" + self.chat if self.chat else "")
+        status, raw, _ = request(url, opener=self.opener)
         if status != 200:
             raise AssertionError("poll failed: HTTP %d" % status)
         return json.loads(raw)

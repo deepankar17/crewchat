@@ -143,7 +143,8 @@ class Protocol(Base):
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
                                                       "hub_status", "hub_history", "hub_rename", "hub_file", "hub_role",
-                                                      "hub_assign", "hub_update", "hub_link"])
+                                                      "hub_tasks", "hub_task_add", "hub_assign", "hub_update",
+                                                      "hub_link"])
 
     def test_json_rpc_edges(self):
         session = Session(self.base, self.token)
@@ -612,7 +613,7 @@ class Launching(Base):
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
-        cli("start", str(self.folder), "--no-open", "--no-service", "--place", "Studio")
+        cli("start", str(self.folder), "--no-open", "--no-service", "--place", "Studio", "--chat", "demo")
         self.place = crewchat.joined_place(self.folder)[0]
 
     def tearDown(self):
@@ -644,7 +645,7 @@ class Launching(Base):
         token = crewchat.read_token(self.place)
         session = Session(self.base, token)
         out = session.text("hub_link", key=key)
-        self.assertIn("You are docs-writer, started from the crewchat by the owner.", out)
+        self.assertIn("You are docs-writer, in the project Demo, started from the crewchat by the owner.", out)
         self.assertIn("Your role's instructions and your first task are in hub_inbox", out)
         self.assertEqual(session.me, "docs-writer")
         row = next(r for r in self.hub.rows() if r["agent"] == "docs-writer")
@@ -700,7 +701,7 @@ class Linking(Base):
         self.assertEqual(self.hook("key-first-0001"), {"link": True})
         note = session.text("hub_link", key="key-first-0001")
         name = session.me
-        self.assertIn("Linked. You are %s." % name, note)
+        self.assertIn("Linked. You are %s, in the project Demo." % name, note)
         self.assertIn("%s (you)" % name, note)
         self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0, "owner": False})
         number = self.say(name, "through the hook")
@@ -717,7 +718,7 @@ class Linking(Base):
         before = self.names()
         # The tool restarts: new MCP session, same conversation, so the hook has the same key.
         again = Session(self.base, self.token)
-        self.assertIn("This session is %s again." % name, again.text("hub_link", key="key-resume-0001"))
+        self.assertIn("This session is %s again, in the project Demo." % name, again.text("hub_link", key="key-resume-0001"))
         self.assertEqual(again.me, name)
         self.assertEqual(self.names(), before)
 
@@ -930,28 +931,57 @@ class Joining(Base):
 
     def test_start_connects_the_folder_once(self):
         folder = self.project().resolve()
-        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk")
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk", "--chat", "Demo")
         self.assertIn("The server is running at %s." % self.base, out)
-        self.assertRegex(out, r'- (Connected|Added) %s(,| to this machine\'s chat, "Demo",) as "desk"\.' % re.escape(str(folder)))
+        self.assertRegex(out, r'- (Connected|Added) %s to the project "Demo", as "desk"\.' % re.escape(str(folder)))
         token = crewchat.read_token("desk")
         mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + token)
         self.assertTrue((folder / ".cursor" / "hooks.json").exists())
         places = crewchat.list_places()
         out = cli("start", str(folder), "--no-open", "--no-service")
-        self.assertIn('%s is connected, as "desk".' % folder, out)
+        self.assertIn('%s is connected to the project "Demo", as "desk".' % folder, out)
         self.assertEqual(crewchat.list_places(), places)  # no second place for the same folder
 
-    def test_start_in_another_folder_joins_the_same_chat_under_the_folders_name(self):
+    def test_a_new_folder_is_a_new_project_and_projects_are_apart(self):
         first = self.project().resolve()
-        cli("start", str(first), "--no-open", "--no-service")
-        other = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
-        other.mkdir()
-        out = cli("start", str(other), "--no-open", "--no-service")
-        self.assertIn('- Added %s to this machine\'s chat, "Demo", as "notes-app".' % other, out)
-        self.assertIn("every folder you run `crewchat start` in joins it", out)
-        self.assertIn("claude-notes-app, claude-notes-app-2", out)
-        self.assertIn("notes-app", crewchat.list_places())
+        cli("start", str(first), "--no-open", "--no-service", "--chat", "demo")
+        app = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
+        app.mkdir()
+        out = cli("start", str(app), "--no-open", "--no-service")
+        self.assertIn('Created the project "notes-app"', out)
+        self.assertIn('- Connected %s to the project "notes-app", as ' % app, out)
+        entry = crewchat.find_chat("notes-app")
+        self.assertEqual(entry["root"], crewchat.home() / "projects" / "notes-app")
+        place = crewchat.list_places(entry["root"])[0]
+        # Its own token, even where the first project has a folder by the same name.
+        self.assertNotEqual(crewchat.read_token(place, entry["root"]), crewchat.read_token(place))
+        # Another folder joins it with --chat, named after itself.
+        site = (Path(tempfile.mkdtemp(dir=TMP)) / "site").resolve()
+        site.mkdir()
+        out = cli("start", str(site), "--no-open", "--no-service", "--chat", "notes-app")
+        self.assertIn('- Added %s to the project "notes-app", as "site".' % site, out)
+        self.assertIn("notes-app  [--chat notes-app]", cli("projects"))
+        # Agents in different projects do not see or reach each other.
+        here, here_name = self.agent()
+        token = crewchat.read_token(place, entry["root"])
+        there = Session(self.base, token)
+        there_name = there.me
+        self.assertNotIn(here_name, there.text("hub_agents"))
+        self.assertIn("nobody here is called", there.text("hub_send", to=here_name, text="hello?"))
+        crewchat.post_json(self.base + "/api/send", self.owner, {"to": "all", "text": "for the first project"})
+        self.assertNotIn("for the first project", there.text("hub_inbox"))
+        crewchat.post_json(self.base + "/api/send", self.owner, {"to": "all", "text": "for notes-app"},
+                           headers={"X-Crewchat-Chat": "notes-app"})
+        self.assertIn("for notes-app", there.text("hub_inbox"))
+        self.assertNotIn("for notes-app", here.text("hub_inbox"))
+        # An agent's token is its project's only, whatever project it asks for.
+        ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+        status = self.raw("/mcp", ping, {"Authorization": "Bearer " + token, "X-Crewchat-Chat": crewchat.list_projects()[0]["id"]})[0]
+        self.assertEqual(status, 403)
+        status = self.raw("/mcp", ping, {"Authorization": "Bearer " + token, "X-Crewchat-Chat": "notes-app"})[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(self.raw("/mcp", ping, {"Authorization": "Bearer " + self.owner, "X-Crewchat-Chat": "nope"})[0], 404)
 
     def test_the_banner_is_plain_when_not_on_a_terminal(self):
         self.assertEqual(crewchat.banner(io.StringIO()), "crewchat " + crewchat.__version__)
@@ -1160,7 +1190,7 @@ class Hooks(Base):
             for name, spec in tool["inputSchema"]["properties"].items():
                 self.assertTrue(spec.get("description"), "%s.%s" % (tool["name"], name))
         reads = {t["name"] for t in crewchat.TOOLS if t["annotations"]["readOnlyHint"]}
-        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file"})
+        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file", "hub_tasks"})
         session = Session(self.base, self.token)
         listed = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual(listed[0]["annotations"], crewchat.TOOLS[0]["annotations"])
@@ -1629,6 +1659,153 @@ class Lifecycle(Base):
         lowered = script.lower()
         for risky in ("irm ", "iex", "invoke-expression", "invoke-restmethod", "downloadstring", "-enc"):
             self.assertNotIn(risky, lowered)
+
+    def test_project_rules_and_skills_reach_folders_and_agents(self):
+        folder = Path(tempfile.mkdtemp(prefix="guided-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        (folder / "AGENTS.md").write_text("# Mine\n")
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo")
+        skill = folder / crewchat.GUIDE_SKILL
+        self.assertTrue(skill.read_text().startswith("---\nname: crewchat\n"))
+        self.assertIn("alwaysApply: true", (folder / crewchat.GUIDE_RULE).read_text())
+        self.assertIn(crewchat.GUIDE_BEGIN, (folder / "AGENTS.md").read_text())
+        session, name = self.agent(token=crewchat.read_token(crewchat.joined_place(folder)[0]))
+        session.text("hub_inbox")
+        out = crewchat.post_json(self.base + "/api/rules", self.owner, {"rules": "Run the tests first."})
+        self.assertGreaterEqual(out["folders"], 1)
+        self.assertIn("Run the tests first.", skill.read_text())
+        self.assertIn("New rules for this project", session.text("hub_inbox"))
+        self.assertIn("Run the tests first.", Session(self.base, self.token).text("hub_link", key="key-rules-0001"))
+        # Skills: shared, installed, validated, removed; a folder's own skill is never touched.
+        own = folder / ".claude" / "skills" / "deploy"
+        own.mkdir(parents=True)
+        (own / "SKILL.md").write_text("mine")
+        crewchat.post_json(self.base + "/api/skills", self.owner,
+                           {"op": "add", "name": "checklist", "files": {"SKILL.md": "---\nname: checklist\n---\n1."}})
+        crewchat.post_json(self.base + "/api/skills", self.owner,
+                           {"op": "add", "name": "deploy", "files": {"SKILL.md": "theirs"}})
+        self.assertTrue((folder / ".claude/skills/checklist/SKILL.md").exists())
+        self.assertEqual((own / "SKILL.md").read_text(), "mine")
+        for bad in ({"name": "Bad Name", "files": {"SKILL.md": "x"}}, {"name": "crewchat", "files": {"SKILL.md": "x"}},
+                    {"name": "esc", "files": {"SKILL.md": "x", "../../evil": "x"}}, {"name": "nofile", "files": {}}):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                crewchat.post_json(self.base + "/api/skills", self.owner, dict(bad, op="add"))
+            self.assertEqual(e.exception.code, 400)
+        self.assertFalse((crewchat.home() / "evil").exists())
+        crewchat.post_json(self.base + "/api/skills", self.owner, {"op": "remove", "name": "checklist"})
+        self.assertFalse((folder / ".claude/skills/checklist").exists())
+        # Only the owner sets them.
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/rules", self.token, {"rules": "agents rule"})
+        self.assertEqual(e.exception.code, 403)
+        crewchat.post_json(self.base + "/api/rules", self.owner, {"rules": ""})
+        self.assertEqual(crewchat.remove_guides(folder)[-1], "AGENTS.md (crewchat's section)")
+        self.assertEqual((folder / "AGENTS.md").read_text(), "# Mine\n")
+        crewchat.post_json(self.base + "/api/skills", self.owner, {"op": "remove", "name": "deploy"})
+
+    def test_add_an_agent_says_how_to_get_a_missing_tool(self):
+        saved = crewchat.find_tool
+        crewchat.find_tool = lambda tool, config: "/usr/local/bin/claude" if tool == "claude" else None
+        try:
+            tools = crewchat.launch_options({"folders": {}})["tools"]
+        finally:
+            crewchat.find_tool = saved
+        self.assertEqual(tools[0], {"id": "claude", "label": "Claude Code"})
+        self.assertEqual(tools[1]["id"], "cursor")
+        self.assertIn("cursor.com/install", tools[1]["missing"])
+
+    def test_the_task_sheet(self):
+        hub = self.hub
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        add = lambda title, **kw: crewchat.post_json(self.base + "/api/task", self.owner,  # noqa: E731
+                                                     dict({"op": "add", "title": title}, **kw))["id"]
+        login = add("Build the login screen", areas="app/login/")
+        tests = add("Write login tests", depends=login, areas="app/login/tests/")
+        sign = add("Sign the build", where="nowhere-machine")
+        found = a.text("hub_task_add", title="Fix the crash on rotate", areas="app/main/")
+        crash = re.search(r"#(\w+)", found).group(1)
+        nxt = a.text("hub_tasks")
+        self.assertIn("#%s [todo] Build the login screen" % login, nxt)
+        self.assertNotIn("Write login tests", nxt)  # waits for the login screen
+        self.assertNotIn("Sign the build", nxt)  # needs another machine
+        self.assertIn("cannot be taken yet: it waits for #%s" % login, a.text("hub_take", id=tests))
+        self.assertIn("is yours", a.text("hub_take", id=login))
+        # Another task over the same files cannot start while the first is in hand.
+        overlap = add("Restyle the login screen", areas="app/login/style/")
+        self.assertIn("overlap #%s" % login, b.text("hub_take", id=overlap))
+        a.text("hub_update", id=login, status="done", note="built")
+        self.assertIn("Write login tests", b.text("hub_tasks"))
+        b.text("hub_take", id=tests)
+        b.text("hub_update", id=tests, status="todo", note="no time")  # given back
+        sheet = {r["id"]: r for r in hub.sheet_rows()}
+        self.assertEqual((sheet[login]["status"], sheet[tests]["status"], sheet[tests]["holder"]), ("done", "todo", ""))
+        self.assertEqual(sheet[sign]["status"], "todo")
+        # The lead (or the owner) hands out a task already on the sheet.
+        with self.assertRaises(crewchat.HubError):
+            hub.assign_row(a_name, b_name, tests)  # a is not the lead
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "assign", "task": tests, "agent": b_name})
+        self.assertEqual(hub.sheet_rows()[[r["id"] for r in hub.sheet_rows()].index(tests)]["holder"], b_name)
+        self.assertIn("Task #%s is yours" % tests, b.text("hub_inbox"))
+        # The owner orders, settles and removes tasks; that bookkeeping is not news for agents.
+        a.text("hub_inbox")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "move", "task": crash, "where": "top"})
+        self.assertEqual(hub.sheet_rows()[0]["id"], crash)
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": sign})
+        self.assertNotIn(sign, [r["id"] for r in hub.sheet_rows()])
+        self.assertEqual(a.text("hub_inbox"), "No new messages.")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": overlap, "status": "blocked"})
+        self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[overlap]["status"], "blocked")
+        # The sheet outlives the chat's memory: an old task keeps its state.
+        with hub.lock:
+            kept = list(hub.messages)
+            hub.messages = [m for m in hub.messages if m["id"] != login]
+        try:
+            self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[login]["status"], "done")
+        finally:
+            with hub.lock:
+                hub.messages = kept
+        # Agents cannot use the owner's sheet controls.
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/task", self.token, {"op": "remove", "task": crash})
+        self.assertEqual(e.exception.code, 403)
+        self.assertIn("The task sheet, in order:", cli("tasks"))
+
+    def test_a_project_folder_removed_by_hand_stops_working(self):
+        entry = crewchat.create_project("short-lived")
+        project = crewchat.Projects()
+        self.assertIsNotNone(project.get(entry["id"]))
+        shutil.rmtree(entry["root"])
+        self.assertIsNone(project.get(entry["id"]))
+
+    def test_a_skill_file_cannot_name_a_drive_or_leave_its_folder(self):
+        # On Windows a backslash is a folder separator (a\\b is a subfolder, which is fine); elsewhere
+        # it is part of a name that would become a path on a Windows machine, so it is refused.
+        for bad in ("C:foo", "../x", "/etc/x") + (() if os.name == "nt" else ("a\\b",)):
+            with self.assertRaises(crewchat.HubError, msg=bad):
+                self.hub.add_skill("guarded", {"SKILL.md": "x", bad: "y"})
+        self.assertNotIn("guarded", crewchat.project_skills(crewchat.home()))
+
+    def test_a_task_given_back_is_claimed_under_a_new_key(self):
+        tid = self.say("all", "changes hands", "task")
+        self.assertEqual(self.hub.claim_key(tid), tid)
+        a, a_name = self.agent()
+        a.text("hub_take", id=tid)
+        a.text("hub_update", id=tid, status="todo", note="back")
+        self.assertEqual(self.hub.claim_key(tid), tid + "@1")
+        # Only its holder gives a task back: anyone else's "todo" is refused, and the key stays.
+        b, b_name = self.agent()
+        a.text("hub_take", id=tid)
+        self.assertIn("you do not hold task #%s" % tid, b.text("hub_update", id=tid, status="todo", note="not mine"))
+        self.assertEqual(self.hub.claim_key(tid), tid + "@1")
+        self.assertEqual(self.hub.taken[tid], a_name)
+
+    def test_areas_overlap_by_path_prefix(self):
+        self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
+        self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))
+        self.assertFalse(crewchat.areas_overlap(["app/login/"], ["app/logout/"]))
+        self.assertFalse(crewchat.areas_overlap([], ["app/"]))
+        self.assertEqual(crewchat.split_list("#A1, A2,-"), ["A1", "A2"])
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
         with self.assertRaises(SystemExit):

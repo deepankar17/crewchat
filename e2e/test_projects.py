@@ -1,0 +1,193 @@
+"""Projects: each folder its own chat on one machine, apart from the others."""
+import os
+import subprocess
+import unittest
+
+import harness as H
+from harness import request
+
+
+class Projects(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.m = H.Machine("mac", project="test")
+        cls.m.start()
+        cls.test2 = cls.m.dir / "test2"
+        cls.test2.mkdir()
+        subprocess.run(["git", "init", "-q", str(cls.test2)], check=True)
+        cls.out = cls.m.cli("start", "--no-service", "--no-open", cwd=cls.test2)
+        cls.a = cls.m.agent()
+        cls.a.link()
+        cls.b = cls.m.agent(folder=cls.test2)
+        cls.b.link()
+        for x in (cls.a, cls.b):
+            x.stop_hook()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.m.stop()
+
+    def test_a_new_folder_starts_its_own_project(self):
+        self.assertIn('Created the project "test2"', self.out)
+        listing = self.m.cli("projects")
+        self.assertRegex(listing, r"(?m)^test( \(here\))?  \[--chat test\]$")
+        self.assertRegex(listing, r"(?m)^test2  \[--chat test2\]$")
+        self.assertIn("test2 (here)", self.m.cli("projects", cwd=self.test2))
+        self.assertTrue((self.m.home / "projects" / "test2" / "config.json").exists())
+
+    def test_agents_and_messages_stay_in_their_project(self):
+        self.assertNotIn(self.b.name, self.a.call("hub_agents"))
+        self.assertNotIn(self.a.name, self.b.call("hub_agents"))
+        self.m.cli("say", "only for test2", cwd=self.test2)
+        self.assertIn("only for test2", self.b.stop_hook())
+        self.assertEqual(self.a.stop_hook(), "")
+        self.m.cli("say", "only for test")
+        self.assertIn("only for test", self.a.stop_hook())
+        self.assertEqual(self.b.stop_hook(), "")
+        self.assertIn(self.b.name, self.m.cli("agents", "--chat", "test2"))
+        self.assertNotIn(self.b.name, self.m.cli("agents", "--chat", "test").replace(self.a.name, ""))
+
+    def test_the_page_shows_one_project_at_a_time(self):
+        o = self.m.owner
+        test2 = request(self.m.url + "/api/poll?after=-1&v=-1&wait=0&chat=test2", opener=o.opener)
+        data = H.json.loads(test2[1])
+        self.assertEqual(data["chat"], "test2")
+        self.assertEqual(sorted(p["id"] for p in data["projects"]), ["test", "test2"])
+        self.assertIn(self.b.name, [r["agent"] for r in data["agents"]])
+        self.assertNotIn(self.a.name, [r["agent"] for r in data["agents"]])
+        status, raw, _ = request(self.m.url + "/api/send?chat=test2", {"to": "all", "text": "from the page"},
+                                 {"Origin": self.m.url}, o.opener)
+        self.assertEqual(status, 200)
+        self.assertIn("from the page", self.b.stop_hook())
+        self.assertEqual(request(self.m.url + "/api/poll?after=-1&chat=nope", opener=o.opener)[0], 404)
+
+    def test_an_agent_cannot_reach_another_project(self):
+        ping = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
+        status = request(self.b.mcp, ping, {"Authorization": "Bearer " + self.b.token, "X-Crewchat-Chat": "test"})[0]
+        self.assertEqual(status, 403)
+        status = request(self.b.mcp, ping, {"Authorization": "Bearer " + self.b.token, "X-Crewchat-Chat": "test2"})[0]
+        self.assertEqual(status, 200)
+        hook = request(self.m.url + "/api/hook?chat=test", {"key": self.b.key}, {"Authorization": "Bearer " + self.b.token})
+        self.assertEqual(hook[0], 403)
+        # Asking for another project is refused, not counted as a bad token: the agent still works.
+        for _ in range(12):
+            request(self.b.mcp, ping, {"Authorization": "Bearer " + self.b.token, "X-Crewchat-Chat": "test"})
+        self.assertTrue(self.b.call("hub_agents"))
+
+    def test_files_shared_by_path_only_from_the_agents_own_project_folders(self):
+        mine = self.test2 / "notes.txt"
+        mine.write_text("test2 notes")
+        self.b.call("hub_send", to="Owner", text="mine", files=[str(mine)])
+        self.m.owner.chat = "test2"
+        try:
+            msg = self.m.owner.wait_for("mine")
+        finally:
+            self.m.owner.chat = ""
+        status, body, _ = request(self.m.url + "/files/%s/notes.txt" % msg["files"][0]["id"], opener=self.m.owner.opener)
+        self.assertEqual((status, body), (200, b"test2 notes"))
+
+
+class Guides(unittest.TestCase):
+    """What a project teaches its agents, from the terminal."""
+
+    def test_rules_and_skills_from_the_terminal(self):
+        m = H.Machine("guide", project="app")
+        try:
+            m.start()
+            f = m.folder
+            for rel in (".claude/skills/crewchat/SKILL.md", ".cursor/rules/crewchat.mdc"):
+                self.assertTrue((f / rel).exists(), rel)
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=str(f), capture_output=True, text=True).stdout
+            self.assertNotIn("crewchat", status)  # kept out of git
+            a = m.agent()
+            a.link()
+            a.stop_hook()
+            m.cli("rules", "set", "Never", "push", "to", "main.")
+            self.assertIn("Never push to main.", a.stop_hook())
+            self.assertIn("Never push to main.", m.cli("rules", "show"))
+            self.assertIn("Never push to main.", (f / ".claude/skills/crewchat/SKILL.md").read_text())
+            skill = m.dir / "release"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: release\ndescription: Releasing\n---\nTag it.\n")
+            (skill / "steps.md").write_text("1. Tag.\n")
+            m.cli("skills", "add", str(skill))
+            self.assertEqual((f / ".claude/skills/release/steps.md").read_text(), "1. Tag.\n")
+            self.assertIn("release", m.cli("skills"))
+            self.assertIn("Shared the skill release", a.stop_hook())
+            m.cli("skills", "remove", "release")
+            self.assertFalse((f / ".claude/skills/release").exists())
+        finally:
+            m.stop()
+
+
+class TaskSheet(unittest.TestCase):
+    """The task sheet, as agents and the owner use it."""
+
+    def test_agents_work_the_sheet(self):
+        import re
+        m = H.Machine("sheet", project="app")
+        try:
+            m.start()
+            lead, dev = m.agent(), m.agent()
+            lead.link()
+            dev.link()
+            first = re.search(r"#(\w+)", m.cli("tasks", "add", "Set", "up", "the", "database", "--areas", "db/")).group(1)
+            second = re.search(r"#(\w+)", m.cli("tasks", "add", "Seed", "it", "--depends", first, "--areas", "db/seed/")).group(1)
+            dev.stop_hook()
+            # An idle agent takes the top task it may.
+            self.assertIn("#%s [todo] Set up the database" % first, dev.call("hub_tasks"))
+            dev.call("hub_take", id=first)
+            dev.call("hub_update", id=first, status="in_progress", note="creating the schema")
+            m.owner.wait_for("creating the schema", kind="update")
+            # It finds more work and puts it on the sheet.
+            dev.call("hub_task_add", title="Index the users table", depends=first, areas="db/indexes/")
+            self.assertIn("Index the users table", m.cli("tasks"))
+            dev.call("hub_update", id=first, status="done", note="schema in place")
+            # The lead hands out the next one; the developer hears it at the end of its turn.
+            m.owner.role(lead.name, "lead")
+            dev.stop_hook()
+            lead.call("hub_assign", to=dev.name, task=second)
+            self.assertIn("Task #%s is yours: Seed it" % second, dev.stop_hook())
+            self.assertIn("[doing] Seed it", m.cli("tasks"))
+            self.assertIn("held by %s" % dev.name, m.cli("tasks"))
+        finally:
+            m.stop()
+
+
+@unittest.skipUnless(H.shutil.which("uv"), "needs uv")
+class UpgradeToProjects(unittest.TestCase):
+    """A machine set up before projects keeps its chat, tokens and agents; new folders get projects."""
+
+    def test_an_existing_chat_becomes_the_first_project(self):
+        from test_install import Install
+        inst = Install("test_a_fresh_install_runs_a_chat")
+        inst.setUp()
+        old = inst.checkout(os.environ.get("CREWCHAT_E2E_FROM_PROJECTS", "v0.9.10"))
+        inst.install(old, lean=True)
+        m = inst.installed_machine("upgrader")
+        m.start()
+        a = m.agent()
+        a.link()
+        a.stop_hook()
+        tid = m.owner.task("all", "made before projects")
+        a.call("hub_take", id=tid)
+        mcp_before = (m.folder / ".mcp.json").read_text()
+        m.kill(hard=False)
+        inst.install(H.ROOT, lean=True)
+        m.cli("start", "--no-service", "--no-open")
+        m.wait_up()
+        m._owner = None
+        self.assertEqual((m.folder / ".mcp.json").read_text(), mcp_before)  # same address and token
+        self.assertEqual(m.owner.poll()["taken"][tid], a.name)
+        m.owner.send(a.name, "after the upgrade")
+        self.assertIn("after the upgrade", a.stop_hook())
+        listing = m.cli("projects")
+        self.assertRegex(listing, r"(?m)^Demo( \(here\))?  \[--chat demo\]$")
+        other = m.dir / "other"
+        other.mkdir()
+        self.assertIn('Created the project "other"', m.cli("start", "--no-service", "--no-open", cwd=other))
+        self.assertIn(a.name, m.cli("agents"))
+
+
+if __name__ == "__main__":
+    unittest.main()

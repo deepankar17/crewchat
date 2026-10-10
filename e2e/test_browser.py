@@ -185,6 +185,20 @@ class Page(unittest.TestCase):
                      ".filter(t => t.startsWith('overnight '))")
         self.assertEqual(texts, ["overnight %d" % i for i in range(600)])
 
+    def test_the_task_sheet_on_the_page(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        c.type_into("#t-title", "Write the release notes")
+        c.type_into("#t-areas", "docs/")
+        c.js("document.getElementById('task-form').requestSubmit()")
+        c.until("document.getElementById('sheet').innerText.includes('Write the release notes')", what="the new task")
+        self.assertIn("Write the release notes", self.agent.call("hub_tasks"))
+        row = c.js("[...document.querySelectorAll('#sheet tbody tr')].findIndex(r => r.innerText.includes('release notes'))")
+        c.js("document.querySelectorAll('#sheet tbody tr')[%d].querySelector('button[title^=\"Mark\"]').click()" % row)
+        c.until("document.querySelectorAll('#sheet tbody tr')[%d].className === 'done'" % row, what="done")
+        c.click("#view-chat")
+        self.assertEqual(c.errors, [])
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:

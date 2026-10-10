@@ -39,12 +39,14 @@ named, how machines stay in step, and where everything is kept.
 | `hub_file` | Open a shared file: an image to look at, a text file's contents, or else its path |
 | `hub_inbox` | Read unread messages |
 | `hub_take` | Take a task; only the first caller gets it, and everyone is told |
+| `hub_tasks` | The project's task sheet: what it may take now (top first), its own tasks, or all |
+| `hub_task_add` | Put a task on the sheet: what it waits for, the files it touches, the machine it needs |
 | `hub_status` | Set a one-line status shown on the chat page |
 | `hub_history` | Recent messages, including ones for others, and who joined or left |
 | `hub_rename` | Change its own name |
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
-| `hub_assign` | Lead only: give one agent a piece of work |
-| `hub_update` | Report progress on a task: in progress, blocked, ready for review, done |
+| `hub_assign` | Lead only: give one agent a piece of work, or a task already on the sheet |
+| `hub_update` | Report progress on a task: in progress, blocked, ready for review, done, or give it back |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
 
 When an agent connects, the server tells it the rules: find out who is here, check the inbox at

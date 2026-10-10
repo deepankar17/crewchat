@@ -237,15 +237,63 @@ listening agent once. A session that should stay out of the chat is asked to joi
 type, and stops being asked after three prompts; `crewchat hooks off` in a folder (or starting
 one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
 
-## More folders
+## Projects
 
-A machine runs one chat, named after the folder you first ran `crewchat start` in. Running it in
-another folder adds that folder to the same chat, and says so; the chat page stays the same one.
-The first folder's agents are named after the machine (`claude-macbook`), later folders' after the
-folder (`claude-website`), so you can tell them apart. `crewchat places` lists the folders, and
-`crewchat place remove NAME` takes one out at once.
+Each folder you run `crewchat start` in is its own **project**: its own chat, agents, tasks,
+roles, files and rules, apart from your other projects. A new folder starts a project named after
+it; a folder whose name matches a project already here joins that one.
 
-For agents on another machine, see [Several machines](multiple-machines.md).
+```bash
+cd ~/code/website && crewchat start            # a new project, "website"
+cd ~/code/docs && crewchat start --chat website  # another folder in the same project
+crewchat projects                              # this machine's projects and their folders
+```
+
+The chat page has a menu at the top left to switch projects, marking the ones with messages you
+have not seen. Agent names belong to their project: `claude-macbook` in `website` and
+`claude-macbook` in `notes-app` are two agents that never see each other. Commands act on the
+project of the folder you run them in; `--chat NAME` picks another (`crewchat say --chat website
+"..."`). Your first project stays where it was, so a machine set up before projects keeps its chat,
+agents and links as they are. For now, only the first project is shared with your linked machines
+([Several machines](multiple-machines.md)).
+
+## The task sheet
+
+Every project has a task sheet: every task in order, with who holds it. Agents work from it by
+themselves: with nothing to do, an agent takes the top task it may (what it waits for is done,
+nobody else is in its files, and it suits its machine), says it started, works, and reports. Work
+they find (a bug, a follow-up) they add to the sheet. With a lead, the lead hands tasks out.
+
+On the chat page, **Task sheet** (above the conversation) shows it: add tasks, give one to an
+agent, move them up or down, mark them done, put a blocked one back. From a terminal:
+
+```bash
+crewchat tasks                                         # the sheet
+crewchat tasks add "Build the login screen" --areas app/login/
+crewchat tasks add "Write its tests" --depends A12 --areas app/login/tests/
+crewchat tasks add "Sign the iOS build" --where macbook  # only for that machine's agents
+crewchat tasks assign A12 claude-macbook
+crewchat tasks move A14 top
+crewchat tasks done A12                                # or todo (back on the sheet), blocked, remove
+```
+
+A message you post as a task also goes on the sheet.
+
+## What agents learn: rules and skills
+
+Every folder of a project gets crewchat's guide in the form each tool reads by itself: a Claude
+Code skill (`.claude/skills/crewchat/`), a Cursor rule (`.cursor/rules/crewchat.mdc`), and a
+section of the folder's `AGENTS.md` if it has one (for Codex, Gemini and others). They are kept out
+of git and rewritten when something changes. The guide explains the chat and the task sheet, and
+carries two things you set per project:
+
+- **Project rules**: who does what, how to test, what never to do. Edit them in the chat page's
+  sidebar, or `crewchat rules set "..."` (`--file RULES.md`; `show`, `clear`). Agents get them as a
+  message at once, and new sessions read them from the guide.
+- **Shared skills**: a `SKILL.md` (or a folder holding one) that every agent of the project should
+  have, installed in each folder's `.claude/skills/`. Add one on the page, or `crewchat skills add
+  PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out everywhere. A
+  skill of your own by the same name is never touched.
 
 ## Upgrade and uninstall
 

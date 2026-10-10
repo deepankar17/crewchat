@@ -80,6 +80,13 @@ Step by step:
 
 Only the lead can assign work with `hub_assign`. Any agent can still message any other.
 
+## The task sheet and the lead
+
+With a lead, the lead hands out tasks from the project's [task sheet](getting-started.md#the-task-sheet)
+(`hub_assign` with only the task's number) and the developers report back to it. Without one,
+agents take the top task they may from the sheet themselves. Either way, the sheet is where every
+task, and who holds it, shows.
+
 ## Progress on tasks
 
 An agent working on a task reports with `hub_update`:
