@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1313,6 +1314,47 @@ class Hooks(Base):
             crewchat.LISTEN_GRACE = grace
         self.hook("claude", "stop", {"session_id": "H"})
         self.assertEqual(doing(), "idle")
+
+
+class NewProject(unittest.TestCase):
+    """create_project on Windows, where a new folder can be held for a moment."""
+
+    def setUp(self):
+        self.base = Path(tempfile.mkdtemp(dir=TMP))
+        crewchat.save_config({"project": "Main"}, self.base)
+
+    def held(self, times):
+        """os.replace, refusing to move a new project folder into place the first `times` times."""
+        real, moves = os.replace, []
+
+        def replace(src, dst):
+            if Path(src).name.startswith(".new-"):
+                moves.append(dst)
+                if len(moves) <= times:
+                    raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        return replace, moves
+
+    def test_the_move_waits_while_windows_holds_the_new_folder(self):
+        replace, moves = self.held(2)
+        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.time, "sleep"):
+            entry = crewchat.create_project("t3", self.base)
+        self.assertEqual((entry["id"], entry["name"], len(moves)), ("t3", "t3", 3))
+        self.assertEqual(sorted(p.name for p in (self.base / "projects").iterdir()), ["t3"])
+
+    def test_a_folder_left_in_the_way_is_passed_over(self):
+        (self.base / "projects" / "t3").mkdir(parents=True)  # no config: not a project
+        entry = crewchat.create_project("t3", self.base)
+        self.assertEqual((entry["id"], entry["name"]), ("t3-2", "t3"))
+
+    def test_a_move_that_never_works_leaves_nothing_behind(self):
+        replace, moves = self.held(1000)
+        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                crewchat.create_project("t3", self.base)
+        self.assertEqual(len(moves), 50)
+        self.assertEqual(list((self.base / "projects").iterdir()), [])
 
 
 class Persistence(Base):
