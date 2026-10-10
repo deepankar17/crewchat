@@ -3803,13 +3803,12 @@ def cmd_connect(args):
             crewchat_peers.cmd_peers(argparse.Namespace(action="invite", target=None, code=None,
                                                         name=None, url=None))
         return
+    import crewchat_cloud
     try:
-        import crewchat_cloud  # noqa: F401
-        import cryptography  # noqa: F401
-        from google.cloud import firestore  # noqa: F401
-    except ImportError:
-        die("cloud sync needs two libraries this install does not have. Run the installer again without "
-            "CREWCHAT_LEAN, or: pip install \"crewchat[cloud]\"")
+        crewchat_cloud.need_crypto()
+        crewchat_cloud.load_firestore()
+    except crewchat_cloud.CloudError as e:
+        die(str(e))
     print("Cloud sync, on every machine:")
     print()
     print("  1. Once, for all your machines: set up a Firebase project, by hand or by giving the prompt in")

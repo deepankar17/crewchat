@@ -58,11 +58,16 @@ class CloudError(Exception):
     pass
 
 
+COLLECTIONS = ("messages", "tasks", "state", "devices")  # the layout above, besides meta
+NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
+                 "or: pip install \"crewchat[cloud]\"")
+
+
 def need_crypto():
     try:
         import cryptography  # noqa: F401
     except ImportError:
-        raise CloudError("cloud sync needs the cryptography library: pip install cryptography")
+        raise CloudError("cloud sync needs the cryptography library, " + NOT_INSTALLED)
 
 
 # --------------------------------------------------------------------------------------------
@@ -646,16 +651,20 @@ class Account:
         return matches[0]
 
     def _change_trust(self, change):
+        """Change the trusted devices and return them as written."""
         device = self.device
+        written = {}
 
         def update(current):
             base = current if current and self._valid_trust(current) else device.trust
-            devices = change(dict(base.get("devices", {})))
-            return sign_trust(device, devices, max(int(base.get("version", 0)), int(device.trust.get("version", 0))) + 1)
+            written["devices"] = change(dict(base.get("devices", {})))
+            return sign_trust(device, written["devices"],
+                              max(int(base.get("version", 0)), int(device.trust.get("version", 0))) + 1)
 
         if not self.store.transact("meta/trust", update):
             raise CloudError("could not update the trusted devices")
         self.accept_trust(self.store.get("meta/trust"))
+        return written["devices"]
 
     def _valid_trust(self, doc):
         entry = self.device.trusted(doc.get("signer"))
@@ -689,10 +698,10 @@ class Account:
         if not device.ready:
             raise CloudError("this machine is not approved itself yet")
         target_id, doc = self.find(name_or_id)
-        self._change_trust(lambda devices: {k: v for k, v in devices.items() if k != target_id})
+        left = self._change_trust(lambda devices: {k: v for k, v in devices.items() if k != target_id})
         self.store.delete("devices/" + target_id)
         self.store.delete("state/" + target_id)
-        if not ((self.store.get("meta/trust") or {}).get("devices")):
+        if not left:
             self._reset()
         elif target_id != device.id:
             self.rotate()
@@ -702,7 +711,7 @@ class Account:
         """The last trusted device left. No one holds the account key any more, so what is left in
         the cloud can never be read again: clear it, so that the next machine to set up founds the
         account afresh instead of waiting for an approval no one can give."""
-        for collection in ("messages", "tasks", "state", "devices"):
+        for collection in COLLECTIONS:
             for doc_id, _ in self.store.list(collection):
                 self.store.delete("%s/%s" % (collection, doc_id))
         self.store.delete("meta/trust")
@@ -1103,12 +1112,17 @@ class Auth:
         write_private(self.dir / "auth.json", json.dumps(self.data))
 
 
-def firestore_store(root=None):
+def load_firestore():
+    """Import Google's Firestore library, or raise CloudError saying why it cannot be loaded."""
     try:
         import asyncio  # noqa: F401  first: if it cannot load, Firestore's import hides why behind a NameError
         import google.cloud.firestore  # noqa: F401
     except ImportError as e:
         raise CloudError(firestore_import_error(e))
+
+
+def firestore_store(root=None):
+    load_firestore()
     need_crypto()
     auth = Auth(root)
     if not auth.signed_in:
@@ -1118,7 +1132,7 @@ def firestore_store(root=None):
 
 def firestore_import_error(e):
     if isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] == "google":
-        return "cloud sync needs Google's Firestore library: pip install google-cloud-firestore"
+        return "cloud sync needs Google's Firestore library, " + NOT_INSTALLED
     if "Application Control" in str(e):
         return ("Windows Smart App Control blocked a file of this Python (%s). It refuses the unsigned Python "
                 "that uv installs: install Python 3.12 from python.org (winget install -e --id Python.Python.3.12), "

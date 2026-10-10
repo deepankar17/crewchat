@@ -344,20 +344,12 @@ class FreshStart(unittest.TestCase):
             m.stop()
 
 
-def tearDownModule():
-    shutil.rmtree(TMP, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
 class FirestoreImport(unittest.TestCase):
     """What `crewchat cloud` says when Google's library cannot be loaded."""
 
     def test_a_missing_library_says_how_to_install_it(self):
         e = ModuleNotFoundError("No module named 'google'", name="google")
-        self.assertIn("pip install google-cloud-firestore", cloud.firestore_import_error(e))
+        self.assertIn('pip install "crewchat[cloud]"', cloud.firestore_import_error(e))
 
     def test_smart_app_control_says_to_use_a_signed_python(self):
         e = ImportError("DLL load failed while importing _overlapped: "
@@ -371,3 +363,11 @@ class FirestoreImport(unittest.TestCase):
         msg = cloud.firestore_import_error(e)
         self.assertIn("cygrpc", msg)
         self.assertNotIn("pip install", msg)
+
+
+def tearDownModule():
+    shutil.rmtree(TMP, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
