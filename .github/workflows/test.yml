@@ -48,7 +48,8 @@ jobs:
           up || { echo "restart did not start it"; exit 1; }
           crewchat uninstall --yes
           if up; then echo "uninstall left the server running"; exit 1; fi
-          if command -v crewchat; then echo "the program is still installed"; exit 1; fi
+          hash -r  # bash remembers where it last ran crewchat; ask afresh
+          if [ -e "$HOME/.local/bin/crewchat" ] || command -v crewchat; then echo "the program is still installed"; exit 1; fi
           if [ -e .mcp.json ]; then echo "uninstall left .mcp.json"; exit 1; fi
           [ -e "$CREWCHAT_HOME/config.json" ] || { echo "uninstall deleted the chats without --purge"; exit 1; }
       - name: install.ps1 (Windows PowerShell 5.1)
