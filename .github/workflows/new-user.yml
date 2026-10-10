@@ -36,7 +36,24 @@ jobs:
       matrix:
         shell: [powershell, pwsh, cmd]  # where the user types the command
     runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
     steps:
+      # Right after a release, the PyPI server this runner reaches may still serve the one before:
+      # wait until it lists this one, so the README's commands below get it the first time.
+      - name: Wait for this runner's PyPI to list the release
+        if: github.event_name == 'release'
+        shell: powershell
+        run: |
+          $want = $env:TAG.TrimStart('v')
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $index = Invoke-RestMethod https://pypi.org/simple/crewchat/ -Headers @{ Accept = 'application/vnd.pypi.simple.v1+json' }
+              if ($index.versions -contains $want) { exit 0 }
+            } catch { }
+            Start-Sleep -Seconds 10
+          }
+          "PyPI here does not list $want after 10 minutes"; exit 1
       - name: The README's commands, typed in powershell
         if: matrix.shell == 'powershell'
         shell: powershell
@@ -57,8 +74,6 @@ jobs:
           "%USERPROFILE%\.local\bin\uv.exe" tool install --python 3.12 "crewchat[cloud]"
       - name: A first chat
         shell: powershell
-        env:
-          TAG: ${{ github.event.release.tag_name }}
         run: |
           $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
           $v = crewchat --version
@@ -82,13 +97,25 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.release.tag_name }}
     steps:
+      - name: Wait for this runner's PyPI to list the release
+        if: github.event_name == 'release'
+        run: |
+          for i in $(seq 60); do
+            curl -sf -H 'Accept: application/vnd.pypi.simple.v1+json' https://pypi.org/simple/crewchat/ |
+              grep -q "\"${TAG#v}\"" && exit 0
+            sleep 10
+          done
+          echo "PyPI here does not list ${TAG#v} after 10 minutes"; exit 1
       - name: The README's command
         run: curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
       - name: A first chat
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           crewchat --version
+          if [ -n "$TAG" ] && [ "$(crewchat --version)" != "crewchat ${TAG#v}" ]; then echo "expected $TAG"; exit 1; fi
           mkdir "$RUNNER_TEMP/notes-app" && cd "$RUNNER_TEMP/notes-app" && git init -q
           crewchat start --no-service --no-open
           curl -sf http://127.0.0.1:8765/health
