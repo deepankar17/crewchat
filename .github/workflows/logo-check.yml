@@ -10,7 +10,8 @@ jobs:
       - name: Show-Logo from install.ps1 (as on a console)
         shell: powershell
         run: |
-          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors)
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$tokens, [ref]$errors)
           if ($errors) { $errors; exit 1 }
           $fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Show-Logo' }, $true) | Select-Object -First 1
           Invoke-Expression ($fn.Extent.Text -replace '\[Console\]::IsOutputRedirected', '$false')
