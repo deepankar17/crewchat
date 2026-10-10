@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.11.2"
+__version__ = "0.11.3"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -70,6 +70,7 @@ TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "appl
               "application/javascript", "application/x-sh", "application/sql")
 MAX_TEXT = 4000
 PROJECTS_DIR = "projects"  # projects other than the first, in the crewchat home folder
+NEW_PROJECT = ".new-"  # prefix of a project being made in PROJECTS_DIR, before it is moved into place
 PAGE_BATCH = 500  # messages the chat page gets in one answer
 MAX_STATUS = 200
 MAX_WAIT = 50
@@ -400,11 +401,17 @@ def list_projects(base=None):
     if (base / "config.json").exists():
         name = str(load_config(base)["project"])
         out.append({"id": project_id(name), "name": name, "root": base, "chat": ""})
-    folder = base / PROJECTS_DIR
-    for path in sorted(folder.iterdir()) if folder.is_dir() else []:
-        if (path / "config.json").exists():
-            out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
+    for path in project_folders(base / PROJECTS_DIR):
+        out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
     return out
+
+
+def project_folders(folder):
+    """The project folders in projects/, sorted: each has a config, and none is one being made.
+    The command line and the server both go by this, so they never disagree on what is a project."""
+    if not folder.is_dir():
+        return []
+    return sorted(p for p in folder.iterdir() if not p.name.startswith(".") and (p / "config.json").exists())
 
 
 def find_chat(text, base=None):
@@ -418,14 +425,21 @@ def create_project(name, base=None):
     base = Path(base) if base else home()
     folder = base / PROJECTS_DIR
     folder.mkdir(parents=True, exist_ok=True)
-    # Every project's id (the first one has no folder here), and any folder left in projects/
-    # without a config: nothing can be moved onto it either.
+    # Every project's id (the first one has no folder here), and every other folder in projects/:
+    # nothing can be moved onto one either.
     taken = {p["id"] for p in list_projects(base)} | {p.name for p in folder.iterdir()}
     pid, number = project_id(name), 2
     while pid in taken:
         pid, number = "%s-%d" % (project_id(name)[:36], number), number + 1
+    cutoff = time.time() - 600
+    for old in folder.glob(NEW_PROJECT + "*"):  # left by a create that failed (before 0.11.3, or killed)
+        try:
+            if old.stat().st_mtime < cutoff:
+                shutil.rmtree(str(old), ignore_errors=True)
+        except OSError:
+            pass
     # Built under another name and moved in whole: a running server sees it complete or not at all.
-    temp = Path(tempfile.mkdtemp(prefix=".new-", dir=str(folder)))
+    temp = Path(tempfile.mkdtemp(prefix=NEW_PROJECT, dir=str(folder)))
     try:
         (temp / "tokens").mkdir()
         save_config({"project": str(name), "forget_hours": FORGET_HOURS}, temp)
@@ -519,8 +533,7 @@ class Projects:
         with self.lock:
             if stamp == self._stamp:  # another request got here first and did it
                 return
-            found = sorted(p for p in folder.iterdir()
-                           if not p.name.startswith(".") and (p / "config.json").exists()) if stamp else []
+            found = project_folders(folder) if stamp else []
             for path in found:
                 if path.name not in self.others:
                     self.others[path.name] = Project(path)
