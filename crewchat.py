@@ -1142,6 +1142,13 @@ class Hub:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
                     for m in self.messages[-limit:]]
 
+    def set_update(self, newer):
+        """A newer crewchat to tell the owner about on the chat page ('' for none)."""
+        with self.lock:
+            if getattr(self, "newer", "") != newer:
+                self.newer = newer
+                self._changed()
+
     def poll(self, after, version, wait_seconds):
         """Chat page long-poll: returns when something changed since `version`, or on timeout."""
         deadline = time.time() + wait_seconds
@@ -1166,6 +1173,8 @@ class Hub:
                 "statuses": STATUSES,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
+                "update": getattr(self, "newer", ""),
+                "releases": RELEASES,
             }
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
@@ -2191,6 +2200,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.hub.rename(data.get("name"), data.get("new"))
             elif op == "remove":
                 self.hub.remove(data.get("name"))
+            elif op == "shutdown":
+                # Answer first, then end the process: everything is already on disk.
+                sys.stderr.write("%s stopping, as the owner asked (crewchat stop)\n" % now_iso())
+                threading.Timer(0.5, os._exit, [0]).start()
             elif op == "remove-place":
                 place = data.get("place")
                 if place not in list_places(self.roster.root):
@@ -2720,6 +2733,8 @@ def cmd_start(args):
         else:
             print("- Connected %s, as \"%s\"." % (project, place))
 
+    if newer_version():
+        print("- crewchat %s is available (this is %s): run `crewchat update`." % (newer_version(), __version__))
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))
     print()
@@ -2759,6 +2774,8 @@ def cmd_serve(args):
             crewchat_peers.start(server.RequestHandlerClass.hub)
         except Exception as e:  # the local chat keeps working on its own
             sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
+    if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
+        threading.Thread(target=update_checks, args=(server.RequestHandlerClass.hub,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -3006,6 +3023,8 @@ def cmd_status(_args):
         print("Server:  not running (start it with `crewchat serve` or `crewchat service install`)")
         return
     print("Server:  running")
+    if newer_version():
+        print("Update:  crewchat %s is available (this is %s): run `crewchat update`" % (newer_version(), __version__))
     print("Places:  %s" % (", ".join(list_places()) or "none joined yet"))
     if config.get("peers"):
         try:
@@ -3668,6 +3687,324 @@ def cmd_service(args):
         cmd_status(args)
 
 
+# --------------------------------------------------------------------------------------------
+# Stop, restart, update, uninstall
+# --------------------------------------------------------------------------------------------
+RELEASES = "https://github.com/deepankar17/crewchat/releases"
+LATEST_API = os.environ.get("CREWCHAT_UPDATE_URL") or "https://api.github.com/repos/deepankar17/crewchat/releases/latest"
+UPDATE_EVERY = 24 * 3600
+
+
+def version_tuple(text):
+    try:
+        return tuple(int(x) for x in str(text).strip().lstrip("v").split("."))
+    except ValueError:
+        return ()
+
+
+def newer_version():
+    """The latest release if it is newer than this copy, from the server's last daily check;
+    else ''."""
+    try:
+        latest = json.loads((home() / "update.json").read_text(encoding="utf-8")).get("latest", "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return latest if version_tuple(latest) > version_tuple(__version__) else ""
+
+
+def check_for_update():
+    """Ask GitHub for the latest release (nothing about this machine or its chat is sent) and
+    keep the answer. Returns the newer version, or ''."""
+    req = urllib.request.Request(LATEST_API, headers={"Accept": "application/vnd.github+json",
+                                                      "User-Agent": "crewchat/" + __version__})
+    with urllib.request.urlopen(req, timeout=15) as answer:
+        latest = str(json.loads(answer.read().decode("utf-8")).get("tag_name", "")).lstrip("v")
+    write_json(home() / "update.json", {"latest": latest, "checked": time.time()})
+    return newer_version()
+
+
+def update_checks(hub):
+    """The server's daily check for a newer crewchat: logged once per version, and shown on the
+    chat page. CREWCHAT_NO_UPDATE_CHECK=1 turns it off."""
+    told = ""
+    while True:
+        try:
+            newer = check_for_update()
+        except (urllib.error.URLError, OSError, ValueError):
+            newer = newer_version()  # offline: keep what the last check found
+        if newer and newer != told:
+            sys.stderr.write("%s crewchat %s is available (this is %s): run `crewchat update`. %s\n"
+                             % (now_iso(), newer, __version__, RELEASES))
+            told = newer
+        hub.set_update(newer)
+        time.sleep(UPDATE_EVERY)
+
+
+INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
+INSTALL_PS1 = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1"
+
+
+def service_installed():
+    """Is crewchat's login service set up, and for this chat? A machine has one such service; it
+    belongs to another chat when it was set up with another CREWCHAT_HOME, and is then left alone."""
+    if os.name == "nt":
+        out = run(["schtasks", "/Query", "/TN", "crewchat", "/XML"])
+        if out.returncode != 0:
+            return False
+        found = re.search(r"set CREWCHAT_HOME=(.*?)&amp;&amp;", out.stdout)
+    else:
+        path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
+                else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        found = re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)", text)
+    service_home = next((g for g in found.groups() if g), None) if found else None
+    try:
+        return Path(service_home or "~/.crewchat").expanduser().resolve() == home().resolve()
+    except OSError:
+        return False
+
+
+def stop_server(config):
+    """Stop this machine's server, and its login service for now (it starts again at the next
+    login). True if it had been running."""
+    was_up = server_up(config)
+    if service_installed():
+        if os.name == "nt":
+            run(["schtasks", "/End", "/TN", "crewchat"])
+        elif sys.platform == "darwin":
+            run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
+        else:
+            run(["systemctl", "--user", "stop", "crewchat.service"])
+    if server_up(config):
+        try:
+            owner_call("/api/admin", {"op": "shutdown"})
+        except SystemExit:
+            pass
+    for _ in range(40):
+        if not server_up(config):
+            return was_up
+        time.sleep(0.25)
+    die("the server is still running at %s; stop the process by hand (see `crewchat status`)." % local_url(config))
+
+
+def start_server(config):
+    """Start the server: through its login service if it has one, else in the background."""
+    if service_installed():
+        if os.name == "nt":
+            run(["schtasks", "/Run", "/TN", "crewchat"])
+        elif sys.platform == "darwin":
+            plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
+            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)]).returncode != 0:
+                run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
+        else:
+            run(["systemctl", "--user", "start", "crewchat.service"])
+    else:
+        start_background()
+    for _ in range(60):
+        if server_up(config):
+            return
+        time.sleep(0.25)
+    die("the server did not start. See %s, or run `crewchat serve` to see why." % (home() / "hub.log"))
+
+
+def cmd_stop(_args):
+    config = load_config()
+    if not stop_server(config):
+        print("crewchat was not running.")
+        return
+    print("Stopped crewchat. Agents keep working, but cannot reach the chat until it runs again.")
+    print("Start it again with `crewchat restart`%s." % (", or log in again" if service_installed() else ""))
+
+
+def cmd_restart(_args):
+    config = load_config()
+    stop_server(config)
+    start_server(config)
+    print("crewchat %s is running at %s." % (__version__, local_url(config)))
+
+
+def installed_by_installer():
+    """Is this copy the one the installer put in place (a uv tool), rather than a checkout?"""
+    return any((folder / "uv-receipt.toml").exists() for folder in list(Path(__file__).resolve().parents)[:5])
+
+
+def find_uv():
+    found = shutil.which("uv")
+    if found:
+        return found
+    for candidate in ("~/.local/bin/uv", "~/.cargo/bin/uv", "~/.local/bin/uv.exe"):
+        path = Path(candidate).expanduser()
+        if path.exists():
+            return str(path)
+    return None
+
+
+def cmd_update(args):
+    if not installed_by_installer():
+        die("this crewchat runs from %s, not from the installer; update that copy yourself "
+            "(git pull, for a checkout)." % Path(__file__).resolve().parent)
+    config = load_config() if (home() / "config.json").exists() else None
+    running = bool(config) and server_up(config)
+    env = dict(os.environ, **({"CREWCHAT_VERSION": args.version} if args.version else {}))
+    if os.name == "nt":
+        # The installer must stop every crewchat process, this one included, to replace the files.
+        # It runs in a window of its own, which also starts the server again afterwards.
+        python, script = self_command()
+        again = "& '%s' '%s' restart" % (python, script) if running else ""
+        command = ("irm %s | iex; %s; Write-Host ''; Read-Host 'Press Enter to close'" % (INSTALL_PS1, again))
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", command],
+                         env=env, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        print("Updating crewchat in a new window. This window's crewchat stops while it does.")
+        return
+    local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
+    fetch = ("cat %s" % shlex.quote(str(Path(local) / "install.sh")) if local and Path(local).is_dir() else
+             "curl -LsSf %s" % INSTALL_SH if shutil.which("curl") else
+             "wget -qO- %s" % INSTALL_SH if shutil.which("wget") else None)
+    if fetch is None:
+        die("needs curl or wget")
+    if subprocess.run(["sh", "-c", fetch + " | sh"], env=env).returncode != 0:
+        die("the update did not install; crewchat %s is still in place." % __version__)
+    if running:
+        # The new code is in place: a fresh process of the same command runs it.
+        subprocess.run(self_command() + ["restart"], env=env)
+
+
+def disconnect_folder(project):
+    """Take crewchat's connection and hooks out of a project folder, leaving everything else."""
+    changed = []
+
+    def edit(rel, change):
+        path = project / rel
+        data = read_json(path)
+        if not data:
+            return
+        before = json.dumps(data, sort_keys=True)
+        change(data)
+        if json.dumps(data, sort_keys=True) == before:
+            return
+        rest = {k: v for k, v in data.items() if v not in ({}, [], None) and k != "version"}
+        if rest:
+            write_json(path, data)
+        else:
+            path.unlink()
+        changed.append(rel)
+
+    def servers(data):
+        (data.get("mcpServers") or {}).pop(SERVER_NAME, None)
+        if data.get("mcpServers") == {}:
+            del data["mcpServers"]
+
+    def claude_settings(data):
+        enabled = [n for n in data.get("enabledMcpjsonServers") or [] if n != SERVER_NAME]
+        if enabled:
+            data["enabledMcpjsonServers"] = enabled
+        else:
+            data.pop("enabledMcpjsonServers", None)
+        hooks = data.get("hooks") or {}
+        for event in list(hooks):
+            groups = []
+            for group in hooks[event]:
+                kept = [h for h in group.get("hooks", []) if not is_our_hook(h.get("command", ""))]
+                if kept:
+                    groups.append(dict(group, hooks=kept))
+            if groups:
+                hooks[event] = groups
+            else:
+                del hooks[event]
+        if not hooks:
+            data.pop("hooks", None)
+
+    def cursor_hooks(data):
+        hooks = data.get("hooks") or {}
+        stop = [h for h in hooks.get("stop", []) if not is_our_hook(h.get("command", ""))]
+        if stop:
+            hooks["stop"] = stop
+        else:
+            hooks.pop("stop", None)
+        if not hooks:
+            data.pop("hooks", None)
+
+    edit(".mcp.json", servers)
+    edit(".claude/settings.local.json", claude_settings)
+    edit(".cursor/mcp.json", servers)
+    edit(".cursor/hooks.json", cursor_hooks)
+    for name in (".crewchat-listen", ".crewchat-hooks"):
+        try:
+            (project / name).unlink()
+            changed.append(name)
+        except OSError:
+            pass
+    return changed
+
+
+def ask(question, default=False):
+    """Yes or no from the person at the terminal; the default for scripts and agents."""
+    if not sys.stdin.isatty():
+        return default
+    try:
+        answer = input("%s [%s] " % (question, "Y/n" if default else "y/N")).strip().lower()
+    except EOFError:
+        return default
+    return default if not answer else answer in ("y", "yes")
+
+
+def cmd_uninstall(args):
+    config = load_config() if (home() / "config.json").exists() else {}
+    folders = sorted((config.get("folders") or {}).keys())
+    print("This stops crewchat, stops it starting at login, takes it out of %d project folder%s, and "
+          "removes the program." % (len(folders), "" if len(folders) == 1 else "s"))
+    if not args.yes and not ask("Uninstall crewchat?"):
+        print("Nothing changed.")
+        return
+    if config.get("peers"):
+        try:
+            import crewchat_peers
+            crewchat_peers.cmd_peers(argparse.Namespace(action="leave", yes=True, target=None, code=None,
+                                                        name=None, url=None))
+        except (ImportError, SystemExit, Exception) as e:  # never stop halfway over the link
+            print("- Could not tell your other machines (%s); remove this one there with "
+                  "`crewchat peers remove`." % e)
+    if config:
+        stop_server(config)
+        print("- Stopped the server.")
+    if service_installed():
+        cmd_service(argparse.Namespace(action="uninstall", keep_awake=False))
+    for folder in folders:
+        if Path(folder).is_dir():
+            changed = disconnect_folder(Path(folder))
+            if changed:
+                print("- Took crewchat out of %s (%s)." % (folder, ", ".join(changed)))
+    data = home()
+    if data.exists():
+        if args.purge or (not args.yes and ask("Also delete your chats, files and settings in %s?" % data)):
+            shutil.rmtree(data, ignore_errors=True)
+            print("- Deleted %s." % data)
+        else:
+            print("- Kept your chats and settings in %s (delete that folder to remove them)." % data)
+    if not installed_by_installer():
+        print("Done. This copy runs from %s: delete it yourself." % Path(__file__).resolve().parent)
+        return
+    uv = find_uv()
+    if uv is None:
+        print("Done, except the program itself: run `uv tool uninstall crewchat`.")
+        return
+    if os.name == "nt":
+        # Windows cannot remove a program while it runs: remove it once this process has ended.
+        subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+                          "Wait-Process -Id %d -ErrorAction SilentlyContinue; & '%s' tool uninstall crewchat"
+                          % (os.getpid(), uv)], creationflags=0x08000000)  # CREATE_NO_WINDOW
+        print("Done. The crewchat program is removed in a moment, once this window's command ends.")
+        return
+    out = run([uv, "tool", "uninstall", "crewchat"])
+    if out.returncode != 0:
+        print("Done, except the program itself: %s" % (out.stderr.strip() or out.stdout.strip()))
+        return
+    print("Done. crewchat is uninstalled.")
+
+
 RULES = """\
 ## The crewchat: talking to each other
 
@@ -3785,6 +4122,12 @@ main { display: flex; flex-direction: column; min-width: 0; min-height: 0; overf
 form, #banner { flex: none; }
 #banner { display: none; background: var(--err); color: var(--panel); font-size: 13px; padding: 6px 16px; text-align: center; }
 #banner.show { display: block; }
+#update { display: none; flex: none; align-items: center; gap: 10px; justify-content: center; flex-wrap: wrap;
+  background: var(--task); color: var(--task-ink); border-bottom: 1px solid var(--task-line); font-size: 13px; padding: 6px 16px; }
+#update.show { display: flex; }
+#update code { font-size: 12px; }
+#update a { color: inherit; }
+#update button { border: 0; background: none; color: inherit; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
 .empty { color: var(--muted); text-align: center; margin-top: 18vh; }
 .day { text-align: center; color: var(--muted); font-size: 12px; margin: 18px 0 10px; }
 .msg { margin: 0 0 12px; max-width: 86%; }
@@ -3889,6 +4232,9 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
   </form>
 </dialog>
 <main>
+  <div id="update" role="status"><span>A newer crewchat, <b id="update-version"></b>, is available. Run
+    <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
+    <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
   <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
   <form id="form">
@@ -4158,6 +4504,19 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("online", () => { if (state.wake) state.wake(); });
 
+// A newer crewchat: say so until the owner dismisses it, then not again for that version.
+function showUpdate(version, releases) {
+  let dismissed = "";
+  try { dismissed = localStorage.getItem("crewchat-update-dismissed") || ""; } catch (e) {}
+  $("update-version").textContent = version;
+  $("update-notes").href = releases + "/tag/v" + version;
+  $("update").classList.toggle("show", !!version && version !== dismissed);
+}
+$("update-close").addEventListener("click", () => {
+  try { localStorage.setItem("crewchat-update-dismissed", $("update-version").textContent); } catch (e) {}
+  $("update").classList.remove("show");
+});
+
 async function loop() {
   for (;;) {
     try {
@@ -4175,6 +4534,7 @@ async function loop() {
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
+      showUpdate(data.update || "", data.releases || "");
       if (data.project && data.project + " · crewchat" !== state.title) {
         state.title = data.project + " · crewchat";
         $("project").textContent = data.project;
@@ -4407,6 +4767,22 @@ def build_parser():
     p.add_argument("--prompt", help="add: the role's instructions")
     p.add_argument("--file", help="add: read the role's instructions from this file")
     p.set_defaults(fn=cmd_roles)
+
+    p = sub.add_parser("stop", help="stop crewchat on this machine (the server; agents keep working)")
+    p.set_defaults(fn=cmd_stop)
+
+    p = sub.add_parser("restart", help="start the server again (after stop, or to run a newer version)")
+    p.set_defaults(fn=cmd_restart)
+
+    p = sub.add_parser("update", help="install the latest crewchat and restart the server on it")
+    p.add_argument("--version", help="install this release instead, e.g. 0.9.7")
+    p.set_defaults(fn=cmd_update)
+
+    p = sub.add_parser("uninstall", help="remove crewchat: the server, its login start, its hooks in your "
+                       "folders, and the program")
+    p.add_argument("--yes", action="store_true", help="do not ask (keeps your chats unless --purge)")
+    p.add_argument("--purge", action="store_true", help="also delete your chats, files and settings")
+    p.set_defaults(fn=cmd_uninstall)
 
     p = sub.add_parser("status", help="is the server running, and who is connected")
     p.set_defaults(fn=cmd_status)

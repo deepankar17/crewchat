@@ -47,7 +47,7 @@ Windows (PowerShell):
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
 ```
 
-No administrator rights needed; run it again to upgrade. Other ways to install:
+No administrator rights needed. Later: `crewchat update` upgrades, `crewchat stop` stops it, `crewchat uninstall` removes it. Other ways to install:
 [Getting started](docs/getting-started.md#1-install).
 
 ## Start

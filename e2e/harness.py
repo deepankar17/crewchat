@@ -90,9 +90,12 @@ class Machine:
         self.home = self.dir / "crewchat-home"
         self.folder = self.dir / "notes-app"
         self.folder.mkdir(parents=True)
+        (self.dir / "user-home").mkdir()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=True)
         self.port = free_port()
         self.env = dict(os.environ, CREWCHAT_HOME=str(self.home), TMPDIR=str(HOOK_STATE),
+                        CREWCHAT_NO_UPDATE_CHECK="1",  # dozens of servers: GitHub's limit; see test_lifecycle
+                        HOME=str(self.dir / "user-home"),  # never the real login service or settings
                         TEMP=str(HOOK_STATE), TMP=str(HOOK_STATE))
         for var in ("CLAUDE_PROJECT_DIR", "CREWCHAT_PROJECT", "CREWCHAT_LISTEN"):
             self.env.pop(var, None)

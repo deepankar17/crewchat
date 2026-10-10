@@ -41,6 +41,16 @@ jobs:
           curl -sf "http://127.0.0.1:8765/manifest.webmanifest" > /dev/null
           crewchat cloud status || true
           "$(uv tool dir 2>/dev/null || echo "$HOME/.local/share/uv/tools")/crewchat/bin/python" -c "import google.cloud.firestore, cryptography"
+          up() { curl -sf -m 3 http://127.0.0.1:8765/health > /dev/null; }
+          crewchat stop
+          if up; then echo "stop did not stop it"; exit 1; fi
+          crewchat restart
+          up || { echo "restart did not start it"; exit 1; }
+          crewchat uninstall --yes
+          if up; then echo "uninstall left the server running"; exit 1; fi
+          if command -v crewchat; then echo "the program is still installed"; exit 1; fi
+          if [ -e .mcp.json ]; then echo "uninstall left .mcp.json"; exit 1; fi
+          [ -e "$CREWCHAT_HOME/config.json" ] || { echo "uninstall deleted the chats without --purge"; exit 1; }
       - name: install.ps1 (Windows PowerShell 5.1)
         if: runner.os == 'Windows'
         shell: powershell
@@ -61,3 +71,14 @@ jobs:
           $tools = (uv tool dir).Trim()
           & "$tools\crewchat\Scripts\python.exe" -c "import google.cloud.firestore, cryptography"
           if ($LASTEXITCODE -ne 0) { exit 1 }
+          function Up { try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:8765/health).StatusCode -eq 200 } catch { $false } }
+          crewchat stop
+          if ($LASTEXITCODE -ne 0 -or (Up)) { "stop did not stop it"; exit 1 }
+          crewchat restart
+          if ($LASTEXITCODE -ne 0 -or -not (Up)) { "restart did not start it"; exit 1 }
+          crewchat uninstall --yes
+          if ($LASTEXITCODE -ne 0 -or (Up)) { "uninstall left the server running"; exit 1 }
+          if (Test-Path .mcp.json) { "uninstall left .mcp.json"; exit 1 }
+          if (-not (Test-Path "$env:CREWCHAT_HOME\config.json")) { "uninstall deleted the chats without --purge"; exit 1 }
+          for ($i = 0; $i -lt 30 -and (Test-Path "$env:USERPROFILE\.local\bin\crewchat.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$env:USERPROFILE\.local\bin\crewchat.exe") { "the program is still installed"; exit 1 }
