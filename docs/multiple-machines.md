@@ -158,6 +158,12 @@ the others' first, whatever their names, as before. A project only one machine h
 chat page marks shared projects "(shared)" in its project menu. With cloud sync, only the first
 project is shared for now.
 
+Because first projects pair with each other whatever their names, a project that is first on one
+machine and not first on another does not pair: if the Mac's first project is `test` and the
+laptop has a later project also called `test`, the Mac's `test` is shared with the laptop's first
+project, and the laptop's later `test` stays on the laptop. Nothing is mixed; rename one of them to
+pair the projects you mean.
+
 ## What changes across machines
 
 - **The roster** shows agents everywhere. In `hub_agents`, an agent elsewhere reads

@@ -495,6 +495,8 @@ class Projects:
         if stamp == self._stamp:
             return
         with self.lock:
+            if stamp == self._stamp:  # another request got here first and did it
+                return
             found = sorted(p for p in folder.iterdir() if (p / "config.json").exists()) if stamp else []
             found = [p for p in found if not p.name.startswith(".")]
             for path in found:

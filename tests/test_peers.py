@@ -321,6 +321,35 @@ class Projects(unittest.TestCase):
         a3.send(crewchat.OWNER, "all", "late but shared")
         eventually(lambda: any(m["text"] == "late but shared" for m in b3.messages), what="the late project shared")
 
+    def test_one_link_per_project_however_many_ask_at_once(self):
+        entry = crewchat.create_project("busy", self.a.root)
+        link = self.a.hub.sync
+        hub = crewchat.Projects(self.a.root).get(entry["id"]).hub  # a hub not linked yet
+        started = []
+        real_start = peers.PeerSync.start
+
+        def counted(sync):
+            started.append(sync)
+            time.sleep(0.05)  # widen the window two callers could slip through
+            return real_start(sync)
+        peers.PeerSync.start = counted
+        try:
+            threads = [threading.Thread(target=link.share, args=(hub, "busy")) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            peers.PeerSync.start = real_start
+        self.assertEqual(len(started), 1, "one link started, not %d" % len(started))
+        self.assertIs(link.projects["busy"], hub.sync)
+        self.assertEqual(len(link.projects["busy"].threads), len(peers.Mesh(self.a.root).members()))
+        # Unsharing lets it go entirely: it can be linked again (as after a rename).
+        link.unshare("busy")
+        self.assertIsNone(hub.sync)
+        self.assertIsNotNone(link.share(hub, "busy-renamed"))
+        link.unshare("busy-renamed")
+
     def test_an_older_crewchat_that_knows_no_projects_is_not_mixed_in(self):
         b_other = self.hub(self.b, "other")
         crewchat.create_project("other", self.a.root)

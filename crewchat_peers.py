@@ -220,6 +220,7 @@ class PeerSync:
         self.hub, self.mesh = hub, mesh
         self.chat, self.parent = chat, parent  # a project's name, and the machine's link; None for the first
         self.projects = {}  # the machine's link only: project name -> its PeerSync
+        self.projects_lock = threading.Lock()  # one PeerSync per project, however many requests ask at once
         self.shared_with = set()  # members that have this project
         self.wake = {}  # member id -> Event: it asked us for this project, so ask it again now
         self.log = log or (lambda text: globals()["log"](text))
@@ -255,29 +256,37 @@ class PeerSync:
         self.stopped.set()
         for event in list(self.wake.values()):
             event.set()
-        for project in list(self.projects.values()):
-            project.stop()
-            with project.hub.lock:
-                if project.hub.sync is project:
-                    project.hub.sync = None
-                    project.hub.device = ""
-            for mid in list(project.hub.remote):
-                project.hub.drop_remote(mid)
-        self.projects.clear()
+        with self.projects_lock:
+            projects, self.projects = list(self.projects.values()), {}
+        for project in projects:
+            project.detach()
+
+    def detach(self):
+        """A project's link ends: stop it, and leave its hub as if it had never been linked (so it can
+        be shared again, under a new name too)."""
+        PeerSync.stop(self)
+        with self.hub.lock:
+            if self.hub.sync is self:
+                self.hub.sync = None
+                self.hub.device = ""
+        for mid in list(self.hub.remote):
+            self.hub.drop_remote(mid)
 
     def share(self, hub, name):
         """Link another project of this machine: with the same-named project on each member."""
         name = str(name).strip().lower()
-        if self.chat is not None or self.stopped.is_set() or name in self.projects:
-            return self.projects.get(name)
-        sync = PeerSync(hub, self.mesh, self.log, chat=name, parent=self)
-        self.projects[name] = sync
-        return sync.start()
+        with self.projects_lock:
+            if self.chat is not None or self.stopped.is_set() or name in self.projects or hub.sync is not None:
+                return self.projects.get(name)
+            sync = PeerSync(hub, self.mesh, self.log, chat=name, parent=self)
+            self.projects[name] = sync
+            return sync.start()
 
     def unshare(self, name):
-        sync = self.projects.pop(str(name).strip().lower(), None)
+        with self.projects_lock:
+            sync = self.projects.pop(str(name).strip().lower(), None)
         if sync is not None:
-            sync.stop()
+            sync.detach()
 
     def _watch(self, mid):
         if mid in self.threads or self.stopped.is_set():
