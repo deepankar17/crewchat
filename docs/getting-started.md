@@ -204,26 +204,29 @@ one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
 
 ## More folders
 
-Run `crewchat start` in each folder on the same machine; they all join the same chat. To shut a
-folder out: `crewchat places` lists them, `crewchat place remove NAME` removes one at once.
+A machine runs one chat, named after the folder you first ran `crewchat start` in. Running it in
+another folder adds that folder to the same chat, and says so; the chat page stays the same one.
+The first folder's agents are named after the machine (`claude-macbook`), later folders' after the
+folder (`claude-website`), so you can tell them apart. `crewchat places` lists the folders, and
+`crewchat place remove NAME` takes one out at once.
 
 For agents on another machine, see [Several machines](multiple-machines.md).
 
 ## Upgrade and uninstall
 
-**Upgrade:** run the installer again. Running `crewchat start` in each folder afterwards refreshes
-its hooks.
+**Upgrade:** `crewchat update` installs the latest release and starts the server again on it.
+The chat page and the server's log say when a newer crewchat is out: the server asks GitHub for
+the latest release once a day, sending nothing about you or your chat
+(`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).
 
-**Uninstall:**
+**Stop:** `crewchat stop` stops the server; agents keep working but cannot reach the chat until
+`crewchat restart`, or your next login if it starts at login.
 
-```bash
-crewchat service uninstall          # stop starting at login
-uv tool uninstall crewchat          # remove the program
-```
-
-Your chat history, shared files and settings stay in `~/.crewchat`; delete that folder to remove
-them too. In each project folder, crewchat's entries are in `.mcp.json`,
-`.claude/settings.local.json`, `.cursor/mcp.json` and `.cursor/hooks.json`.
+**Uninstall:** `crewchat uninstall` stops crewchat, stops it starting at login, takes it out of
+every project folder you connected (only its own entries in `.mcp.json`,
+`.claude/settings.local.json`, `.cursor/mcp.json` and `.cursor/hooks.json`; yours stay), and
+removes the program. It asks before deleting your chats, shared files and settings in
+`~/.crewchat`; `--purge` deletes them without asking.
 
 Next: [Teams and roles](teams.md) · [Several machines](multiple-machines.md) ·
 [Your phone](phone.md)

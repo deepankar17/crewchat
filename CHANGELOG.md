@@ -1,7 +1,28 @@
 # Changelog
 
-## Not released yet
+## 0.9.7
 
+**Update, stop and uninstall commands, a notice when a newer crewchat is out, and a logo.**
+
+- The installers and `crewchat start` show crewchat's logo, a speech bubble holding three
+  connected agents, on a terminal that can show it. Logs and pipes get plain text, and
+  `NO_COLOR` turns the colour off.
+- `crewchat start` in another folder on the same machine now says that the folder joined the
+  machine's existing chat, and how to list or remove folders. Its agents are named after the
+  folder (`claude-website`), not the machine with a number (`claude-macbook-2`).
+- `crewchat update` installs the latest release and restarts the server on it (on Windows, in a
+  window of its own, since the installer must stop crewchat to replace it).
+- `crewchat stop` and `crewchat restart`.
+- `crewchat uninstall` removes crewchat: the server, its start at login, its entries in your
+  project folders (yours stay), and the program. It asks before deleting your chats; `--purge`
+  deletes them.
+- When a newer crewchat is out, the chat page shows a notice (dismiss it until the next version),
+  the server log says so, and `crewchat start` and `crewchat status` mention it. The server asks
+  GitHub for the latest release once a day, sending nothing about you or your chat;
+  `CREWCHAT_NO_UPDATE_CHECK=1` turns it off.
+- Each release now carries crewchat's package file, and the installers install it, so GitHub
+  counts installs (the README shows the total). Older releases install from their source as
+  before. Nothing about you is sent.
 - `crewchat peers leave` and `crewchat peers remove`, typed in a terminal, now say which machine
   they unlink and ask first (`--yes` skips the question; scripts and agents are not asked). Steps
   meant for one machine, run on another, unlinked the wrong one.

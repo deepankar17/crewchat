@@ -211,5 +211,41 @@ class Page(unittest.TestCase):
         self.assertEqual(c.errors, [])
 
 
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class UpdateNoticeOnThePage(unittest.TestCase):
+    def test_the_page_says_a_newer_crewchat_is_out_until_dismissed(self):
+        from test_lifecycle import FakeGitHub
+        github = FakeGitHub("v99.0.0")
+        m = H.Machine("notice-page")
+        del m.env["CREWCHAT_NO_UPDATE_CHECK"]
+        m.env["CREWCHAT_UPDATE_URL"] = github.url
+        chrome = None
+        try:
+            m.start()
+            eventually(lambda: m.owner.poll()["update"] == "99.0.0", what="the check")
+            chrome = Chrome()
+            chrome.size(1280, 900)
+            code = m.cli("ui", "--print").split(": ")[1].split()[0]
+            chrome.open(m.url + "/login?code=" + code.replace("-", ""))
+            chrome.until("document.getElementById('update').classList.contains('show')", what="the notice")
+            text = chrome.js("document.getElementById('update').innerText")
+            self.assertIn("99.0.0", text)
+            self.assertIn("crewchat update", text)
+            self.assertTrue(chrome.js("document.getElementById('update-notes').href").endswith(
+                "/releases/tag/v99.0.0"))
+            chrome.click("#update-close")
+            self.assertFalse(chrome.js("document.getElementById('update').classList.contains('show')"))
+            chrome.open(m.url + "/")
+            chrome.until("!!document.getElementById('log') && document.getElementById('project').textContent === 'Demo'")
+            time.sleep(1)
+            self.assertFalse(chrome.js("document.getElementById('update').classList.contains('show')"))
+            self.assertEqual(chrome.errors, [])
+        finally:
+            if chrome:
+                chrome.close()
+            m.stop()
+            github.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,20 +6,26 @@
 # own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   $env:CREWCHAT_VERSION = "0.9.6"   install this release ("main" for the latest code)
+#   $env:CREWCHAT_VERSION = "0.9.7"   install this release ("main" for the latest code)
 #   $env:CREWCHAT_LEAN = "1"          leave out cloud sync (about 70 MB of libraries)
 #   $env:CREWCHAT_SOURCE = "PATH"     install from a local checkout (for testing this script)
 # Native programs report failure through $LASTEXITCODE, checked after each one. ("Stop" would
 # also turn uv's progress output into errors in Windows PowerShell 5.1.)
 $ErrorActionPreference = "Continue"
 
-$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.6" }
+$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.7" }
 $Repo = "https://github.com/deepankar17/crewchat"
 
+$Fallback = $null
 if ($env:CREWCHAT_SOURCE) { $Source = $env:CREWCHAT_SOURCE }
 elseif ($Version -eq "main") { $Source = "$Repo/archive/refs/heads/main.zip" }
-else { $Source = "$Repo/archive/refs/tags/v$Version.zip" }
-$Spec = if ($env:CREWCHAT_LEAN) { "crewchat @ $Source" } else { "crewchat[cloud] @ $Source" }
+else {
+    # The release's own package file: GitHub counts its downloads (nothing about you is sent).
+    # Releases before 0.9.7 have none, and install from their source archive instead.
+    $Source = "$Repo/releases/download/v$Version/crewchat-$Version-py3-none-any.whl"
+    $Fallback = "$Repo/archive/refs/tags/v$Version.zip"
+}
+function Spec([string]$From) { if ($env:CREWCHAT_LEAN) { "crewchat @ $From" } else { "crewchat[cloud] @ $From" } }
 
 $Uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
 if (-not $Uv) {
@@ -52,7 +58,11 @@ if ($Running.Count -gt 0) {
 }
 
 Write-Host "Installing crewchat $Version..."
-& $Uv tool install --force --python 3.12 $Spec
+& $Uv tool install --force --python 3.12 (Spec $Source)
+if ($LASTEXITCODE -ne 0 -and $Fallback) {
+    Write-Host "Release $Version has no package file; installing it from its source instead..."
+    & $Uv tool install --force --python 3.12 (Spec $Fallback)
+}
 if ($LASTEXITCODE -ne 0) { throw "crewchat did not install (uv exit code $LASTEXITCODE)" }
 if ($Restart) {
     schtasks /Query /TN crewchat *> $null
@@ -71,6 +81,26 @@ $Exe = Join-Path $Bin "crewchat.exe"
 $Installed = & $Exe --version
 if ($LASTEXITCODE -ne 0 -or -not $Installed) { throw "crewchat installed but does not run; try: $Exe --version" }
 
+# The logo (a speech bubble holding three connected agents), on a console that can show it. It is
+# built from character codes so this file stays plain ASCII, which Windows PowerShell reads right
+# however it is started.
+function Show-Logo([string]$Ver) {
+    if ([Console]::IsOutputRedirected) { return }
+    $plain = [bool]$env:NO_COLOR
+    function Part([string]$Text, [string]$Colour) {
+        if ($plain -or -not $Colour) { Write-Host $Text -NoNewline } else { Write-Host $Text -NoNewline -ForegroundColor $Colour }
+    }
+    $h = [string][char]0x2500; $v = [string][char]0x2502; $dot = [string][char]0x25CF
+    Write-Host ""
+    Part ("  " + [char]0x256D + ($h * 11) + [char]0x256E) Blue; Write-Host ""
+    Part "  $v" Blue; Part "     $dot     " White; Part $v Blue; Part "   crewchat " White; Write-Host $Ver
+    Part "  $v" Blue; Part ("    " + [char]0x2571 + " " + [char]0x2572 + "    ") Gray; Part $v Blue; Write-Host "   one group chat for all your AI agents"
+    Part "  $v" Blue; Part "   $dot" White; Part ($h * 3) Gray; Part "$dot   " White; Part $v Blue; Write-Host ""
+    Part ("  " + [char]0x2570 + ($h * 2) + [char]0x256E + " " + [char]0x256D + ($h * 6) + [char]0x256F) Blue; Write-Host ""
+    Part ("     " + $v + [char]0x2571) Blue; Write-Host ""
+}
+
+Show-Logo ($Installed -replace '^crewchat ', '')
 Write-Host ""
 Write-Host "Installed $Installed."
 if (-not (($env:Path -split ";") -contains $Bin)) {

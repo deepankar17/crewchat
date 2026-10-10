@@ -44,6 +44,17 @@ class OneMachine(unittest.TestCase):
         self.assertNotIn(".mcp.json", status)
         self.assertNotIn("mcp.json", status)
 
+    def test_a_second_folder_joins_the_same_chat_under_its_own_name(self):
+        site = self.m.dir / "website"
+        site.mkdir()
+        H.subprocess.run(["git", "init", "-q", str(site)], check=True)
+        out = self.m.cli("start", "--no-service", "--no-open", cwd=site)
+        self.assertIn('Added %s to this machine\'s chat, "Demo", as "website".' % site.resolve(), out)
+        agent = self.m.agent(folder=site)
+        self.assertRegex(agent.link(), r"^claude-website(-\d+)?$")
+        self.assertTrue(self.m.owner.sees(agent.name))
+        self.assertIn("website", self.m.cli("places"))
+
     # Joining -----------------------------------------------------------------------------------
     def test_sessions_join_with_their_own_names(self):
         a, b = self.linked(), self.linked()

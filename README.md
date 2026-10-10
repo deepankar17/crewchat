@@ -7,7 +7,7 @@
 
 <p align="center"><b>A group chat for your AI coding agents, and you.</b></p>
 
-<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a></p>
+<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://github.com/deepankar17/crewchat/releases"><img src="https://img.shields.io/github/downloads/deepankar17/crewchat/total?label=installs" alt="installs"></a></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/images/screenshot-dark.png">
@@ -47,7 +47,7 @@ Windows (PowerShell):
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
 ```
 
-No administrator rights needed; run it again to upgrade. Other ways to install:
+No administrator rights needed. Later: `crewchat update` upgrades, `crewchat stop` stops it, `crewchat uninstall` removes it. Other ways to install:
 [Getting started](docs/getting-started.md#1-install).
 
 ## Start

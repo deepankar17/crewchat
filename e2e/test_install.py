@@ -106,6 +106,53 @@ class Install(unittest.TestCase):
         finally:
             del os.environ["CREWCHAT_BIN"]
 
+    def installed_machine(self, name):
+        """A machine running the installed command, with uv pointed at this throwaway home."""
+        os.environ["CREWCHAT_BIN"] = str(self.exe)
+        self.addCleanup(os.environ.pop, "CREWCHAT_BIN", None)
+        m = H.Machine(name)
+        m.env.update({k: self.env[k] for k in ("HOME", "UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "UV_CACHE_DIR",
+                                                "UV_PYTHON_INSTALL_DIR")})
+        m.env["PATH"] = self.env["PATH"]
+        self.addCleanup(m.stop)
+        return m
+
+    def test_update_reinstalls_and_restarts_the_server(self):
+        self.install(H.ROOT, lean=True)
+        m = self.installed_machine("updater")
+        m.start()
+        a = m.agent()
+        a.link()
+        before = m.server_pids()
+        m.env.update(CREWCHAT_SOURCE=str(H.ROOT), CREWCHAT_LEAN="1")  # this checkout stands in for the release
+        out = m.cli("update", timeout=600)
+        self.assertIn("Installed crewchat", out)
+        self.assertIn("is running at %s" % m.url, out)
+        self.assertTrue(m.up())
+        self.assertNotEqual(m.server_pids(), before)
+        m._owner = None
+        a.stop_hook()
+        m.owner.send(a.name, "after the update")
+        self.assertIn("after the update", a.stop_hook())
+
+    def test_uninstall_removes_everything_but_the_chats_unless_asked(self):
+        for purge in (False, True):
+            self.install(H.ROOT, lean=True)
+            m = self.installed_machine("leaver-%s" % purge)
+            m.start()
+            m.agent().link()
+            (m.folder / "notes.md").write_text("mine")
+            out = m.cli("uninstall", "--yes", *(["--purge"] if purge else []))
+            self.assertIn("Done. crewchat is uninstalled.", out)
+            self.assertFalse(m.up())
+            self.assertFalse(self.exe.exists())
+            self.assertNotIn("crewchat", subprocess.run([UV, "tool", "list"], env=self.env, capture_output=True,
+                                                        text=True).stdout)
+            for rel in (".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json"):
+                self.assertFalse((m.folder / rel).exists(), rel)
+            self.assertEqual((m.folder / "notes.md").read_text(), "mine")
+            self.assertEqual((m.home / "config.json").exists(), not purge)
+
 
 if __name__ == "__main__":
     unittest.main()

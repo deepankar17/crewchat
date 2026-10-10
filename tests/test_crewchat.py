@@ -926,7 +926,7 @@ class Joining(Base):
         folder = self.project().resolve()
         out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk")
         self.assertIn("The server is running at %s." % self.base, out)
-        self.assertIn('- Connected %s, as "desk".' % folder, out)
+        self.assertRegex(out, r'- (Connected|Added) %s(,| to this machine\'s chat, "Demo",) as "desk"\.' % re.escape(str(folder)))
         token = crewchat.read_token("desk")
         mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + token)
@@ -935,6 +935,20 @@ class Joining(Base):
         out = cli("start", str(folder), "--no-open", "--no-service")
         self.assertIn('%s is connected, as "desk".' % folder, out)
         self.assertEqual(crewchat.list_places(), places)  # no second place for the same folder
+
+    def test_start_in_another_folder_joins_the_same_chat_under_the_folders_name(self):
+        first = self.project().resolve()
+        cli("start", str(first), "--no-open", "--no-service")
+        other = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
+        other.mkdir()
+        out = cli("start", str(other), "--no-open", "--no-service")
+        self.assertIn('- Added %s to this machine\'s chat, "Demo", as "notes-app".' % other, out)
+        self.assertIn("every folder you run `crewchat start` in joins it", out)
+        self.assertIn("claude-notes-app, claude-notes-app-2", out)
+        self.assertIn("notes-app", crewchat.list_places())
+
+    def test_the_banner_is_plain_when_not_on_a_terminal(self):
+        self.assertEqual(crewchat.banner(io.StringIO()), "crewchat " + crewchat.__version__)
 
     def test_a_join_code_works_once_and_wrong_codes_fail(self):
         args = self.invite("--client", "generic")
@@ -1315,6 +1329,68 @@ class Service(unittest.TestCase):
 
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
+
+
+
+class Lifecycle(Base):
+    """Updates and uninstalling, as far as they run in this process."""
+
+    def test_versions_compare_as_numbers(self):
+        self.assertGreater(crewchat.version_tuple("0.10.0"), crewchat.version_tuple("0.9.7"))
+        self.assertEqual(crewchat.version_tuple("v1.2.3"), (1, 2, 3))
+        self.assertEqual(crewchat.version_tuple("nightly"), ())
+
+    def test_a_newer_release_reaches_the_page(self):
+        path = crewchat.home() / "update.json"
+        try:
+            path.write_text(json.dumps({"latest": "99.0.0"}))
+            self.assertEqual(crewchat.newer_version(), "99.0.0")
+            path.write_text(json.dumps({"latest": crewchat.__version__}))
+            self.assertEqual(crewchat.newer_version(), "")
+            path.write_text("not json")
+            self.assertEqual(crewchat.newer_version(), "")
+        finally:
+            path.unlink()
+        opener, _ = self.owner_browser()
+        poll = lambda: json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])  # noqa: E731
+        self.hub.set_update("99.0.0")
+        self.assertEqual((poll()["update"], poll()["releases"]), ("99.0.0", crewchat.RELEASES))
+        self.hub.set_update("")
+        self.assertEqual(poll()["update"], "")
+        page = self.raw("/", opener=opener)[1].decode()
+        self.assertIn('id="update"', page)
+        self.assertIn("crewchat update", page)
+
+    def test_uninstall_takes_crewchat_out_of_a_folder_and_leaves_the_rest(self):
+        mine = Path(tempfile.mkdtemp(dir=TMP))
+        crewchat.install_claude(mine, self.base, self.token)
+        crewchat.install_cursor(mine, self.base, self.token)
+        (mine / ".crewchat-listen").write_text("0\n")
+        self.assertEqual(set(crewchat.disconnect_folder(mine)), {
+            ".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json", ".crewchat-listen"})
+        for rel in (".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json",
+                    ".crewchat-listen"):
+            self.assertFalse((mine / rel).exists(), rel)
+        # A folder with the owner's own servers and hooks keeps them.
+        shared = Path(tempfile.mkdtemp(dir=TMP))
+        (shared / ".claude").mkdir()
+        (shared / ".mcp.json").write_text(json.dumps({"mcpServers": {"other": {"type": "http", "url": "x"}}}))
+        (shared / ".claude" / "settings.local.json").write_text(json.dumps({
+            "permissions": {"allow": ["Bash(ls)"]}, "enabledMcpjsonServers": ["other"],
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]}}))
+        crewchat.install_claude(shared, self.base, self.token)
+        crewchat.disconnect_folder(shared)
+        self.assertEqual(json.loads((shared / ".mcp.json").read_text()),
+                         {"mcpServers": {"other": {"type": "http", "url": "x"}}})
+        settings = json.loads((shared / ".claude" / "settings.local.json").read_text())
+        self.assertEqual(settings["enabledMcpjsonServers"], ["other"])
+        self.assertEqual(settings["permissions"], {"allow": ["Bash(ls)"]})
+        self.assertEqual(settings["hooks"], {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]})
+        self.assertEqual(crewchat.disconnect_folder(shared), [])  # nothing of ours left
+
+    def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
+        with self.assertRaises(SystemExit):
+            cli("update")
 
 
 if __name__ == "__main__":
