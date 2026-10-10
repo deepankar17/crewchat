@@ -15,43 +15,61 @@ minutes: install, start, open your agents, talk to them, share files, and tune h
 
 ## 1. Install
 
-**macOS or Linux:**
+There are two ways, on every system: a one-line installer, or [uv](https://docs.astral.sh/uv/)
+(the tool that installs crewchat with its own Python) and one command. Both install the same
+crewchat, from [PyPI](https://pypi.org/project/crewchat/).
+
+**macOS or Linux**, in one line:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
 ```
 
-**Windows** (PowerShell): install [uv](https://docs.astral.sh/uv/), the tool that installs
-crewchat with its own Python, then crewchat:
+or with uv:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```bash
+uv tool install --python 3.12 "crewchat[cloud]"
+```
+
+**Windows** (PowerShell), with uv: install it, open a new PowerShell window (so `uv` is found),
+then crewchat:
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Open a new PowerShell window (so `uv` is found), then:
-
 ```powershell
 uv tool install --python 3.12 "crewchat[cloud]"
 ```
 
-crewchat is on [PyPI](https://pypi.org/project/crewchat/), so with uv already installed, on any
-system, that last command is all it takes. Without cloud sync's libraries (about 70 MB):
-`uv tool install --python 3.12 crewchat`.
+or in one line:
 
-Why not one command, as on macOS? Windows Defender's automatic detection took the old one-line
-crewchat installer (download a script and run it at once) for a trojan, `Commando.A!ml`, and
-stopped it. uv's own installer is widely used and trusted, and after it nothing is downloaded and
-run: crewchat comes from PyPI like any Python package. The one-line `install.ps1` still exists
-for older notes and for `crewchat update` from 0.9.7 to 0.9.9.
+```powershell
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+```
 
-The macOS and Linux installer:
+Windows Defender's automatic detection sometimes takes the one-line installer (a script
+downloaded and run at once) for a trojan, `Commando.A!ml`, and stops it. uv's own installer is
+widely used and trusted, and after it nothing is downloaded and run: crewchat comes from PyPI like
+any Python package. If Defender stops the one line, use uv.
 
-- needs no administrator rights and asks for no password;
-- installs [uv](https://docs.astral.sh/uv/) if it is missing, and uv installs crewchat with its
+With uv already installed, on any system, `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
+libraries (about 70 MB): `uv tool install --python 3.12 crewchat`.
+
+The one-line installers:
+
+- need no administrator rights and ask for no password;
+- install [uv](https://docs.astral.sh/uv/) if it is missing, and uv installs crewchat with its
   own Python 3.12, so the Python already on the machine does not matter;
-- includes cloud sync. `CREWCHAT_LEAN=1` leaves out its libraries (about 70 MB); the chat and
+- include cloud sync. `CREWCHAT_LEAN=1` leaves out its libraries (about 70 MB); the chat and
   linking over Tailscale work the same without them;
-- puts the `crewchat` command in `~/.local/bin`. If the command is not found afterwards, open a
+- when crewchat is already running, stop it for the upgrade and start it again on the new
+  version;
+- put the `crewchat` command in `~/.local/bin`. If the command is not found afterwards, open a
   new terminal.
 
 Check it worked:

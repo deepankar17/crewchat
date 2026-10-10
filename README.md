@@ -35,27 +35,46 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 
 ## Install
 
-macOS or Linux:
+Two ways on every system; both install the same crewchat, from [PyPI](https://pypi.org/project/crewchat/),
+with its own Python. No administrator rights needed.
+
+**macOS or Linux**, in one line (it installs [uv](https://docs.astral.sh/uv/) too if needed):
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
 ```
 
-Windows (PowerShell): install [uv](https://docs.astral.sh/uv/), then crewchat with it.
+or with uv, in two steps:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+```bash
+uv tool install --python 3.12 "crewchat[cloud]"
+```
+
+**Windows** (PowerShell), with uv: install it, open a new PowerShell window, then crewchat:
 
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-Open a new PowerShell window, then:
-
 ```powershell
 uv tool install --python 3.12 "crewchat[cloud]"
 ```
 
-Already have uv (on any system)? `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes.
-No administrator rights needed. Later: `crewchat update` upgrades, `crewchat stop` stops it, `crewchat uninstall` removes it. Other ways to install:
-[Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
+or in one line:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+```
+
+Windows Defender's automatic detection sometimes takes that one line (a script downloaded and run
+at once) for a trojan, `Commando.A!ml`, and stops it; then use uv.
+
+Already have uv? `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes. Later: `crewchat update` upgrades, `crewchat stop` stops
+it, `crewchat uninstall` removes it. More: [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
 
 ## Start
 
