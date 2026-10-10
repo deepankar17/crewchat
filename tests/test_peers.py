@@ -367,6 +367,136 @@ class Projects(unittest.TestCase):
             sync._pull = saved
 
 
+class SharingEdges(unittest.TestCase):
+    """What sharing projects must get right at its edges (review of 0.11.0)."""
+
+    def setUp(self):
+        self.a = Machine("alpha").found()
+        self.b = Machine("beta").join(self.a)
+        self.machines = [self.a, self.b]
+        for m in self.machines:
+            m.projects = m.server.RequestHandlerClass.projects
+
+    def tearDown(self):
+        for m in self.machines:
+            m.stop()
+
+    def follow(self, machine):
+        machine.projects.refresh()
+        crewchat.share_projects(machine.projects)
+        machine.projects.on_change = crewchat.share_projects
+
+    def test_open_tasks_from_before_the_link_are_shared_as_history(self):
+        for m in self.machines:
+            crewchat.create_project("prelink", m.root)
+            m.projects.refresh()  # not linked yet: nothing follows changes so far
+        a2, b2 = self.a.projects.get("prelink").hub, self.b.projects.get("prelink").hub
+        x = a2.agent_for(a2.open_session("alpha", "claude"))
+        old = a2.add_row(crewchat.OWNER, "written before the link")["id"]
+        done = a2.add_row(crewchat.OWNER, "finished before the link")["id"]
+        a2.update(crewchat.OWNER, done, "done", "")
+        a2.send(crewchat.OWNER, "all", "chatter before the link")
+        self.assertFalse(old.startswith("A"))
+        for m in self.machines:
+            self.follow(m)
+        new = "A" + old
+        y = b2.agent_for(b2.open_session("beta", "claude"))
+        eventually(lambda: new in b2.sheet, what="the open task on beta's sheet")
+        self.assertNotIn("A" + done, b2.sheet)  # a finished one stays behind
+        self.assertFalse(any(m["text"] == "chatter before the link" for m in b2.messages))
+        # History: on the sheet and the page, but no one is woken for it.
+        self.assertFalse(any(m["id"] == new for m in b2.inbox(y, 0, True)))
+        self.assertFalse(any(m["id"] == new for m in a2.inbox(x, 0, True)))
+        self.assertTrue(any("now shared" in m["text"] for m in a2.messages if m["kind"] == "event"))
+        # The old number still works where it was written, and the take holds on both machines.
+        a2.take(x, old)
+        eventually(lambda: b2.taken.get(new) == x, what="beta to see who took it")
+        with self.assertRaises(crewchat.HubError):
+            b2.take(y, new)
+        # It survives a restart: the log on disk carries the new number at its new place.
+        again = crewchat.Hub(a2.roster)
+        self.assertIn(new, again.sheet)
+        self.assertEqual(again._id(old), new)
+        self.assertEqual(again.messages[-1]["seq"] < again.next_seq, True)
+
+    def test_a_machine_that_joins_later_is_followed_by_every_shared_project(self):
+        for m in self.machines:
+            crewchat.create_project("t9", m.root)
+            self.follow(m)
+        c = Machine("gamma").join(self.a)  # alpha learns of gamma through its join request
+        self.machines.append(c)
+        c.projects = c.server.RequestHandlerClass.projects
+        crewchat.create_project("t9", c.root)
+        self.follow(c)
+        c9, a9 = c.projects.get("t9").hub, self.a.projects.get("t9").hub
+        c9.send(crewchat.OWNER, "all", "from gamma's t9")
+        eventually(lambda: any(m["text"] == "from gamma's t9" for m in a9.messages), timeout=15,
+                   what="alpha's t9 to pull from gamma")
+
+    def test_a_link_let_go_does_not_bring_back_the_other_machines_agents(self):
+        crewchat.create_project("ghostly", self.a.root)
+        self.follow(self.a)
+        link = self.a.hub.sync
+        sync = link.projects["ghostly"]
+        hub = sync.hub
+        link.unshare("ghostly")
+        self.assertIsNone(hub.sync)
+        mid = next(iter(self.a.hub.sync.mesh.members()))
+        member = self.a.hub.sync.mesh.members()[mid]
+        sync._apply(mid, member, {"messages": [], "agents": [{"agent": "claude-beta", "client": "claude",
+                                                               "seen": time.time()}]})
+        self.assertFalse(hub.remote)
+
+    def test_share_projects_acts_on_the_projects_as_they_are_when_it_runs(self):
+        class Fake:
+            pass
+
+        class FakeLink:
+            def __init__(self):
+                self.projects = {}
+
+            def share(self, hub, name):
+                if name == "x":
+                    time.sleep(0.3)  # the other run starts meanwhile
+                self.projects[name] = hub
+
+            def unshare(self, name):
+                self.projects.pop(name, None)
+
+        projects = Fake()
+        projects.primary = Fake()
+        projects.primary.name = "first"
+        projects.primary.hub = Fake()
+        projects.primary.hub.sync = link = FakeLink()
+
+        def project(name):
+            one = Fake()
+            one.name, one.hub = name, Fake()
+            return one
+        projects.others = {"x": project("x")}
+        first = threading.Thread(target=crewchat.share_projects, args=(projects,))
+        first.start()
+        time.sleep(0.1)
+        projects.others["y"] = project("y")  # a second project, and a second run for it
+        second = threading.Thread(target=crewchat.share_projects, args=(projects,))
+        second.start()
+        first.join()
+        second.join()
+        self.assertEqual(sorted(link.projects), ["x", "y"])
+
+    def test_a_new_project_is_found_even_if_the_folder_time_does_not_move(self):
+        root = Path(TMP) / "coarse-clock"
+        root.mkdir()
+        crewchat.save_config({"project": "Demo", "port": 1, "url": "", "forget_hours": 24}, root)
+        crewchat.create_project("one", root)
+        found = crewchat.Projects(root)
+        folder = root / crewchat.PROJECTS_DIR
+        before = folder.stat().st_mtime_ns
+        crewchat.create_project("two", root)
+        os.utime(str(folder), ns=(before, before))  # as a one-second clock would leave it
+        self.assertIsNotNone(found.get("two"))
+
+
 class OfflineAndRemoval(unittest.TestCase):
     def test_a_machine_that_was_off_catches_up(self):
         a = Machine("one").found()

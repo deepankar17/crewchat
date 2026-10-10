@@ -216,9 +216,9 @@ class PeerSync:
     pulls and serves only that project: projects with the same name on linked machines are one
     chat, and a project one machine lacks stays on the other."""
 
-    def __init__(self, hub, mesh, log=None, chat=None, parent=None):
+    def __init__(self, hub, mesh, log=None, chat=None):
         self.hub, self.mesh = hub, mesh
-        self.chat, self.parent = chat, parent  # a project's name, and the machine's link; None for the first
+        self.chat = chat  # a project's name; None for the first project, which is the machine's link
         self.projects = {}  # the machine's link only: project name -> its PeerSync
         self.projects_lock = threading.Lock()  # one PeerSync per project, however many requests ask at once
         self.shared_with = set()  # members that have this project
@@ -242,11 +242,28 @@ class PeerSync:
 
     def start(self):
         hub, me = self.hub, self.mesh.me
+        first_time = False
+        if self.chat is not None:
+            with self.mesh.lock:  # said once per project, not at every start
+                announced = self.mesh.data.setdefault("announced", [])
+                if self.chat not in announced:
+                    announced.append(self.chat)
+                    self.mesh.save()
+                    first_time = True
+        adopted = hub.adopt_open_tasks(me["tag"], self.device_id) if hasattr(hub, "adopt_open_tasks") else {}
+        if first_time:
+            with hub.lock:
+                hub._event("This project is now shared with your other machines that have a project called %s. "
+                           "From now on its messages reach them; earlier ones stay on each machine%s." % (
+                               self.chat, ", except the %d open task%s on the sheet, shared too" % (
+                                   len(adopted), "" if len(adopted) == 1 else "s") if adopted else ""))
+                hub._changed()
         with hub.lock:
             hub.prefix, hub.device, hub.sync = me["tag"], me["name"], self
             # Tasks posted here before a restart keep their first taker.
+            own = {m["id"] for m in hub.messages if m.get("origin") == self.device_id}
             for task, agent in hub.taken.items():
-                if any(m["id"] == task and m.get("origin") == self.device_id for m in hub.messages):
+                if task in own:
                     self.mesh.data.setdefault("claims", {}).setdefault(self._key(task), agent)
         for mid in self.mesh.members():
             self._watch(mid)
@@ -264,13 +281,23 @@ class PeerSync:
     def detach(self):
         """A project's link ends: stop it, and leave its hub as if it had never been linked (so it can
         be shared again, under a new name too)."""
-        PeerSync.stop(self)
+        self.stop()
         with self.hub.lock:
             if self.hub.sync is self:
                 self.hub.sync = None
                 self.hub.device = ""
+        self._drop_remotes()
+
+    def _drop_remotes(self):
         for mid in list(self.hub.remote):
             self.hub.drop_remote(mid)
+
+    def _wake(self, mid):
+        """The Event that wakes this project's puller for a member (made on first use)."""
+        event = self.wake.get(mid)
+        if event is None:
+            event = self.wake[mid] = threading.Event()
+        return event
 
     def share(self, hub, name):
         """Link another project of this machine: with the same-named project on each member."""
@@ -278,7 +305,7 @@ class PeerSync:
         with self.projects_lock:
             if self.chat is not None or self.stopped.is_set() or name in self.projects or hub.sync is not None:
                 return self.projects.get(name)
-            sync = PeerSync(hub, self.mesh, self.log, chat=name, parent=self)
+            sync = PeerSync(hub, self.mesh, self.log, chat=name)
             self.projects[name] = sync
             return sync.start()
 
@@ -287,6 +314,16 @@ class PeerSync:
             sync = self.projects.pop(str(name).strip().lower(), None)
         if sync is not None:
             sync.detach()
+
+    def _member_joined(self, mid, name):
+        """A machine joined the link (by code, by its own request, or heard of from another member):
+        the link and every shared project start following it."""
+        self.log("%s joined" % name)
+        self._watch(mid)
+        with self.projects_lock:
+            projects = list(self.projects.values())
+        for project in projects:
+            project._watch(mid)
 
     def _watch(self, mid):
         if mid in self.threads or self.stopped.is_set():
@@ -376,7 +413,7 @@ class PeerSync:
                     if mid in self.shared_with:
                         self.shared_with.discard(mid)
                         self.hub.drop_remote(mid)
-                    wake = self.wake.setdefault(mid, threading.Event())
+                    wake = self._wake(mid)
                     wake.clear()
                     if not self.stopped.is_set():
                         wake.wait(MISSING_WAIT)
@@ -418,24 +455,22 @@ class PeerSync:
         self.stop()
         self.log("this machine was removed from the chat between your machines; its agents now only see "
                  "each other. To rejoin: `crewchat peers leave`, then join with a new code")
-        for mid in list(self.hub.remote):
-            self.hub.drop_remote(mid)
+        self._drop_remotes()
 
     def _apply(self, mid, member, out):
+        removed = out.get("removed") or {}
         if self.chat is not None:
             self.shared_with.add(mid)
-        elif self.device_id in (out.get("removed") or {}):
-            self._removed()
-            return
-        if self.chat is None:  # membership is the machine's link's business
-            for new in self.mesh.merge(out.get("members") or {}, out.get("removed") or {}):
-                self.log("%s joined" % self.mesh.members().get(new, {}).get("name", new))
-                self._watch(new)
-                for project in list(self.projects.values()):
-                    project._watch(new)
-        for gone in (out.get("removed") or {}):
+        else:  # membership is the machine's link's business
+            if self.device_id in removed:
+                self._removed()
+                return
+            for new in self.mesh.merge(out.get("members") or {}, removed):
+                self._member_joined(new, self.mesh.members().get(new, {}).get("name", new))
+        for gone in removed:
             self.hub.drop_remote(gone)
-        last = self.mesh.cursor(self._key(mid))
+        cursor = self._key(mid)
+        start = last = self.mesh.cursor(cursor)
         for msg in out.get("messages") or []:
             if not isinstance(msg, dict) or msg.get("origin") != mid:
                 continue
@@ -448,10 +483,12 @@ class PeerSync:
             except Exception as e:  # skip it, so one message cannot stop all the ones after it
                 self.log("skipped message #%s from %s (%s: %s)" % (msg.get("id"), member["name"], type(e).__name__, e))
             last = max(last, seq)
-        if last != self.mesh.cursor(self._key(mid)):
-            self.mesh.set_cursor(self._key(mid), last)
+        if last != start:
+            self.mesh.set_cursor(cursor, last)
         self.agents[mid] = out.get("agents") or []
-        self.hub.set_remote(mid, member["name"], self.agents[mid], time.time())
+        with self.hub.lock:  # (reentrant) detach() lets go of the hub under this lock
+            if self.hub.sync is self:
+                self.hub.set_remote(mid, member["name"], self.agents[mid], time.time())
 
     # Requests from members -------------------------------------------------------------------
     def peer_request(self, path, token, device, body):
@@ -469,12 +506,11 @@ class PeerSync:
         sender = body.get("sender") if isinstance(body.get("sender"), dict) else {}
         if self.chat is None and device and sender.get("id") == device:
             for new in self.mesh.merge({device: sender}):
-                self.log("%s joined" % sender.get("name", new))
-                self._watch(new)
+                self._member_joined(new, sender.get("name", new))
         if path == "/peer/pull":
-            if self.chat is not None and device in self.mesh.members():
+            if self.chat is not None and device:
                 self.shared_with.add(device)  # it asks for this project, so it has it too
-                self.wake.setdefault(device, threading.Event()).set()
+                self._wake(device).set()
             return 200, self._pull(body)
         if path == "/peer/file":
             meta, local = self.hub.file(str(body.get("id") or ""))
@@ -537,8 +573,7 @@ class PeerSync:
             answer = {"mesh": self.mesh.data["mesh"], "secret": self.mesh.data["secret"],
                       "you": dict(info, id=mid), "members": self.mesh.everyone(),
                       "removed": self.mesh.data.get("removed", {}), "project": self.hub.roster.project}
-        self.log("%s joined" % info["name"])
-        self._watch(mid)
+        self._member_joined(mid, info["name"])
         return 200, answer
 
     @staticmethod
@@ -568,10 +603,11 @@ class PeerSync:
                     break
                 hub.lock.wait(timeout=max(0.0, deadline - time.time()))
             own = [dict(m) for m in own[:MAX_BATCH]]
-        out = {"messages": own, "v": key, "agents": agents, "members": self.mesh.everyone(),
-               "removed": self.mesh.data.get("removed", {})}
-        if self.chat is not None:
-            out["chat"] = self.chat  # so the asker knows this is the project it asked for
+        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {})}
+        if self.chat is None:
+            out["members"] = self.mesh.everyone()
+        else:
+            out["chat"] = self.chat  # so the asker knows this is the project it asked for (it ignores members)
         return out
 
     # Membership changes ----------------------------------------------------------------------
@@ -639,12 +675,7 @@ def admin(hub, root, op, data):
                 break
             except PeerError:
                 continue
-        sync.stop()  # and every other project's link with it
-        with hub.lock:
-            hub.sync = None
-            hub.device = ""
-        for mid in list(hub.remote):
-            hub.drop_remote(mid)
+        sync.detach()  # and every other project's link with it
         return {"told": told}
     raise PeerError("unknown operation")
 

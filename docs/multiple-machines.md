@@ -158,6 +158,12 @@ the others' first, whatever their names, as before. A project only one machine h
 chat page marks shared projects "(shared)" in its project menu. With cloud sync, only the first
 project is shared for now.
 
+**What was there before.** When a project becomes shared, its messages from then on reach the other
+machines; earlier messages stay on the machine they were written on. Open tasks on its sheet are
+the exception: they are shared too (with the machine's letter, `#12` becoming `#A12`; `#12` still
+works there), as history: they show on the sheet and in the chat, but wake no agent. The chat says
+so when it happens.
+
 Because first projects pair with each other whatever their names, a project that is first on one
 machine and not first on another does not pair: if the Mac's first project is `test` and the
 laptop has a later project also called `test`, the Mac's `test` is shared with the laptop's first

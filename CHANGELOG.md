@@ -15,6 +15,9 @@
 - `crewchat update` no longer prints uv's error when PyPI has not caught up with a release minutes
   old: it says so in a line and installs the release from GitHub.
 - With cloud sync, only the first project is shared for now.
+- When a project becomes shared, its open tasks from before go with it, as history: on every
+  machine's sheet and takeable from any of them, without waking agents. Earlier messages stay on
+  the machine they were written on, and the chat says so.
 
 ## 0.10.1
 
