@@ -350,3 +350,24 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FirestoreImport(unittest.TestCase):
+    """What `crewchat cloud` says when Google's library cannot be loaded."""
+
+    def test_a_missing_library_says_how_to_install_it(self):
+        e = ModuleNotFoundError("No module named 'google'", name="google")
+        self.assertIn("pip install google-cloud-firestore", cloud.firestore_import_error(e))
+
+    def test_smart_app_control_says_to_use_a_signed_python(self):
+        e = ImportError("DLL load failed while importing _overlapped: "
+                        "An Application Control policy has blocked this file.")
+        msg = cloud.firestore_import_error(e)
+        self.assertIn("Smart App Control", msg)
+        self.assertIn("--python-preference only-system", msg)
+
+    def test_any_other_failure_shows_the_error(self):
+        e = ImportError("DLL load failed while importing cygrpc: something else")
+        msg = cloud.firestore_import_error(e)
+        self.assertIn("cygrpc", msg)
+        self.assertNotIn("pip install", msg)

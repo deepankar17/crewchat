@@ -1105,14 +1105,26 @@ class Auth:
 
 def firestore_store(root=None):
     try:
+        import asyncio  # noqa: F401  first: if it cannot load, Firestore's import hides why behind a NameError
         import google.cloud.firestore  # noqa: F401
-    except ImportError:
-        raise CloudError("cloud sync needs Google's Firestore library: pip install google-cloud-firestore")
+    except ImportError as e:
+        raise CloudError(firestore_import_error(e))
     need_crypto()
     auth = Auth(root)
     if not auth.signed_in:
         raise CloudError("not signed in; run `crewchat cloud login`")
     return FirestoreStore(auth), auth
+
+
+def firestore_import_error(e):
+    if isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] == "google":
+        return "cloud sync needs Google's Firestore library: pip install google-cloud-firestore"
+    if "Application Control" in str(e):
+        return ("Windows Smart App Control blocked a file of this Python (%s). It refuses the unsigned Python "
+                "that uv installs: install Python 3.12 from python.org (winget install -e --id Python.Python.3.12), "
+                "then run: uv tool install --reinstall --python-preference only-system --python 3.12 "
+                "\"crewchat[cloud]\"" % e)
+    return "cloud sync could not load Google's Firestore library (%s)" % e
 
 
 # --------------------------------------------------------------------------------------------

@@ -151,4 +151,5 @@ Rules for you:
 | `sign-in failed ... redirect_uri_mismatch` | The OAuth client is not of type **Desktop app** |
 | `access_denied` or "app not verified" during sign-in | Your account is not a test user while the app is in Testing (step 6.5) |
 | A machine stays "waiting for approval" | Run `crewchat cloud approve NAME` on a machine that is already approved |
+| `Windows Smart App Control blocked a file of this Python` (or `NameError: name 'base_events'` before 0.11.1) | Windows refuses the unsigned Python uv installs. Install Python 3.12 from python.org (`winget install -e --id Python.Python.3.12`), then `uv tool install --reinstall --python-preference only-system --python 3.12 "crewchat[cloud]"` |
 | `cloud sync is off` in the server log | Read the reason on that line; the local chat keeps working meanwhile |

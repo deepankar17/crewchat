@@ -6,6 +6,10 @@
   what was left in Firestore could never be read again, and the next machine to set up waited for
   an approval no one could give. The last logout now clears the account's data from Firestore, and
   the next machine founds the account afresh.
+- On Windows with Smart App Control on, `crewchat cloud login` failed with `NameError: name
+  'base_events' is not defined`: Windows refuses a DLL of the unsigned Python that uv installs, and
+  Google's library hid that. crewchat now says so, and how to switch to the signed Python from
+  python.org.
 
 ## 0.11.0
 
