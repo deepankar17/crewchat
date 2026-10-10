@@ -420,6 +420,9 @@ class PeerSync:
             agent = str(body.get("agent") or "")
             if not crewchat.NAME_RE.match(agent):
                 return 400, {"error": "bad agent name"}
+            # This machine posted the task and saw every give-back of it: its count of them decides the
+            # key, not the asker's, which may lag (a machine that joined later, or lost old messages).
+            key = self.hub.claim_key(task) if hasattr(self.hub, "claim_key") else key
             return 200, {"holder": self.mesh.claim(key, agent)}
         if path == "/peer/rekey":
             secret = str(body.get("secret") or "")

@@ -1393,7 +1393,7 @@ class Hub:
             total += len(text.encode("utf-8"))
         if total > MAX_SKILL:
             raise HubError("the skill is too big: %d KB at most" % (MAX_SKILL // 1024))
-        target = Path(self.roster.root) / "skills" / name
+        target = Path(os.path.abspath(str(Path(self.roster.root) / "skills" / name)))
         for rel in files:
             if Path(os.path.abspath(str(target / rel))).parts[:len(target.parts)] != target.parts:
                 raise HubError("bad file in the skill: %s" % rel)

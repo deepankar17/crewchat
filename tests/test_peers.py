@@ -173,6 +173,25 @@ class Linked(unittest.TestCase):
         for m in self.machines:
             eventually(lambda: m.hub.taken.get(task["id"]) == winners[0], what="%s to know the taker" % m.name)
 
+    def test_the_machine_that_posted_a_task_decides_its_claim_key(self):
+        x, y, z = self.a.agent(), self.a.agent(), self.c.agent()
+        task = self.b.say("all", "handed around", "task")
+        for m in self.machines:
+            eventually(lambda: m.has("handed around"), what="%s to get the task" % m.name)
+        tid = task["id"]
+        self.a.hub.take(x, tid)
+        self.a.hub.update(x, tid, "todo", "giving it back")
+        for m in self.machines:
+            eventually(lambda: m.hub.claim_gen.get(tid) == 1, what="%s to count the give-back" % m.name)
+        self.a.hub.take(y, tid)
+        # gamma lags (it joined later, or lost old messages): it counts no give-back.
+        with self.c.hub.lock:
+            self.c.hub.claim_gen.pop(tid, None)
+            self.c.hub.taken.pop(tid, None)
+        with self.assertRaises(crewchat.HubError) as e:
+            self.c.hub.take(z, tid)
+        self.assertIn("already taken by %s" % y, str(e.exception))  # the live holder, not the first one
+
     def test_activity_travels(self):
         agent = self.a.agent()
         self.a.hub.touch(agent, active=True)
