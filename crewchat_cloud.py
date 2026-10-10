@@ -533,6 +533,11 @@ class Account:
     def register(self):
         """Publish this device's public key. Returns "founded", "ready" or "pending"."""
         device = self.device
+        trust = self.store.get("meta/trust")
+        if trust is not None and not trust.get("devices"):
+            # The last trusted device left, but the account was not cleared: its reset was cut off,
+            # or it left on crewchat 0.11.0 or older. Clear it now, so that this device founds it.
+            self._reset()
         docs = self.store.list("devices")
         if not device.tag:
             device.tag = self._free_tag(docs)
@@ -1117,7 +1122,7 @@ def load_firestore():
     try:
         import asyncio  # noqa: F401  first: if it cannot load, Firestore's import hides why behind a NameError
         import google.cloud.firestore  # noqa: F401
-    except ImportError as e:
+    except Exception as e:  # a blocked DLL can also surface as a NameError from a half-loaded module
         raise CloudError(firestore_import_error(e))
 
 
@@ -1312,7 +1317,10 @@ def _cmd_cloud(args):
         if not args.name:
             raise CloudError("usage: crewchat cloud remove DEVICE")
         name = account.remove(args.name)
-        print("Removed %s and switched the others to a new account key it never sees." % name)
+        if device.trust.get("devices"):
+            print("Removed %s and switched the others to a new account key it never sees." % name)
+        else:
+            print("Removed %s, the last machine on the account, and cleared the account's data from the cloud." % name)
         return
     if action == "logout":
         if device.ready:

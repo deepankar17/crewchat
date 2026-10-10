@@ -343,6 +343,21 @@ class FreshStart(unittest.TestCase):
         for m in (a, b, c):
             m.stop()
 
+    def test_an_account_whose_last_machine_left_without_clearing_it_is_founded_afresh(self):
+        store = cloud.MemoryStore()
+        a = Machine(store, "mac")
+        a.say("all", "left behind")
+        wait_until(lambda: any(p.startswith("messages/") for p in store.docs), message="the publish")
+        a.stop()
+        # What crewchat 0.11.0 left, or a reset cut off: no trusted device, the rest still there.
+        a.account._change_trust(lambda devices: {})
+        store.delete("devices/" + a.device.id)
+        c = Machine(store, "new-laptop")
+        self.assertEqual(c.result, "founded")
+        self.assertTrue(c.device.ready)
+        self.assertEqual([p for p in store.docs if p.startswith("messages/")], [])
+        c.stop()
+
 
 class FirestoreImport(unittest.TestCase):
     """What `crewchat cloud` says when Google's library cannot be loaded."""
