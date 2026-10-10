@@ -72,6 +72,22 @@ jobs:
         run: |
           powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
           "%USERPROFILE%\.local\bin\uv.exe" tool install --python 3.12 "crewchat[cloud]"
+      # PyPI's CDN can still hand uv the index from before the release just after the wait above saw
+      # the new one (it happened to v0.11.0 and v0.11.1). That is the CDN, not the README: install
+      # again until uv gets the release, for up to five minutes.
+      - name: If uv was given the release before, install again
+        if: github.event_name == 'release'
+        shell: powershell
+        run: |
+          $want = "crewchat " + $env:TAG.TrimStart('v')
+          for ($i = 0; $i -lt 20; $i++) {
+            $v = & "$env:USERPROFILE\.local\bin\crewchat.exe" --version
+            if ($v -eq $want) { exit 0 }
+            "uv installed $v; trying again in 15 s"
+            Start-Sleep -Seconds 15
+            & "$env:USERPROFILE\.local\bin\uv.exe" tool install --reinstall --refresh --python 3.12 "crewchat[cloud]"
+          }
+          "uv never got $want"; exit 1
       - name: A first chat
         shell: powershell
         run: |
