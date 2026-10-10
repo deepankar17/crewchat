@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.9"
+__version__ = "0.9.10"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -261,8 +261,13 @@ def client_kind(info):
 
 
 def place_label(text):
-    """A short word for a machine or folder, used in agent names ("macbook")."""
-    return slug(str(text).split(".")[0], 16, "machine")
+    """A short word for a machine or folder, used in agent names ("macbook"). A long name is cut
+    at a word break: "Deepankars-Mac-mini" is "deepankars-mac", not "deepankars-mac-m"."""
+    word = slug(str(text).split(".")[0], 64, "machine")
+    if len(word) > 16:
+        cut = word[:17].rfind("-")
+        word = word[:cut] if cut >= 3 else word[:16].strip("-")
+    return word
 
 
 def load_config(root=None):
@@ -963,6 +968,10 @@ class Hub:
                 raise HubError("that start key is unknown or has expired; carry on, and call hub_agents to "
                                "see who is here")
             name = self.agent_for(sid)
+            # The launch gave the session's hooks this same key (CREWCHAT_LINK_KEY): tie it to the
+            # agent, so its messages reach it at the end of each turn. A rename carries it along.
+            self.links[key] = name
+            self._save()
         notes = []
         if spec["name"] and spec["name"] != name:
             try:
@@ -2637,13 +2646,14 @@ def launch_command(exe, tool, key, accept_edits=False):
     return [exe] + options + [LAUNCH_PROMPT % key]
 
 
-def macos_script(folder, command):
+def macos_script(folder, command, key):
     return "\n".join([
         "#!/bin/sh",
         "# Opened by crewchat to start an agent. It deletes itself.",
         'rm -f "$0"',
         "cd %s || exit 1" % shlex.quote(str(folder)),
         'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
+        "export CREWCHAT_LINK_KEY=%s" % shlex.quote(key),  # its hooks link with the same key
         "exec " + " ".join(shlex.quote(part) for part in command),
     ]) + "\n"
 
@@ -2658,14 +2668,18 @@ def launch_agent(tool, folder, key, accept_edits=False, root=None):
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(macos_script(folder, command), encoding="utf-8")
+        script.write_text(macos_script(folder, command, key), encoding="utf-8")
         os.chmod(script, 0o700)
         out = run(["open", str(script)])
         if out.returncode != 0:
             raise HubError("could not open a Terminal window: %s" % (out.stderr.strip() or out.stdout.strip()))
     elif os.name == "nt":
-        subprocess.Popen(command, cwd=str(folder), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
+        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, CREWCHAT_LINK_KEY=key),
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
     else:
+        # Some terminals start the window from a server process that does not get this one's
+        # environment, so the key goes on the command line, through env.
+        command = ["env", "CREWCHAT_LINK_KEY=%s" % key] + command
         for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
             if shutil.which(term[0]):
                 subprocess.Popen(term + command, cwd=str(folder), start_new_session=True)
@@ -3317,6 +3331,26 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
             return "ok", out.get("text", ""), int(out.get("last") or 0), bool(out.get("owner")), capped
 
 
+def claim_launch_key(folder, key, session):
+    """Is this session the one the chat page started with `key`? The first session to ask claims
+    it; the same session asking again keeps it."""
+    path = folder / ("claimed-%s" % sha(key)[:16])
+    mine = sha(session)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return path.read_text().strip() == mine
+        except OSError:
+            return False
+    except OSError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(mine)
+    return True
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -3337,7 +3371,14 @@ def run_hook(client, event):
         state = {}
     # The link key names this agent session to the server. The agent ties it to its chat identity
     # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
-    key = state.get("key") or secrets.token_urlsafe(12)
+    # A session started from the chat page was given its start key: it links with that one. Only
+    # that session: what it runs from its shell inherits the variable (`claude -p ...`) and must
+    # not act as the agent, so the first session to use the key claims it.
+    launched = os.environ.get("CREWCHAT_LINK_KEY", "")
+    if not state.get("key") and KEY_RE.match(launched) and claim_launch_key(state_file.parent, launched, session):
+        key = launched
+    else:
+        key = state.get("key") or secrets.token_urlsafe(12)
     chain = int(state.get("chain", 0))
     asks = int(state.get("asks", 0))
     # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:
@@ -3678,8 +3719,8 @@ def cmd_service_windows(args):
                 die("could not add crewchat to Task Scheduler (%s) or to your startup programs (%s)" % (refused, e))
             if not server_up(load_config()):
                 start_background()
-            print("crewchat now starts when you log on to Windows, from your startup programs (Task "
-                  "Scheduler needs an administrator: %s). Log: %s" % (refused, home() / "hub.log"))
+            print("crewchat now starts when you log on to Windows, from your startup programs, which "
+                  "need no administrator. Log: %s" % (home() / "hub.log"))
         print("Windows may still sleep when idle: agents on other machines lose the chat while it sleeps.")
     elif args.action == "uninstall":
         run(["schtasks", "/End", "/TN", "crewchat"])
@@ -3820,7 +3861,6 @@ def update_checks(hub):
 
 
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
-INSTALL_PS1 = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1"
 
 
 def service_installed():
@@ -3954,6 +3994,66 @@ def find_uv():
     return None
 
 
+def tool_folder():
+    """The folder uv installed this crewchat into (the one holding uv-receipt.toml), or None."""
+    return next((f for f in list(Path(__file__).resolve().parents)[:5] if (f / "uv-receipt.toml").exists()), None)
+
+
+def latest_release():
+    """The newest release's version, asked of GitHub now, else from the last daily check; ''."""
+    try:
+        check_for_update()
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    try:
+        return str(json.loads((home() / "update.json").read_text(encoding="utf-8")).get("latest", ""))
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def update_specs(version):
+    """What `crewchat update` installs, in order: the release from PyPI, else its package file on
+    GitHub. With cloud sync's libraries if this copy has them."""
+    try:
+        import cryptography  # noqa: F401
+        extra = "[cloud]"
+    except ImportError:
+        extra = ""
+    specs = ["crewchat%s%s" % (extra, "==" + version if version else "")]
+    if version:
+        specs.append("crewchat%s @ %s/download/v%s/crewchat-%s-py3-none-any.whl" % (extra, RELEASES, version, version))
+    return specs
+
+
+def windows_update_script(uv, specs, crewchat_exe, folder, pid):
+    """The PowerShell that updates crewchat on Windows, in a window of its own: Windows cannot
+    replace a program while it runs, so it waits for this crewchat to end and stops the others
+    (the server, hooks waiting for messages), installs with uv, and starts the chat again. It
+    downloads no script."""
+    quote = lambda text: "'%s'" % str(text).replace("'", "''")  # noqa: E731
+    lines = [
+        "$ErrorActionPreference = 'Continue'",
+        "Wait-Process -Id %d -ErrorAction SilentlyContinue" % pid,
+        "Write-Host 'Stopping crewchat for the update...'",
+        "schtasks /End /TN crewchat *> $null",
+        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and "
+        "$_.CommandLine.Contains(%s) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
+        "-ErrorAction SilentlyContinue }" % quote(folder),
+        "Start-Sleep -Seconds 2",
+        "$done = $false",
+    ]
+    for spec in specs:
+        lines.append("if (-not $done) { & %s tool install --force --refresh-package crewchat --python 3.12 %s; "
+                     "$done = $LASTEXITCODE -eq 0 }" % (quote(uv), quote(spec)))
+    lines += [
+        "if ($done) { & %s resume; Write-Host ''; & %s --version }" % (quote(crewchat_exe), quote(crewchat_exe)),
+        "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
+        "Write-Host ''",
+        "Read-Host 'Press Enter to close'",
+    ]
+    return "\n".join(lines)
+
+
 def cmd_update(args):
     if not installed_by_installer():
         die("this crewchat runs from %s, not from the installer; update that copy yourself "
@@ -3961,15 +4061,27 @@ def cmd_update(args):
     config = load_config() if (home() / "config.json").exists() else None
     running = bool(config) and server_up(config)
     env = dict(os.environ, **({"CREWCHAT_VERSION": args.version} if args.version else {}))
-    if os.name == "nt":
-        # The installer must stop every crewchat process, this one included, to replace the files.
-        # It runs in a window of its own, and starts the server again itself once it is done.
-        command = "irm %s | iex; Write-Host ''; Read-Host 'Press Enter to close'" % INSTALL_PS1
-        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", command],
-                         env=env, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
-        print("Updating crewchat in a new window. This window's crewchat stops while it does.")
-        return
+    version = args.version or latest_release()  # "" if GitHub cannot be asked: PyPI's latest, then
+    uv = find_uv()
     local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
+    if os.name == "nt" and uv and not local:
+        exe = Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
+        script = windows_update_script(uv, update_specs(version), exe, tool_folder() or Path(__file__).parent,
+                                       os.getpid())
+        subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", script],
+                         env=env, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
+        print("Updating crewchat in a new window; this crewchat stops while it does.")
+        return
+    if uv and not local:
+        for spec in update_specs(version):
+            if subprocess.run([uv, "tool", "install", "--force", "--refresh-package", "crewchat", "--python", "3.12",
+                               spec], env=env).returncode == 0:
+                break
+        else:
+            die("the update did not install; crewchat %s is still in place." % __version__)
+        if running:
+            subprocess.run(self_command() + ["restart"], env=env)  # a fresh process runs the new code
+        return
     fetch = ("cat %s" % shlex.quote(str(Path(local) / "install.sh")) if local and Path(local).is_dir() else
              "curl -LsSf %s" % INSTALL_SH if shutil.which("curl") else
              "wget -qO- %s" % INSTALL_SH if shutil.which("wget") else None)
@@ -3977,9 +4089,7 @@ def cmd_update(args):
         die("needs curl or wget")
     if subprocess.run(["sh", "-c", fetch + " | sh"], env=env).returncode != 0:
         die("the update did not install; crewchat %s is still in place." % __version__)
-    if running:
-        # The new code is in place: a fresh process of the same command runs it.
-        subprocess.run(self_command() + ["restart"], env=env)
+    # install.sh restarts a server that was running.
 
 
 def disconnect_folder(project):

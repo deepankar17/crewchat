@@ -127,7 +127,7 @@ class Install(unittest.TestCase):
         m.env.update(CREWCHAT_SOURCE=str(H.ROOT), CREWCHAT_LEAN="1")  # this checkout stands in for the release
         out = m.cli("update", timeout=600)
         self.assertIn("Installed crewchat", out)
-        self.assertIn("is running at %s" % m.url, out)
+        self.assertIn("Restarted the crewchat server on the new version.", out)  # once, by the installer
         self.assertTrue(m.up())
         self.assertNotEqual(m.server_pids(), before)
         m._owner = None

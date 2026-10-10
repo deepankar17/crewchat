@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.9.10
+
+**On PyPI, so Windows installs without a downloaded script; agents started from the chat page get
+their messages.**
+
+- crewchat is on PyPI. On Windows, install uv and then `uv tool install --python 3.12
+  "crewchat[cloud]"`: Windows Defender's automatic detection took the old one-line installer
+  (download a script and run it) for a trojan, `Commando.A!ml`, and stopped it. The macOS and
+  Linux installer, `install.ps1` and `crewchat update` install from PyPI too, falling back to the
+  release's package file on GitHub, then its source.
+- `crewchat update` on Windows no longer downloads and runs a script either: in a window of its
+  own it waits for crewchat to end, upgrades it with uv, and starts the chat again. On 0.9.7 to
+  0.9.9, update this once with `uv tool install --force --python 3.12 "crewchat[cloud]"` (stop
+  crewchat first with `crewchat stop`), then `crewchat restart`.
+- An agent started from the chat page ("Add an agent", or `crewchat agent add`) now gets its
+  messages. It linked with its start key, but its hooks used a key of their own that nothing
+  linked, so it said it was ready and then heard nothing. The launch now hands the start key to
+  its hooks too (`CREWCHAT_LINK_KEY`), on macOS, Windows and Linux. Only the agent's own session
+  uses it, not a `claude -p` it runs from its shell.
+- Machine names are cut at a word break: "Deepankars-Mac-mini" is `deepankars-mac`, not
+  `deepankars-mac-m`.
+- The installers end with `crewchat update` and `crewchat uninstall`, not the old manual steps,
+  and starting at log on without an administrator on Windows no longer shows Windows' "Access is
+  denied" as if something failed.
+- The README's pictures and links work on PyPI's project page too.
+
 ## 0.9.9
 
 **After an upgrade on Windows, `crewchat start` sets up start-at-login.**

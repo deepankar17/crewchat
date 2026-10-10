@@ -237,7 +237,7 @@ class Identity(Base):
         self.assertEqual(crewchat.client_kind({"name": "Cursor"}), "cursor")
         self.assertEqual(crewchat.client_kind({"name": "My Fancy Tool 3000!"}), "my-fancy-too")
         self.assertEqual(crewchat.client_kind(None), "agent")
-        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac-m")
+        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac")  # cut at a word break
         self.assertEqual(crewchat.place_label("123"), "machine")
 
     def test_a_client_without_session_ids_still_gets_one_identity(self):
@@ -652,6 +652,11 @@ class Launching(Base):
         inbox = session.text("hub_inbox")
         self.assertIn("Your role in this chat is now: Docs", inbox)
         self.assertIn("[TASK, assigned to you] Write the settings guide", inbox)
+        # Its hooks use the same key (the launch passes it as CREWCHAT_LINK_KEY), so they reach it
+        # without asking it to link again: messages get to it at the end of each turn.
+        hooked = crewchat.post_json(self.base + "/api/hook", token, {"key": key})
+        self.assertEqual(hooked.get("agent"), "docs-writer")
+        self.assertNotIn("link", hooked)
         # A start key works once.
         again = Session(self.base, token).call("hub_link", key=key)["content"][0]["text"]
         self.assertIn("unknown or has expired", again)
@@ -676,8 +681,9 @@ class Launching(Base):
         self.assertRegex(command[3], r"^[A-Za-z0-9 .,:_-]+$")  # safe in any shell, cmd.exe included
         self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1", True)[1:2],
                          [crewchat.LAUNCH_PROMPT % "start-1"])
-        script = crewchat.macos_script("/tmp/it's a folder", command)
+        script = crewchat.macos_script("/tmp/it's a folder", command, "start-0123456789abcdef")
         self.assertIn("cd '/tmp/it'\"'\"'s a folder' || exit 1", script)
+        self.assertIn("export CREWCHAT_LINK_KEY=start-0123456789abcdef", script)
         self.assertIn("exec /x/claude --permission-mode acceptEdits 'You were started", script)
 
 
@@ -970,9 +976,9 @@ class Hooks(Base):
         crewchat.install_cursor(cls.folder, cls.base, cls.token)
         cls.state = tempfile.mkdtemp(prefix="hookstate-", dir=TMP)
 
-    def hook(self, client, event, payload, project=None, listen="0"):
+    def hook(self, client, event, payload, project=None, listen="0", env_extra=None):
         env = dict(os.environ, CREWCHAT_PROJECT=str(project or self.folder), CREWCHAT_LISTEN=listen,
-                   TMPDIR=self.state, TEMP=self.state, TMP=self.state)
+                   TMPDIR=self.state, TEMP=self.state, TMP=self.state, **(env_extra or {}))
         env.pop("CLAUDE_PROJECT_DIR", None)
         out = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "hook", client, event],
                              input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=60)
@@ -1004,6 +1010,35 @@ class Hooks(Base):
         session.call("hub_link", key=key)
         self.say(session.me, "now it works")
         self.assertIn("now it works", self.hook("claude", "stop", {"session_id": "L"}))
+
+    def test_a_launched_sessions_first_hook_may_be_its_stop_hook(self):
+        key = self.hub.new_start()
+        session = Session(self.base, self.token)
+        session.call("hub_link", key=key)
+        self.say(session.me, "before any prompt")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "stop-first"},
+                                      env_extra={"CREWCHAT_LINK_KEY": key}))["reason"]
+        self.assertIn("before any prompt", reason)
+
+    def test_a_session_started_from_the_chat_page_links_its_hooks_with_its_start_key(self):
+        key = self.hub.new_start()
+        launched = {"CREWCHAT_LINK_KEY": key}
+        asked = self.hook("claude", "prompt", {"session_id": "launched"}, env_extra=launched)
+        self.assertIn('key "%s"' % key, asked)  # one key for the launch prompt and the hook alike
+        session = Session(self.base, self.token)
+        session.call("hub_link", key=key)
+        self.say(session.me, "first message for the launched agent")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched"}, env_extra=launched))["reason"]
+        self.assertIn("first message for the launched agent", reason)
+        # Something the agent runs from its shell (`claude -p ...`, another session) inherits the
+        # variable, but is not the agent: it gets a key of its own and stays out of the agent's mail.
+        self.say(session.me, "third message, for the agent only")
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "nested-claude-p"}, env_extra=launched), "")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched"}, env_extra=launched))["reason"]
+        self.assertIn("third message, for the agent only", reason)
+        # A bad value in the variable is ignored, not used as a key.
+        self.assertIn("Call the hub_link tool", self.hook("claude", "prompt", {"session_id": "odd"},
+                                                          env_extra={"CREWCHAT_LINK_KEY": "no spaces allowed"}))
 
     def test_a_session_that_never_links_is_left_alone(self):
         for _ in range(crewchat.MAX_LINK_PROMPTS):
@@ -1365,7 +1400,8 @@ class Service(unittest.TestCase):
             crewchat.cmd_service_windows(crewchat.argparse.Namespace(action="install", keep_awake=False))
         self.assertEqual(values["crewchat"], crewchat.windows_command())
         self.assertIn("from your startup programs", out.getvalue())
-        self.assertIn("Access is denied", out.getvalue())
+        self.assertIn("which need no administrator", out.getvalue())
+        self.assertNotIn("Access is denied", out.getvalue())  # Windows' own words read like a failure
         crewchat.start_background.assert_called_once()  # running now, not only after the next log on
         self.assertEqual(crewchat.windows_service(), "run")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1563,6 +1599,36 @@ class Lifecycle(Base):
         self.assertEqual(settings["permissions"], {"allow": ["Bash(ls)"]})
         self.assertEqual(settings["hooks"], {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]})
         self.assertEqual(crewchat.disconnect_folder(shared), [])  # nothing of ours left
+
+    def test_machine_names_are_cut_at_a_word_break(self):
+        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac")
+        self.assertEqual(crewchat.place_label("ATSLAP-73"), "atslap-73")
+        self.assertEqual(crewchat.place_label("averyveryverylongmachinename"), "averyveryverylon")
+        self.assertEqual(crewchat.place_label("my-mac"), "my-mac")
+        self.assertEqual(crewchat.place_label("123"), "machine")
+
+    def test_update_installs_from_pypi_first_then_the_release_file(self):
+        specs = crewchat.update_specs("1.2.3")
+        self.assertRegex(specs[0], r"^crewchat(\[cloud\])?==1\.2\.3$")
+        self.assertTrue(specs[1].endswith("/releases/download/v1.2.3/crewchat-1.2.3-py3-none-any.whl"))
+        self.assertRegex(crewchat.update_specs("")[0], r"^crewchat(\[cloud\])?$")
+        self.assertEqual(len(crewchat.update_specs("")), 1)
+
+    def test_the_windows_update_waits_installs_with_uv_and_resumes_without_running_a_download(self):
+        script = crewchat.windows_update_script(r"C:\Users\o'neil\.local\bin\uv.exe",
+                                                crewchat.update_specs("1.2.3"),
+                                                r"C:\Users\o'neil\.local\bin\crewchat.exe",
+                                                r"C:\Users\o'neil\AppData\Roaming\uv\tools\crewchat", 4242)
+        lines = script.splitlines()
+        self.assertEqual(lines[1], "Wait-Process -Id 4242 -ErrorAction SilentlyContinue")
+        self.assertIn("'C:\\Users\\o''neil\\AppData\\Roaming\\uv\\tools\\crewchat'", script)  # quoted
+        installs = [l for l in lines if "tool install" in l]
+        self.assertEqual(len(installs), 2)
+        self.assertIn("==1.2.3'", installs[0])
+        self.assertIn("resume", script)
+        lowered = script.lower()
+        for risky in ("irm ", "iex", "invoke-expression", "invoke-restmethod", "downloadstring", "-enc"):
+            self.assertNotIn(risky, lowered)
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
         with self.assertRaises(SystemExit):

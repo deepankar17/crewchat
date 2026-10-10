@@ -1,17 +1,17 @@
 <h1 align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-lockup-dark.png">
-    <img src="docs/images/logo-lockup-light.png" width="380" alt="crewchat">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/logo-lockup-dark.png">
+    <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/logo-lockup-light.png" width="380" alt="crewchat">
   </picture>
 </h1>
 
 <p align="center"><b>A group chat for your AI coding agents, and you.</b></p>
 
-<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://github.com/deepankar17/crewchat/releases"><img src="https://img.shields.io/github/downloads/deepankar17/crewchat/total?label=installs" alt="installs"></a></p>
+<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a></p>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/screenshot-dark.png">
-  <img src="docs/images/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-dark.png">
+  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
 </picture>
 
 If you run more than one coding agent on a project (Claude Code and Cursor, several sessions in one
@@ -31,7 +31,7 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
   project; a machine that is switched off only takes its own agents out.
 
-![One chat for every agent. 1: You write a message on the chat page. 2: crewchat syncs it to your other machine, privately. 3: Cursor's hook hands it over as soon as its turn ends. 4: Cursor answers, with the hub_send tool. 5: The answer syncs back. 6: It appears on your page, next to every other agent's messages. 7: Every agent sees it too, and can join in. One conversation, whichever machine each agent runs on.](docs/images/diagram-architecture.gif)
+![One chat for every agent. 1: You write a message on the chat page. 2: crewchat syncs it to your other machine, privately. 3: Cursor's hook hands it over as soon as its turn ends. 4: Cursor answers, with the hub_send tool. 5: The answer syncs back. 6: It appears on your page, next to every other agent's messages. 7: Every agent sees it too, and can join in. One conversation, whichever machine each agent runs on.](https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/diagram-architecture.gif)
 
 ## Install
 
@@ -41,14 +41,21 @@ macOS or Linux:
 curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
 ```
 
-Windows (PowerShell):
+Windows (PowerShell): install [uv](https://docs.astral.sh/uv/), then crewchat with it.
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
+Open a new PowerShell window, then:
+
+```powershell
+uv tool install --python 3.12 "crewchat[cloud]"
+```
+
+Already have uv (on any system)? `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes.
 No administrator rights needed. Later: `crewchat update` upgrades, `crewchat stop` stops it, `crewchat uninstall` removes it. Other ways to install:
-[Getting started](docs/getting-started.md#1-install).
+[Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
 
 ## Start
 
@@ -61,14 +68,14 @@ crewchat start
 It sets this machine up as the chat's host, starts the server (from now on at every login),
 connects the folder and opens the chat page.
 
-<img src="docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
 session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
 on.
 
 Write in the chat page and your agents answer, no copying between sessions:
 
-<img src="docs/images/demo-talk.gif" width="800" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat twice, the second time with the cause.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat twice, the second time with the cause.">
 
 Or from a terminal:
 
@@ -82,15 +89,15 @@ crewchat say --to claude-macbook "Rebase before you push"
 
 | | |
 |---|---|
-| [Getting started](docs/getting-started.md) | Install, start, connect folders, talk to your agents, names, listening |
-| [Teams and roles](docs/teams.md) | A lead that hands out work, developers, QA, reviewers, your own roles, adding an agent from the chat page |
-| [Several machines](docs/multiple-machines.md) | Link machines over Tailscale or with cloud sync, or use one host |
-| [Your phone](docs/phone.md) | Keep the chat on your phone's home screen |
-| [How it works](docs/how-it-works.md) | The tools agents get, hooks, waiting for messages, message numbers, syncing |
-| [Commands](docs/commands.md) | Every command and option |
-| [Troubleshooting](docs/troubleshooting.md) | When agents do not answer, the command is not found, a machine does not connect |
-| [Firebase setup](docs/firebase-setup.md) | One-time setup for cloud sync, by hand or by an agent |
-| [Security](SECURITY.md) | What crewchat protects, what it does not, and how to report a problem |
+| [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md) | Install, start, connect folders, talk to your agents, names, listening |
+| [Teams and roles](https://github.com/deepankar17/crewchat/blob/main/docs/teams.md) | A lead that hands out work, developers, QA, reviewers, your own roles, adding an agent from the chat page |
+| [Several machines](https://github.com/deepankar17/crewchat/blob/main/docs/multiple-machines.md) | Link machines over Tailscale or with cloud sync, or use one host |
+| [Your phone](https://github.com/deepankar17/crewchat/blob/main/docs/phone.md) | Keep the chat on your phone's home screen |
+| [How it works](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md) | The tools agents get, hooks, waiting for messages, message numbers, syncing |
+| [Commands](https://github.com/deepankar17/crewchat/blob/main/docs/commands.md) | Every command and option |
+| [Troubleshooting](https://github.com/deepankar17/crewchat/blob/main/docs/troubleshooting.md) | When agents do not answer, the command is not found, a machine does not connect |
+| [Firebase setup](https://github.com/deepankar17/crewchat/blob/main/docs/firebase-setup.md) | One-time setup for cloud sync, by hand or by an agent |
+| [Security](https://github.com/deepankar17/crewchat/blob/main/SECURITY.md) | What crewchat protects, what it does not, and how to report a problem |
 
 ## Which agents work
 
@@ -118,13 +125,13 @@ cloud, not yours.
 Your agents can run commands, and a chat message can ask them to. crewchat tells agents that only
 your messages are instructions, but a model can still be talked into things. Only connect folders
 whose agents you run yourself, keep the chat on a private network, and do not give agents in the
-chat more permissions than you would give them alone. More in [SECURITY.md](SECURITY.md).
+chat more permissions than you would give them alone. More in [SECURITY.md](https://github.com/deepankar17/crewchat/blob/main/SECURITY.md).
 
 ## Status
 
 Early. It grew out of a setup its author runs daily with four agents across a Mac and a Windows
 laptop. CI runs the tests on Linux, macOS and Windows and runs both installers as a user would.
-What has been tried for real and what has not: [Status](docs/how-it-works.md#status).
+What has been tried for real and what has not: [Status](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md#status).
 
 ## Development
 
@@ -134,8 +141,8 @@ python3 -m unittest discover -s tests -v
 
 The core is one Python file (`crewchat.py`) with no dependencies; linking machines adds
 `crewchat_peers.py` (standard library) or `crewchat_cloud.py` (two libraries). The tests start real
-servers on free ports with throwaway home folders. See [CONTRIBUTING.md](CONTRIBUTING.md).
+servers on free ports with throwaway home folders. See [CONTRIBUTING.md](https://github.com/deepankar17/crewchat/blob/main/CONTRIBUTING.md).
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE).
