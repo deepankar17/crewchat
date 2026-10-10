@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.11.1"
+__version__ = "0.11.2"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -416,20 +416,35 @@ def find_chat(text, base=None):
 def create_project(name, base=None):
     """A new, empty project called name, in projects/<id>/. Returns its list_projects() entry."""
     base = Path(base) if base else home()
-    taken = {p["id"] for p in list_projects(base)}
+    folder = base / PROJECTS_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    # Every project's id (the first one has no folder here), and any folder left in projects/
+    # without a config: nothing can be moved onto it either.
+    taken = {p["id"] for p in list_projects(base)} | {p.name for p in folder.iterdir()}
     pid, number = project_id(name), 2
     while pid in taken:
         pid, number = "%s-%d" % (project_id(name)[:36], number), number + 1
-    folder = base / PROJECTS_DIR
-    folder.mkdir(parents=True, exist_ok=True)
     # Built under another name and moved in whole: a running server sees it complete or not at all.
     temp = Path(tempfile.mkdtemp(prefix=".new-", dir=str(folder)))
-    (temp / "tokens").mkdir()
-    save_config({"project": str(name), "forget_hours": FORGET_HOURS}, temp)
-    if os.name != "nt":
-        os.chmod(temp, 0o700)
-        os.chmod(temp / "tokens", 0o700)
-    os.replace(str(temp), str(folder / pid))
+    try:
+        (temp / "tokens").mkdir()
+        save_config({"project": str(name), "forget_hours": FORGET_HOURS}, temp)
+        if os.name != "nt":
+            os.chmod(temp, 0o700)
+            os.chmod(temp / "tokens", 0o700)
+        for _ in range(49):
+            try:
+                os.replace(str(temp), str(folder / pid))
+                break
+            except PermissionError:
+                # Windows: a virus scanner or the search indexer may still hold the new config
+                # open, and a folder cannot be renamed until it lets go. That takes a moment.
+                time.sleep(0.1)
+        else:
+            os.replace(str(temp), str(folder / pid))
+    except BaseException:
+        shutil.rmtree(str(temp), ignore_errors=True)
+        raise
     return next(p for p in list_projects(base) if p["id"] == pid)
 
 

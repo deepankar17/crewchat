@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.2
+
+- On Windows, `crewchat start` in a new folder could stop with `PermissionError: [WinError 5]
+  Access is denied` while making the folder's project: a virus scanner or the search indexer still
+  held the new project's files, so its folder could not be moved into place. crewchat now waits
+  for it, and a folder left in the way under `projects/` no longer blocks the name.
+
 ## 0.11.1
 
 - Cloud sync: when the last approved machine logs out, nobody holds the account key any more, so
