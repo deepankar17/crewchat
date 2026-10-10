@@ -143,7 +143,8 @@ class Protocol(Base):
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
                                                       "hub_status", "hub_history", "hub_rename", "hub_file", "hub_role",
-                                                      "hub_assign", "hub_update", "hub_link"])
+                                                      "hub_tasks", "hub_task_add", "hub_assign", "hub_update",
+                                                      "hub_link"])
 
     def test_json_rpc_edges(self):
         session = Session(self.base, self.token)
@@ -1189,7 +1190,7 @@ class Hooks(Base):
             for name, spec in tool["inputSchema"]["properties"].items():
                 self.assertTrue(spec.get("description"), "%s.%s" % (tool["name"], name))
         reads = {t["name"] for t in crewchat.TOOLS if t["annotations"]["readOnlyHint"]}
-        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file"})
+        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file", "hub_tasks"})
         session = Session(self.base, self.token)
         listed = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual(listed[0]["annotations"], crewchat.TOOLS[0]["annotations"])
@@ -1712,6 +1713,70 @@ class Lifecycle(Base):
         self.assertEqual(tools[0], {"id": "claude", "label": "Claude Code"})
         self.assertEqual(tools[1]["id"], "cursor")
         self.assertIn("cursor.com/install", tools[1]["missing"])
+
+    def test_the_task_sheet(self):
+        hub = self.hub
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        add = lambda title, **kw: crewchat.post_json(self.base + "/api/task", self.owner,  # noqa: E731
+                                                     dict({"op": "add", "title": title}, **kw))["id"]
+        login = add("Build the login screen", areas="app/login/")
+        tests = add("Write login tests", depends=login, areas="app/login/tests/")
+        sign = add("Sign the build", where="nowhere-machine")
+        found = a.text("hub_task_add", title="Fix the crash on rotate", areas="app/main/")
+        crash = re.search(r"#(\w+)", found).group(1)
+        nxt = a.text("hub_tasks")
+        self.assertIn("#%s [todo] Build the login screen" % login, nxt)
+        self.assertNotIn("Write login tests", nxt)  # waits for the login screen
+        self.assertNotIn("Sign the build", nxt)  # needs another machine
+        self.assertIn("cannot be taken yet: it waits for #%s" % login, a.text("hub_take", id=tests))
+        self.assertIn("is yours", a.text("hub_take", id=login))
+        # Another task over the same files cannot start while the first is in hand.
+        overlap = add("Restyle the login screen", areas="app/login/style/")
+        self.assertIn("overlap #%s" % login, b.text("hub_take", id=overlap))
+        a.text("hub_update", id=login, status="done", note="built")
+        self.assertIn("Write login tests", b.text("hub_tasks"))
+        b.text("hub_take", id=tests)
+        b.text("hub_update", id=tests, status="todo", note="no time")  # given back
+        sheet = {r["id"]: r for r in hub.sheet_rows()}
+        self.assertEqual((sheet[login]["status"], sheet[tests]["status"], sheet[tests]["holder"]), ("done", "todo", ""))
+        self.assertEqual(sheet[sign]["status"], "todo")
+        # The lead (or the owner) hands out a task already on the sheet.
+        with self.assertRaises(crewchat.HubError):
+            hub.assign_row(a_name, b_name, tests)  # a is not the lead
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "assign", "task": tests, "agent": b_name})
+        self.assertEqual(hub.sheet_rows()[[r["id"] for r in hub.sheet_rows()].index(tests)]["holder"], b_name)
+        self.assertIn("Task #%s is yours" % tests, b.text("hub_inbox"))
+        # The owner orders, settles and removes tasks; that bookkeeping is not news for agents.
+        a.text("hub_inbox")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "move", "task": crash, "where": "top"})
+        self.assertEqual(hub.sheet_rows()[0]["id"], crash)
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": sign})
+        self.assertNotIn(sign, [r["id"] for r in hub.sheet_rows()])
+        self.assertEqual(a.text("hub_inbox"), "No new messages.")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": overlap, "status": "blocked"})
+        self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[overlap]["status"], "blocked")
+        # The sheet outlives the chat's memory: an old task keeps its state.
+        with hub.lock:
+            kept = list(hub.messages)
+            hub.messages = [m for m in hub.messages if m["id"] != login]
+        try:
+            self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[login]["status"], "done")
+        finally:
+            with hub.lock:
+                hub.messages = kept
+        # Agents cannot use the owner's sheet controls.
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/task", self.token, {"op": "remove", "task": crash})
+        self.assertEqual(e.exception.code, 403)
+        self.assertIn("The task sheet, in order:", cli("tasks"))
+
+    def test_areas_overlap_by_path_prefix(self):
+        self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
+        self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))
+        self.assertFalse(crewchat.areas_overlap(["app/login/"], ["app/logout/"]))
+        self.assertFalse(crewchat.areas_overlap([], ["app/"]))
+        self.assertEqual(crewchat.split_list("#A1, A2,-"), ["A1", "A2"])
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
         with self.assertRaises(SystemExit):

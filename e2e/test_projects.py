@@ -120,6 +120,40 @@ class Guides(unittest.TestCase):
             m.stop()
 
 
+class TaskSheet(unittest.TestCase):
+    """The task sheet, as agents and the owner use it."""
+
+    def test_agents_work_the_sheet(self):
+        import re
+        m = H.Machine("sheet", project="app")
+        try:
+            m.start()
+            lead, dev = m.agent(), m.agent()
+            lead.link()
+            dev.link()
+            first = re.search(r"#(\w+)", m.cli("tasks", "add", "Set", "up", "the", "database", "--areas", "db/")).group(1)
+            second = re.search(r"#(\w+)", m.cli("tasks", "add", "Seed", "it", "--depends", first, "--areas", "db/seed/")).group(1)
+            dev.stop_hook()
+            # An idle agent takes the top task it may.
+            self.assertIn("#%s [todo] Set up the database" % first, dev.call("hub_tasks"))
+            dev.call("hub_take", id=first)
+            dev.call("hub_update", id=first, status="in_progress", note="creating the schema")
+            m.owner.wait_for("creating the schema", kind="update")
+            # It finds more work and puts it on the sheet.
+            dev.call("hub_task_add", title="Index the users table", depends=first, areas="db/indexes/")
+            self.assertIn("Index the users table", m.cli("tasks"))
+            dev.call("hub_update", id=first, status="done", note="schema in place")
+            # The lead hands out the next one; the developer hears it at the end of its turn.
+            m.owner.role(lead.name, "lead")
+            dev.stop_hook()
+            lead.call("hub_assign", to=dev.name, task=second)
+            self.assertIn("Task #%s is yours: Seed it" % second, dev.stop_hook())
+            self.assertIn("[doing] Seed it", m.cli("tasks"))
+            self.assertIn("held by %s" % dev.name, m.cli("tasks"))
+        finally:
+            m.stop()
+
+
 @unittest.skipUnless(H.shutil.which("uv"), "needs uv")
 class UpgradeToProjects(unittest.TestCase):
     """A machine set up before projects keeps its chat, tokens and agents; new folders get projects."""

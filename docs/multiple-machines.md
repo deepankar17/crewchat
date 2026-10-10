@@ -144,6 +144,13 @@ server only listens on its own machine, so this also needs a private network suc
    crewchat join --url https://host.your-tailnet.ts.net --code ABCD-EFGH
    ```
 
+## Projects and linked machines
+
+A machine can hold several [projects](getting-started.md#projects). For now, linked machines share
+the **first** project of each (the one set up first); the others stay on their own machine. The
+chat page marks the shared one with ⇄. Sharing every project by name between linked machines is
+the next step.
+
 ## What changes across machines
 
 - **The roster** shows agents everywhere. In `hub_agents`, an agent elsewhere reads

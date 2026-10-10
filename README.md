@@ -92,6 +92,10 @@ connects the folder and opens the chat page.
 session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
 on.
 
+Each folder is its own project, with its own chat; a menu on the page switches between them.
+Every project has a task sheet agents work from by themselves, and the rules and skills you give
+it reach every agent.
+
 Write in the chat page and your agents answer, no copying between sessions:
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat twice, the second time with the cause.">

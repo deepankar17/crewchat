@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.10"
+__version__ = "0.10.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -92,8 +92,9 @@ REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offlin
 REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
-EXTRA_FIELDS = ("task", "role", "status")  # optional message fields, kept when messages travel between machines
-STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done"}
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order")  # optional message fields, kept when messages travel between machines
+STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
+            "todo": "given back"}
 ROLES = {
     "lead": ("Lead", """\
 You are the team lead. Your job is to plan and coordinate, not to write most of the code yourself.
@@ -170,6 +171,8 @@ their owner, who reads it on a chat page and writes as Owner.
   out work with hub_assign. Otherwise reply to all "BID #<id>: yes" or "no" with one line of why,
   read the other bids, and hub_take it if you are best placed; if someone has it, stop. A task
   addressed only to you is yours.
+- Nothing to do? hub_tasks lists what you may take now: hub_take the top one. Work you find goes
+  on the task sheet with hub_task_add.
 - If you get a role, follow it (hub_role shows it again); take one only when the owner says so.
 - Hooks hand you new messages after each turn; also check hub_inbox when you start and finish.
 - Use hub_send when someone needs to know: you will touch their files, you changed what they
@@ -429,6 +432,20 @@ def create_project(name, base=None):
     return next(p for p in list_projects(base) if p["id"] == pid)
 
 
+def split_list(text):
+    """A comma-separated list (task ids, areas) as a clean list."""
+    if isinstance(text, (list, tuple)):
+        text = ",".join(str(t) for t in text)
+    return [part.strip().lstrip("#") for part in str(text or "").split(",") if part.strip() and part.strip() != "-"]
+
+
+def areas_overlap(a, b):
+    """Do two tasks touch the same files? Areas are path prefixes; one inside another overlaps."""
+    def norm(area):
+        return area.strip().strip("/").lower() + "/"
+    return any(norm(x).startswith(norm(y)) or norm(y).startswith(norm(x)) for x in a for y in b)
+
+
 def project_id(name):
     """The id of a project in URLs, commands and folder names: its name, made safe."""
     return slug(name, 40, "project")
@@ -537,6 +554,7 @@ class Hub:
         self.links = {}  # hook link key -> agent name
         self.taken = {}  # task message id -> agent
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
+        self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent[, removed]}
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
@@ -596,6 +614,7 @@ class Hub:
         self.links = {str(k): str(v) for k, v in data.get("links", {}).items() if v in self.agents}
         self.taken = {str(k): str(v) for k, v in data.get("taken", {}).items()}
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
+        self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
@@ -603,7 +622,7 @@ class Hub:
     def _save(self):
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
-            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web,
+            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -619,20 +638,22 @@ class Hub:
         if len(self.messages) > KEEP_MESSAGES:
             for old in self.messages[:-KEEP_MESSAGES]:
                 self.ids.pop(old["id"], None)
-                self.progress.pop(old["id"], None)
+                if old["id"] not in self.sheet:  # a task on the sheet keeps its state
+                    self.progress.pop(old["id"], None)
             del self.messages[:-KEEP_MESSAGES]
         with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-    def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None):
+    def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None, **extra):
         """A message written on this machine: stored, and published when cloud sync is on."""
         seq = self.next_seq
         self.next_seq += 1
         msg = {"id": "%s%d" % (self.prefix, seq), "seq": seq, "ts": time.time(),
                "from": sender, "to": to, "text": text, "kind": kind}
-        for field, value in zip(EXTRA_FIELDS, (task, role, status)):
-            if value is not None:
-                msg[field] = value
+        fields = dict(extra, task=task, role=role, status=status)
+        for field in EXTRA_FIELDS:
+            if fields.get(field) not in (None, ""):
+                msg[field] = str(fields[field])
         if files:
             msg["files"] = files
         if self.sync is not None:
@@ -680,6 +701,27 @@ class Hub:
             self._save()
         elif kind == "update" and msg.get("task") and msg.get("status") in STATUSES:
             self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
+            if msg["status"] == "todo" and self.taken.get(msg["task"]) in (msg["from"], None) or (
+                    msg["status"] == "todo" and msg["from"] == OWNER):
+                self.taken.pop(msg["task"], None)  # given back: on the sheet for anyone again
+            self._save()
+        elif kind == "assign" and msg.get("task") in self.sheet:
+            self.taken.setdefault(msg["task"], msg["to"])
+            self._save()
+        elif kind == "plan" and msg.get("task") in self.sheet:
+            row = self.sheet[msg["task"]]
+            if msg.get("order"):
+                row["order"] = float(msg["order"])
+            if msg.get("status") == "removed":
+                row["removed"] = True
+            self._save()
+        if kind == "task" and msg["id"] not in self.sheet:
+            title = " ".join(str(msg["text"]).split())
+            self.sheet[msg["id"]] = {
+                "title": title[:300], "from": msg["from"], "to": msg["to"], "ts": msg["ts"],
+                "depends": split_list(msg.get("depends")), "areas": split_list(msg.get("areas")),
+                "where": str(msg.get("where") or ""), "order": float(msg.get("order") or msg["ts"]),
+                "parent": msg.get("task") or ""}
             self._save()
 
     def _event(self, text):
@@ -966,7 +1008,7 @@ class Hub:
         cur = self._cursor(name)
         return [
             m for m in self.messages
-            if m["seq"] > cur and m["kind"] != "event" and m["from"] != name and m["to"] in (name, "all")
+            if m["seq"] > cur and m["kind"] not in ("event", "plan") and m["from"] != name and m["to"] in (name, "all")
         ]
 
     def send(self, sender, to, text, kind="msg", files=None):
@@ -1144,6 +1186,9 @@ class Hub:
     def _task(self, mid):
         """The task message with this id. Caller holds the lock."""
         task = next((m for m in reversed(self.messages) if m["id"] == mid), None)
+        if task is None and mid in self.sheet:
+            row = self.sheet[mid]
+            task = {"id": mid, "from": row["from"], "to": row["to"], "text": row["title"], "kind": "task"}
         if task is None or task["kind"] != "task":
             raise HubError("#%s is not a task" % mid)
         return task
@@ -1223,6 +1268,9 @@ class Hub:
                 return task
             if holder is not None:
                 raise HubError("task #%s is already taken by %s" % (mid, holder))
+            why = self._not_yet(agent, mid)
+            if why:
+                raise HubError("task #%s cannot be taken yet: %s. hub_tasks lists what you can take" % (mid, why))
             if self.sync is None:
                 self._record_take(agent, mid, task)
                 return task
@@ -1354,6 +1402,145 @@ class Hub:
     def rules_note(self):
         rules = project_rules(self.roster.root)
         return ("\n\nThe owner's rules for this project (follow them):\n%s" % rules) if rules else ""
+
+    # The task sheet ----------------------------------------------------------------------------
+    # Every task is a row: what the owner posts, what the lead hands out, what agents add. An agent
+    # with nothing to do takes the top row it may (hub_tasks, then hub_take). A row waits for the
+    # rows it depends on, never runs at once with another row over the same files (areas), and may
+    # need one machine (where).
+    def _row_status(self, mid):
+        row = self.sheet[mid]
+        if row.get("removed"):
+            return "removed"
+        done = (self.progress.get(mid) or {}).get("status")
+        if done in ("done", "blocked", "review"):
+            return done
+        return "doing" if self.taken.get(mid) else "todo"
+
+    def _row_machine_ok(self, agent, row):
+        where = str(row.get("where") or "").strip().lower()
+        if where in ("", "any"):
+            return True
+        info = next((r for r in self._rows() if r["agent"] == agent), {})
+        return where in {str(info.get("place", "")).lower(), str(info.get("device", "")).lower(), agent.lower()}
+
+    def _not_yet(self, agent, mid):
+        """Why an agent may not take a row now, or ''. Caller holds the lock."""
+        row = self.sheet.get(mid)
+        if row is None:
+            return ""
+        if row.get("removed"):
+            return "it was taken off the sheet"
+        waiting = [d for d in row["depends"] if d in self.sheet and self._row_status(d) != "done"]
+        if waiting:
+            return "it waits for %s" % ", ".join("#" + d for d in waiting)
+        for other, holder in self.taken.items():
+            if other == mid or holder == agent or other not in self.sheet:
+                continue
+            if self._row_status(other) in ("doing", "review") and areas_overlap(row["areas"], self.sheet[other]["areas"]):
+                return "its files overlap #%s, which %s is working on" % (other, holder)
+        if not self._row_machine_ok(agent, row):
+            return "it needs the machine %s" % row["where"]
+        return ""
+
+    def sheet_rows(self, agent=None, view="all"):
+        """The sheet, in order: dicts with id, title, status, holder, ... For view "next", only the
+        rows agent may take now; "mine", the ones it holds."""
+        with self.lock:
+            rows = []
+            for mid, row in sorted(self.sheet.items(), key=lambda kv: kv[1]["order"]):
+                status = self._row_status(mid)
+                if status == "removed":
+                    continue
+                if view == "next" and (status != "todo" or row["to"] not in ("all", agent) or self._not_yet(agent, mid)):
+                    continue
+                if view == "mine" and self.taken.get(mid) != agent:
+                    continue
+                if view == "open" and status == "done":
+                    continue
+                if status == "todo" and any(d in self.sheet and self._row_status(d) != "done" for d in row["depends"]):
+                    status = "waiting"  # shown so: it cannot start before what it waits for is done
+                rows.append(dict(row, id=mid, status=status, holder=self.taken.get(mid) or "",
+                                 note=(self.progress.get(mid) or {}).get("by", "")))
+            return rows
+
+    def add_row(self, sender, title, depends="", areas="", where="", to="all"):
+        """A new row on the sheet, as a task message (agents add work they find; the owner and the
+        lead add work too)."""
+        title = " ".join(str(title or "").split())
+        if not title or len(title) > MAX_TEXT:
+            raise HubError("a task needs a title of at most %d characters" % MAX_TEXT)
+        with self.lock:
+            if to != "all":
+                self._check_recipient(to)
+            deps = split_list(depends)
+            unknown = [d for d in deps if d not in self.sheet]
+            if unknown:
+                raise HubError("no task %s on the sheet" % ", ".join("#" + d for d in unknown))
+            msg = self._append(sender, to, title, "task", depends=",".join(deps),
+                               areas=",".join(split_list(areas)), where=str(where or "").strip())
+            self._changed()
+            return msg
+
+    def assign_row(self, lead, to, mid):
+        """The lead (or the owner) gives an open row on the sheet to one agent."""
+        mid = clean_id(mid)
+        with self.lock:
+            if lead != OWNER and (self.agents.get(lead) or {}).get("role") != "lead":
+                raise HubError("only the lead assigns work; take a task yourself with hub_take")
+            self._check_recipient(to)
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            holder = self.taken.get(mid)
+            if holder and holder != to:
+                raise HubError("task #%s is held by %s; they give it back with hub_update todo" % (mid, holder))
+            msg = self._append(lead, to, "Task #%s is yours: %s" % (mid, self.sheet[mid]["title"]), "assign", task=mid)
+            self._changed()
+            return msg
+
+    def plan_change(self, mid, order=None, status=None):
+        """The owner reorders a row or takes it off the sheet."""
+        mid = clean_id(mid)
+        with self.lock:
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            self._append(OWNER, "all", "", "plan", task=mid, order=order, status=status)
+            self._changed()
+
+    def move_row(self, mid, where):
+        """Up, down or top: a new order between its neighbours."""
+        mid = clean_id(mid)
+        with self.lock:
+            rows = [k for k, _ in sorted(((k, v) for k, v in self.sheet.items() if not v.get("removed")),
+                                          key=lambda kv: kv[1]["order"])]
+            if mid not in rows:
+                raise HubError("#%s is not on the task sheet" % mid)
+            i = rows.index(mid)
+            order = lambda k: self.sheet[k]["order"]  # noqa: E731
+            if where == "top":
+                new = order(rows[0]) - 1 if i else None
+            elif where == "up":
+                new = (order(rows[i - 2]) + order(rows[i - 1])) / 2 if i >= 2 else (order(rows[0]) - 1 if i else None)
+            elif where == "down":
+                new = ((order(rows[i + 1]) + order(rows[i + 2])) / 2 if i + 2 < len(rows)
+                       else (order(rows[-1]) + 1 if i + 1 < len(rows) else None))
+            else:
+                raise HubError("move a task up, down or to the top")
+        if new is not None:
+            self.plan_change(mid, order=repr(new))
+
+    def owner_status(self, mid, status, note=""):
+        """The owner settles a row: back to todo (unblock, or take it from its holder), or done."""
+        mid = clean_id(mid)
+        if status not in ("todo", "done", "blocked"):
+            raise HubError("set a task to todo, done or blocked")
+        with self.lock:
+            if mid not in self.sheet:
+                raise HubError("#%s is not on the task sheet" % mid)
+            to = self.taken.get(mid) or "all"
+            self._append(OWNER, to, note or {"todo": "Back on the sheet.", "done": "Done.", "blocked": "Blocked."}[status],
+                         "update", task=mid, status=status)
+            self._changed()
 
     def last_seq(self):
         """The newest message's seq, for the page's "new in other projects" marks."""
@@ -1749,10 +1936,44 @@ TOOLS = [
         },
     },
     {
+        "name": "hub_tasks",
+        "description": "The project's task sheet. With nothing to do, call it (view next) and hub_take the top task "
+        "it lists: that is the work you may start now (what it waits for is done, nobody is in its files, and it "
+        "suits your machine). view all shows the whole sheet with who holds what; mine, your tasks.",
+        "annotations": READ,
+        "inputSchema": {
+            "type": "object",
+            "properties": {"view": {"type": "string", "enum": ["next", "mine", "all"], "default": "next",
+                                    "description": "next: what you may take now; mine: your tasks; all: the sheet."}},
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "hub_task_add",
+        "description": "Put a task on the project's task sheet: work you found that someone (maybe you) should "
+        "do, such as a bug, a follow-up or a missing piece. Give what it waits for (depends), the files it "
+        "touches (areas) and the machine it needs (where), so it is only taken when it can be done. With "
+        "take, it is yours at once. Not for chatting: use hub_send.",
+        "annotations": WRITE,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "maxLength": MAX_TEXT, "description": "The work, and what done looks like."},
+                "depends": {"type": "string", "description": "Task numbers it waits for, comma-separated: A12,A14."},
+                "areas": {"type": "string", "description": "Path prefixes it changes, comma-separated: app/login/,docs/."},
+                "where": {"type": "string", "description": "A machine or place name it needs, if any (else any)."},
+                "take": {"type": "boolean", "default": False, "description": "Take it yourself now."},
+            },
+            "required": ["title"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "hub_assign",
-        "description": "Lead only: give one agent a piece of work. It becomes a task that is theirs at "
-        "once (no bidding), and they report back to you with hub_update. Not the lead? Ask the lead, or "
-        "message the agent with hub_send. Fails if you are not the lead or nobody has that name.",
+        "description": "Lead only: give one agent a piece of work. With text, a new task that is theirs at "
+        "once (no bidding); with only task, a task already on the sheet. They report back to you with "
+        "hub_update. Not the lead? Ask the lead, or message the agent with hub_send. Fails if you are not the "
+        "lead or nobody has that name.",
         "annotations": WRITE,
         "inputSchema": {
             "type": "object",
@@ -1761,10 +1982,10 @@ TOOLS = [
                 "text": {"type": "string", "maxLength": MAX_TEXT,
                          "description": "The work, and what done looks like."},
                 "task": {"type": ["string", "integer"],
-                         "description": "The owner's task this piece belongs to, if any: its progress then "
-                         "shows there too."},
+                         "description": "With text: the owner's task this piece belongs to. Without text: the "
+                         "task on the sheet to give them."},
             },
-            "required": ["to", "text"],
+            "required": ["to"],
             "additionalProperties": False,
         },
     },
@@ -1781,7 +2002,7 @@ TOOLS = [
                 "id": {"type": ["string", "integer"], "description": "The task's number."},
                 "status": {"type": "string", "enum": list(STATUSES),
                            "description": "in_progress (started), blocked (you need something), review (ready "
-                           "to be tested or reviewed) or done."},
+                           "to be tested or reviewed), done, or todo (give it back to the sheet, for someone else)."},
                 "note": {"type": "string", "maxLength": MAX_TEXT, "description": "What happened, what you need."},
             },
             "required": ["id", "status"],
@@ -1859,8 +2080,29 @@ def call_tool(hub, sid, name, args, owner=False):
         return TRUST_NOTE + "\n\n" + "\n".join(fmt(m, me) for m in rows)
     if name == "hub_assign":
         to, text = args.get("to"), args.get("text")
+        if not text and args.get("task"):
+            hub.assign_row(me, to, args.get("task"))
+            return "Gave task #%s to %s. They report back to you with hub_update." % (clean_id(args["task"]), to)
         msg = hub.assign(me, to, clean_text(to, text, me), args.get("task"))
         return "Assigned task #%s to %s. They report back to you with hub_update." % (msg["id"], to)
+    if name == "hub_tasks":
+        view = args.get("view") or "next"
+        if view not in ("next", "mine", "all"):
+            raise HubError("view is next, mine or all")
+        rows = hub.sheet_rows(me, view if not owner else "all")
+        if not rows:
+            return {"next": "Nothing on the sheet you can take now. Ask the lead or Owner, or find work and add it "
+                    "with hub_task_add.", "mine": "You hold no task.", "all": "The task sheet is empty."}[view]
+        head = {"next": "Tasks you may take now, top first (hub_take the first one):",
+                "mine": "Your tasks:", "all": "The task sheet, in order:"}[view]
+        return head + "\n" + "\n".join(sheet_line(r) for r in rows)
+    if name == "hub_task_add":
+        msg = hub.add_row(me, args.get("title"), args.get("depends", ""), args.get("areas", ""), args.get("where", ""))
+        if args.get("take") and not owner:
+            hub.take(me, msg["id"])
+            return ("Task #%s is on the sheet and yours. Send hub_update id=%s status=in_progress with your plan, "
+                    "then start." % (msg["id"], msg["id"]))
+        return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if owner:
         raise HubError("only agents have a status and a name")
     if name == "hub_status":
@@ -1892,6 +2134,22 @@ def call_tool(hub, sid, name, args, owner=False):
     new = args.get("name")
     hub.rename(me, new)
     return "You are now %s. Everyone has been told." % new
+
+
+def sheet_line(row):
+    """One task on the sheet, as agents and the command line see it."""
+    extra = ["from %s" % row["from"]]
+    if row["holder"]:
+        extra.append("held by %s" % row["holder"])
+    if row["depends"]:
+        extra.append("waits for " + ", ".join("#" + d for d in row["depends"]))
+    if row["areas"]:
+        extra.append("files " + ", ".join(row["areas"]))
+    if row["where"]:
+        extra.append("on " + row["where"])
+    if row["to"] != "all":
+        extra.append("for " + row["to"])
+    return "#%s [%s] %s (%s)" % (row["id"], row["status"], row["title"], "; ".join(extra))
 
 
 def share_file(hub, path):
@@ -1982,7 +2240,7 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -2394,6 +2652,7 @@ class Handler(BaseHTTPRequestHandler):
             data = self.hub.poll(after, version, wait)
             data["chat"] = self.project.id
             data["rules"] = project_rules(self.roster.root)
+            data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
             data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
                                 for p in self.projects.all()]
@@ -2448,6 +2707,26 @@ class Handler(BaseHTTPRequestHandler):
         kind = "task" if data.get("kind") == "task" else "msg"
         files = self.hub.attach(data.get("files") or [])
         return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
+
+    def _task_op(self, data):
+        """The owner on the task sheet: add, assign, move, settle (todo, done, blocked) or remove a task."""
+        op, task = data.get("op"), data.get("task")
+        if op == "add":
+            to = data.get("to") or "all"
+            msg = self.hub.add_row(OWNER, data.get("title"), data.get("depends", ""), data.get("areas", ""),
+                                   data.get("where", ""), to)
+            return {"id": msg["id"]}
+        if op == "assign":
+            self.hub.assign_row(OWNER, data.get("agent"), task)
+        elif op == "move":
+            self.hub.move_row(task, data.get("where"))
+        elif op == "status":
+            self.hub.owner_status(task, data.get("status"), str(data.get("note") or ""))
+        elif op == "remove":
+            self.hub.plan_change(task, status="removed")
+        else:
+            raise HubError("op is add, assign, move, status or remove")
+        return {"ok": True}
 
     def _rules(self, data):
         return {"project": self.roster.project, "folders": self.hub.set_rules(data.get("rules"))}
@@ -2638,11 +2917,11 @@ class Handler(BaseHTTPRequestHandler):
             self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
             return
-        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills"):
+        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
             if not self._owner_request():
                 return
             action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch,
-                      "/api/rules": self._rules, "/api/skills": self._skills}[path]
+                      "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}[path]
             try:
                 self._json(200, action(self._object(raw)))
             except HubError as e:
@@ -4607,8 +4886,8 @@ RULES = """\
 ## The crewchat: talking to each other
 
 This project's AI agents and the owner share a chat (crewchat). If your tool list has `hub_send`,
-`hub_inbox`, `hub_take`, `hub_agents`, `hub_status`, `hub_history`, `hub_rename`, `hub_role`,
-`hub_assign`, `hub_update` and `hub_link`, you are connected.
+`hub_inbox`, `hub_take`, `hub_tasks`, `hub_task_add`, `hub_agents`, `hub_status`, `hub_history`,
+`hub_rename`, `hub_role`, `hub_assign`, `hub_update` and `hub_link`, you are connected.
 
 - **Know who is who.** `hub_agents` lists every agent with its name, tool, place and status; your
   row is marked `(you)`. You are named automatically; if the owner gives you a name, take it with
@@ -4631,6 +4910,13 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   with `BID #<id>: yes` or `no` and one line of why. Read the other bids, then call `hub_take` if
   you bid yes and nobody better placed did. `hub_take` gives the task to the first caller and
   tells everyone. A task addressed only to you is yours: take it without bidding.
+- **The task sheet.** Every task is a row on the project's sheet (`hub_tasks` with view `all`).
+  With nothing to do, call `hub_tasks` and `hub_take` the top task it lists: what it waits for is
+  done, nobody else is in its files, and it suits your machine. Work you find (a bug, a follow-up,
+  a missing piece) goes on the sheet with `hub_task_add`, with what it waits for (`depends`), the
+  files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
+  finish a task? Give it back with `hub_update` status `todo` and a note. The lead hands out tasks
+  already on the sheet with `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_update`.
@@ -4813,6 +5099,39 @@ def cmd_rules(args):
                                                        out["folders"]))
 
 
+def cmd_tasks(args):
+    if args.action == "list":
+        out = owner_tool("hub_tasks", view="all")
+        print(out)
+        return
+    if args.action == "add":
+        if not args.rest:
+            die('usage: crewchat tasks add "the work" [--depends A12] [--areas app/] [--where win] [--to AGENT]')
+        out = owner_call("/api/task", {"op": "add", "title": " ".join(args.rest), "depends": args.depends or "",
+                                       "areas": args.areas or "", "where": args.where or "", "to": args.to or "all"})
+        print("Task #%s is on the sheet." % out["id"])
+        return
+    if not args.rest:
+        die("usage: crewchat tasks %s ID%s" % (args.action, " AGENT" if args.action == "assign" else
+                                              " up|down|top" if args.action == "move" else ""))
+    task = args.rest[0]
+    if args.action == "assign":
+        if len(args.rest) < 2:
+            die("usage: crewchat tasks assign ID AGENT")
+        owner_call("/api/task", {"op": "assign", "task": task, "agent": args.rest[1]})
+        print("Gave task #%s to %s." % (task.lstrip("#"), args.rest[1]))
+    elif args.action == "move":
+        owner_call("/api/task", {"op": "move", "task": task, "where": (args.rest[1:] or ["up"])[0]})
+        print("Moved task #%s." % task.lstrip("#"))
+    elif args.action in ("done", "todo", "blocked"):
+        owner_call("/api/task", {"op": "status", "task": task, "status": args.action, "note": " ".join(args.rest[1:])})
+        print("Task #%s is %s." % (task.lstrip("#"), {"todo": "back on the sheet", "done": "done",
+                                                       "blocked": "blocked"}[args.action]))
+    else:
+        owner_call("/api/task", {"op": "remove", "task": task})
+        print("Took task #%s off the sheet." % task.lstrip("#"))
+
+
 def cmd_skills(args):
     if args.action == "list":
         names = project_skills(project_root())
@@ -4961,6 +5280,28 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 .chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
 .chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
 #form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
+#views { display: flex; gap: 4px; padding: 10px max(16px, calc((100% - 820px) / 2)) 0; border-bottom: 1px solid var(--line); }
+#views button { background: none; color: var(--muted); border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 6px 10px; font-weight: 600; }
+#views button.on { color: var(--ink); border-bottom-color: var(--accent); }
+#tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
+#tasks[hidden], #log[hidden] { display: none; }
+.tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.task-form input { flex: 1 1 120px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 9px; color: var(--ink); font: inherit; font-size: 13.5px; }
+.task-form #t-title { flex: 3 1 260px; }
+#sheet { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+#sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+#sheet td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+#sheet td.meta { font-size: 12px; color: var(--muted); }
+#sheet tr.done td { opacity: .55; }
+#sheet .st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 8px; background: var(--line); white-space: nowrap; }
+#sheet .st.doing, #sheet .st.review { background: var(--accent); color: var(--on-accent); }
+#sheet .st.done { background: var(--ok); color: var(--panel); } #sheet .st.blocked { background: var(--err); color: var(--panel); }
+#sheet .acts { white-space: nowrap; text-align: right; }
+#sheet .acts button, #sheet .acts select { font-size: 12px; padding: 2px 6px; margin-left: 3px; background: transparent;
+  color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
 .msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
 .msg .body > .files:first-child { margin-top: 0; }
 .msg .file { display: inline-flex; gap: 6px; align-items: baseline; color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; text-decoration: none; background: var(--bg); color: var(--ink); }
@@ -5055,7 +5396,24 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <nav id="views" aria-label="View">
+    <button type="button" id="view-chat" class="on" aria-pressed="true">Chat</button>
+    <button type="button" id="view-tasks" aria-pressed="false">Task sheet <span id="tasks-count"></span></button>
+  </nav>
   <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
+  <section id="tasks" hidden aria-label="Task sheet">
+    <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
+      what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
+      the lead hands tasks out.</p>
+    <form id="task-form" class="task-form">
+      <input id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
+      <input id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
+      <input id="t-areas" placeholder="files (app/login/)" aria-label="Files">
+      <input id="t-where" placeholder="machine" aria-label="Machine">
+      <button id="t-add">Add</button>
+    </form>
+    <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
   <form id="form">
     <div class="row">
       <label for="to">To</label>
@@ -5141,6 +5499,75 @@ async function postJSON(path, body) {
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
   return res.json();
 }
+
+// The task sheet: every task of the project, in order, with who holds it.
+function showView(tasks) {
+  $("log").hidden = tasks; $("tasks").hidden = !tasks; $("form").hidden = tasks;
+  $("view-chat").classList.toggle("on", !tasks); $("view-tasks").classList.toggle("on", tasks);
+  $("view-chat").setAttribute("aria-pressed", String(!tasks)); $("view-tasks").setAttribute("aria-pressed", String(tasks));
+  try { sessionStorage.setItem("crewchat-view", tasks ? "tasks" : "chat"); } catch (e) {}
+}
+$("view-chat").addEventListener("click", () => showView(false));
+$("view-tasks").addEventListener("click", () => showView(true));
+async function taskOp(body) {
+  try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
+}
+function renderSheet(rows) {
+  const open = rows.filter((r) => r.status !== "done").length;
+  $("tasks-count").textContent = open ? "(" + open + ")" : "";
+  const body = $("sheet").tBodies[0];
+  if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  if (!rows.length) {
+    const row = body.insertRow(); body.replaceChildren(row);
+    const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
+    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
+    return;
+  }
+  body.replaceChildren(...rows.map((r) => {
+    const tr = el("tr", r.status);
+    tr.append(el("td", "meta", "#" + r.id));
+    const what = el("td");
+    what.append(el("div", "", r.title));
+    const meta = [];
+    if (r.depends.length) meta.push("waits for " + r.depends.map((d) => "#" + d).join(", "));
+    if (r.areas.length) meta.push("files " + r.areas.join(", "));
+    if (r.where) meta.push("on " + r.where);
+    if (r.to !== "all") meta.push("for " + r.to);
+    meta.push("from " + (r.from === "Owner" ? "you" : r.from));
+    what.append(el("div", "meta", meta.join(" · ")));
+    tr.append(what);
+    const st = el("td"); st.append(el("span", "st " + r.status, r.status)); tr.append(st);
+    tr.append(el("td", "meta", r.holder || ""));
+    const acts = el("td", "acts");
+    if (r.status === "todo" || r.status === "waiting") {
+      const pick = el("select");
+      pick.setAttribute("aria-label", "Give task " + r.id + " to");
+      pick.append(new Option("Give to…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+      pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
+      acts.append(pick);
+    }
+    const button = (label, title, body) => {
+      const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
+      b.addEventListener("click", () => taskOp(body)); acts.append(b);
+    };
+    button("\u2191", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
+    button("\u2193", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
+    if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
+    if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
+      button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
+    button("\u00d7", "Take task " + r.id + " off the sheet", { op: "remove", task: r.id });
+    tr.append(acts);
+    return tr;
+  }));
+}
+$("task-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const title = $("t-title").value.trim();
+  if (!title) return;
+  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
+  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+});
+try { if (sessionStorage.getItem("crewchat-view") === "tasks") showView(true); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 function renderSetup(rules, skills) {
@@ -5394,6 +5821,7 @@ function addMessages(list, first) {
   const log = $("log");
   $("empty")?.remove();
   for (const m of list) {
+    if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
     if (day !== state.lastDay) { log.append(el("p", "day", day)); state.lastDay = day; }
     const node = buildMessage(m);
@@ -5451,6 +5879,7 @@ async function loop() {
       }
       renderProjects(data.projects, data.chat);
       renderSetup(data.rules, data.skills);
+      renderSheet(data.sheet || []);
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
@@ -5727,6 +6156,16 @@ def build_parser():
     p.add_argument("--file", help="set: read the rules from this file")
     p.set_defaults(fn=cmd_rules)
 
+    p = sub.add_parser("tasks", help="the project's task sheet: list, add, assign, move, done, todo, blocked, remove")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "add", "assign", "move", "done", "todo", "blocked", "remove"])
+    p.add_argument("rest", nargs="*", help="add: the work; assign: ID AGENT; move: ID up|down|top; others: ID [note]")
+    p.add_argument("--depends", help="add: task numbers it waits for (A12,A14)")
+    p.add_argument("--areas", help="add: path prefixes it changes (app/login/,docs/)")
+    p.add_argument("--where", help="add: the machine or place it needs")
+    p.add_argument("--to", help="add: for one agent only")
+    p.set_defaults(fn=cmd_tasks)
+
     p = sub.add_parser("skills", help="skills shared with every agent of the project: list, add or remove")
     p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
     p.add_argument("path", nargs="?", help="add: a folder with SKILL.md, or a .md file; remove: the skill's name")
@@ -5764,7 +6203,7 @@ def build_parser():
     p.set_defaults(fn=cmd_projects)
 
     for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
-                 "rules", "skills"):
+                 "rules", "skills", "tasks"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "
