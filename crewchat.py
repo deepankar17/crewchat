@@ -963,6 +963,10 @@ class Hub:
                 raise HubError("that start key is unknown or has expired; carry on, and call hub_agents to "
                                "see who is here")
             name = self.agent_for(sid)
+            # The launch gave the session's hooks this same key (CREWCHAT_LINK_KEY): tie it to the
+            # agent, so its messages reach it at the end of each turn. A rename carries it along.
+            self.links[key] = name
+            self._save()
         notes = []
         if spec["name"] and spec["name"] != name:
             try:
@@ -2637,13 +2641,14 @@ def launch_command(exe, tool, key, accept_edits=False):
     return [exe] + options + [LAUNCH_PROMPT % key]
 
 
-def macos_script(folder, command):
+def macos_script(folder, command, key):
     return "\n".join([
         "#!/bin/sh",
         "# Opened by crewchat to start an agent. It deletes itself.",
         'rm -f "$0"',
         "cd %s || exit 1" % shlex.quote(str(folder)),
         'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
+        "export CREWCHAT_LINK_KEY=%s" % shlex.quote(key),  # its hooks link with the same key
         "exec " + " ".join(shlex.quote(part) for part in command),
     ]) + "\n"
 
@@ -2658,14 +2663,18 @@ def launch_agent(tool, folder, key, accept_edits=False, root=None):
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(macos_script(folder, command), encoding="utf-8")
+        script.write_text(macos_script(folder, command, key), encoding="utf-8")
         os.chmod(script, 0o700)
         out = run(["open", str(script)])
         if out.returncode != 0:
             raise HubError("could not open a Terminal window: %s" % (out.stderr.strip() or out.stdout.strip()))
     elif os.name == "nt":
-        subprocess.Popen(command, cwd=str(folder), creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
+        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, CREWCHAT_LINK_KEY=key),
+                         creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
     else:
+        # Some terminals start the window from a server process that does not get this one's
+        # environment, so the key goes on the command line, through env.
+        command = ["env", "CREWCHAT_LINK_KEY=%s" % key] + command
         for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
             if shutil.which(term[0]):
                 subprocess.Popen(term + command, cwd=str(folder), start_new_session=True)
@@ -3337,7 +3346,9 @@ def run_hook(client, event):
         state = {}
     # The link key names this agent session to the server. The agent ties it to its chat identity
     # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
-    key = state.get("key") or secrets.token_urlsafe(12)
+    # A session started from the chat page was given its start key: it links with that one.
+    launched = os.environ.get("CREWCHAT_LINK_KEY", "")
+    key = state.get("key") or (launched if KEY_RE.match(launched) else "") or secrets.token_urlsafe(12)
     chain = int(state.get("chain", 0))
     asks = int(state.get("asks", 0))
     # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:

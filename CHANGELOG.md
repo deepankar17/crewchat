@@ -1,5 +1,12 @@
 # Changelog
 
+## Not released yet
+
+- An agent started from the chat page ("Add an agent", or `crewchat agent add`) now gets its
+  messages. It linked with its start key, but its hooks used a key of their own that nothing
+  linked, so it said it was ready and then heard nothing. The launch now hands the start key to
+  its hooks too (`CREWCHAT_LINK_KEY`), on macOS, Windows and Linux.
+
 ## 0.9.9
 
 **After an upgrade on Windows, `crewchat start` sets up start-at-login.**

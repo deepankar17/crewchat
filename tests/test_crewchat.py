@@ -652,6 +652,11 @@ class Launching(Base):
         inbox = session.text("hub_inbox")
         self.assertIn("Your role in this chat is now: Docs", inbox)
         self.assertIn("[TASK, assigned to you] Write the settings guide", inbox)
+        # Its hooks use the same key (the launch passes it as CREWCHAT_LINK_KEY), so they reach it
+        # without asking it to link again: messages get to it at the end of each turn.
+        hooked = crewchat.post_json(self.base + "/api/hook", token, {"key": key})
+        self.assertEqual(hooked.get("agent"), "docs-writer")
+        self.assertNotIn("link", hooked)
         # A start key works once.
         again = Session(self.base, token).call("hub_link", key=key)["content"][0]["text"]
         self.assertIn("unknown or has expired", again)
@@ -676,8 +681,9 @@ class Launching(Base):
         self.assertRegex(command[3], r"^[A-Za-z0-9 .,:_-]+$")  # safe in any shell, cmd.exe included
         self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1", True)[1:2],
                          [crewchat.LAUNCH_PROMPT % "start-1"])
-        script = crewchat.macos_script("/tmp/it's a folder", command)
+        script = crewchat.macos_script("/tmp/it's a folder", command, "start-0123456789abcdef")
         self.assertIn("cd '/tmp/it'\"'\"'s a folder' || exit 1", script)
+        self.assertIn("export CREWCHAT_LINK_KEY=start-0123456789abcdef", script)
         self.assertIn("exec /x/claude --permission-mode acceptEdits 'You were started", script)
 
 
@@ -970,9 +976,9 @@ class Hooks(Base):
         crewchat.install_cursor(cls.folder, cls.base, cls.token)
         cls.state = tempfile.mkdtemp(prefix="hookstate-", dir=TMP)
 
-    def hook(self, client, event, payload, project=None, listen="0"):
+    def hook(self, client, event, payload, project=None, listen="0", env_extra=None):
         env = dict(os.environ, CREWCHAT_PROJECT=str(project or self.folder), CREWCHAT_LISTEN=listen,
-                   TMPDIR=self.state, TEMP=self.state, TMP=self.state)
+                   TMPDIR=self.state, TEMP=self.state, TMP=self.state, **(env_extra or {}))
         env.pop("CLAUDE_PROJECT_DIR", None)
         out = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "hook", client, event],
                              input=json.dumps(payload), capture_output=True, text=True, env=env, timeout=60)
@@ -1004,6 +1010,24 @@ class Hooks(Base):
         session.call("hub_link", key=key)
         self.say(session.me, "now it works")
         self.assertIn("now it works", self.hook("claude", "stop", {"session_id": "L"}))
+
+    def test_a_session_started_from_the_chat_page_links_its_hooks_with_its_start_key(self):
+        key = self.hub.new_start()
+        launched = {"CREWCHAT_LINK_KEY": key}
+        asked = self.hook("claude", "prompt", {"session_id": "launched"}, env_extra=launched)
+        self.assertIn('key "%s"' % key, asked)  # one key for the launch prompt and the hook alike
+        session = Session(self.base, self.token)
+        session.call("hub_link", key=key)
+        self.say(session.me, "first message for the launched agent")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched"}, env_extra=launched))["reason"]
+        self.assertIn("first message for the launched agent", reason)
+        # Even a stop hook with nothing saved yet (its first hook call) finds the agent by that key.
+        self.say(session.me, "second message")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched-fresh"}, env_extra=launched))["reason"]
+        self.assertIn("second message", reason)
+        # A bad value in the variable is ignored, not used as a key.
+        self.assertIn("Call the hub_link tool", self.hook("claude", "prompt", {"session_id": "odd"},
+                                                          env_extra={"CREWCHAT_LINK_KEY": "no spaces allowed"}))
 
     def test_a_session_that_never_links_is_left_alone(self):
         for _ in range(crewchat.MAX_LINK_PROMPTS):
