@@ -1011,6 +1011,15 @@ class Hooks(Base):
         self.say(session.me, "now it works")
         self.assertIn("now it works", self.hook("claude", "stop", {"session_id": "L"}))
 
+    def test_a_launched_sessions_first_hook_may_be_its_stop_hook(self):
+        key = self.hub.new_start()
+        session = Session(self.base, self.token)
+        session.call("hub_link", key=key)
+        self.say(session.me, "before any prompt")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "stop-first"},
+                                      env_extra={"CREWCHAT_LINK_KEY": key}))["reason"]
+        self.assertIn("before any prompt", reason)
+
     def test_a_session_started_from_the_chat_page_links_its_hooks_with_its_start_key(self):
         key = self.hub.new_start()
         launched = {"CREWCHAT_LINK_KEY": key}
@@ -1021,10 +1030,12 @@ class Hooks(Base):
         self.say(session.me, "first message for the launched agent")
         reason = json.loads(self.hook("claude", "stop", {"session_id": "launched"}, env_extra=launched))["reason"]
         self.assertIn("first message for the launched agent", reason)
-        # Even a stop hook with nothing saved yet (its first hook call) finds the agent by that key.
-        self.say(session.me, "second message")
-        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched-fresh"}, env_extra=launched))["reason"]
-        self.assertIn("second message", reason)
+        # Something the agent runs from its shell (`claude -p ...`, another session) inherits the
+        # variable, but is not the agent: it gets a key of its own and stays out of the agent's mail.
+        self.say(session.me, "third message, for the agent only")
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "nested-claude-p"}, env_extra=launched), "")
+        reason = json.loads(self.hook("claude", "stop", {"session_id": "launched"}, env_extra=launched))["reason"]
+        self.assertIn("third message, for the agent only", reason)
         # A bad value in the variable is ignored, not used as a key.
         self.assertIn("Call the hub_link tool", self.hook("claude", "prompt", {"session_id": "odd"},
                                                           env_extra={"CREWCHAT_LINK_KEY": "no spaces allowed"}))

@@ -3326,6 +3326,26 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
             return "ok", out.get("text", ""), int(out.get("last") or 0), bool(out.get("owner")), capped
 
 
+def claim_launch_key(folder, key, session):
+    """Is this session the one the chat page started with `key`? The first session to ask claims
+    it; the same session asking again keeps it."""
+    path = folder / ("claimed-%s" % sha(key)[:16])
+    mine = sha(session)
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        try:
+            return path.read_text().strip() == mine
+        except OSError:
+            return False
+    except OSError:
+        return False
+    with os.fdopen(fd, "w") as f:
+        f.write(mine)
+    return True
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -3346,9 +3366,14 @@ def run_hook(client, event):
         state = {}
     # The link key names this agent session to the server. The agent ties it to its chat identity
     # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
-    # A session started from the chat page was given its start key: it links with that one.
+    # A session started from the chat page was given its start key: it links with that one. Only
+    # that session: what it runs from its shell inherits the variable (`claude -p ...`) and must
+    # not act as the agent, so the first session to use the key claims it.
     launched = os.environ.get("CREWCHAT_LINK_KEY", "")
-    key = state.get("key") or (launched if KEY_RE.match(launched) else "") or secrets.token_urlsafe(12)
+    if not state.get("key") and KEY_RE.match(launched) and claim_launch_key(state_file.parent, launched, session):
+        key = launched
+    else:
+        key = state.get("key") or secrets.token_urlsafe(12)
     chain = int(state.get("chain", 0))
     asks = int(state.get("asks", 0))
     # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:
