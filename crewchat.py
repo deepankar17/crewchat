@@ -418,7 +418,8 @@ def create_project(name, base=None):
     base = Path(base) if base else home()
     folder = base / PROJECTS_DIR
     folder.mkdir(parents=True, exist_ok=True)
-    # A folder left in projects/ without a config is in the way too: nothing can be moved onto it.
+    # Every project's id (the first one has no folder here), and any folder left in projects/
+    # without a config: nothing can be moved onto it either.
     taken = {p["id"] for p in list_projects(base)} | {p.name for p in folder.iterdir()}
     pid, number = project_id(name), 2
     while pid in taken:
@@ -431,18 +432,19 @@ def create_project(name, base=None):
         if os.name != "nt":
             os.chmod(temp, 0o700)
             os.chmod(temp / "tokens", 0o700)
-        for attempt in range(50):
+        for _ in range(49):
             try:
                 os.replace(str(temp), str(folder / pid))
                 break
             except PermissionError:
                 # Windows: a virus scanner or the search indexer may still hold the new config
                 # open, and a folder cannot be renamed until it lets go. That takes a moment.
-                if attempt == 49:
-                    raise
                 time.sleep(0.1)
-    finally:
-        shutil.rmtree(str(temp), ignore_errors=True)  # gone already, unless the move failed
+        else:
+            os.replace(str(temp), str(folder / pid))
+    except BaseException:
+        shutil.rmtree(str(temp), ignore_errors=True)
+        raise
     return next(p for p in list_projects(base) if p["id"] == pid)
 
 

@@ -1323,8 +1323,9 @@ class NewProject(unittest.TestCase):
         self.base = Path(tempfile.mkdtemp(dir=TMP))
         crewchat.save_config({"project": "Main"}, self.base)
 
+    @contextlib.contextmanager
     def held(self, times):
-        """os.replace, refusing to move a new project folder into place the first `times` times."""
+        """Refuse to move a new project folder into place the first `times` times; yields the moves."""
         real, moves = os.replace, []
 
         def replace(src, dst):
@@ -1334,11 +1335,11 @@ class NewProject(unittest.TestCase):
                     raise PermissionError(13, "Access is denied")
             return real(src, dst)
 
-        return replace, moves
+        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.time, "sleep"):
+            yield moves
 
     def test_the_move_waits_while_windows_holds_the_new_folder(self):
-        replace, moves = self.held(2)
-        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.time, "sleep"):
+        with self.held(2) as moves:
             entry = crewchat.create_project("t3", self.base)
         self.assertEqual((entry["id"], entry["name"], len(moves)), ("t3", "t3", 3))
         self.assertEqual(sorted(p.name for p in (self.base / "projects").iterdir()), ["t3"])
@@ -1349,8 +1350,7 @@ class NewProject(unittest.TestCase):
         self.assertEqual((entry["id"], entry["name"]), ("t3-2", "t3"))
 
     def test_a_move_that_never_works_leaves_nothing_behind(self):
-        replace, moves = self.held(1000)
-        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.time, "sleep"):
+        with self.held(float("inf")) as moves:
             with self.assertRaises(PermissionError):
                 crewchat.create_project("t3", self.base)
         self.assertEqual(len(moves), 50)
