@@ -23,9 +23,6 @@
 - Each release now carries crewchat's package file, and the installers install it, so GitHub
   counts installs (the README shows the total). Older releases install from their source as
   before. Nothing about you is sent.
-
-## Not released yet
-
 - `crewchat peers leave` and `crewchat peers remove`, typed in a terminal, now say which machine
   they unlink and ask first (`--yes` skips the question; scripts and agents are not asked). Steps
   meant for one machine, run on another, unlinked the wrong one.
