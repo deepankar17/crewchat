@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.8"
+__version__ = "0.9.9"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -2674,6 +2674,41 @@ def launch_agent(tool, folder, key, accept_edits=False, root=None):
             raise HubError("no terminal program found to open the agent in")
 
 
+def ensure_server(config, args):
+    """`crewchat start`: get the server running, set to start at login unless --no-service."""
+    if server_up(config):
+        print("- The server is running at %s." % local_url(config))
+        return
+    supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
+    if args.no_service and config.get("service") is not False:
+        # A choice like `crewchat service uninstall`: an upgrade's `crewchat resume` keeps to it.
+        config["service"] = False
+        save_config(config)
+    # Not when the owner turned it off (`crewchat service uninstall`, `crewchat start --no-service`).
+    wanted = config.get("service") is not False
+    started = False
+    if supported and wanted and not args.no_service:
+        try:
+            cmd_service(argparse.Namespace(action="install", keep_awake=args.keep_awake))
+            started = True
+        except SystemExit as e:
+            print("- Could not register it to start at login (%s); running it in the background "
+                  "instead." % e)
+    if not started:
+        start_background()
+    for _ in range(40):
+        if server_up(config):
+            break
+        time.sleep(0.25)
+    else:
+        tail = log_tail()
+        die("the server did not start.%s\nSee %s, or run `crewchat serve` to see why."
+            % ("\nThe end of its log:\n" + tail if tail else "", home() / "hub.log"))
+    print("- Started the server at %s%s." % (local_url(config), "" if started else
+                                              " (until you log out; `crewchat service install` "
+                                              "starts it at login)"))
+
+
 def cmd_start(args):
     project = Path(args.folder or ".").resolve()
     if not project.is_dir():
@@ -2686,31 +2721,7 @@ def cmd_start(args):
         print("- Set up this machine as the chat's host (%s), for \"%s\"." % (home(), config["project"]))
     config = load_config()
 
-    if server_up(config):
-        print("- The server is running at %s." % local_url(config))
-    else:
-        supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
-        started = False
-        if supported and not args.no_service:
-            try:
-                cmd_service(argparse.Namespace(action="install", keep_awake=args.keep_awake))
-                started = True
-            except SystemExit as e:
-                print("- Could not register it to start at login (%s); running it in the background "
-                      "instead." % e)
-        if not started:
-            start_background()
-        for _ in range(40):
-            if server_up(config):
-                break
-            time.sleep(0.25)
-        else:
-            tail = log_tail()
-            die("the server did not start.%s\nSee %s, or run `crewchat serve` to see why."
-                % ("\nThe end of its log:\n" + tail if tail else "", home() / "hub.log"))
-        print("- Started the server at %s%s." % (local_url(config), "" if started else
-                                                  " (until you log out; `crewchat service install` "
-                                                  "starts it at login)"))
+    ensure_server(config, args)
 
     place, token, clients = joined_place(project, config)
     if place:
@@ -3690,8 +3701,18 @@ def cmd_service_windows(args):
         cmd_status(args)
 
 
+def remember_service_choice(action):
+    """Note whether the owner wants crewchat to start at login, so that `crewchat start` does not
+    turn it back on after `crewchat service uninstall`."""
+    if action in ("install", "uninstall"):
+        config = load_config()
+        config["service"] = action == "install"
+        save_config(config)
+
+
 def cmd_service(args):
     load_config()
+    remember_service_choice(args.action)
     mac = sys.platform == "darwin"
     linux = sys.platform.startswith("linux")
     if os.name == "nt":
@@ -3872,6 +3893,33 @@ def start_server(config):
             return
         time.sleep(0.25)
     die("the server did not start. See %s, or run `crewchat serve` to see why." % (home() / "hub.log"))
+
+
+def service_present():
+    """Does this machine have crewchat's login service at all, for this chat or another one?"""
+    if os.name == "nt":
+        return run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0 or run_entry() is not None
+    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")).exists() or \
+        (Path.home() / ".config" / "systemd" / "user" / "crewchat.service").exists()
+
+
+def cmd_resume(_args):
+    """After an upgrade (the installers run this): start the server again. Through its login
+    service if it has one; else set that up, unless the owner turned it off or the machine's login
+    service belongs to another chat; else in the background. Never leaves the chat down."""
+    config = load_config()
+    if server_up(config):
+        return
+    supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
+    if (supported and config.get("service") is not False and not service_installed()
+            and not service_present()):
+        try:
+            cmd_service(argparse.Namespace(action="install", keep_awake=False))
+        except SystemExit:
+            pass
+    if not server_up(config):
+        start_server(config)  # through the login service if there is one, else in the background
+    print("crewchat %s is running at %s." % (__version__, local_url(config)))
 
 
 def cmd_stop(_args):
@@ -4835,6 +4883,9 @@ def build_parser():
 
     p = sub.add_parser("restart", help="start the server again (after stop, or to run a newer version)")
     p.set_defaults(fn=cmd_restart)
+
+    p = sub.add_parser("resume", help="after an upgrade: start the server again, and at login unless turned off")
+    p.set_defaults(fn=cmd_resume)
 
     p = sub.add_parser("update", help="install the latest crewchat and restart the server on it")
     p.add_argument("--version", help="install this release instead, e.g. 0.9.7")

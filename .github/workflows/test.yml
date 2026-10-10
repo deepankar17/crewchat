@@ -46,6 +46,12 @@ jobs:
           if up; then echo "stop did not stop it"; exit 1; fi
           crewchat restart
           up || { echo "restart did not start it"; exit 1; }
+          # An upgrade over a running server restarts it on the new code.
+          starts() { grep -c ' for .* on http' "$CREWCHAT_HOME/hub.log"; }
+          before=$(starts)
+          CREWCHAT_SOURCE="file://$GITHUB_WORKSPACE" sh "$GITHUB_WORKSPACE/install.sh"
+          up || { echo "an upgrade left the server stopped"; exit 1; }
+          [ "$(starts)" -gt "$before" ] || { echo "an upgrade did not restart the server"; exit 1; }
           crewchat uninstall --yes
           if up; then echo "uninstall left the server running"; exit 1; fi
           hash -r  # bash remembers where it last ran crewchat; ask afresh
@@ -77,6 +83,11 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (Up)) { "stop did not stop it"; exit 1 }
           crewchat restart
           if ($LASTEXITCODE -ne 0 -or -not (Up)) { "restart did not start it"; exit 1 }
+          # An upgrade over a running server that does not start at log on: it must come back up.
+          & "$env:GITHUB_WORKSPACE\install.ps1"
+          if (-not $?) { exit 1 }
+          for ($i = 0; $i -lt 20 -and -not (Up); $i++) { Start-Sleep 1 }
+          if (-not (Up)) { "an upgrade left the server stopped"; exit 1 }
           crewchat uninstall --yes
           if ($LASTEXITCODE -ne 0 -or (Up)) { "uninstall left the server running"; exit 1 }
           if (Test-Path .mcp.json) { "uninstall left .mcp.json"; exit 1 }

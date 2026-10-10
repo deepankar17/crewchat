@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.9.9
+
+**After an upgrade on Windows, `crewchat start` sets up start-at-login.**
+
+- After an upgrade, the Windows installer started the server again in the background, so a later
+  `crewchat start` found it running and did not set up start-at-login: it was gone after the next
+  reboot. The installer now runs `crewchat resume`, which starts the server through its login
+  service, or sets that up (unless you turned it off, or another chat on the machine has it), or
+  else starts it in the background. The chat is never left down after an upgrade or
+  `crewchat update`.
+- `crewchat service uninstall` and `crewchat start --no-service` are remembered: `crewchat start`
+  and upgrades no longer turn start-at-login back on afterwards (`crewchat service install` does).
+- The Mac and Linux installer restarts a running server after an upgrade, so it runs the new code
+  (before, it kept the old one until `crewchat restart`).
+
 ## 0.9.8
 
 **crewchat on Windows starts at log on without an administrator.**

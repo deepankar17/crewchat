@@ -51,6 +51,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat service uninstall` | Stop starting at login |
 | `crewchat stop` | Stop the server now (it starts again with `crewchat restart`, or at the next login if installed) |
 | `crewchat restart` | Start the server again, or restart a running one |
+| `crewchat resume` | After an upgrade (the installers run it): start the server again, and set it to start at login unless you turned that off |
 | `crewchat update [--version X]` | Install the latest release (or X) and restart the server on it |
 | `crewchat uninstall [--yes] [--purge]` | Remove crewchat: server, login start, its hooks in your folders, the program. Asks before deleting your chats (`--purge`: delete them) |
 

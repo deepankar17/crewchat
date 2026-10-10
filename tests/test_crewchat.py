@@ -1389,6 +1389,108 @@ class Service(unittest.TestCase):
         values["crewchat"] = crewchat.windows_command()
         self.assertEqual(crewchat.windows_service(), "run")
 
+    def start(self, up, installed, no_service=False, install_fails=False, config=None):
+        """ensure_server with stand-ins for the server and the login service; what it did."""
+        from unittest import mock
+        did = []
+        state = {"up": up}
+
+        def stop(config):
+            did.append("stop")
+            state["up"] = False
+            return True
+
+        def install(args):
+            did.append("install")
+            if install_fails:
+                sys.exit("Access is denied")
+            state["up"] = True
+
+        def background():
+            did.append("background")
+            state["up"] = True
+
+        with mock.patch.object(crewchat, "server_up", lambda config: state["up"]), \
+                mock.patch.object(crewchat, "service_installed", return_value=installed), \
+                mock.patch.object(crewchat, "stop_server", stop), mock.patch.object(crewchat, "cmd_service", install), \
+                mock.patch.object(crewchat, "start_background", background), \
+                mock.patch.object(crewchat, "save_config", lambda config: did.append("saved service=%s"
+                                                                                    % config["service"])), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            crewchat.ensure_server(dict({"port": 1}, **(config or {})),
+                                   crewchat.argparse.Namespace(no_service=no_service, keep_awake=False))
+        return did, out.getvalue()
+
+    def test_start_leaves_a_running_server_alone(self):
+        # One the owner runs in a terminal (`crewchat serve`), or a second chat's: never replaced.
+        for installed in (True, False):
+            did, out = self.start(up=True, installed=installed)
+            self.assertEqual(did, [])
+            self.assertIn("The server is running", out)
+
+    def test_start_sets_up_login_unless_the_owner_turned_it_off(self):
+        self.assertEqual(self.start(up=False, installed=False)[0], ["install"])
+        did, out = self.start(up=False, installed=False, config={"service": False})
+        self.assertEqual(did, ["background"])  # `crewchat service uninstall` is respected
+        self.assertIn("until you log out", out)
+        # --no-service is the same choice, and is remembered for upgrades (`crewchat resume`).
+        self.assertEqual(self.start(up=False, installed=False, no_service=True)[0],
+                         ["saved service=False", "background"])
+        self.assertEqual(self.start(up=False, installed=False, no_service=True, config={"service": False})[0],
+                         ["background"])
+
+    def test_start_runs_the_server_in_the_background_when_login_cannot_be_set_up(self):
+        did, out = self.start(up=False, installed=False, install_fails=True)
+        self.assertEqual(did, ["install", "background"])
+        self.assertIn("Could not register it to start at login", out)
+
+    def resume(self, up=False, ours=False, present=False, config=None, install_fails=False):
+        """cmd_resume with stand-ins; what it did."""
+        from unittest import mock
+        did = []
+        state = {"up": up}
+
+        def install(args):
+            did.append("install")
+            if install_fails:
+                sys.exit("Access is denied")
+            state["up"] = True
+
+        def start(config):
+            did.append("start")
+            state["up"] = True
+
+        with mock.patch.object(crewchat, "load_config", return_value=dict({"port": 1}, **(config or {}))), \
+                mock.patch.object(crewchat, "server_up", lambda config: state["up"]), \
+                mock.patch.object(crewchat, "service_installed", return_value=ours), \
+                mock.patch.object(crewchat, "service_present", return_value=present or ours), \
+                mock.patch.object(crewchat, "cmd_service", install), mock.patch.object(crewchat, "start_server", start), \
+                contextlib.redirect_stdout(io.StringIO()):
+            crewchat.cmd_resume(None)
+        self.assertTrue(state["up"], "resume must never leave the chat down")
+        return did
+
+    def test_after_an_upgrade_the_server_comes_back_and_starts_at_login(self):
+        self.assertEqual(self.resume(up=True), [])
+        self.assertEqual(self.resume(ours=True), ["start"])  # through its own login service
+        self.assertEqual(self.resume(), ["install"])  # none yet: set it up, which starts it
+        self.assertEqual(self.resume(present=True), ["start"])  # another chat's: leave that alone
+        self.assertEqual(self.resume(config={"service": False}), ["start"])  # turned off by the owner
+        self.assertEqual(self.resume(install_fails=True), ["install", "start"])
+
+    def test_the_owners_choice_about_starting_at_login_is_remembered(self):
+        from unittest import mock
+        saved = {}
+        with mock.patch.object(crewchat, "load_config", return_value={"port": 1}), \
+                mock.patch.object(crewchat, "save_config", lambda config: saved.update(config)):
+            crewchat.remember_service_choice("uninstall")
+            self.assertIs(saved["service"], False)
+            crewchat.remember_service_choice("install")
+            self.assertIs(saved["service"], True)
+            saved.clear()
+            crewchat.remember_service_choice("status")
+            self.assertEqual(saved, {})
+
     def test_service_files_run_this_program(self):
         plist = crewchat.launchd_plist(keep_awake=True)
         self.assertIn("<string>/usr/bin/caffeinate</string>", plist)

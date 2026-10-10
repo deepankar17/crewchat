@@ -8,12 +8,12 @@
 # Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   CREWCHAT_VERSION=0.9.8   install this release instead of the one below ("main" for the latest code)
+#   CREWCHAT_VERSION=0.9.9   install this release instead of the one below ("main" for the latest code)
 #   CREWCHAT_LEAN=1          leave out cloud sync (about 70 MB of libraries); the chat works the same
 #   CREWCHAT_SOURCE=PATH     install from a local checkout (for testing this script)
 set -eu
 
-VERSION="${CREWCHAT_VERSION:-0.9.8}"
+VERSION="${CREWCHAT_VERSION:-0.9.9}"
 REPO="https://github.com/deepankar17/crewchat"
 
 say() { printf '%s\n' "$*"; }
@@ -61,6 +61,13 @@ if [ -z "$UV" ]; then
   [ -x "$UV" ] || fail "uv did not install; see https://docs.astral.sh/uv/getting-started/installation/"
 fi
 
+# A server that is running keeps the old code until it restarts: restart it after the install.
+WAS_RUNNING=
+OLD="$(command -v crewchat 2>/dev/null || echo "$HOME/.local/bin/crewchat")"
+if [ -x "$OLD" ] && "$OLD" status 2>/dev/null | grep -q '^Server: *running'; then
+  WAS_RUNNING=1
+fi
+
 say "Installing crewchat $VERSION..."
 if install_from "$SOURCE" >/dev/null 2>&1; then
   :
@@ -96,6 +103,13 @@ INSTALLED="$("$BIN/crewchat" --version)"
 logo "${INSTALLED#crewchat }"
 say ""
 say "Installed $INSTALLED."
+if [ -n "$WAS_RUNNING" ]; then
+  if "$BIN/crewchat" restart >/dev/null 2>&1; then
+    say "Restarted the crewchat server on the new version."
+  else
+    say "Restart the crewchat server to run the new version: crewchat restart"
+  fi
+fi
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) say "Open a new terminal first (or run: export PATH=\"$BIN:\$PATH\"), so the crewchat command is found." ;;
