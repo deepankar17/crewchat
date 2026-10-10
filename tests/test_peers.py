@@ -418,6 +418,20 @@ class SharingEdges(unittest.TestCase):
         self.assertIn(new, again.sheet)
         self.assertEqual(again._id(old), new)
         self.assertEqual(again.messages[-1]["seq"] < again.next_seq, True)
+        # A crash between saving the state and rewriting the log: the old log is put right on load.
+        log = a2.home / "messages.jsonl"
+        lines = log.read_text(encoding="utf-8").splitlines()
+        stale = [json.loads(line) for line in lines]
+        for msg in stale:
+            if msg["id"] == new:
+                msg["id"] = old
+                msg.pop("origin", None)
+                msg.pop("history", None)
+        log.write_text("".join(json.dumps(m) + "\n" for m in stale), encoding="utf-8")
+        recovered = crewchat.Hub(a2.roster)
+        row = next(m for m in recovered.messages if m["id"] == new)
+        self.assertEqual((row["origin"], row["history"]), (a2.sync.device_id, "1"))
+        self.assertNotIn(old, recovered.ids)
 
     def test_a_machine_that_joins_later_is_followed_by_every_shared_project(self):
         for m in self.machines:

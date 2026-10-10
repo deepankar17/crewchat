@@ -639,6 +639,21 @@ class Hub:
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
+        self._apply_renames()
+
+    def _apply_renames(self):
+        """Tasks renamed by adopt_open_tasks: their state is saved before the log is rewritten, so a
+        log a crash left behind may still use the old numbers. Put it right in memory; the next
+        rewrite (or this one's retry) puts it right on disk."""
+        stale = [m for m in self.messages if m["id"] in self.renamed or m.get("task") in self.renamed]
+        for msg in stale:
+            if msg.get("task") in self.renamed:
+                msg["task"] = self.renamed[msg["task"]]
+            if msg["id"] in self.renamed:
+                new = self.renamed[msg["id"]]
+                msg.update(id=new, origin=(self.sheet.get(new) or {}).get("origin") or msg.get("origin"), history="1")
+        if stale:
+            self.ids = {m["id"]: m["seq"] for m in self.messages}
 
     def _save(self):
         write_json(self.home / "state.json", {
@@ -1236,10 +1251,11 @@ class Hub:
         one; the old numbers keep working here. Returns {old id: new id}."""
         with self.lock:
             rename = {}
+            by_id = {m["id"]: m for m in self.messages}
             for mid, row in self.sheet.items():
                 if row.get("removed") or row.get("origin") or self._row_status(mid) == "done":
                     continue
-                msg = next((m for m in self.messages if m["id"] == mid), None)
+                msg = by_id.get(mid)
                 if msg is not None and not msg.get("origin") and not mid.startswith(prefix):
                     rename[mid] = prefix + mid
             if not rename:
@@ -1266,8 +1282,8 @@ class Hub:
             for new in rename.values():
                 self.sheet[new]["origin"] = origin
             self.renamed.update(rename)
+            self._save()  # first: a crash before the log is rewritten is put right on load (_apply_renames)
             self._rewrite_log(rename, {m["id"]: m for m in moved})
-            self._save()
             self._changed()
             return rename
 
