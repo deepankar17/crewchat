@@ -1665,6 +1665,8 @@ class Lifecycle(Base):
         installs = [l for l in lines if "tool install" in l]
         self.assertEqual(len(installs), 2)
         self.assertIn("==1.2.3'", installs[0])
+        self.assertIn("*> $null", installs[0])  # PyPI quietly: the GitHub release is the fallback
+        self.assertNotIn("*> $null", installs[1])
         self.assertIn("resume", script)
         lowered = script.lower()
         for risky in ("irm ", "iex", "invoke-expression", "invoke-restmethod", "downloadstring", "-enc"):

@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.10.1"
+__version__ = "0.11.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -93,7 +93,7 @@ REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offlin
 REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history")  # optional message fields, kept when messages travel between machines
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
 ROLES = {
@@ -483,6 +483,7 @@ class Projects:
         self.others = {}
         self._stamp = None
         self.lock = threading.Lock()
+        self.on_change = None  # called after projects appear or go (cmd_serve: their links follow)
         self.refresh()
 
     def refresh(self):
@@ -491,18 +492,29 @@ class Projects:
             stamp = folder.stat().st_mtime_ns
         except OSError:
             stamp = 0
+        if stamp and time.time() - stamp / 1e9 < 2:
+            # Freshly changed: on a disk whose clock ticks once a second, a project can appear
+            # without the folder's time moving, so for a moment the listing counts too.
+            try:
+                stamp = (stamp, tuple(sorted(p.name for p in folder.iterdir())))
+            except OSError:
+                pass
         if stamp == self._stamp:
             return
         with self.lock:
-            found = sorted(p for p in folder.iterdir() if (p / "config.json").exists()) if stamp else []
-            found = [p for p in found if not p.name.startswith(".")]
+            if stamp == self._stamp:  # another request got here first and did it
+                return
+            found = sorted(p for p in folder.iterdir()
+                           if not p.name.startswith(".") and (p / "config.json").exists()) if stamp else []
             for path in found:
-                if path.name not in self.others and not path.name.startswith("."):
+                if path.name not in self.others:
                     self.others[path.name] = Project(path)
             names = {p.name for p in found}
             for gone in [k for k in self.others if k not in names]:
                 del self.others[gone]  # its folder was removed: its tokens stop working
             self._stamp = stamp
+        if self.on_change is not None:
+            self.on_change(self)
 
     def all(self):
         self.refresh()
@@ -560,6 +572,7 @@ class Hub:
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
         self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
+        self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
@@ -622,14 +635,31 @@ class Hub:
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
         self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
         self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
+        self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
+        self._apply_renames()
+
+    def _apply_renames(self):
+        """Tasks renamed by adopt_open_tasks: their state is saved before the log is rewritten, so a
+        log a crash left behind may still use the old numbers. Put it right in memory; the next
+        rewrite (or this one's retry) puts it right on disk."""
+        stale = [m for m in self.messages if m["id"] in self.renamed or m.get("task") in self.renamed]
+        for msg in stale:
+            if msg.get("task") in self.renamed:
+                msg["task"] = self.renamed[msg["task"]]
+            if msg["id"] in self.renamed:
+                new = self.renamed[msg["id"]]
+                msg.update(id=new, origin=(self.sheet.get(new) or {}).get("origin") or msg.get("origin"), history="1")
+        if stale:
+            self.ids = {m["id"]: m["seq"] for m in self.messages}
 
     def _save(self):
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
+            "renamed": self.renamed,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -1019,6 +1049,7 @@ class Hub:
         return [
             m for m in self.messages
             if m["seq"] > cur and m["kind"] not in ("event", "plan") and m["from"] != name and m["to"] in (name, "all")
+            and not m.get("history")  # from before the chat was linked: on the page and the sheet, never news
         ]
 
     def send(self, sender, to, text, kind="msg", files=None):
@@ -1208,6 +1239,73 @@ class Hub:
         if not (to in self.names and (everyone or to != OWNER) or everyone and to == "all"):
             raise HubError("nobody here is called %s; hub_agents lists who is" % to)
 
+    def _id(self, value):
+        """A task number as written (12, "#12"), following a rename (adopt_open_tasks)."""
+        mid = clean_id(value)
+        return self.renamed.get(mid, mid)
+
+    def adopt_open_tasks(self, prefix, origin):
+        """Open tasks on the sheet that were written here before this chat was linked: they get this
+        machine's tag and origin and a new place at the end of the chat, so linked machines receive
+        them, file them on their sheets and can take them. They travel as history, so they wake no
+        one; the old numbers keep working here. Returns {old id: new id}."""
+        with self.lock:
+            rename = {}
+            by_id = {m["id"]: m for m in self.messages}
+            for mid, row in self.sheet.items():
+                if row.get("removed") or row.get("origin") or self._row_status(mid) == "done":
+                    continue
+                msg = by_id.get(mid)
+                if msg is not None and not msg.get("origin") and not mid.startswith(prefix):
+                    rename[mid] = prefix + mid
+            if not rename:
+                return {}
+            moved = []
+            for msg in self.messages:
+                if msg.get("task") in rename:
+                    msg["task"] = rename[msg["task"]]
+                if msg["id"] in rename:
+                    moved.append(msg)
+            for msg in moved:  # a new place at the end, so pulls past the old one still bring it
+                self.messages.remove(msg)
+                msg.update(id=rename[msg["id"]], origin=origin, history="1", seq=self.next_seq)
+                self.next_seq += 1
+                self.messages.append(msg)
+            self.ids = {m["id"]: m["seq"] for m in self.messages}
+            for table in (self.sheet, self.taken, self.progress, self.claim_gen):
+                for old, new in rename.items():
+                    if old in table:
+                        table[new] = table.pop(old)
+            for row in self.sheet.values():
+                if row.get("parent") in rename:
+                    row["parent"] = rename[row["parent"]]
+            for new in rename.values():
+                self.sheet[new]["origin"] = origin
+            self.renamed.update(rename)
+            self._save()  # first: a crash before the log is rewritten is put right on load (_apply_renames)
+            self._rewrite_log(rename, {m["id"]: m for m in moved})
+            self._changed()
+            return rename
+
+    def _rewrite_log(self, rename, moved):
+        """messages.jsonl after adopt_open_tasks: references renamed, the moved messages at the end."""
+        log = self.home / "messages.jsonl"
+        kept = []
+        for line in (log.read_text(encoding="utf-8").splitlines() if log.exists() else []):
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict) or str(msg.get("id")) in rename:
+                continue
+            if msg.get("task") in rename:
+                msg["task"] = rename[msg["task"]]
+            kept.append(json.dumps(msg, ensure_ascii=False))
+        kept += [json.dumps(m, ensure_ascii=False) for m in moved.values()]
+        temp = log.with_name(log.name + ".new")
+        temp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        os.replace(str(temp), str(log))
+
     def _task(self, mid):
         """The task message with this id. Caller holds the lock."""
         task = next((m for m in reversed(self.messages) if m["id"] == mid), None)
@@ -1250,14 +1348,14 @@ class Hub:
                                "message the agent with hub_send")
             self._check_recipient(to)
             if parent:
-                parent = self._task(clean_id(parent))["id"]
+                parent = self._task(self._id(parent))["id"]
             msg = self._append(lead, to, text, "task", task=parent, status="assigned")
             self._changed()
             return msg
 
     def update(self, agent, mid, status, note):
         """Progress on a task, sent to whoever coordinates it: the lead, or else whoever posted it."""
-        mid = clean_id(mid)
+        mid = self._id(mid)
         if status not in STATUSES:
             raise HubError("status must be one of: %s" % ", ".join(STATUSES))
         with self.lock:
@@ -1288,7 +1386,7 @@ class Hub:
         self._changed()
 
     def take(self, agent, mid):
-        mid = clean_id(mid)
+        mid = self._id(mid)
         with self.lock:
             task = self._task(mid)
             if task["to"] not in ("all", agent):
@@ -1526,7 +1624,7 @@ class Hub:
 
     def assign_row(self, lead, to, mid):
         """The lead (or the owner) gives an open row on the sheet to one agent."""
-        mid = clean_id(mid)
+        mid = self._id(mid)
         with self.lock:
             if lead != OWNER and (self.agents.get(lead) or {}).get("role") != "lead":
                 raise HubError("only the lead assigns work; take a task yourself with hub_take")
@@ -1553,7 +1651,7 @@ class Hub:
 
     def plan_change(self, mid, order=None, status=None):
         """The owner reorders a row or takes it off the sheet."""
-        mid = clean_id(mid)
+        mid = self._id(mid)
         with self.lock:
             if mid not in self.sheet:
                 raise HubError("#%s is not on the task sheet" % mid)
@@ -1562,7 +1660,7 @@ class Hub:
 
     def move_row(self, mid, where):
         """Up, down or top: a new order between its neighbours."""
-        mid = clean_id(mid)
+        mid = self._id(mid)
         with self.lock:
             rows = [k for k, _ in sorted(((k, v) for k, v in self.sheet.items() if not v.get("removed")),
                                           key=lambda kv: kv[1]["order"])]
@@ -1584,7 +1682,7 @@ class Hub:
 
     def owner_status(self, mid, status, note=""):
         """The owner settles a row: back to todo (unblock, or take it from its holder), or done."""
-        mid = clean_id(mid)
+        mid = self._id(mid)
         if status not in ("todo", "done", "blocked"):
             raise HubError("set a task to todo, done or blocked")
         with self.lock:
@@ -2707,7 +2805,8 @@ class Handler(BaseHTTPRequestHandler):
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
-            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(),
+                                 "linked": p.hub.sync is not None and getattr(p.hub.sync, "shared", True)}
                                 for p in self.projects.all()]
             self._json(200, data)
         else:
@@ -2811,7 +2910,10 @@ class Handler(BaseHTTPRequestHandler):
             if str(op).startswith("peer"):
                 import crewchat_peers
                 try:
-                    result = crewchat_peers.admin(self.hub, self.roster.root, op, data)
+                    first = self.projects.primary
+                    result = crewchat_peers.admin(first.hub, first.roster.root, op, data)
+                    if op == "peers-start":
+                        link_projects(self.projects)
                 except crewchat_peers.PeerError as e:
                     raise HubError(str(e))
             elif op == "rename":
@@ -2868,18 +2970,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def _peer(self, path, raw):
         """A request from another of the owner's machines (crewchat_peers)."""
-        handler = getattr(self.hub.sync, "peer_request", None)
+        link = self.projects.primary.hub.sync
+        handler = getattr(link, "peer_request", None)
         if handler is None:
             self._json(404, {"error": "this machine is not linked to other machines"})
             return
+        body = self._object(raw)
+        header = self.headers.get("Authorization", "")
+        token = header[7:].strip() if header.startswith("Bearer ") else ""
+        chat = str(body.get("chat") or "").strip().lower() if path != "/peer/join" else ""
+        if chat:
+            # Another project: its own link answers. One this machine lacks is not an error, but it is
+            # said only to a member (the key is checked first).
+            self.projects.refresh()  # a project made a moment ago is linked first
+            target = link.projects.get(chat)
+            if target is not None and target.hub.sync is target:
+                handler = target.peer_request
+            elif link.mesh.key_ok(token):
+                self._json(404, {"error": "no project called %s here" % chat, "missing": True})
+                return
         # Joining takes a short code, so a locked-out address may not try one. Other requests carry
         # the group's long key, and a right key always works (as tokens do in _bearer).
         if path == "/peer/join" and self._locked():
             self._json(429, {"error": "too many wrong keys or codes; try again later"})
             return
-        header = self.headers.get("Authorization", "")
-        token = header[7:].strip() if header.startswith("Bearer ") else ""
-        status, out = handler(path, token, self.headers.get("X-Crewchat-Device", ""), self._object(raw))
+        status, out = handler(path, token, self.headers.get("X-Crewchat-Device", ""), body)
         if status == 401:
             if self._locked():
                 self._json(429, {"error": "too many wrong keys or codes; try again later"})
@@ -3458,6 +3573,36 @@ def cmd_start(args):
         print("Agents on your other machines too? Run `crewchat start` there, then `crewchat connect`.")
 
 
+def link_projects(projects):
+    """Link this machine's projects with the same-named ones on the other machines, now and
+    whenever projects appear or go."""
+    share_projects(projects)
+    projects.on_change = share_projects
+
+
+SHARE_LOCK = threading.Lock()  # one share_projects at a time: each acts on the projects as it finds them
+
+
+def share_projects(projects):
+    """Over Tailscale, link every project besides the first with the same-named project on the
+    other machines (the first projects are linked with each other, whatever their names)."""
+    with SHARE_LOCK:
+        link = projects.primary.hub.sync
+        if not hasattr(link, "share"):
+            return
+        first = projects.primary.name.strip().lower()
+        wanted = {}
+        for project in list(projects.others.values()):
+            name = project.name.strip().lower()
+            if name and name != first and name not in wanted:
+                wanted[name] = project
+        for name, project in wanted.items():
+            link.share(project.hub, name)
+        for name in list(link.projects):
+            if name not in wanted:
+                link.unshare(name)
+
+
 def cmd_serve(args):
     if getattr(args, "log", None) or sys.stderr is None:
         path = Path(getattr(args, "log", None) or (home() / "hub.log"))
@@ -3481,6 +3626,7 @@ def cmd_serve(args):
         try:
             import crewchat_peers
             crewchat_peers.start(server.RequestHandlerClass.hub)
+            link_projects(server.RequestHandlerClass.projects)
         except Exception as e:  # the local chat keeps working on its own
             sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
@@ -4720,6 +4866,9 @@ def latest_release():
         return ""
 
 
+UV_INSTALL = ["tool", "install", "--force", "--refresh-package", "crewchat", "--python", "3.12"]
+
+
 def update_specs(version):
     """What `crewchat update` installs, in order: the release from PyPI, else its package file on
     GitHub. With cloud sync's libraries if this copy has them."""
@@ -4751,9 +4900,11 @@ def windows_update_script(uv, specs, crewchat_exe, folder, pid):
         "Start-Sleep -Seconds 2",
         "$done = $false",
     ]
-    for spec in specs:
-        lines.append("if (-not $done) { & %s tool install --force --refresh-package crewchat --python 3.12 %s; "
-                     "$done = $LASTEXITCODE -eq 0 }" % (quote(uv), quote(spec)))
+    install = lambda spec: " ".join([quote(uv)] + UV_INSTALL + [quote(spec)])  # noqa: E731
+    for spec in specs[:-1]:  # quietly: PyPI may not have a release minutes old yet
+        lines.append("if (-not $done) { & %s *> $null; $done = $LASTEXITCODE -eq 0; if (-not $done) { Write-Host "
+                     "'Not on PyPI yet; installing it from its GitHub release.' } }" % install(spec))
+    lines.append("if (-not $done) { & %s; $done = $LASTEXITCODE -eq 0 }" % install(specs[-1]))
     lines += [
         "if ($done) { & %s resume; Write-Host ''; & %s --version }" % (quote(crewchat_exe), quote(crewchat_exe)),
         "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
@@ -4782,12 +4933,17 @@ def cmd_update(args):
         print("Updating crewchat in a new window; this crewchat stops while it does.")
         return
     if uv and not local:
-        for spec in update_specs(version):
-            if subprocess.run([uv, "tool", "install", "--force", "--refresh-package", "crewchat", "--python", "3.12",
-                               spec], env=env).returncode == 0:
+        specs = update_specs(version)
+        for spec in specs[:-1]:
+            # Quietly: PyPI may not have a release minutes old yet; the next source is no failure.
+            if subprocess.run([uv] + UV_INSTALL + [spec], env=env, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL).returncode == 0:
+                print("Installed crewchat %s." % (version or "(the latest)"))
                 break
+            print("crewchat %s is not on PyPI yet; installing it from its GitHub release." % version)
         else:
-            die("the update did not install; crewchat %s is still in place." % __version__)
+            if subprocess.run([uv] + UV_INSTALL + [specs[-1]], env=env).returncode != 0:
+                die("the update did not install; crewchat %s is still in place." % __version__)
         if running:
             subprocess.run(self_command() + ["restart"], env=env)  # a fresh process runs the new code
         return

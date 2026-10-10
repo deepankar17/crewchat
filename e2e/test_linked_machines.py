@@ -203,6 +203,56 @@ class TwoMachines(unittest.TestCase):
         eventually(lambda: self.mac.owner.row(self.dev.name)["status"] == "compiling", what="the status")
 
 
+class SharedProjects(unittest.TestCase):
+    """The owner's case: a folder called t2 on both machines is one project, t2, on both."""
+
+    def test_projects_with_the_same_name_are_one_chat(self):
+        mac, win = H.Machine("mac", project="test"), H.Machine("win", project="android")
+        try:
+            mac.start()
+            win.start()
+            win.link_to(mac)
+            folders = {}
+            for m in (mac, win):
+                folder = m.dir / "t2"
+                folder.mkdir()
+                H.subprocess.run(["git", "init", "-q", str(folder)], check=True)
+                self.assertIn('Created the project "t2"', m.cli("start", "--no-service", "--no-open", cwd=folder))
+                folders[m.name] = folder
+            x = mac.agent(folder=folders["mac"])
+            y = win.agent(folder=folders["win"])
+            x.link()
+            y.link()
+            mac.owner.chat = win.owner.chat = "t2"
+            for m, other in ((mac, y), (win, x)):
+                eventually(lambda: m.owner.sees(other.name), timeout=60, what="%s's t2 to show %s" % (m.name, other.name))
+            y.stop_hook()
+            x.call("hub_send", to=y.name, text="hello from the Mac's t2")
+            self.assertIn("hello from the Mac's t2", eventually(y.stop_hook, timeout=60, what="the laptop's t2 agent"))
+            # The first projects (test and android) stay linked with each other, and apart from t2.
+            a, b = mac.agent(), win.agent()
+            a.link()
+            b.link()
+            mac.owner.chat = win.owner.chat = ""
+            eventually(lambda: win.owner.sees(a.name), timeout=60, what="the first projects linked")
+            self.assertNotIn(y.name, [r["agent"] for r in mac.owner.agents()])
+            projects = {p["id"]: p for p in mac.owner.poll()["projects"]}
+            eventually(lambda: {p["id"]: p for p in mac.owner.poll()["projects"]}["t2"]["linked"], timeout=60,
+                       what="t2 marked shared")
+            self.assertTrue(projects["test"]["linked"])
+            # A task on the shared sheet is taken once, from either machine.
+            win.owner.chat = "t2"
+            tid = win.owner.post("/api/task?chat=t2", {"op": "add", "title": "shared sheet task"})
+            self.assertEqual(tid[0], 200)
+            task = H.json.loads(tid[1])["id"]
+            eventually(lambda: task in x.call("hub_tasks", view="all"), timeout=60, what="the task on the Mac's sheet")
+            x.call("hub_take", id=task)
+            eventually(lambda: win.owner.poll()["taken"].get(task) == x.name, timeout=60, what="the laptop to know")
+        finally:
+            mac.stop()
+            win.stop()
+
+
 class Outages(unittest.TestCase):
     """A machine going down, coming back, and leaving."""
 
