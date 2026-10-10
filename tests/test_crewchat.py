@@ -612,7 +612,7 @@ class Launching(Base):
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
-        cli("start", str(self.folder), "--no-open", "--no-service", "--place", "Studio")
+        cli("start", str(self.folder), "--no-open", "--no-service", "--place", "Studio", "--chat", "demo")
         self.place = crewchat.joined_place(self.folder)[0]
 
     def tearDown(self):
@@ -644,7 +644,7 @@ class Launching(Base):
         token = crewchat.read_token(self.place)
         session = Session(self.base, token)
         out = session.text("hub_link", key=key)
-        self.assertIn("You are docs-writer, started from the crewchat by the owner.", out)
+        self.assertIn("You are docs-writer, in the project Demo, started from the crewchat by the owner.", out)
         self.assertIn("Your role's instructions and your first task are in hub_inbox", out)
         self.assertEqual(session.me, "docs-writer")
         row = next(r for r in self.hub.rows() if r["agent"] == "docs-writer")
@@ -700,7 +700,7 @@ class Linking(Base):
         self.assertEqual(self.hook("key-first-0001"), {"link": True})
         note = session.text("hub_link", key="key-first-0001")
         name = session.me
-        self.assertIn("Linked. You are %s." % name, note)
+        self.assertIn("Linked. You are %s, in the project Demo." % name, note)
         self.assertIn("%s (you)" % name, note)
         self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0, "owner": False})
         number = self.say(name, "through the hook")
@@ -717,7 +717,7 @@ class Linking(Base):
         before = self.names()
         # The tool restarts: new MCP session, same conversation, so the hook has the same key.
         again = Session(self.base, self.token)
-        self.assertIn("This session is %s again." % name, again.text("hub_link", key="key-resume-0001"))
+        self.assertIn("This session is %s again, in the project Demo." % name, again.text("hub_link", key="key-resume-0001"))
         self.assertEqual(again.me, name)
         self.assertEqual(self.names(), before)
 
@@ -930,28 +930,57 @@ class Joining(Base):
 
     def test_start_connects_the_folder_once(self):
         folder = self.project().resolve()
-        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk")
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk", "--chat", "Demo")
         self.assertIn("The server is running at %s." % self.base, out)
-        self.assertRegex(out, r'- (Connected|Added) %s(,| to this machine\'s chat, "Demo",) as "desk"\.' % re.escape(str(folder)))
+        self.assertRegex(out, r'- (Connected|Added) %s to the project "Demo", as "desk"\.' % re.escape(str(folder)))
         token = crewchat.read_token("desk")
         mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + token)
         self.assertTrue((folder / ".cursor" / "hooks.json").exists())
         places = crewchat.list_places()
         out = cli("start", str(folder), "--no-open", "--no-service")
-        self.assertIn('%s is connected, as "desk".' % folder, out)
+        self.assertIn('%s is connected to the project "Demo", as "desk".' % folder, out)
         self.assertEqual(crewchat.list_places(), places)  # no second place for the same folder
 
-    def test_start_in_another_folder_joins_the_same_chat_under_the_folders_name(self):
+    def test_a_new_folder_is_a_new_project_and_projects_are_apart(self):
         first = self.project().resolve()
-        cli("start", str(first), "--no-open", "--no-service")
-        other = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
-        other.mkdir()
-        out = cli("start", str(other), "--no-open", "--no-service")
-        self.assertIn('- Added %s to this machine\'s chat, "Demo", as "notes-app".' % other, out)
-        self.assertIn("every folder you run `crewchat start` in joins it", out)
-        self.assertIn("claude-notes-app, claude-notes-app-2", out)
-        self.assertIn("notes-app", crewchat.list_places())
+        cli("start", str(first), "--no-open", "--no-service", "--chat", "demo")
+        app = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
+        app.mkdir()
+        out = cli("start", str(app), "--no-open", "--no-service")
+        self.assertIn('Created the project "notes-app"', out)
+        self.assertIn('- Connected %s to the project "notes-app", as ' % app, out)
+        entry = crewchat.find_chat("notes-app")
+        self.assertEqual(entry["root"], crewchat.home() / "projects" / "notes-app")
+        place = crewchat.list_places(entry["root"])[0]
+        # Its own token, even where the first project has a folder by the same name.
+        self.assertNotEqual(crewchat.read_token(place, entry["root"]), crewchat.read_token(place))
+        # Another folder joins it with --chat, named after itself.
+        site = (Path(tempfile.mkdtemp(dir=TMP)) / "site").resolve()
+        site.mkdir()
+        out = cli("start", str(site), "--no-open", "--no-service", "--chat", "notes-app")
+        self.assertIn('- Added %s to the project "notes-app", as "site".' % site, out)
+        self.assertIn("notes-app  [--chat notes-app]", cli("projects"))
+        # Agents in different projects do not see or reach each other.
+        here, here_name = self.agent()
+        token = crewchat.read_token(place, entry["root"])
+        there = Session(self.base, token)
+        there_name = there.me
+        self.assertNotIn(here_name, there.text("hub_agents"))
+        self.assertIn("nobody here is called", there.text("hub_send", to=here_name, text="hello?"))
+        crewchat.post_json(self.base + "/api/send", self.owner, {"to": "all", "text": "for the first project"})
+        self.assertNotIn("for the first project", there.text("hub_inbox"))
+        crewchat.post_json(self.base + "/api/send", self.owner, {"to": "all", "text": "for notes-app"},
+                           headers={"X-Crewchat-Chat": "notes-app"})
+        self.assertIn("for notes-app", there.text("hub_inbox"))
+        self.assertNotIn("for notes-app", here.text("hub_inbox"))
+        # An agent's token is its project's only, whatever project it asks for.
+        ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}'
+        status = self.raw("/mcp", ping, {"Authorization": "Bearer " + token, "X-Crewchat-Chat": crewchat.list_projects()[0]["id"]})[0]
+        self.assertEqual(status, 403)
+        status = self.raw("/mcp", ping, {"Authorization": "Bearer " + token, "X-Crewchat-Chat": "notes-app"})[0]
+        self.assertEqual(status, 200)
+        self.assertEqual(self.raw("/mcp", ping, {"Authorization": "Bearer " + self.owner, "X-Crewchat-Chat": "nope"})[0], 404)
 
     def test_the_banner_is_plain_when_not_on_a_terminal(self):
         self.assertEqual(crewchat.banner(io.StringIO()), "crewchat " + crewchat.__version__)

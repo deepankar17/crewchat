@@ -69,6 +69,7 @@ INLINE_IMAGES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
               "application/javascript", "application/x-sh", "application/sql")
 MAX_TEXT = 4000
+PROJECTS_DIR = "projects"  # projects other than the first, in the crewchat home folder
 PAGE_BATCH = 500  # messages the chat page gets in one answer
 MAX_STATUS = 200
 MAX_WAIT = 50
@@ -366,7 +367,7 @@ class Roster:
         except (TypeError, ValueError):
             self.forget = FORGET_HOURS * 3600
         self.tokens = {}
-        owner = read_token(OWNER, self.root)
+        owner = read_token(OWNER, self.root) or read_token(OWNER)  # projects/<id> use the machine's
         if owner:
             self.tokens[sha(owner)] = ("owner", None)
         for place in list_places(self.root):
@@ -385,6 +386,121 @@ class Roster:
             return max(1, min(MAX_CHAIN_LIMIT, int(self.config.get("max_chain", MAX_CHAIN))))
         except (TypeError, ValueError):
             return MAX_CHAIN
+
+
+def list_projects(base=None):
+    """Every project on this machine, first one first: [{id, name, root, chat}], where chat is
+    the key folders are filed under ("" for the first project, else its id)."""
+    base = Path(base) if base else home()
+    out = []
+    if (base / "config.json").exists():
+        name = str(load_config(base)["project"])
+        out.append({"id": project_id(name), "name": name, "root": base, "chat": ""})
+    folder = base / PROJECTS_DIR
+    for path in sorted(folder.iterdir()) if folder.is_dir() else []:
+        if (path / "config.json").exists():
+            out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
+    return out
+
+
+def find_chat(text, base=None):
+    """A project by id or name (any case), or None."""
+    want = str(text or "").strip().lower()
+    return next((p for p in list_projects(base) if want in (p["id"], p["name"].lower())), None)
+
+
+def create_project(name, base=None):
+    """A new, empty project called name, in projects/<id>/. Returns its list_projects() entry."""
+    base = Path(base) if base else home()
+    taken = {p["id"] for p in list_projects(base)}
+    pid, number = project_id(name), 2
+    while pid in taken:
+        pid, number = "%s-%d" % (project_id(name)[:36], number), number + 1
+    folder = base / PROJECTS_DIR
+    folder.mkdir(parents=True, exist_ok=True)
+    # Built under another name and moved in whole: a running server sees it complete or not at all.
+    temp = Path(tempfile.mkdtemp(prefix=".new-", dir=str(folder)))
+    (temp / "tokens").mkdir()
+    save_config({"project": str(name), "forget_hours": FORGET_HOURS}, temp)
+    if os.name != "nt":
+        os.chmod(temp, 0o700)
+        os.chmod(temp / "tokens", 0o700)
+    os.replace(str(temp), str(folder / pid))
+    return next(p for p in list_projects(base) if p["id"] == pid)
+
+
+def project_id(name):
+    """The id of a project in URLs, commands and folder names: its name, made safe."""
+    return slug(name, 40, "project")
+
+
+class Project:
+    """One project's chat: its settings and tokens (a Roster) and its messages and agents (a Hub)."""
+
+    def __init__(self, root, primary=False):
+        self.root = Path(root)
+        self.primary = primary
+        self.roster = Roster(self.root)
+        self.hub = Hub(self.roster)
+        self.hub.chat_key = "" if primary else self.root.name  # how this machine files its folders
+        self.hub.machine_root = self.root if primary else self.root.parent.parent
+
+    @property
+    def id(self):
+        return self.root.name if not self.primary else project_id(self.roster.project)
+
+    @property
+    def name(self):
+        return self.roster.project
+
+
+class Projects:
+    """Every project on this machine. The first lives in the crewchat home folder itself (so a
+    machine set up before projects keeps its chat as it is); each other one in projects/<id>/,
+    laid out the same way, and is picked up as soon as its folder appears."""
+
+    def __init__(self, root=None):
+        self.base = Path(root) if root else home()
+        self.primary = Project(self.base, primary=True)
+        self.others = {}
+        self._stamp = None
+        self.lock = threading.Lock()
+        self.refresh()
+
+    def refresh(self):
+        folder = self.base / PROJECTS_DIR
+        try:
+            stamp = folder.stat().st_mtime_ns
+        except OSError:
+            stamp = 0
+        if stamp == self._stamp:
+            return
+        with self.lock:
+            found = sorted(p for p in folder.iterdir() if (p / "config.json").exists()) if stamp else []
+            found = [p for p in found if not p.name.startswith(".")]
+            for path in found:
+                if path.name not in self.others and not path.name.startswith("."):
+                    self.others[path.name] = Project(path)
+            self._stamp = stamp
+
+    def all(self):
+        self.refresh()
+        return [self.primary] + [self.others[k] for k in sorted(self.others)]
+
+    def get(self, pid):
+        """The project with this id (the first one for None or ""), or None."""
+        if not pid:
+            return self.primary
+        return next((p for p in self.all() if p.id == pid), None)
+
+    def by_token(self, digest):
+        """(project, who) for a token's sha256, or (None, None)."""
+        for project in self.all():
+            project.roster.refresh()
+            who = project.roster.tokens.get(digest)
+            if who is not None:
+                return project, who
+        return None, None
 
 
 # --------------------------------------------------------------------------------------------
@@ -428,6 +544,8 @@ class Hub:
         self.starts = {}  # start key -> {name, role, task, expires}: agents being launched (memory only)
         self.remote = {}  # device id -> {"device": name, "agents": [rows], "updated": time} (cloud sync)
         self.sync = None  # set by crewchat_cloud when cloud sync is on
+        self.chat_key = ""  # the project's key for this machine's folders ("" for the first project)
+        self.machine_root = None  # where this machine's settings are, if not in this project's folder
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
@@ -711,14 +829,14 @@ class Hub:
                 self.agents[owner]["checked"] = time.time()
                 self._save()
                 self._changed()
-                return owner, "Linked. This session is %s again." % owner
+                return owner, "Linked. This session is %s again, in the project %s." % (owner, self.roster.project)
             if mine is None:
                 mine = row["agent"] = self._new_agent(row["place"], row["client"])
             self.links[key] = mine
             self.agents[mine]["checked"] = time.time()
             self._save()
             self._changed()
-            return mine, "Linked. You are %s." % mine
+            return mine, "Linked. You are %s, in the project %s." % (mine, self.roster.project)
 
     def _remote_device_of(self, name):
         for dev in self.remote.values():
@@ -946,7 +1064,7 @@ class Hub:
         start key and gets this name, role and first task."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
-        if folder not in [f["path"] for f in launch_folders(self.roster.config, self.home)]:
+        if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("that folder is not connected to this chat on this machine")
         key = self.new_start(name, role, task)
         try:
@@ -983,7 +1101,8 @@ class Hub:
             self.set_role(OWNER, name, spec["role"])
         if spec["task"]:
             self.assign(OWNER, name, spec["task"])
-        notes.insert(0, "You are %s, started from the crewchat by the owner." % name)
+        notes.insert(0, "You are %s, in the project %s, started from the crewchat by the owner."
+                     % (name, self.roster.project))
         waiting = [x for x, on in (("your role's instructions", spec["role"]), ("your first task", spec["task"])) if on]
         if waiting:
             notes.append("%s %s in hub_inbox: read it now and start." % (" and ".join(waiting).capitalize(),
@@ -1007,7 +1126,14 @@ class Hub:
         here), rather than one connected from another machine?"""
         with self.lock:
             place = (self.agents.get(agent) or {}).get("place")
-        return place is not None and place in (self.roster.config.get("folders") or {}).values()
+        config = self.machine_config()
+        return place is not None and any(p == place and folder_chat(config, path) == self.chat_key
+                                         for path, p in (config.get("folders") or {}).items())
+
+    def machine_config(self):
+        """This machine's settings (its folders, tools, port), wherever this project is kept."""
+        root = getattr(self, "machine_root", None)
+        return self.roster.config if root is None or Path(root) == Path(self.roster.root) else load_config(root)
 
     def _check_recipient(self, to, everyone=False):
         """An agent's name, or with `everyone` also "all" and Owner. Caller holds the lock."""
@@ -1150,6 +1276,11 @@ class Hub:
         with self.lock:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
                     for m in self.messages[-limit:]]
+
+    def last_seq(self):
+        """The newest message's seq, for the page's "new in other projects" marks."""
+        with self.lock:
+            return self.messages[-1]["seq"] if self.messages else 0
 
     def set_update(self, newer):
         """A newer crewchat to tell the owner about on the chat page ('' for none)."""
@@ -1950,6 +2081,31 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     hub = None
     roster = None
+    projects = None
+    project = None
+
+    # Projects: an agent's requests go to the project its token belongs to, and nowhere else. The
+    # owner picks one (the page's ?chat=, or X-Crewchat-Chat from the command line); sign-in and
+    # sign-in codes belong to the machine, so they live in the first project.
+    def _use(self, project):
+        self.project, self.hub, self.roster = project, project.hub, project.roster
+        self.roster.refresh()
+
+    def _asked_project(self):
+        """The project id the request names, or ''."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        return (self.headers.get("X-Crewchat-Chat") or query.get("chat", [""])[0] or "").strip()
+
+    def _use_asked(self):
+        """For the owner: switch to the project the request names. False (after replying) if
+        there is no such project."""
+        asked = self._asked_project()
+        project = self.projects.get(asked)
+        if project is None:
+            self._json(404, {"error": "no project called %s here; `crewchat projects` lists them" % asked})
+            return False
+        self._use(project)
+        return True
     failures = {}  # address -> [timestamps]
     fail_lock = threading.Lock()
 
@@ -2004,7 +2160,18 @@ class Handler(BaseHTTPRequestHandler):
         header = self.headers.get("Authorization", "")
         if quiet and not header:
             return None
-        who = self.roster.tokens.get(sha(header[7:].strip())) if header.startswith("Bearer ") else None
+        project, who = (self.projects.by_token(sha(header[7:].strip())) if header.startswith("Bearer ")
+                        else (None, None))
+        if who is not None:
+            if who[0] == "place":
+                asked = self._asked_project()
+                if asked and asked != project.id:
+                    self._json(403, {"error": "this token belongs to the project %s" % project.id})
+                    return None
+                self._use(project)
+            elif not self._use_asked():
+                return None
+            return who
         if who is None:
             # Only wrong tokens are locked out. A right one always works: tokens are far too long to
             # guess, and a stale token still in use (a removed folder, an old copy of a project) must
@@ -2019,7 +2186,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _owner_session(self):
         cookie = SimpleCookie(self.headers.get("Cookie", ""))
-        return self.hub.session_ok(cookie[COOKIE].value if COOKIE in cookie else "")
+        return self.projects.primary.hub.session_ok(cookie[COOKIE].value if COOKIE in cookie else "")
 
     def _same_origin(self):
         """Browser writes must come from the chat page itself, not another site."""
@@ -2040,6 +2207,8 @@ class Handler(BaseHTTPRequestHandler):
                 return False
             if not self._same_origin():
                 self._json(403, {"error": "wrong origin"})
+                return False
+            if not self._use_asked():
                 return False
         elif who[0] != "owner":
             self._json(403, {"error": "only the owner can do this"})
@@ -2079,7 +2248,7 @@ class Handler(BaseHTTPRequestHandler):
         note = '<p class="err">%s</p>' % error if error else ""
         self._html(code, LOGIN_PAGE.replace("__ERROR__", note))
 
-    def _sign_in(self, code):
+    def _sign_in(self, code, chat=""):
         if self._locked():
             self._login_page(429, "Too many wrong codes. Try again later.")
             return
@@ -2090,11 +2259,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
         cookie = "%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict%s" % (COOKIE, sid, SESSION_TTL, secure)
-        self._reply(303, b"", extra={"Location": "/", "Set-Cookie": cookie, "Cache-Control": "no-store"})
+        where = "/?chat=" + urllib.parse.quote(chat) if chat and self.projects.get(chat) else "/"
+        self._reply(303, b"", extra={"Location": where, "Set-Cookie": cookie, "Cache-Control": "no-store"})
 
     # Routes ----------------------------------------------------------------------------------
     def do_GET(self):
-        self.roster.refresh()
+        self._use(self.projects.primary)
         url = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(url.query)
         if url.path == "/health":
@@ -2118,7 +2288,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/login":
             if "code" in query:
-                self._sign_in(query["code"][0])
+                self._sign_in(query["code"][0], query.get("chat", [""])[0])
             else:
                 self._login_page(200)
         elif url.path.startswith("/files/"):
@@ -2127,10 +2297,14 @@ class Handler(BaseHTTPRequestHandler):
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
                 return
-            self._json(200, launch_options(self.roster.config, self.roster.root))
+            if not self._use_asked():
+                return
+            self._json(200, launch_options(self.hub.machine_config(), self.roster.root, self.hub.chat_key))
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
+                return
+            if not self._use_asked():
                 return
             try:
                 after = int(query.get("after", ["-1"])[0])
@@ -2139,13 +2313,17 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "bad query"})
                 return
-            self._json(200, self.hub.poll(after, version, wait))
+            data = self.hub.poll(after, version, wait)
+            data["chat"] = self.project.id
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
+                                for p in self.projects.all()]
+            self._json(200, data)
         else:
             self._reply(404, b"")
 
     def do_DELETE(self):
         """An MCP client ending its session."""
-        self.roster.refresh()
+        self._use(self.projects.primary)
         if urllib.parse.urlsplit(self.path).path != "/mcp":
             self._reply(404, b"")
             return
@@ -2163,7 +2341,12 @@ class Handler(BaseHTTPRequestHandler):
             self._json(429, {"error": "too many wrong codes; try again later"})
             return
         data = self._object(raw)
-        fixed = self.hub.redeem_invite(data.get("code", "")) if data.get("code") else None
+        fixed = None
+        for project in self.projects.all() if data.get("code") else []:
+            fixed = project.hub.redeem_invite(data.get("code", ""))
+            if fixed is not None:
+                self._use(project)
+                break
         if fixed is None:
             self._fail()
             self._json(401, {"error": "that code is wrong or has expired"})
@@ -2175,7 +2358,8 @@ class Handler(BaseHTTPRequestHandler):
             place, number = "%s-%d" % (base[:13], number), number + 1
         ensure_token(place, root)
         self.roster.refresh()
-        self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project})
+        self._json(200, {"place": place, "token": read_token(place, root), "project": self.roster.project,
+                         "chat": self.hub.chat_key})
 
     # The owner's actions, from the chat page or the command line: each takes the request body and
     # returns the answer, or raises HubError for a 400.
@@ -2234,6 +2418,12 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(401, b"", ctype="text/plain")
             return
         fid = path.split("/")[2] if path.count("/") >= 2 else ""
+        holder = next((p for p in self.projects.all() if p.hub.file(fid)[0] is not None), None)
+        if holder is None and self._use_asked():  # one shared on another machine: its project's
+            holder = self.project
+        if holder is None:
+            return
+        self._use(holder)
         try:
             meta, local = self.hub.open_file(fid)
         except HubError as e:
@@ -2320,7 +2510,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, out, extra=extra)
 
     def do_POST(self):
-        self.roster.refresh()
+        self._use(self.projects.primary)
         path = urllib.parse.urlsplit(self.path).path
         if path not in POST_PATHS and path not in PEER_PATHS:
             self._reply(404, b"")
@@ -2352,6 +2542,7 @@ class Handler(BaseHTTPRequestHandler):
             self._join(raw)
             return
         if path in PEER_PATHS:
+            self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
             return
         if path in ("/api/send", "/api/role", "/api/launch"):
@@ -2388,7 +2579,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "only the owner token can do this"})
                 return
             if path == "/api/login-code":
-                self._json(200, {"code": self.hub.new_code(), "ttl": CODE_TTL})
+                self._json(200, {"code": self.projects.primary.hub.new_code(), "ttl": CODE_TTL})
             elif path == "/api/invite":
                 place = self._object(raw).get("place") or ""
                 self._json(200, {"code": self.hub.new_invite(place_label(place) if place else ""), "ttl": INVITE_TTL})
@@ -2410,8 +2601,10 @@ class Server(ThreadingHTTPServer):
 
 def make_server(port, root=None):
     """A ready server (not yet serving). Port 0 picks a free one; see server.server_address."""
-    roster = Roster(root)
-    handler = type("BoundHandler", (Handler,), {"roster": roster, "hub": Hub(roster), "failures": {}})
+    projects = Projects(root)
+    first = projects.primary
+    handler = type("BoundHandler", (Handler,), {"projects": projects, "project": first, "roster": first.roster,
+                                                "hub": first.hub, "failures": {}})
     return Server((BIND, port), handler)
 
 
@@ -2448,9 +2641,13 @@ def owner_token():
     return token
 
 
-def owner_call(path, body):
+CURRENT_CHAT = None  # the project owner commands act on: --chat, or the one of the folder they run in
+
+
+def owner_call(path, body, chat=None):
+    chat = chat or CURRENT_CHAT
     try:
-        return post_json(local_url() + path, owner_token(), body)
+        return post_json(local_url() + path, owner_token(), body, headers={"X-Crewchat-Chat": chat} if chat else None)
     except urllib.error.HTTPError as e:
         try:
             die(json.loads(e.read().decode("utf-8")).get("error", "HTTP %d" % e.code))
@@ -2572,6 +2769,32 @@ def log_tail(lines=6):
     return "\n".join("  " + line for line in text[-lines:])
 
 
+def connected_project(folder, config=None):
+    """(place, token, clients, project) for a folder connected to any project on this machine,
+    else (None, None, [], None)."""
+    config = config or load_config()
+    for entry in list_projects():
+        place, token, clients = joined_place(folder, config, entry["root"])
+        if place:
+            return place, token, clients, entry
+    return None, None, [], None
+
+
+def chat_of_folder(folder):
+    """The project id of the connected folder this is in (or below), or None."""
+    try:
+        config = load_config()
+    except SystemExit:
+        return None
+    folder = Path(folder).resolve()
+    for candidate in [folder] + list(folder.parents):
+        if str(candidate) in (config.get("folders") or {}):
+            chat = folder_chat(config, candidate)
+            projects = list_projects()
+            return chat or (projects[0]["id"] if projects else None)
+    return None
+
+
 def joined_place(project, config=None, root=None):
     """The place this folder joined this machine's chat as, with its token and the clients set
     up for it, or (None, None, [])."""
@@ -2596,16 +2819,23 @@ LAUNCH_PROMPT = ("You were started from the crewchat by your owner. Call the cre
                  "%s now: it tells you your name, your role and your first task.")
 
 
-def remember(project, place, root=None):
-    """Note a folder connected to this machine's chat, and where Claude Code and Cursor's agent
-    are (as found in the user's own shell), so the chat page can start agents there."""
+def remember(project, place, root=None, chat=""):
+    """Note a folder connected to this machine's chat, and which project it is in (chat: "" for
+    the first), and where Claude Code and Cursor's agent are (as found in the user's own shell),
+    so the chat page can start agents there."""
     config = load_config(root)
     folders = dict(config.get("folders") or {}, **{str(project): place})
+    chats = {k: v for k, v in dict(config.get("folder_chats") or {}, **{str(project): chat}).items() if v}
     tools = dict(config.get("tools") or {})
     tools.update({t: path for t, path in ((t, shutil.which(exe)) for t, (_, exe) in LAUNCH_TOOLS.items()) if path})
-    if folders != config.get("folders") or tools != (config.get("tools") or {}):
-        config["folders"], config["tools"] = folders, tools
+    if (folders, chats, tools) != (config.get("folders"), config.get("folder_chats") or {}, config.get("tools") or {}):
+        config["folders"], config["folder_chats"], config["tools"] = folders, chats, tools
         save_config(config, root)
+
+
+def folder_chat(config, path):
+    """The project a connected folder is in ("" for the first)."""
+    return (config.get("folder_chats") or {}).get(str(path), "")
 
 
 def find_tool(tool, config):
@@ -2624,19 +2854,20 @@ def find_tool(tool, config):
     return None
 
 
-def launch_folders(config, root=None):
-    """The project folders on this machine still connected to its chat, as `crewchat start` noted."""
+def launch_folders(config, root=None, chat=""):
+    """The folders on this machine still connected to one project's chat (chat: "" for the
+    first), as `crewchat start` noted. config is the machine's; root the project's folder."""
     folders = []
     for path, place in sorted((config.get("folders") or {}).items()):
-        if Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
+        if folder_chat(config, path) == chat and Path(path).is_dir() and joined_place(Path(path), config, root)[0] == place:
             folders.append({"path": path, "name": Path(path).name, "place": place})
     return folders
 
 
-def launch_options(config, root=None):
-    """What the chat page's "Add an agent" offers on this machine."""
+def launch_options(config, root=None, chat=""):
+    """What the chat page's "Add an agent" offers on this machine, for one project."""
     tools = [{"id": t, "label": label} for t, (label, _) in LAUNCH_TOOLS.items() if find_tool(t, config)]
-    return {"tools": tools, "folders": launch_folders(config, root)}
+    return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
 def launch_command(exe, tool, key, accept_edits=False):
@@ -2731,32 +2962,47 @@ def cmd_start(args):
     print()
     first = not (home() / "config.json").exists()
     if first:
-        config = setup_host(args.project or project.name, args.port)
+        config = setup_host(args.chat or args.project or project.name, args.port)
         print("- Set up this machine as the chat's host (%s), for \"%s\"." % (home(), config["project"]))
     config = load_config()
 
     ensure_server(config, args)
 
-    place, token, clients = joined_place(project, config)
-    if place:
+    place, token, clients, chosen = connected_project(project, config)
+    if place and (not args.chat or find_chat(args.chat) == chosen):
         # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
         for client in clients:
             {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
-        remember(project, place)
-        print("- %s is connected, as \"%s\"." % (project, place))
+        remember(project, place, chat=chosen["chat"])
+        print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
     else:
-        # This machine has one chat. A further folder joins it, and is named after itself, so its
-        # agents are told apart from the first folder's (claude-notes-app, not claude-macbook-2).
-        others = [f for f in launch_folders(config) if Path(f["path"]) != project]
+        if place:
+            die("%s is in the project \"%s\". To move it, take it out first: `crewchat place remove %s "
+                "--chat %s`, then `crewchat start --chat %s`." % (project, chosen["name"], place, chosen["id"], args.chat))
+        # Each project is its own chat. A new folder starts a project named after itself, unless
+        # one by that name is here already (its folder on another machine, or a second folder) or
+        # --chat names one.
+        wanted = args.chat or args.project or project.name
+        chosen = list_projects()[0] if first else find_chat(wanted)
+        created = chosen is None
+        if created:
+            chosen = create_project(wanted)
+        # The first folder of a project on a machine is named after the machine (claude-macbook),
+        # others after themselves (claude-website, not claude-macbook-2).
+        others = [f for f in launch_folders(config, chosen["root"], chosen["chat"]) if Path(f["path"]) != project]
         label = args.place or (place_label(project.name) if others else "")
-        code = owner_call("/api/invite", {"place": label})["code"]
+        code = owner_call("/api/invite", {"place": label}, chat=chosen["id"])["code"]
         place = join_folder(local_url(config), code, project, label or None, args.client, quiet=True)
-        if others and not first:
-            print("- Added %s to this machine's chat, \"%s\", as \"%s\"." % (project, config["project"], place))
-            print("  A machine has one chat, and every folder you run `crewchat start` in joins it.")
-            print("  `crewchat places` lists them; `crewchat place remove %s` takes this one out." % place)
+        if created:
+            print("- Created the project \"%s\": its own chat, apart from your other projects (switch on the "
+                  "chat page, top left)." % chosen["name"])
+        if others:
+            print("- Added %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+            print("  `crewchat places` lists its folders; `crewchat place remove %s` takes this one out." % place)
         else:
-            print("- Connected %s, as \"%s\"." % (project, place))
+            print("- Connected %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+    global CURRENT_CHAT
+    CURRENT_CHAT = chosen["id"]
 
     if newer_version():
         print("- crewchat %s is available (this is %s): run `crewchat update`." % (newer_version(), __version__))
@@ -2800,7 +3046,7 @@ def cmd_serve(args):
         except Exception as e:  # the local chat keeps working on its own
             sys.stderr.write("%s linking with other machines is off: %s\n" % (now_iso(), e))
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
-        threading.Thread(target=update_checks, args=(server.RequestHandlerClass.hub,), daemon=True).start()
+        threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -2890,10 +3136,33 @@ def cmd_agent(args):
               "to shut a folder out, use `crewchat place remove`." % args.name)
 
 
+def project_root():
+    """The folder of the project owner commands act on (CURRENT_CHAT), else the first project's."""
+    found = find_chat(CURRENT_CHAT) if CURRENT_CHAT else None
+    return found["root"] if found else home()
+
+
 def cmd_places(_args):
     load_config()
-    names = list_places()
+    names = list_places(project_root())
     print("\n".join(names) if names else "No folder has joined yet. Start with `crewchat invite`.")
+
+
+def cmd_projects(_args):
+    config = load_config()
+    projects = list_projects()
+    shared = config.get("peers") or config.get("cloud")
+    for entry in projects:
+        folders = sorted(path for path in (config.get("folders") or {}) if folder_chat(config, path) == entry["chat"])
+        mark = " (here)" if entry["id"] == CURRENT_CHAT else ""
+        link = ", shared with your linked machines" if shared and entry is projects[0] else ""
+        print("%s%s  [--chat %s]%s" % (entry["name"], mark, entry["id"], link))
+        for folder in folders:
+            print("    %s" % folder)
+        if not folders:
+            print("    (no folder on this machine)")
+    print("\nA new project: `crewchat start` in a new folder. A folder into an existing project: "
+          "`crewchat start --chat NAME`.")
 
 
 def cmd_place(args):
@@ -2907,7 +3176,7 @@ def cmd_ui(args):
         print("Sign-in code (works once, for two minutes): %s-%s" % (code[:4], code[4:]))
         print("Open the chat's address on your other device and type it in.")
         return
-    webbrowser.open(local_url() + "/login?code=" + code)
+    webbrowser.open(local_url() + "/login?code=" + code + ("&chat=" + CURRENT_CHAT if CURRENT_CHAT else ""))
     print("Opened the chat in your browser.")
 
 
@@ -2976,7 +3245,8 @@ def cmd_role(args):
 
 
 def cmd_roles(args):
-    config = load_config()
+    root = project_root()
+    config = load_config(root)
     custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
     roles = all_roles(config)
     if args.action == "list":
@@ -2999,7 +3269,7 @@ def cmd_roles(args):
             die("give the role's instructions with --prompt \"...\" or --file FILE")
         custom[name] = {"title": args.title or name.replace("-", " ").capitalize(), "prompt": prompt.strip()}
         config["roles"] = custom
-        save_config(config)
+        save_config(config, root)
         print("Role %s saved%s. Give it to an agent with: crewchat role AGENT %s" % (
             name, " (it replaces the built-in one)" if name in ROLES else "", name))
     else:
@@ -3007,7 +3277,7 @@ def cmd_roles(args):
             die("no custom role called %s%s" % (name, " (built-in roles cannot be removed)" if name in ROLES else ""))
         del custom[name]
         config["roles"] = custom
-        save_config(config)
+        save_config(config, root)
         print("Role %s removed. Agents that had it keep it until you change their role." % name)
 
 
@@ -3226,7 +3496,7 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
         written += install_cursor(project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
     if (home() / "config.json").exists() and url == local_url():
-        remember(project, place)
+        remember(project, place, chat=answer.get("chat", ""))
     if quiet:
         if not ignored:
             print("- %s hold a secret token: do not commit them." % ", ".join(written))
@@ -3843,7 +4113,7 @@ def check_for_update():
     return newer_version()
 
 
-def update_checks(hub):
+def update_checks(projects):
     """The server's daily check for a newer crewchat: logged once per version, and shown on the
     chat page. CREWCHAT_NO_UPDATE_CHECK=1 turns it off."""
     told = ""
@@ -3856,7 +4126,8 @@ def update_checks(hub):
             sys.stderr.write("%s crewchat %s is available (this is %s): run `crewchat update`. %s\n"
                              % (now_iso(), newer, __version__, RELEASES))
             told = newer
-        hub.set_update(newer)
+        for project in projects.all():  # every project's page shows the notice
+            project.hub.set_update(newer)
         time.sleep(UPDATE_EVERY)
 
 
@@ -4321,6 +4592,8 @@ body {
 aside { border-right: 1px solid var(--line); padding: 20px 16px; overflow-y: auto; }
 h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywhere; display: flex; align-items: center; gap: 9px; }
 .logo { width: 30px; height: 30px; flex: none; }
+#projects { font: inherit; font-weight: 700; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 3px 6px; max-width: 100%; min-width: 0; cursor: pointer; }
 .sub { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
 .agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
 .agent .top { display: flex; align-items: center; gap: 8px; }
@@ -4428,7 +4701,7 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
 </head>
 <body>
 <aside>
-  <h1>__LOGO__<span id="project">crewchat</span></h1>
+  <h1>__LOGO__<span id="project">crewchat</span><select id="projects" aria-label="Project" hidden></select></h1>
   <p class="sub">Everything your agents say to each other, live.</p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
@@ -4503,8 +4776,40 @@ function ago(seen, now) {
 }
 
 // POST to the chat server. Sends the page to sign-in on 401; throws the server's error otherwise.
+// The project this page shows (?chat=, or the first one): every request names it.
+const CHAT = new URLSearchParams(location.search).get("chat") || "";
+function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "chat=" + encodeURIComponent(CHAT) : path; }
+
+// Several projects: a menu to switch, marking the ones with messages since you last looked there.
+document.addEventListener("change", (e) => {
+  if (e.target && e.target.id === "projects") location.href = "/?chat=" + encodeURIComponent(e.target.value);
+});
+function seen(id, last) {
+  try {
+    if (last === undefined) return Number(localStorage.getItem("crewchat-seen-" + id) || 0);
+    localStorage.setItem("crewchat-seen-" + id, String(last));
+  } catch (e) {}
+  return 0;
+}
+function renderProjects(list, current) {
+  const menu = $("projects");
+  if (!list || list.length < 2) { menu.hidden = true; $("project").hidden = false; return; }
+  const mine = list.find((p) => p.id === current);
+  if (mine) seen(mine.id, mine.last);
+  if (menu === document.activeElement) return;  // open: do not rebuild it under the pointer
+  menu.replaceChildren(...list.map((p) => {
+    const fresh = p.id !== current && p.last > seen(p.id);
+    // \u21c4: shared with your other machines (stage 1: the first project only).
+    const option = new Option(p.name + (p.linked ? " \u21c4" : "") + (fresh ? "  \u2022 new" : ""), p.id);
+    option.selected = p.id === current;
+    return option;
+  }));
+  menu.hidden = false;
+  $("project").hidden = true;
+}
+
 async function postJSON(path, body) {
-  const res = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" },
+  const res = await fetch(api(path), { method: "POST", headers: { "Content-Type": "application/json" },
                                   body: JSON.stringify(body) });
   if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
@@ -4516,7 +4821,7 @@ async function openLaunch() {
   note.textContent = ""; $("l-start").disabled = false;
   dialog.showModal();
   try {
-    const res = await fetch("/api/launch", { cache: "no-store" });
+    const res = await fetch(api("/api/launch"), { cache: "no-store" });
     if (res.status === 401) { location.href = "/login"; return; }
     const opts = await res.json();
     $("l-tool").replaceChildren(...opts.tools.map((t) => new Option(t.label, t.id)));
@@ -4742,7 +5047,7 @@ async function loop() {
     try {
       const wait = state.version < 0 ? 0 : 25;
       // With more messages to catch up on, ask again at once (a version that never matches).
-      const res = await fetch("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait,
+      const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
                               { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
       if (!res.ok) throw new Error("HTTP " + res.status);
@@ -4760,6 +5065,7 @@ async function loop() {
         $("project").textContent = data.project;
         if (!state.missed) document.title = state.title;
       }
+      renderProjects(data.projects, data.chat);
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
@@ -4814,7 +5120,7 @@ function renderPending() {
 }
 
 async function uploadFile(file) {
-  const res = await fetch("/api/upload", { method: "POST", body: file,
+  const res = await fetch(api("/api/upload"), { method: "POST", body: file,
     headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } });
   if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
   if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
@@ -5059,6 +5365,15 @@ def build_parser():
     p.add_argument("--token", help="with --url: the folder's token (or set CREWCHAT_TOKEN)")
     p.set_defaults(fn=cmd_stdio)
 
+    p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
+    p.set_defaults(fn=cmd_projects)
+
+    for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status"):
+        sub.choices[name].add_argument("--chat", metavar="PROJECT",
+                                       help="the project (default: the one of the folder you are in)"
+                                       if name != "start" else "put this folder in this project (a new one if "
+                                       "none is called that); default: a project named after the folder")
+
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])
     p.add_argument("event", choices=["prompt", "stop"])
@@ -5075,6 +5390,15 @@ def main(argv=None):
     if not getattr(args, "fn", None):
         parser.print_help()
         return
+    global CURRENT_CHAT
+    CURRENT_CHAT = None
+    if getattr(args, "chat", None) and args.fn is not cmd_start:
+        found = find_chat(args.chat) if (home() / "config.json").exists() else None
+        if found is None:
+            die("no project called %s here; `crewchat projects` lists them" % args.chat)
+        CURRENT_CHAT = found["id"]
+    elif args.fn not in (cmd_start, cmd_hook):
+        CURRENT_CHAT = chat_of_folder(Path.cwd())
     args.fn(args)
 
 
