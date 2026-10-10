@@ -926,7 +926,7 @@ class Joining(Base):
         folder = self.project().resolve()
         out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Desk")
         self.assertIn("The server is running at %s." % self.base, out)
-        self.assertIn('- Connected %s, as "desk".' % folder, out)
+        self.assertRegex(out, r'- (Connected|Added) %s(,| to this machine\'s chat, "Demo",) as "desk"\.' % re.escape(str(folder)))
         token = crewchat.read_token("desk")
         mcp = json.loads((folder / ".mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(mcp["headers"]["Authorization"], "Bearer " + token)
@@ -935,6 +935,20 @@ class Joining(Base):
         out = cli("start", str(folder), "--no-open", "--no-service")
         self.assertIn('%s is connected, as "desk".' % folder, out)
         self.assertEqual(crewchat.list_places(), places)  # no second place for the same folder
+
+    def test_start_in_another_folder_joins_the_same_chat_under_the_folders_name(self):
+        first = self.project().resolve()
+        cli("start", str(first), "--no-open", "--no-service")
+        other = (Path(tempfile.mkdtemp(dir=TMP)) / "notes-app").resolve()
+        other.mkdir()
+        out = cli("start", str(other), "--no-open", "--no-service")
+        self.assertIn('- Added %s to this machine\'s chat, "Demo", as "notes-app".' % other, out)
+        self.assertIn("every folder you run `crewchat start` in joins it", out)
+        self.assertIn("claude-notes-app, claude-notes-app-2", out)
+        self.assertIn("notes-app", crewchat.list_places())
+
+    def test_the_banner_is_plain_when_not_on_a_terminal(self):
+        self.assertEqual(crewchat.banner(io.StringIO()), "crewchat " + crewchat.__version__)
 
     def test_a_join_code_works_once_and_wrong_codes_fail(self):
         args = self.invite("--client", "generic")

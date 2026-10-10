@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -186,6 +186,45 @@ def now_iso(ts=None):
 
 def sha(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+TAGLINE = "one group chat for all your AI agents"
+
+
+def banner(stream=None):
+    """The logo, a speech bubble holding three connected agents, with the name and version: in
+    colour on a terminal that can show it, else the plain name and version."""
+    stream = stream or sys.stdout
+    plain = "crewchat %s" % __version__
+    try:
+        if not stream.isatty() or os.environ.get("TERM") == "dumb":
+            return plain
+        "\u256d\u25cf\u2571".encode(stream.encoding or "ascii")
+    except (AttributeError, ValueError, UnicodeError, LookupError):
+        return plain
+    colour = not os.environ.get("NO_COLOR") and (os.name != "nt" or windows_vt())
+    b, w, d, r = ("\033[38;5;69m", "\033[1;97m", "\033[38;5;250m", "\033[0m") if colour else ("",) * 4
+    return "\n".join([
+        "%s\u256d\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e%s" % (b, r),
+        "%s\u2502%s     %s\u25cf%s     %s\u2502%s   %screwchat%s %s" % (b, r, w, r, b, r, w, r, __version__),
+        "%s\u2502%s    %s\u2571 \u2572%s    %s\u2502%s   %s" % (b, r, d, r, b, r, TAGLINE),
+        "%s\u2502%s   %s\u25cf%s\u2500\u2500\u2500%s\u25cf%s   %s\u2502%s" % (b, r, w, d, w, r, b, r),
+        "%s\u2570\u2500\u2500\u256e \u256d\u2500\u2500\u2500\u2500\u2500\u2500\u256f%s" % (b, r),
+        "%s   \u2502\u2571%s" % (b, r),
+    ])
+
+
+def windows_vt():
+    """Switch this Windows console to understanding colour codes. True if it does."""
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        handle = kernel.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        return bool(kernel.GetConsoleMode(handle, ctypes.byref(mode))
+                    and kernel.SetConsoleMode(handle, mode.value | 0x0004))
+    except Exception:
+        return False
 
 
 def die(message):
@@ -2626,8 +2665,10 @@ def cmd_start(args):
     project = Path(args.folder or ".").resolve()
     if not project.is_dir():
         die("%s is not a folder" % project)
-    print("crewchat %s" % __version__)
-    if not (home() / "config.json").exists():
+    print(banner())
+    print()
+    first = not (home() / "config.json").exists()
+    if first:
         config = setup_host(args.project or project.name, args.port)
         print("- Set up this machine as the chat's host (%s), for \"%s\"." % (home(), config["project"]))
     config = load_config()
@@ -2666,9 +2707,18 @@ def cmd_start(args):
         remember(project, place)
         print("- %s is connected, as \"%s\"." % (project, place))
     else:
-        code = owner_call("/api/invite", {"place": args.place or ""})["code"]
-        place = join_folder(local_url(config), code, project, args.place, args.client, quiet=True)
-        print("- Connected %s, as \"%s\"." % (project, place))
+        # This machine has one chat. A further folder joins it, and is named after itself, so its
+        # agents are told apart from the first folder's (claude-notes-app, not claude-macbook-2).
+        others = [f for f in launch_folders(config) if Path(f["path"]) != project]
+        label = args.place or (place_label(project.name) if others else "")
+        code = owner_call("/api/invite", {"place": label})["code"]
+        place = join_folder(local_url(config), code, project, label or None, args.client, quiet=True)
+        if others and not first:
+            print("- Added %s to this machine's chat, \"%s\", as \"%s\"." % (project, config["project"], place))
+            print("  A machine has one chat, and every folder you run `crewchat start` in joins it.")
+            print("  `crewchat places` lists them; `crewchat place remove %s` takes this one out." % place)
+        else:
+            print("- Connected %s, as \"%s\"." % (project, place))
 
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))

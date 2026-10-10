@@ -6,14 +6,14 @@
 # own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   $env:CREWCHAT_VERSION = "0.9.6"   install this release ("main" for the latest code)
+#   $env:CREWCHAT_VERSION = "0.9.7"   install this release ("main" for the latest code)
 #   $env:CREWCHAT_LEAN = "1"          leave out cloud sync (about 70 MB of libraries)
 #   $env:CREWCHAT_SOURCE = "PATH"     install from a local checkout (for testing this script)
 # Native programs report failure through $LASTEXITCODE, checked after each one. ("Stop" would
 # also turn uv's progress output into errors in Windows PowerShell 5.1.)
 $ErrorActionPreference = "Continue"
 
-$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.6" }
+$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "0.9.7" }
 $Repo = "https://github.com/deepankar17/crewchat"
 
 if ($env:CREWCHAT_SOURCE) { $Source = $env:CREWCHAT_SOURCE }
@@ -71,6 +71,26 @@ $Exe = Join-Path $Bin "crewchat.exe"
 $Installed = & $Exe --version
 if ($LASTEXITCODE -ne 0 -or -not $Installed) { throw "crewchat installed but does not run; try: $Exe --version" }
 
+# The logo (a speech bubble holding three connected agents), on a console that can show it. It is
+# built from character codes so this file stays plain ASCII, which Windows PowerShell reads right
+# however it is started.
+function Show-Logo([string]$Ver) {
+    if ([Console]::IsOutputRedirected) { return }
+    $plain = [bool]$env:NO_COLOR
+    function Part([string]$Text, [string]$Colour) {
+        if ($plain -or -not $Colour) { Write-Host $Text -NoNewline } else { Write-Host $Text -NoNewline -ForegroundColor $Colour }
+    }
+    $h = [string][char]0x2500; $v = [string][char]0x2502; $dot = [string][char]0x25CF
+    Write-Host ""
+    Part ("  " + [char]0x256D + ($h * 11) + [char]0x256E) Blue; Write-Host ""
+    Part "  $v" Blue; Part "     $dot     " White; Part $v Blue; Part "   crewchat " White; Write-Host $Ver
+    Part "  $v" Blue; Part ("    " + [char]0x2571 + " " + [char]0x2572 + "    ") Gray; Part $v Blue; Write-Host "   one group chat for all your AI agents"
+    Part "  $v" Blue; Part "   $dot" White; Part ($h * 3) Gray; Part "$dot   " White; Part $v Blue; Write-Host ""
+    Part ("  " + [char]0x2570 + ($h * 2) + [char]0x256E + " " + [char]0x256D + ($h * 6) + [char]0x256F) Blue; Write-Host ""
+    Part ("     " + $v + [char]0x2571) Blue; Write-Host ""
+}
+
+Show-Logo ($Installed -replace '^crewchat ', '')
 Write-Host ""
 Write-Host "Installed $Installed."
 if (-not (($env:Path -split ";") -contains $Bin)) {

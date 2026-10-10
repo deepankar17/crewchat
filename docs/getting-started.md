@@ -204,8 +204,11 @@ one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
 
 ## More folders
 
-Run `crewchat start` in each folder on the same machine; they all join the same chat. To shut a
-folder out: `crewchat places` lists them, `crewchat place remove NAME` removes one at once.
+A machine runs one chat, named after the folder you first ran `crewchat start` in. Running it in
+another folder adds that folder to the same chat, and says so; the chat page stays the same one.
+The first folder's agents are named after the machine (`claude-macbook`), later folders' after the
+folder (`claude-website`), so you can tell them apart. `crewchat places` lists the folders, and
+`crewchat place remove NAME` takes one out at once.
 
 For agents on another machine, see [Several machines](multiple-machines.md).
 

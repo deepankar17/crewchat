@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.7
+
+**A logo in the terminal, and a second folder says what it joined.**
+
+- The installers and `crewchat start` show crewchat's logo, a speech bubble holding three
+  connected agents, on a terminal that can show it. Logs and pipes get plain text, and
+  `NO_COLOR` turns the colour off.
+- `crewchat start` in another folder on the same machine now says that the folder joined the
+  machine's existing chat, and how to list or remove folders. Its agents are named after the
+  folder (`claude-website`), not the machine with a number (`claude-macbook-2`).
+
 ## Not released yet
 
 - `crewchat peers leave` and `crewchat peers remove`, typed in a terminal, now say which machine

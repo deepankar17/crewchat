@@ -8,12 +8,12 @@
 # Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   CREWCHAT_VERSION=0.9.6   install this release instead of the one below ("main" for the latest code)
+#   CREWCHAT_VERSION=0.9.7   install this release instead of the one below ("main" for the latest code)
 #   CREWCHAT_LEAN=1          leave out cloud sync (about 70 MB of libraries); the chat works the same
 #   CREWCHAT_SOURCE=PATH     install from a local checkout (for testing this script)
 set -eu
 
-VERSION="${CREWCHAT_VERSION:-0.9.6}"
+VERSION="${CREWCHAT_VERSION:-0.9.7}"
 REPO="https://github.com/deepankar17/crewchat"
 
 say() { printf '%s\n' "$*"; }
@@ -63,8 +63,28 @@ say "Installing crewchat $VERSION..."
 BIN="$("$UV" tool dir --bin 2>/dev/null || echo "$HOME/.local/bin")"
 "$BIN/crewchat" --version >/dev/null 2>&1 || fail "crewchat installed but does not run; try: $BIN/crewchat --version"
 
+# The logo (a speech bubble holding three connected agents), on a terminal that can show it.
+logo() {
+  if [ -t 1 ] && [ "${TERM:-}" != dumb ] && locale charmap 2>/dev/null | grep -qi 'utf-\{0,1\}8'; then
+    if [ -z "${NO_COLOR:-}" ]; then
+      b=$(printf '\033[38;5;69m'); w=$(printf '\033[1;97m'); d=$(printf '\033[38;5;250m'); r=$(printf '\033[0m')
+    else
+      b=; w=; d=; r=
+    fi
+    say ""
+    say "  ${b}╭───────────╮${r}"
+    say "  ${b}│${r}     ${w}●${r}     ${b}│${r}   ${w}crewchat${r} $1"
+    say "  ${b}│${r}    ${d}╱ ╲${r}    ${b}│${r}   one group chat for all your AI agents"
+    say "  ${b}│${r}   ${w}●${d}───${w}●${r}   ${b}│${r}"
+    say "  ${b}╰──╮ ╭──────╯${r}"
+    say "  ${b}   │╱${r}"
+  fi
+}
+
+INSTALLED="$("$BIN/crewchat" --version)"
+logo "${INSTALLED#crewchat }"
 say ""
-say "Installed $("$BIN/crewchat" --version)."
+say "Installed $INSTALLED."
 case ":$PATH:" in
   *":$BIN:"*) ;;
   *) say "Open a new terminal first (or run: export PATH=\"$BIN:\$PATH\"), so the crewchat command is found." ;;

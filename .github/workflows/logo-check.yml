@@ -1,0 +1,20 @@
+name: logo check
+on:
+  push:
+    branches: [logo-0.9.7]
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show-Logo from install.ps1 (as on a console)
+        shell: powershell
+        run: |
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errors)
+          if ($errors) { $errors; exit 1 }
+          $fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq 'Show-Logo' }, $true) | Select-Object -First 1
+          Invoke-Expression ($fn.Extent.Text -replace '\[Console\]::IsOutputRedirected', '$false')
+          $out = Show-Logo "0.9.7" 6>&1 | Out-String
+          $out
+          $bytes = [Text.Encoding]::UTF8.GetBytes($out); "utf8 hex of line 1: " + (($bytes[0..40] | ForEach-Object { $_.ToString('x2') }) -join ' ')
+          if ($out -notmatch [char]0x25CF) { "no dots"; exit 1 }
