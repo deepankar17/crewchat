@@ -692,9 +692,21 @@ class Account:
         self._change_trust(lambda devices: {k: v for k, v in devices.items() if k != target_id})
         self.store.delete("devices/" + target_id)
         self.store.delete("state/" + target_id)
-        if target_id != device.id:
+        if not ((self.store.get("meta/trust") or {}).get("devices")):
+            self._reset()
+        elif target_id != device.id:
             self.rotate()
         return doc.get("name", target_id)
+
+    def _reset(self):
+        """The last trusted device left. No one holds the account key any more, so what is left in
+        the cloud can never be read again: clear it, so that the next machine to set up founds the
+        account afresh instead of waiting for an approval no one can give."""
+        for collection in ("messages", "tasks", "state", "devices"):
+            for doc_id, _ in self.store.list(collection):
+                self.store.delete("%s/%s" % (collection, doc_id))
+        self.store.delete("meta/trust")
+        self.store.delete("meta/account")
 
     def rotate(self):
         device = self.device

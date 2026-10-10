@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.1
+
+- Cloud sync: when the last approved machine logs out, nobody holds the account key any more, so
+  what was left in Firestore could never be read again, and the next machine to set up waited for
+  an approval no one could give. The last logout now clears the account's data from Firestore, and
+  the next machine founds the account afresh.
+
 ## 0.11.0
 
 **Linked machines share every project by name.**

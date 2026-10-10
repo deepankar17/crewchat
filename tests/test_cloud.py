@@ -322,6 +322,28 @@ class Sync(unittest.TestCase):
         c.stop()
 
 
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class FreshStart(unittest.TestCase):
+    def test_when_the_last_machine_leaves_the_next_one_founds_the_account_afresh(self):
+        store = cloud.MemoryStore()
+        a, b = Machine(store, "mac"), Machine(store, "windows")
+        a.account.approve("windows", expect_fp=b.device.fp)
+        wait_until(lambda: b.device.ready, message="the approval")
+        a.say("all", "before anyone leaves")
+        wait_until(lambda: b.has("before anyone leaves"))
+        b.account.remove(b.device.id)  # one machine leaves: the account carries on
+        self.assertIsNotNone(store.get("meta/account"))
+        a.account.remove(a.device.id)  # the last one leaves: nothing anyone can read is left
+        self.assertEqual([p for p in store.docs if not p.startswith("meta/")], [])
+        self.assertIsNone(store.get("meta/account"))
+        self.assertIsNone(store.get("meta/trust"))
+        c = Machine(store, "new-laptop")
+        self.assertEqual(c.result, "founded")  # not left waiting for an approval no one can give
+        self.assertTrue(c.device.ready)
+        for m in (a, b, c):
+            m.stop()
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 
