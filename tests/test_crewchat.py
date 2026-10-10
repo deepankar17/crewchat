@@ -1779,7 +1779,9 @@ class Lifecycle(Base):
         self.assertIsNone(project.get(entry["id"]))
 
     def test_a_skill_file_cannot_name_a_drive_or_leave_its_folder(self):
-        for bad in ("C:foo", "a\\b", "../x", "/etc/x"):
+        # On Windows a backslash is a folder separator (a\\b is a subfolder, which is fine); elsewhere
+        # it is part of a name that would become a path on a Windows machine, so it is refused.
+        for bad in ("C:foo", "../x", "/etc/x") + (() if os.name == "nt" else ("a\\b",)):
             with self.assertRaises(crewchat.HubError, msg=bad):
                 self.hub.add_skill("guarded", {"SKILL.md": "x", bad: "y"})
         self.assertNotIn("guarded", crewchat.project_skills(crewchat.home()))
