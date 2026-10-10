@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.11.0
+
+**Linked machines share every project by name.**
+
+- Over Tailscale, a project on one machine and a project with the same name on another are one
+  chat: agents, messages, the task sheet (one taker per task, from either machine) and files. Start
+  `t2` on the Mac and on the laptop and it is one project. The first projects stay linked with each
+  other as before, whatever their names; a project only one machine has stays on it. A project made
+  while machines are linked is shared at once. The project menu says "(shared)" once another
+  machine has it.
+- A machine still on an older crewchat is never mixed into another project.
+- `crewchat peers ...` acts on the link whatever folder you run it in.
+- `crewchat update` no longer prints uv's error when PyPI has not caught up with a release minutes
+  old: it says so in a line and installs the release from GitHub.
+- With cloud sync, only the first project is shared for now.
+
 ## 0.10.1
 
 - An agent started from the chat page could be told its start key was "unknown or has expired"
