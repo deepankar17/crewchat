@@ -1315,6 +1315,80 @@ class Service(unittest.TestCase):
         self.assertIn("serve --log", action)
         self.assertIn("CREWCHAT_HOME", action)  # the tests run with a custom home
 
+    def windows(self, schtasks_ok):
+        """crewchat's Windows service code with a stand-in registry and Task Scheduler."""
+        from unittest import mock
+        values = {}
+
+        class Key:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def query(key, name):
+            if name not in values:
+                raise FileNotFoundError(name)
+            return values[name], 1
+
+        def delete(key, name):
+            if name not in values:
+                raise FileNotFoundError(name)
+            del values[name]
+
+        winreg = mock.Mock(HKEY_CURRENT_USER=1, REG_SZ=1, OpenKey=lambda *a: Key(), CreateKey=lambda *a: Key(),
+                           QueryValueEx=query, DeleteValue=delete,
+                           SetValueEx=lambda key, name, _, kind, value: values.__setitem__(name, value))
+        calls = []
+
+        def run(command):
+            calls.append(command)
+            task = command[:2] in (["schtasks", "/Create"], ["schtasks", "/Query"]) and schtasks_ok
+            out = ("<Command>set CREWCHAT_HOME=%s&amp;&amp; serve</Command>" % crewchat.home()) if task else ""
+            return mock.Mock(returncode=0 if task or command[1] in ("/End", "/Delete", "/Run") else 1,
+                             stdout=out, stderr="" if task else "ERROR: Access is denied.")
+
+        patches = [mock.patch.dict(sys.modules, {"winreg": winreg}), mock.patch.object(crewchat, "run", run),
+                   mock.patch.object(crewchat, "start_background"),
+                   mock.patch.object(crewchat, "server_up", return_value=False),
+                   mock.patch.object(crewchat, "load_config", return_value={"port": 1})]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return values, calls
+
+    def test_without_an_administrator_windows_starts_it_from_the_startup_programs(self):
+        values, calls = self.windows(schtasks_ok=False)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            crewchat.cmd_service_windows(crewchat.argparse.Namespace(action="install", keep_awake=False))
+        self.assertEqual(values["crewchat"], crewchat.windows_command())
+        self.assertIn("from your startup programs", out.getvalue())
+        self.assertIn("Access is denied", out.getvalue())
+        crewchat.start_background.assert_called_once()  # running now, not only after the next log on
+        self.assertEqual(crewchat.windows_service(), "run")
+        with contextlib.redirect_stdout(io.StringIO()):
+            crewchat.cmd_service_windows(crewchat.argparse.Namespace(action="uninstall", keep_awake=False))
+        self.assertNotIn("crewchat", values)
+        self.assertIsNone(crewchat.windows_service())
+
+    def test_with_task_scheduler_there_is_no_startup_entry_as_well(self):
+        values, calls = self.windows(schtasks_ok=True)
+        values["crewchat"] = "an old entry"
+        with contextlib.redirect_stdout(io.StringIO()):
+            crewchat.cmd_service_windows(crewchat.argparse.Namespace(action="install", keep_awake=False))
+        self.assertNotIn("crewchat", values)
+        self.assertIn(["schtasks", "/Run", "/TN", "crewchat"], calls)
+        self.assertEqual(crewchat.windows_service(), "task")
+
+    def test_a_startup_entry_for_another_chat_is_not_ours(self):
+        values, _ = self.windows(schtasks_ok=False)
+        values["crewchat"] = 'cmd /c "set CREWCHAT_HOME=C:\\elsewhere&& pythonw crewchat.py serve"'
+        self.assertIsNone(crewchat.windows_service())
+        values["crewchat"] = crewchat.windows_command()
+        self.assertEqual(crewchat.windows_service(), "run")
+
     def test_service_files_run_this_program(self):
         plist = crewchat.launchd_plist(keep_awake=True)
         self.assertIn("<string>/usr/bin/caffeinate</string>", plist)

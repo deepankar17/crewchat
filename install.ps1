@@ -64,15 +64,6 @@ if ($LASTEXITCODE -ne 0 -and $Fallback) {
     & $Uv tool install --force --python 3.12 (Spec $Fallback)
 }
 if ($LASTEXITCODE -ne 0) { throw "crewchat did not install (uv exit code $LASTEXITCODE)" }
-if ($Restart) {
-    schtasks /Query /TN crewchat *> $null
-    if ($LASTEXITCODE -eq 0) {
-        schtasks /Run /TN crewchat *> $null
-        Write-Host "Started the crewchat server again."
-    } else {
-        Write-Host "The crewchat server was stopped for the upgrade: start it again with crewchat start."
-    }
-}
 & $Uv tool update-shell *> $null
 
 $Bin = (& $Uv tool dir --bin).Trim()
@@ -80,6 +71,16 @@ if (-not $Bin) { $Bin = Join-Path $env:USERPROFILE ".local\bin" }
 $Exe = Join-Path $Bin "crewchat.exe"
 $Installed = & $Exe --version
 if ($LASTEXITCODE -ne 0 -or -not $Installed) { throw "crewchat installed but does not run; try: $Exe --version" }
+if ($Restart) {
+    # The new crewchat starts its server the way it starts at log on: Task Scheduler, or the
+    # user's startup programs when Task Scheduler needed an administrator.
+    & $Exe restart *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Started the crewchat server again."
+    } else {
+        Write-Host "The crewchat server was stopped for the upgrade: start it again with crewchat start."
+    }
+}
 
 # The logo (a speech bubble holding three connected agents), on a console that can show it. It is
 # built from character codes so this file stays plain ASCII, which Windows PowerShell reads right

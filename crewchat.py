@@ -3598,37 +3598,95 @@ def run(command):
     return subprocess.run(command, capture_output=True, text=True)
 
 
-def windows_task():
-    """The Task Scheduler command that starts crewchat at log on, with no console window."""
+def windows_command():
+    """The command that runs the server at log on, with no console window."""
     python, script = self_command()
     windowless = str(Path(python).with_name("pythonw.exe")) if Path(python).name.lower() == "python.exe" else python
     action = '"%s" "%s" serve --log "%s"' % (windowless, script, home() / "hub.log")
     if os.environ.get("CREWCHAT_HOME"):
         action = 'cmd /c "set CREWCHAT_HOME=%s&& %s"' % (home(), action)
-    return ["schtasks", "/Create", "/TN", "crewchat", "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR", action]
+    return action
+
+
+def windows_task():
+    """The Task Scheduler command that starts crewchat at log on."""
+    return ["schtasks", "/Create", "/TN", "crewchat", "/SC", "ONLOGON", "/RL", "LIMITED", "/F", "/TR",
+            windows_command()]
+
+
+# Task Scheduler wants an administrator for a task that starts at log on, so in an everyday
+# PowerShell crewchat goes in the user's own startup programs instead: a value under this key.
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def run_entry(value=None, remove=False):
+    """The user's startup-programs entry for crewchat: read it (None if there is none), set it to
+    `value`, or with `remove` delete it."""
+    import winreg
+    if value is None and not remove:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+                return winreg.QueryValueEx(key, SERVER_NAME)[0]
+        except OSError:
+            return None
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+        if remove:
+            try:
+                winreg.DeleteValue(key, SERVER_NAME)
+            except OSError:
+                pass
+        else:
+            winreg.SetValueEx(key, SERVER_NAME, 0, winreg.REG_SZ, value)
+    return None
+
+
+def windows_service():
+    """How this chat starts at log on on Windows: "task" (Task Scheduler), "run" (the user's
+    startup programs) or None. One that belongs to another CREWCHAT_HOME does not count."""
+    out = run(["schtasks", "/Query", "/TN", "crewchat", "/XML"])
+    if out.returncode == 0 and service_home_is_ours(re.search(r"set CREWCHAT_HOME=(.*?)&amp;&amp;", out.stdout)):
+        return "task"
+    entry = run_entry()
+    if entry is not None and service_home_is_ours(re.search(r"set CREWCHAT_HOME=(.*?)&&", entry)):
+        return "run"
+    return None
 
 
 def cmd_service_windows(args):
     if args.action == "install":
         out = run(windows_task())
-        if out.returncode != 0:
-            die("could not add the Task Scheduler task: %s" % (out.stderr.strip() or out.stdout.strip()))
-        run(["schtasks", "/Run", "/TN", "crewchat"])
-        print("crewchat now starts when you log on to Windows. Log: %s" % (home() / "hub.log"))
+        if out.returncode == 0:
+            run_entry(remove=True)  # one way to start at log on, not two
+            run(["schtasks", "/Run", "/TN", "crewchat"])
+            print("crewchat now starts when you log on to Windows. Log: %s" % (home() / "hub.log"))
+        else:
+            refused = out.stderr.strip() or out.stdout.strip()
+            try:
+                run_entry(windows_command())
+            except OSError as e:
+                die("could not add crewchat to Task Scheduler (%s) or to your startup programs (%s)" % (refused, e))
+            if not server_up(load_config()):
+                start_background()
+            print("crewchat now starts when you log on to Windows, from your startup programs (Task "
+                  "Scheduler needs an administrator: %s). Log: %s" % (refused, home() / "hub.log"))
         print("Windows may still sleep when idle: agents on other machines lose the chat while it sleeps.")
     elif args.action == "uninstall":
         run(["schtasks", "/End", "/TN", "crewchat"])
         run(["schtasks", "/Delete", "/TN", "crewchat", "/F"])
+        run_entry(remove=True)
         print("crewchat no longer starts at log on.")
     elif args.action == "restart":
-        run(["schtasks", "/End", "/TN", "crewchat"])
-        out = run(["schtasks", "/Run", "/TN", "crewchat"])
-        if out.returncode != 0:
-            die("could not restart: is the service installed? (%s)" % (out.stderr.strip() or out.stdout.strip()))
+        kind = windows_service()
+        if kind is None:
+            die("crewchat does not start at log on here; use `crewchat restart`.")
+        config = load_config()
+        stop_server(config)
+        start_server(config)
         print("Restarted.")
     else:
-        installed = run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0
-        print("Service: %s" % ("installed" if installed else "not installed"))
+        kind = windows_service()
+        print("Service: %s" % {"task": "installed (Task Scheduler)", "run": "installed (startup programs)",
+                               None: "not installed"}[kind])
         cmd_status(args)
 
 
@@ -3748,18 +3806,19 @@ def service_installed():
     """Is crewchat's login service set up, and for this chat? A machine has one such service; it
     belongs to another chat when it was set up with another CREWCHAT_HOME, and is then left alone."""
     if os.name == "nt":
-        out = run(["schtasks", "/Query", "/TN", "crewchat", "/XML"])
-        if out.returncode != 0:
-            return False
-        found = re.search(r"set CREWCHAT_HOME=(.*?)&amp;&amp;", out.stdout)
-    else:
-        path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
-                else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
-        try:
-            text = path.read_text(encoding="utf-8")
-        except OSError:
-            return False
-        found = re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)", text)
+        return windows_service() is not None
+    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
+            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return service_home_is_ours(re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)",
+                                          text))
+
+
+def service_home_is_ours(found):
+    """Is the CREWCHAT_HOME a service sets (a regex match, or None for none: ~/.crewchat) this chat's?"""
     service_home = next((g for g in found.groups() if g), None) if found else None
     try:
         return Path(service_home or "~/.crewchat").expanduser().resolve() == home().resolve()
@@ -3773,7 +3832,9 @@ def stop_server(config):
     was_up = server_up(config)
     if service_installed():
         if os.name == "nt":
-            run(["schtasks", "/End", "/TN", "crewchat"])
+            if windows_service() == "task":
+                run(["schtasks", "/End", "/TN", "crewchat"])
+            # From startup programs it is a plain process: the shutdown below stops it.
         elif sys.platform == "darwin":
             run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
         else:
@@ -3794,7 +3855,10 @@ def start_server(config):
     """Start the server: through its login service if it has one, else in the background."""
     if service_installed():
         if os.name == "nt":
-            run(["schtasks", "/Run", "/TN", "crewchat"])
+            if windows_service() == "task":
+                run(["schtasks", "/Run", "/TN", "crewchat"])
+            else:
+                start_background()
         elif sys.platform == "darwin":
             plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
             if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)]).returncode != 0:
