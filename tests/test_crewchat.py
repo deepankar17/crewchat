@@ -1349,6 +1349,16 @@ class NewProject(unittest.TestCase):
         entry = crewchat.create_project("t3", self.base)
         self.assertEqual((entry["id"], entry["name"]), ("t3-2", "t3"))
 
+    def test_a_half_made_project_is_not_a_project_and_is_cleared_later(self):
+        left = self.base / "projects" / ".new-thyu0zj5"  # what a failed create left before 0.11.2
+        (left / "tokens").mkdir(parents=True)
+        crewchat.save_config({"project": "t3"}, left)
+        self.assertIsNone(crewchat.find_chat("t3", self.base))
+        os.utime(str(left), (time.time() - 3600,) * 2)
+        entry = crewchat.create_project("t3", self.base)
+        self.assertEqual(entry["id"], "t3")
+        self.assertEqual(sorted(p.name for p in (self.base / "projects").iterdir()), ["t3"])
+
     def test_a_move_that_never_works_leaves_nothing_behind(self):
         with self.held(float("inf")) as moves:
             with self.assertRaises(PermissionError):

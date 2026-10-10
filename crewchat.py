@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.11.2"
+__version__ = "0.11.3"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -402,7 +402,7 @@ def list_projects(base=None):
         out.append({"id": project_id(name), "name": name, "root": base, "chat": ""})
     folder = base / PROJECTS_DIR
     for path in sorted(folder.iterdir()) if folder.is_dir() else []:
-        if (path / "config.json").exists():
+        if not path.name.startswith(".") and (path / "config.json").exists():  # .new-*: being made
             out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
     return out
 
@@ -424,6 +424,12 @@ def create_project(name, base=None):
     pid, number = project_id(name), 2
     while pid in taken:
         pid, number = "%s-%d" % (project_id(name)[:36], number), number + 1
+    for old in folder.glob(".new-*"):  # left by a create that failed (before 0.11.3, or killed)
+        try:
+            if time.time() - old.stat().st_mtime > 600:
+                shutil.rmtree(str(old), ignore_errors=True)
+        except OSError:
+            pass
     # Built under another name and moved in whole: a running server sees it complete or not at all.
     temp = Path(tempfile.mkdtemp(prefix=".new-", dir=str(folder)))
     try:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.3
+
+- After a `crewchat start` that failed on 0.11.1 or older (the Windows "Access is denied" fixed in
+  0.11.2), the next `crewchat start` in that folder said `no project called .new-...`: the command
+  took the half-made project left behind for the project itself. Half-made projects are no longer
+  listed, and one older than ten minutes is cleared when the next project is made.
+
 ## 0.11.2
 
 - On Windows, `crewchat start` in a new folder could stop with `PermissionError: [WinError 5]
