@@ -153,7 +153,7 @@ holder; take it from a machine that was there, or post it again.
 
 A machine can hold several [projects](getting-started.md#projects). For now, linked machines share
 the **first** project of each (the one set up first); the others stay on their own machine. The
-chat page marks the shared one with ⇄. Sharing every project by name between linked machines is
+chat page marks the shared one "(shared)" in its project menu. Sharing every project by name between linked machines is
 the next step.
 
 ## What changes across machines

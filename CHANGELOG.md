@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.1
+
+- An agent started from the chat page could be told its start key was "unknown or has expired"
+  and believe it was not linked: its first `hub_link` was answered, but the answer was lost on the
+  way (a connection reset), and its tool asked again with a key already used. A second ask from
+  the same folder within ten minutes now gets the same answer, and is the same agent.
+- The project menu says "(shared)" for the project shared with your linked machines, with a
+  tooltip, instead of an arrow sign.
+
 ## 0.10.0
 
 **Projects, a task sheet, and rules and skills that reach every agent.**
