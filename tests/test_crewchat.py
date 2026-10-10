@@ -1659,6 +1659,60 @@ class Lifecycle(Base):
         for risky in ("irm ", "iex", "invoke-expression", "invoke-restmethod", "downloadstring", "-enc"):
             self.assertNotIn(risky, lowered)
 
+    def test_project_rules_and_skills_reach_folders_and_agents(self):
+        folder = Path(tempfile.mkdtemp(prefix="guided-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        (folder / "AGENTS.md").write_text("# Mine\n")
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo")
+        skill = folder / crewchat.GUIDE_SKILL
+        self.assertTrue(skill.read_text().startswith("---\nname: crewchat\n"))
+        self.assertIn("alwaysApply: true", (folder / crewchat.GUIDE_RULE).read_text())
+        self.assertIn(crewchat.GUIDE_BEGIN, (folder / "AGENTS.md").read_text())
+        session, name = self.agent(token=crewchat.read_token(crewchat.joined_place(folder)[0]))
+        session.text("hub_inbox")
+        out = crewchat.post_json(self.base + "/api/rules", self.owner, {"rules": "Run the tests first."})
+        self.assertGreaterEqual(out["folders"], 1)
+        self.assertIn("Run the tests first.", skill.read_text())
+        self.assertIn("New rules for this project", session.text("hub_inbox"))
+        self.assertIn("Run the tests first.", Session(self.base, self.token).text("hub_link", key="key-rules-0001"))
+        # Skills: shared, installed, validated, removed; a folder's own skill is never touched.
+        own = folder / ".claude" / "skills" / "deploy"
+        own.mkdir(parents=True)
+        (own / "SKILL.md").write_text("mine")
+        crewchat.post_json(self.base + "/api/skills", self.owner,
+                           {"op": "add", "name": "checklist", "files": {"SKILL.md": "---\nname: checklist\n---\n1."}})
+        crewchat.post_json(self.base + "/api/skills", self.owner,
+                           {"op": "add", "name": "deploy", "files": {"SKILL.md": "theirs"}})
+        self.assertTrue((folder / ".claude/skills/checklist/SKILL.md").exists())
+        self.assertEqual((own / "SKILL.md").read_text(), "mine")
+        for bad in ({"name": "Bad Name", "files": {"SKILL.md": "x"}}, {"name": "crewchat", "files": {"SKILL.md": "x"}},
+                    {"name": "esc", "files": {"SKILL.md": "x", "../../evil": "x"}}, {"name": "nofile", "files": {}}):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                crewchat.post_json(self.base + "/api/skills", self.owner, dict(bad, op="add"))
+            self.assertEqual(e.exception.code, 400)
+        self.assertFalse((crewchat.home() / "evil").exists())
+        crewchat.post_json(self.base + "/api/skills", self.owner, {"op": "remove", "name": "checklist"})
+        self.assertFalse((folder / ".claude/skills/checklist").exists())
+        # Only the owner sets them.
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/rules", self.token, {"rules": "agents rule"})
+        self.assertEqual(e.exception.code, 403)
+        crewchat.post_json(self.base + "/api/rules", self.owner, {"rules": ""})
+        self.assertEqual(crewchat.remove_guides(folder)[-1], "AGENTS.md (crewchat's section)")
+        self.assertEqual((folder / "AGENTS.md").read_text(), "# Mine\n")
+        crewchat.post_json(self.base + "/api/skills", self.owner, {"op": "remove", "name": "deploy"})
+
+    def test_add_an_agent_says_how_to_get_a_missing_tool(self):
+        saved = crewchat.find_tool
+        crewchat.find_tool = lambda tool, config: "/usr/local/bin/claude" if tool == "claude" else None
+        try:
+            tools = crewchat.launch_options({"folders": {}})["tools"]
+        finally:
+            crewchat.find_tool = saved
+        self.assertEqual(tools[0], {"id": "claude", "label": "Claude Code"})
+        self.assertEqual(tools[1]["id"], "cursor")
+        self.assertIn("cursor.com/install", tools[1]["missing"])
+
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
         with self.assertRaises(SystemExit):
             cli("update")

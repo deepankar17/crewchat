@@ -87,6 +87,39 @@ class Projects(unittest.TestCase):
         self.assertEqual((status, body), (200, b"test2 notes"))
 
 
+class Guides(unittest.TestCase):
+    """What a project teaches its agents, from the terminal."""
+
+    def test_rules_and_skills_from_the_terminal(self):
+        m = H.Machine("guide", project="app")
+        try:
+            m.start()
+            f = m.folder
+            for rel in (".claude/skills/crewchat/SKILL.md", ".cursor/rules/crewchat.mdc"):
+                self.assertTrue((f / rel).exists(), rel)
+            status = subprocess.run(["git", "status", "--porcelain"], cwd=str(f), capture_output=True, text=True).stdout
+            self.assertNotIn("crewchat", status)  # kept out of git
+            a = m.agent()
+            a.link()
+            a.stop_hook()
+            m.cli("rules", "set", "Never", "push", "to", "main.")
+            self.assertIn("Never push to main.", a.stop_hook())
+            self.assertIn("Never push to main.", m.cli("rules", "show"))
+            self.assertIn("Never push to main.", (f / ".claude/skills/crewchat/SKILL.md").read_text())
+            skill = m.dir / "release"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text("---\nname: release\ndescription: Releasing\n---\nTag it.\n")
+            (skill / "steps.md").write_text("1. Tag.\n")
+            m.cli("skills", "add", str(skill))
+            self.assertEqual((f / ".claude/skills/release/steps.md").read_text(), "1. Tag.\n")
+            self.assertIn("release", m.cli("skills"))
+            self.assertIn("Shared the skill release", a.stop_hook())
+            m.cli("skills", "remove", "release")
+            self.assertFalse((f / ".claude/skills/release").exists())
+        finally:
+            m.stop()
+
+
 @unittest.skipUnless(H.shutil.which("uv"), "needs uv")
 class UpgradeToProjects(unittest.TestCase):
     """A machine set up before projects keeps its chat, tokens and agents; new folders get projects."""

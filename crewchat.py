@@ -829,14 +829,15 @@ class Hub:
                 self.agents[owner]["checked"] = time.time()
                 self._save()
                 self._changed()
-                return owner, "Linked. This session is %s again, in the project %s." % (owner, self.roster.project)
+                return owner, "Linked. This session is %s again, in the project %s.%s" % (
+                    owner, self.roster.project, self.rules_note())
             if mine is None:
                 mine = row["agent"] = self._new_agent(row["place"], row["client"])
             self.links[key] = mine
             self.agents[mine]["checked"] = time.time()
             self._save()
             self._changed()
-            return mine, "Linked. You are %s, in the project %s." % (mine, self.roster.project)
+            return mine, "Linked. You are %s, in the project %s.%s" % (mine, self.roster.project, self.rules_note())
 
     def _remote_device_of(self, name):
         for dev in self.remote.values():
@@ -1276,6 +1277,83 @@ class Hub:
         with self.lock:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
                     for m in self.messages[-limit:]]
+
+    def project_folders(self):
+        """This project's connected folders on this machine."""
+        config = self.machine_config()
+        return [Path(path) for path, place in sorted((config.get("folders") or {}).items())
+                if folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
+
+    def refresh_guides(self):
+        """Rewrite the guide and skills in every folder of the project on this machine."""
+        done = 0
+        for folder in self.project_folders():
+            try:
+                write_guides(folder, self.roster.root)
+                done += 1
+            except OSError as e:
+                sys.stderr.write("%s could not update crewchat's guide in %s: %s\n" % (now_iso(), folder, e))
+        return done
+
+    def set_rules(self, text):
+        """The owner's rules for the project: saved, written into its folders, and sent to its agents."""
+        text = str(text or "").strip()
+        if len(text) > MAX_TEXT * 4:
+            raise HubError("the rules are too long: %d characters at most" % (MAX_TEXT * 4))
+        config = load_config(self.roster.root)
+        if text:
+            config["rules"] = text
+        else:
+            config.pop("rules", None)
+        save_config(config, self.roster.root)
+        self.roster.refresh()
+        folders = self.refresh_guides()
+        with self.lock:
+            note = ("New rules for this project. Follow them from now on:\n\n%s" % text if text
+                    else "This project's rules are cleared.")
+            self._append(OWNER, "all", note, "msg")
+            self._changed()
+        return folders
+
+    def add_skill(self, name, files):
+        name = str(name or "").strip().lower()
+        if not SKILL_NAME_RE.match(name) or name == "crewchat":
+            raise HubError("a skill's name is lowercase letters, digits and -, and not crewchat")
+        if not isinstance(files, dict) or not isinstance(files.get("SKILL.md"), str):
+            raise HubError("a skill needs a SKILL.md")
+        total = 0
+        for rel, text in files.items():
+            parts = Path(str(rel)).parts
+            if not isinstance(text, str) or Path(str(rel)).is_absolute() or ".." in parts or not parts:
+                raise HubError("bad file in the skill: %s" % rel)
+            total += len(text.encode("utf-8"))
+        if total > MAX_SKILL:
+            raise HubError("the skill is too big: %d KB at most" % (MAX_SKILL // 1024))
+        target = Path(self.roster.root) / "skills" / name
+        shutil.rmtree(target, ignore_errors=True)
+        for rel, text in files.items():
+            (target / rel).parent.mkdir(parents=True, exist_ok=True)
+            (target / rel).write_text(text, encoding="utf-8")
+        folders = self.refresh_guides()
+        with self.lock:
+            self._append(OWNER, "all", "Shared the skill %s with this project: it is in .claude/skills/%s/ in "
+                         "your folder. Read it when it applies." % (name, name), "msg")
+            self._changed()
+        return folders
+
+    def remove_skill(self, name):
+        target = Path(self.roster.root) / "skills" / str(name or "")
+        if str(name or "") not in project_skills(self.roster.root):
+            raise HubError("this project has no skill called %s" % name)
+        shutil.rmtree(target, ignore_errors=True)
+        folders = self.refresh_guides()
+        with self.lock:
+            self._changed()
+        return folders
+
+    def rules_note(self):
+        rules = project_rules(self.roster.root)
+        return ("\n\nThe owner's rules for this project (follow them):\n%s" % rules) if rules else ""
 
     def last_seq(self):
         """The newest message's seq, for the page's "new in other projects" marks."""
@@ -1904,7 +1982,7 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -2315,6 +2393,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
             data = self.hub.poll(after, version, wait)
             data["chat"] = self.project.id
+            data["rules"] = project_rules(self.roster.root)
+            data["skills"] = project_skills(self.roster.root)
             data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": p.hub.sync is not None}
                                 for p in self.projects.all()]
             self._json(200, data)
@@ -2368,6 +2448,19 @@ class Handler(BaseHTTPRequestHandler):
         kind = "task" if data.get("kind") == "task" else "msg"
         files = self.hub.attach(data.get("files") or [])
         return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
+
+    def _rules(self, data):
+        return {"project": self.roster.project, "folders": self.hub.set_rules(data.get("rules"))}
+
+    def _skills(self, data):
+        name = str(data.get("name") or "").strip().lower()
+        if data.get("op") == "add":
+            folders = self.hub.add_skill(name, data.get("files"))
+        elif data.get("op") == "remove":
+            folders = self.hub.remove_skill(name)
+        else:
+            raise HubError("op must be add or remove")
+        return {"project": self.roster.project, "name": name, "folders": folders}
 
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
@@ -2545,10 +2638,11 @@ class Handler(BaseHTTPRequestHandler):
             self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
             return
-        if path in ("/api/send", "/api/role", "/api/launch"):
+        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills"):
             if not self._owner_request():
                 return
-            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch}[path]
+            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch,
+                      "/api/rules": self._rules, "/api/skills": self._skills}[path]
             try:
                 self._json(200, action(self._object(raw)))
             except HubError as e:
@@ -2864,9 +2958,15 @@ def launch_folders(config, root=None, chat=""):
     return folders
 
 
+TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
+              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash"}
+
+
 def launch_options(config, root=None, chat=""):
-    """What the chat page's "Add an agent" offers on this machine, for one project."""
-    tools = [{"id": t, "label": label} for t, (label, _) in LAUNCH_TOOLS.items() if find_tool(t, config)]
+    """What the chat page's "Add an agent" offers on this machine, for one project. A tool that
+    is not installed is listed with how to get it (Cursor's app alone has no command-line agent)."""
+    tools = [{"id": t, "label": label} if find_tool(t, config) else {"id": t, "label": label, "missing": TOOL_HINTS[t]}
+             for t, (label, _) in LAUNCH_TOOLS.items()]
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
@@ -3003,6 +3103,12 @@ def cmd_start(args):
             print("- Connected %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
     global CURRENT_CHAT
     CURRENT_CHAT = chosen["id"]
+    try:
+        if write_guides(project, chosen["root"]):
+            print("- Wrote the project's guide for its agents (a Claude Code skill, a Cursor rule%s), kept out "
+                  "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
+    except OSError as e:
+        print("- Could not write the project's guide for its agents (%s)." % e)
 
     if newer_version():
         print("- crewchat %s is available (this is %s): run `crewchat update`." % (newer_version(), __version__))
@@ -4418,6 +4524,7 @@ def disconnect_folder(project):
         if not hooks:
             data.pop("hooks", None)
 
+    changed += remove_guides(project)
     edit(".mcp.json", servers)
     edit(".claude/settings.local.json", claude_settings)
     edit(".cursor/mcp.json", servers)
@@ -4531,8 +4638,199 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
 """
 
 
-def cmd_rules(_args):
-    print(RULES, end="")
+# Each project teaches its agents: crewchat writes a guide into every folder of the project on
+# this machine, in the form each tool loads by itself (a Claude Code skill, a Cursor rule, a
+# section of an AGENTS.md the folder already has), with the owner's rules for that project, and
+# installs the project's shared skills. All of it is kept out of git, and rewritten when the
+# rules or skills change.
+GUIDE_SKILL = ".claude/skills/crewchat/SKILL.md"
+GUIDE_RULE = ".cursor/rules/crewchat.mdc"
+GUIDE_BEGIN = "<!-- crewchat: begin (written by crewchat; edit the rules with `crewchat rules set`) -->"
+GUIDE_END = "<!-- crewchat: end -->"
+SKILL_MARK = ".crewchat-skill"  # in a skill folder crewchat installed, and so may replace or remove
+MAX_SKILL = 200 * 1024
+SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}$")
+
+
+def project_rules(root):
+    return str(load_config(root).get("rules") or "").strip()
+
+
+def project_skills(root):
+    folder = Path(root) / "skills"
+    return sorted(p.name for p in folder.iterdir() if (p / "SKILL.md").is_file()) if folder.is_dir() else []
+
+
+def project_guide(root):
+    """What every agent in the project should know: how the chat works, the owner's rules for
+    the project, and its shared skills."""
+    config = load_config(root)
+    rules, skills = project_rules(root), project_skills(root)
+    parts = ["# crewchat: the project %s\n\nYou are in the project **%s**: its agents and the owner share a "
+             "chat (crewchat). Agents in other projects do not see it.\n\n" % (config["project"], config["project"]),
+             RULES.replace("## The crewchat: talking to each other\n\n", "## How the chat works\n\n", 1)]
+    parts.append("\n## The owner's rules for this project\n\n%s\n" % (
+        rules or "None yet. The owner sets them on the chat page, or with `crewchat rules set`."))
+    if skills:
+        parts.append("\n## Skills shared in this project\n\n%s\n" % "\n".join(
+            "- `%s`: in `.claude/skills/%s/SKILL.md`" % (n, n) for n in skills))
+    return "".join(parts)
+
+
+def _write_if_changed(path, text):
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def write_guides(folder, root):
+    """Write the project's guide and skills into one connected folder. Returns what changed."""
+    folder, root = Path(folder), Path(root)
+    guide, changed = project_guide(root), []
+    name = load_config(root)["project"]
+    skill = ("---\nname: crewchat\ndescription: How to work in the project %s's crewchat, the group chat "
+             "between its AI agents and their owner, and the owner's rules for the project. Use it whenever a "
+             "crewchat message arrives, when Owner gives an instruction or a task, before taking or reporting "
+             "on a task, and before messaging another agent.\n---\n\n" % name) + guide
+    if _write_if_changed(folder / GUIDE_SKILL, skill):
+        changed.append(GUIDE_SKILL)
+    rule = ("---\ndescription: The crewchat of the project %s: how to work with the other agents and the owner, "
+            "and the owner's rules\nalwaysApply: true\n---\n\n" % name) + guide
+    if _write_if_changed(folder / GUIDE_RULE, rule):
+        changed.append(GUIDE_RULE)
+    agents = folder / "AGENTS.md"
+    if agents.is_file():  # only one the folder already has
+        text = agents.read_text(encoding="utf-8")
+        block = "%s\n%s\n%s" % (GUIDE_BEGIN, guide.strip(), GUIDE_END)
+        if GUIDE_BEGIN in text and GUIDE_END in text:
+            new = text[:text.index(GUIDE_BEGIN)] + block + text[text.index(GUIDE_END) + len(GUIDE_END):]
+        else:
+            new = text.rstrip("\n") + "\n\n" + block + "\n"
+        if new != text:
+            agents.write_text(new, encoding="utf-8")
+            changed.append("AGENTS.md")
+    # The project's shared skills, as Claude Code skills; ones it no longer has are removed.
+    wanted = project_skills(root)
+    skills_dir = folder / ".claude" / "skills"
+    for n in wanted:
+        target = skills_dir / n
+        if target.exists() and not (target / SKILL_MARK).exists():
+            continue  # a skill of the folder's own by that name: left alone
+        source = root / "skills" / n
+        files = {p.relative_to(source): p.read_bytes() for p in source.rglob("*") if p.is_file()}
+        current = ({p.relative_to(target): p.read_bytes() for p in target.rglob("*") if p.is_file()
+                    and p.name != SKILL_MARK} if target.exists() else {})
+        if current != files:
+            shutil.rmtree(target, ignore_errors=True)
+            for rel, data in files.items():
+                (target / rel).parent.mkdir(parents=True, exist_ok=True)
+                (target / rel).write_bytes(data)
+            (target / SKILL_MARK).write_text("installed by crewchat for the project %s\n" % name, encoding="utf-8")
+            changed.append(".claude/skills/%s/" % n)
+    for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
+        if old.name not in wanted and old.name != "crewchat" and (old / SKILL_MARK).exists():
+            shutil.rmtree(old, ignore_errors=True)
+            changed.append(".claude/skills/%s/ (removed)" % old.name)
+    git_exclude(folder, [".claude/skills/crewchat/", GUIDE_RULE] + [".claude/skills/%s/" % n for n in wanted])
+    return changed
+
+
+def remove_guides(folder):
+    """Take the guide and the skills crewchat installed out of a folder (uninstall)."""
+    folder, removed = Path(folder), []
+    for rel in (".claude/skills/crewchat", GUIDE_RULE):
+        path = folder / rel
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=True)
+            removed.append(rel)
+        elif path.exists():
+            path.unlink()
+            removed.append(rel)
+    skills_dir = folder / ".claude" / "skills"
+    for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
+        if (old / SKILL_MARK).exists():
+            shutil.rmtree(old, ignore_errors=True)
+            removed.append(".claude/skills/%s" % old.name)
+    agents = folder / "AGENTS.md"
+    if agents.is_file():
+        text = agents.read_text(encoding="utf-8")
+        if GUIDE_BEGIN in text and GUIDE_END in text:
+            new = (text[:text.index(GUIDE_BEGIN)].rstrip("\n") + "\n"
+                   + text[text.index(GUIDE_END) + len(GUIDE_END):].lstrip("\n"))
+            agents.write_text(new if new.strip() else "", encoding="utf-8")
+            removed.append("AGENTS.md (crewchat's section)")
+    return removed
+
+
+def skill_files(path):
+    """A skill to share, from a folder holding SKILL.md or from one Markdown file: {relative path:
+    text}."""
+    path = Path(path).expanduser()
+    if path.is_file():
+        return {"SKILL.md": path.read_text(encoding="utf-8")}
+    if not (path / "SKILL.md").is_file():
+        die("%s is neither a SKILL.md file nor a folder holding one" % path)
+    files, total = {}, 0
+    for p in sorted(path.rglob("*")):
+        if p.is_file() and not any(part.startswith(".") for part in p.relative_to(path).parts):
+            try:
+                text = p.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                die("%s is not a text file; a shared skill holds text files only" % p)
+            total += len(text.encode("utf-8"))
+            files[p.relative_to(path).as_posix()] = text
+    if total > MAX_SKILL:
+        die("the skill is too big to share: %d KB at most" % (MAX_SKILL // 1024))
+    return files
+
+
+def cmd_rules(args):
+    action = getattr(args, "action", None) or "print"
+    if action == "print":
+        root = project_root() if (home() / "config.json").exists() else None
+        print(project_guide(root) if root else RULES, end="")
+        return
+    if action == "show":
+        print(project_rules(project_root()) or "This project has no rules yet. Set them with "
+              "`crewchat rules set \"...\"` or `crewchat rules set --file RULES.md`.")
+        return
+    if action == "clear":
+        text = ""
+    elif args.file:
+        text = Path(args.file).expanduser().read_text(encoding="utf-8")
+    else:
+        text = " ".join(args.text)
+    if action == "set" and not text.strip():
+        die('give the rules: crewchat rules set "..." or crewchat rules set --file RULES.md')
+    out = owner_call("/api/rules", {"rules": text})
+    print("%s the rules of the project %s. Its agents got them as a message, and every folder of the project "
+          "on this machine has them (updated: %d)." % ("Set" if text.strip() else "Cleared", out["project"],
+                                                       out["folders"]))
+
+
+def cmd_skills(args):
+    if args.action == "list":
+        names = project_skills(project_root())
+        print("\n".join(names) if names else "No skills shared in this project. Add one: crewchat skills add PATH")
+        return
+    if args.action == "add":
+        if not args.path:
+            die("usage: crewchat skills add PATH (a folder with SKILL.md, or a .md file)")
+        files = skill_files(args.path)
+        name = (args.name or Path(args.path).expanduser().resolve().name.rsplit(".md", 1)[0]).lower()
+        out = owner_call("/api/skills", {"op": "add", "name": name, "files": files})
+    else:
+        if not args.path:
+            die("usage: crewchat skills remove NAME")
+        out = owner_call("/api/skills", {"op": "remove", "name": args.path.lower()})
+    print("%s the skill %s %s the project %s (folders updated: %d)." % (
+        "Shared" if args.action == "add" else "Removed", out["name"], "in" if args.action == "add" else "from",
+        out["project"], out["folders"]))
 
 
 # --------------------------------------------------------------------------------------------
@@ -4675,9 +4973,21 @@ button:disabled { opacity: 0.5; cursor: default; }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 #error { color: var(--err); font-size: 13px; margin-top: 6px; min-height: 0; }
 .add-agent { width: 100%; margin: 0 0 10px; background: transparent; color: var(--accent); border: 1px dashed var(--line); }
-dialog#launch { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
-dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
-#launch h2 { font-size: 17px; margin: 0 0 4px; } #launch p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+dialog#launch, dialog#rules-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
+dialog#launch::backdrop, dialog#rules-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+#launch h2, #rules-dialog h2 { font-size: 17px; margin: 0 0 4px; }
+#launch p, #rules-dialog p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+#rules-input { width: 100%; box-sizing: border-box; min-height: 160px; resize: vertical; background: var(--bg);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--ink); font: inherit; }
+#rules-dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
+#rules-dialog .buttons .secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+#rules-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
+#setup { margin-top: 14px; }
+#setup h3 { font-size: 13px; margin: 12px 0 4px; display: flex; justify-content: space-between; align-items: center; }
+#setup .rules { font-size: 12.5px; white-space: pre-wrap; margin: 0; color: var(--muted); max-height: 7.5em; overflow: hidden; }
+#setup ul { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
+#setup li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+button.link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
 #launch label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
 #launch label.check { font-weight: 400; display: flex; gap: 8px; align-items: center; }
 #launch select, #launch input[type=text], #launch textarea { width: 100%; box-sizing: border-box; max-width: none; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
@@ -4705,6 +5015,13 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
   <p class="sub">Everything your agents say to each other, live.</p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
+  <section id="setup" aria-label="What this project's agents learn">
+    <h3>Project rules <button type="button" class="link" id="rules-edit">Edit</button></h3>
+    <p id="rules-text" class="rules"></p>
+    <h3>Shared skills <button type="button" class="link" id="skill-add">Add</button></h3>
+    <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
+    <ul id="skills-list"></ul>
+  </section>
   <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent has the <b>Lead</b> role, it takes your tasks and hands out the work instead. Give agents roles with the menu on their cards.</p>
   <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types (<code>crewchat listen</code> changes how long agents wait). Grey means it has not been heard from lately.</p>
 </aside>
@@ -4722,6 +5039,15 @@ dialog#launch::backdrop { background: rgba(0, 0, 0, 0.45); }
     </div>
     <div id="launch-note" role="status"></div>
     <div class="buttons"><button type="button" class="secondary" id="l-cancel">Cancel</button><button type="submit" id="l-start">Start</button></div>
+  </form>
+</dialog>
+<dialog id="rules-dialog" aria-labelledby="rules-title">
+  <form id="rules-form" method="dialog">
+    <h2 id="rules-title">Project rules</h2>
+    <p>What every agent in this project should follow: who does what, how to test, what never to do. They get them as a message now, and new sessions read them from the project's guide.</p>
+    <textarea id="rules-input" maxlength="16000" placeholder="For example: The Mac agent does Apple work, the laptop agent Windows. Run the tests before reporting done. Never push to main."></textarea>
+    <div id="rules-note" role="status"></div>
+    <div class="buttons"><button type="button" class="secondary" id="rules-cancel">Cancel</button><button type="submit" id="rules-save">Save</button></div>
   </form>
 </dialog>
 <main>
@@ -4816,6 +5142,55 @@ async function postJSON(path, body) {
   return res.json();
 }
 
+// The project's rules and shared skills: what its agents learn by themselves.
+function renderSetup(rules, skills) {
+  const text = $("rules-text");
+  text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
+  state.rules = rules || "";
+  const list = $("skills-list");
+  list.replaceChildren(...(skills || []).map((name) => {
+    const item = el("li");
+    const remove = el("button", "link", "Remove");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "Remove the skill " + name);
+    remove.addEventListener("click", async () => {
+      if (!confirm("Remove the skill " + name + " from every folder of this project?")) return;
+      try { await postJSON("/api/skills", { op: "remove", name }); } catch (e) { alert(e.message); }
+    });
+    item.append(el("span", "", name), remove);
+    return item;
+  }));
+  if (!(skills || []).length) list.append(el("li", "", "None yet: Add shares a SKILL.md with every agent."));
+}
+$("rules-edit").addEventListener("click", () => {
+  $("rules-input").value = state.rules || "";
+  $("rules-note").textContent = "";
+  $("rules-dialog").showModal();
+});
+$("rules-cancel").addEventListener("click", () => $("rules-dialog").close());
+$("rules-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("rules-note").textContent = "Saving…";
+  try {
+    await postJSON("/api/rules", { rules: $("rules-input").value });
+    $("rules-dialog").close();
+  } catch (e) {
+    $("rules-note").textContent = e.message;
+  }
+});
+$("skill-add").addEventListener("click", () => $("skill-file").click());
+$("skill-file").addEventListener("change", async () => {
+  const file = $("skill-file").files[0];
+  $("skill-file").value = "";
+  if (!file) return;
+  const suggested = file.name.toLowerCase().replace(/\.md$/, "").replace(/^skill$/, "").replace(/[^a-z0-9-]+/g, "-");
+  const name = prompt("A name for the skill (lowercase letters, digits and -):", suggested);
+  if (!name) return;
+  try {
+    await postJSON("/api/skills", { op: "add", name, files: { "SKILL.md": await file.text() } });
+  } catch (e) { alert(e.message); }
+});
+
 async function openLaunch() {
   const dialog = $("launch"), note = $("launch-note");
   note.textContent = ""; $("l-start").disabled = false;
@@ -4824,7 +5199,14 @@ async function openLaunch() {
     const res = await fetch(api("/api/launch"), { cache: "no-store" });
     if (res.status === 401) { location.href = "/login"; return; }
     const opts = await res.json();
-    $("l-tool").replaceChildren(...opts.tools.map((t) => new Option(t.label, t.id)));
+    $("l-tool").replaceChildren(...opts.tools.map((t) => {
+      const option = new Option(t.missing ? t.label + " (not installed)" : t.label, t.id);
+      option.disabled = !!t.missing;
+      option.title = t.missing || "";
+      return option;
+    }));
+    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
+    opts.tools = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
     $("l-role").replaceChildren(new Option("No role", ""), ...state.roles.map((r) => new Option(r.title, r.name)));
     if (!opts.tools.length || !opts.folders.length) {
@@ -4832,6 +5214,8 @@ async function openLaunch() {
         ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
         : "No project folder on this machine is connected yet. Run `crewchat start` in one first.";
       $("l-start").disabled = true;
+    } else if (missing) {
+      note.textContent = missing;
     }
   } catch (err) {
     note.textContent = "Could not load the options: " + err.message;
@@ -5066,6 +5450,7 @@ async function loop() {
         if (!state.missed) document.title = state.title;
       }
       renderProjects(data.projects, data.chat);
+      renderSetup(data.rules, data.skills);
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
@@ -5335,8 +5720,18 @@ def build_parser():
     p.add_argument("--project")
     p.set_defaults(fn=cmd_hooks)
 
-    p = sub.add_parser("rules", help="print a section about the chat for your AGENTS.md / CLAUDE.md")
+    p = sub.add_parser("rules", help="the project's rules for its agents: print the guide, or show, set or clear "
+                       "the owner's rules")
+    p.add_argument("action", nargs="?", default="print", choices=["print", "show", "set", "clear"])
+    p.add_argument("text", nargs="*", help="set: the rules")
+    p.add_argument("--file", help="set: read the rules from this file")
     p.set_defaults(fn=cmd_rules)
+
+    p = sub.add_parser("skills", help="skills shared with every agent of the project: list, add or remove")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
+    p.add_argument("path", nargs="?", help="add: a folder with SKILL.md, or a .md file; remove: the skill's name")
+    p.add_argument("--name", help="add: the skill's name (default: the folder's or file's name)")
+    p.set_defaults(fn=cmd_skills)
 
     try:
         import crewchat_cloud
@@ -5368,7 +5763,8 @@ def build_parser():
     p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
     p.set_defaults(fn=cmd_projects)
 
-    for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status"):
+    for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
+                 "rules", "skills"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "
