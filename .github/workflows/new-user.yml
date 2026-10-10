@@ -11,8 +11,8 @@ on:
     - cron: "17 6 * * 1"  # weekly: each run downloads the release from 5 machines, and GitHub counts them
 
 jobs:
-  # A release's package is attached by release-assets.yml just after it is published: wait for it,
-  # so a new release is tested as people will install it.
+  # release-assets.yml publishes a release to PyPI and attaches its package just after it is
+  # published: wait for both, so a new release is tested as people will install it.
   package:
     runs-on: ubuntu-latest
     if: github.event_name == 'release'
@@ -22,10 +22,11 @@ jobs:
     steps:
       - run: |
           for i in $(seq 60); do
-            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -q '\.whl$' && exit 0
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -q '\.whl$' &&
+               curl -sf "https://pypi.org/pypi/crewchat/${TAG#v}/json" > /dev/null; then exit 0; fi
             sleep 10
           done
-          echo "no package on $TAG after 10 minutes"; exit 1
+          echo "$TAG is not on PyPI with its package after 10 minutes"; exit 1
 
   windows:
     needs: package
@@ -36,25 +37,34 @@ jobs:
         shell: [powershell, pwsh, cmd]  # where the user types the command
     runs-on: windows-latest
     steps:
-      - name: The README's command, typed in powershell
+      - name: The README's commands, typed in powershell
         if: matrix.shell == 'powershell'
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
-      - name: The README's command, typed in pwsh
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          & "$env:USERPROFILE\.local\bin\uv.exe" tool install --python 3.12 "crewchat[cloud]"
+      - name: The README's commands, typed in pwsh
         if: matrix.shell == 'pwsh'
         shell: pwsh
-        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
-      - name: The README's command, typed in cmd
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          & "$env:USERPROFILE\.local\bin\uv.exe" tool install --python 3.12 "crewchat[cloud]"
+      - name: The README's commands, typed in cmd
         if: matrix.shell == 'cmd'
         shell: cmd
-        run: powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          "%USERPROFILE%\.local\bin\uv.exe" tool install --python 3.12 "crewchat[cloud]"
       - name: A first chat
         shell: powershell
+        env:
+          TAG: ${{ github.event.release.tag_name }}
         run: |
           $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
           $v = crewchat --version
           if ($LASTEXITCODE -ne 0) { exit 1 }
           Write-Host $v
+          if ($env:TAG -and $v -ne "crewchat $($env:TAG.TrimStart('v'))") { "expected $env:TAG"; exit 1 }
           New-Item -ItemType Directory "$env:RUNNER_TEMP\notes-app" | Out-Null
           Set-Location "$env:RUNNER_TEMP\notes-app"
           git init -q

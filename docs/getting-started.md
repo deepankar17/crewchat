@@ -21,13 +21,30 @@ minutes: install, start, open your agents, talk to them, share files, and tune h
 curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
 ```
 
-**Windows** (PowerShell):
+**Windows** (PowerShell): install [uv](https://docs.astral.sh/uv/), the tool that installs
+crewchat with its own Python, then crewchat:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
-The installer:
+Open a new PowerShell window (so `uv` is found), then:
+
+```powershell
+uv tool install --python 3.12 "crewchat[cloud]"
+```
+
+crewchat is on [PyPI](https://pypi.org/project/crewchat/), so with uv already installed, on any
+system, that last command is all it takes. Without cloud sync's libraries (about 70 MB):
+`uv tool install --python 3.12 crewchat`.
+
+Why not one command, as on macOS? Windows Defender's automatic detection took the old one-line
+crewchat installer (download a script and run it at once) for a trojan, `Commando.A!ml`, and
+stopped it. uv's own installer is widely used and trusted, and after it nothing is downloaded and
+run: crewchat comes from PyPI like any Python package. The one-line `install.ps1` still exists
+for older notes and for `crewchat update` from 0.9.7 to 0.9.9.
+
+The macOS and Linux installer:
 
 - needs no administrator rights and asks for no password;
 - installs [uv](https://docs.astral.sh/uv/) if it is missing, and uv installs crewchat with its

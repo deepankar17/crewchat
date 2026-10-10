@@ -237,7 +237,7 @@ class Identity(Base):
         self.assertEqual(crewchat.client_kind({"name": "Cursor"}), "cursor")
         self.assertEqual(crewchat.client_kind({"name": "My Fancy Tool 3000!"}), "my-fancy-too")
         self.assertEqual(crewchat.client_kind(None), "agent")
-        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac-m")
+        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac")  # cut at a word break
         self.assertEqual(crewchat.place_label("123"), "machine")
 
     def test_a_client_without_session_ids_still_gets_one_identity(self):
@@ -1400,7 +1400,8 @@ class Service(unittest.TestCase):
             crewchat.cmd_service_windows(crewchat.argparse.Namespace(action="install", keep_awake=False))
         self.assertEqual(values["crewchat"], crewchat.windows_command())
         self.assertIn("from your startup programs", out.getvalue())
-        self.assertIn("Access is denied", out.getvalue())
+        self.assertIn("which need no administrator", out.getvalue())
+        self.assertNotIn("Access is denied", out.getvalue())  # Windows' own words read like a failure
         crewchat.start_background.assert_called_once()  # running now, not only after the next log on
         self.assertEqual(crewchat.windows_service(), "run")
         with contextlib.redirect_stdout(io.StringIO()):
@@ -1598,6 +1599,36 @@ class Lifecycle(Base):
         self.assertEqual(settings["permissions"], {"allow": ["Bash(ls)"]})
         self.assertEqual(settings["hooks"], {"Stop": [{"hooks": [{"type": "command", "command": "echo mine"}]}]})
         self.assertEqual(crewchat.disconnect_folder(shared), [])  # nothing of ours left
+
+    def test_machine_names_are_cut_at_a_word_break(self):
+        self.assertEqual(crewchat.place_label("Deepankars-Mac-mini.local"), "deepankars-mac")
+        self.assertEqual(crewchat.place_label("ATSLAP-73"), "atslap-73")
+        self.assertEqual(crewchat.place_label("averyveryverylongmachinename"), "averyveryverylon")
+        self.assertEqual(crewchat.place_label("my-mac"), "my-mac")
+        self.assertEqual(crewchat.place_label("123"), "machine")
+
+    def test_update_installs_from_pypi_first_then_the_release_file(self):
+        specs = crewchat.update_specs("1.2.3")
+        self.assertRegex(specs[0], r"^crewchat(\[cloud\])?==1\.2\.3$")
+        self.assertTrue(specs[1].endswith("/releases/download/v1.2.3/crewchat-1.2.3-py3-none-any.whl"))
+        self.assertRegex(crewchat.update_specs("")[0], r"^crewchat(\[cloud\])?$")
+        self.assertEqual(len(crewchat.update_specs("")), 1)
+
+    def test_the_windows_update_waits_installs_with_uv_and_resumes_without_running_a_download(self):
+        script = crewchat.windows_update_script(r"C:\Users\o'neil\.local\bin\uv.exe",
+                                                crewchat.update_specs("1.2.3"),
+                                                r"C:\Users\o'neil\.local\bin\crewchat.exe",
+                                                r"C:\Users\o'neil\AppData\Roaming\uv\tools\crewchat", 4242)
+        lines = script.splitlines()
+        self.assertEqual(lines[1], "Wait-Process -Id 4242 -ErrorAction SilentlyContinue")
+        self.assertIn("'C:\\Users\\o''neil\\AppData\\Roaming\\uv\\tools\\crewchat'", script)  # quoted
+        installs = [l for l in lines if "tool install" in l]
+        self.assertEqual(len(installs), 2)
+        self.assertIn("==1.2.3'", installs[0])
+        self.assertIn("resume", script)
+        lowered = script.lower()
+        for risky in ("irm ", "iex", "invoke-expression", "invoke-restmethod", "downloadstring", "-enc"):
+            self.assertNotIn(risky, lowered)
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):
         with self.assertRaises(SystemExit):

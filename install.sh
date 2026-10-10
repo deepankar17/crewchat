@@ -8,12 +8,12 @@
 # Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   CREWCHAT_VERSION=0.9.9   install this release instead of the one below ("main" for the latest code)
+#   CREWCHAT_VERSION=0.9.10   install this release instead of the one below ("main" for the latest code)
 #   CREWCHAT_LEAN=1          leave out cloud sync (about 70 MB of libraries); the chat works the same
 #   CREWCHAT_SOURCE=PATH     install from a local checkout (for testing this script)
 set -eu
 
-VERSION="${CREWCHAT_VERSION:-0.9.9}"
+VERSION="${CREWCHAT_VERSION:-0.9.10}"
 REPO="https://github.com/deepankar17/crewchat"
 
 say() { printf '%s\n' "$*"; }
@@ -21,25 +21,23 @@ fail() { printf 'crewchat installer: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
-  *) fail "this script is for macOS and Linux. On Windows, run in PowerShell: powershell -NoProfile -ExecutionPolicy ByPass -c \"irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex\"" ;;
+  *) fail "this script is for macOS and Linux. On Windows, install uv (https://docs.astral.sh/uv/), then: uv tool install --python 3.12 \"crewchat[cloud]\"" ;;
 esac
 
-FALLBACK=""
+# Where to install from, in order: PyPI, the release's package file on GitHub, its source archive
+# (releases before 0.9.10 are not on PyPI, and before 0.9.7 have no package file).
+if [ -n "${CREWCHAT_LEAN:-}" ]; then NAME="crewchat"; else NAME="crewchat[cloud]"; fi
 if [ -n "${CREWCHAT_SOURCE:-}" ]; then
-  SOURCE="$CREWCHAT_SOURCE"
+  SOURCES="$NAME @ $CREWCHAT_SOURCE"
 elif [ "$VERSION" = "main" ]; then
-  SOURCE="$REPO/archive/refs/heads/main.tar.gz"
+  SOURCES="$NAME @ $REPO/archive/refs/heads/main.tar.gz"
 else
-  # The release's own package file: GitHub counts its downloads (nothing about you is sent).
-  # Releases before 0.9.7 have none, and install from their source archive instead.
-  SOURCE="$REPO/releases/download/v$VERSION/crewchat-$VERSION-py3-none-any.whl"
-  FALLBACK="$REPO/archive/refs/tags/v$VERSION.tar.gz"
+  SOURCES="$NAME==$VERSION
+$NAME @ $REPO/releases/download/v$VERSION/crewchat-$VERSION-py3-none-any.whl
+$NAME @ $REPO/archive/refs/tags/v$VERSION.tar.gz"
 fi
-spec() {
-  if [ -n "${CREWCHAT_LEAN:-}" ]; then echo "crewchat @ $1"; else echo "crewchat[cloud] @ $1"; fi
-}
 install_from() {
-  "$UV" tool install --force --python 3.12 "$(spec "$1")"
+  "$UV" tool install --force --refresh-package crewchat --python 3.12 "$1"
 }
 
 UV="$(command -v uv 2>/dev/null || true)"
@@ -69,12 +67,17 @@ if [ -x "$OLD" ] && "$OLD" status 2>/dev/null | grep -q '^Server: *running'; the
 fi
 
 say "Installing crewchat $VERSION..."
-if install_from "$SOURCE" >/dev/null 2>&1; then
-  :
-elif [ -n "$FALLBACK" ] && install_from "$FALLBACK" >/dev/null 2>&1; then
-  :
-else
-  install_from "${FALLBACK:-$SOURCE}" || fail "crewchat did not install (see uv's message above)"
+INSTALLED_FROM=""
+LAST=""
+OLDIFS="$IFS"; IFS='
+'
+for spec in $SOURCES; do
+  LAST="$spec"
+  if install_from "$spec" >/dev/null 2>&1; then INSTALLED_FROM="$spec"; break; fi
+done
+IFS="$OLDIFS"
+if [ -z "$INSTALLED_FROM" ]; then
+  install_from "$LAST" || fail "crewchat did not install (see uv's message above)"
 fi
 "$UV" tool update-shell >/dev/null 2>&1 || true
 
@@ -119,4 +122,4 @@ say "Start a chat: open a terminal in your project folder and run"
 say ""
 say "  crewchat start"
 say ""
-say "Upgrade later by running this installer again. Remove: crewchat service uninstall; uv tool uninstall crewchat"
+say "Later: \`crewchat update\` upgrades it, \`crewchat uninstall\` removes it."

@@ -20,7 +20,7 @@ its core.
 | `crewchat.py` | The server, the MCP tools, the chat page, hooks, and every command |
 | `crewchat_peers.py` | Linking machines over Tailscale |
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
-| `install.sh`, `install.ps1` | The one-line installers |
+| `install.sh`, `install.ps1` | The installers: macOS and Linux's one line; on Windows the README uses uv and PyPI, and `install.ps1` serves older notes |
 | `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines) |
 | `e2e/` | End-to-end tests: real servers, agents' hooks, the chat page, linked machines, the installer |
 | `tools/docs_screenshots.py` | Makes the pictures in `docs/images` |
