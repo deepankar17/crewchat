@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.9.7"
+__version__ = "0.9.8"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -3915,10 +3915,8 @@ def cmd_update(args):
     env = dict(os.environ, **({"CREWCHAT_VERSION": args.version} if args.version else {}))
     if os.name == "nt":
         # The installer must stop every crewchat process, this one included, to replace the files.
-        # It runs in a window of its own, which also starts the server again afterwards.
-        python, script = self_command()
-        again = "& '%s' '%s' restart" % (python, script) if running else ""
-        command = ("irm %s | iex; %s; Write-Host ''; Read-Host 'Press Enter to close'" % (INSTALL_PS1, again))
+        # It runs in a window of its own, and starts the server again itself once it is done.
+        command = "irm %s | iex; Write-Host ''; Read-Host 'Press Enter to close'" % INSTALL_PS1
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", command],
                          env=env, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
         print("Updating crewchat in a new window. This window's crewchat stops while it does.")

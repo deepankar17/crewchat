@@ -1,12 +1,15 @@
 # Changelog
 
-## Not released yet
+## 0.9.8
+
+**crewchat on Windows starts at log on without an administrator.**
 
 - Windows: `crewchat start` in an everyday PowerShell window now makes crewchat start at log on.
   Task Scheduler needs an administrator for that, so it said "Access is denied", and the server
   was gone after a reboot. crewchat now goes in your own startup programs instead (no
   administrator), and `stop`, `restart`, `update`, `uninstall` and `service status` handle both.
-- The Windows installer starts the server again after an upgrade either way.
+- The Windows installer starts the server again after an upgrade either way, and `crewchat update`
+  on Windows no longer restarts it a second time.
 
 ## 0.9.7
 
