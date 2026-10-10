@@ -878,10 +878,12 @@ class CloudSync:
                 self.store.delete("tasks/" + doc_id)
 
     # Tasks -------------------------------------------------------------------------------------
-    def claim_task(self, task_id, agent):
-        """Settle who takes a task, across machines: the first create of tasks/{id} wins."""
+    def claim_task(self, task_id, agent, key=None):
+        """Settle who takes a task, across machines: the first create of tasks/{key} wins (the key is
+        the task's id, or a new one each time it was given back)."""
         if not self.device.ready:
             raise crewchat.HubError("this machine is not approved for cloud sync yet")
+        task_id = key or task_id
         aad = "crewchat|%s|task|%s|%%s" % (self._uid(), task_id)
         try:
             doc = self._seal(aad, {"agent": agent})

@@ -498,6 +498,9 @@ class Projects:
             for path in found:
                 if path.name not in self.others and not path.name.startswith("."):
                     self.others[path.name] = Project(path)
+            names = {p.name for p in found}
+            for gone in [k for k in self.others if k not in names]:
+                del self.others[gone]  # its folder was removed: its tokens stop working
             self._stamp = stamp
 
     def all(self):
@@ -554,7 +557,8 @@ class Hub:
         self.links = {}  # hook link key -> agent name
         self.taken = {}  # task message id -> agent
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
-        self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent[, removed]}
+        self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
+        self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
         self.codes = {}  # owner sign-in code -> expiry (memory only)
@@ -615,6 +619,7 @@ class Hub:
         self.taken = {str(k): str(v) for k, v in data.get("taken", {}).items()}
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
         self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
+        self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
@@ -622,7 +627,7 @@ class Hub:
     def _save(self):
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
-            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet,
+            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -701,9 +706,12 @@ class Hub:
             self._save()
         elif kind == "update" and msg.get("task") and msg.get("status") in STATUSES:
             self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
-            if msg["status"] == "todo" and self.taken.get(msg["task"]) in (msg["from"], None) or (
-                    msg["status"] == "todo" and msg["from"] == OWNER):
-                self.taken.pop(msg["task"], None)  # given back: on the sheet for anyone again
+            if msg["status"] == "todo":
+                # Given back: on the sheet for anyone again. Every machine counts the same messages,
+                # so all of them settle the next claim under the same new key.
+                self.claim_gen[msg["task"]] = self.claim_gen.get(msg["task"], 0) + 1
+                if self.taken.get(msg["task"]) in (msg["from"], None) or msg["from"] == OWNER:
+                    self.taken.pop(msg["task"], None)
             self._save()
         elif kind == "assign" and msg.get("task") in self.sheet:
             self.taken.setdefault(msg["task"], msg["to"])
@@ -721,7 +729,7 @@ class Hub:
                 "title": title[:300], "from": msg["from"], "to": msg["to"], "ts": msg["ts"],
                 "depends": split_list(msg.get("depends")), "areas": split_list(msg.get("areas")),
                 "where": str(msg.get("where") or ""), "order": float(msg.get("order") or msg["ts"]),
-                "parent": msg.get("task") or ""}
+                "parent": msg.get("task") or "", "origin": msg.get("origin") or ""}
             self._save()
 
     def _event(self, text):
@@ -1237,6 +1245,11 @@ class Hub:
             raise HubError("status must be one of: %s" % ", ".join(STATUSES))
         with self.lock:
             task = self._task(mid)
+            if status == "todo" and agent != OWNER and self.taken.get(mid) != agent:
+                # Only a release by its holder (or the owner) is real: a stray one would move the
+                # task's claim key on every machine while someone still holds it.
+                raise HubError("you do not hold task #%s, so you cannot give it back%s" % (
+                    mid, " (%s holds it)" % self.taken[mid] if self.taken.get(mid) else ""))
             lead = self._lead()
             direct = task["from"] == OWNER and task["to"] == agent
             if lead and lead != agent and not direct:
@@ -1274,8 +1287,10 @@ class Hub:
             if self.sync is None:
                 self._record_take(agent, mid, task)
                 return task
-        # Several machines: Firestore decides who was first. Network, so outside the lock.
-        holder = self.sync.claim_task(mid, agent)
+            key = self.claim_key(mid)
+        # Several machines: the machine it was posted on (or Firestore) decides who was first.
+        # Network, so outside the lock.
+        holder = self.sync.claim_task(mid, agent, key=key)
         with self.lock:
             if self.taken.get(mid) == agent:
                 return task
@@ -1372,12 +1387,16 @@ class Hub:
         total = 0
         for rel, text in files.items():
             parts = Path(str(rel)).parts
-            if not isinstance(text, str) or Path(str(rel)).is_absolute() or ".." in parts or not parts:
+            if (not isinstance(text, str) or Path(str(rel)).is_absolute() or ".." in parts or not parts
+                    or any(":" in part or "\\" in part for part in parts)):
                 raise HubError("bad file in the skill: %s" % rel)
             total += len(text.encode("utf-8"))
         if total > MAX_SKILL:
             raise HubError("the skill is too big: %d KB at most" % (MAX_SKILL // 1024))
         target = Path(self.roster.root) / "skills" / name
+        for rel in files:
+            if Path(os.path.abspath(str(target / rel))).parts[:len(target.parts)] != target.parts:
+                raise HubError("bad file in the skill: %s" % rel)
         shutil.rmtree(target, ignore_errors=True)
         for rel, text in files.items():
             (target / rel).parent.mkdir(parents=True, exist_ok=True)
@@ -1408,6 +1427,12 @@ class Hub:
     # with nothing to do takes the top row it may (hub_tasks, then hub_take). A row waits for the
     # rows it depends on, never runs at once with another row over the same files (areas), and may
     # need one machine (where).
+    def claim_key(self, mid):
+        """The key a task's claim is settled under across machines: its id, then a new one each time
+        it is given back (old claims stay recorded; they never release)."""
+        gen = self.claim_gen.get(mid, 0)
+        return mid if not gen else "%s@%d" % (mid, gen)
+
     def _row_status(self, mid):
         row = self.sheet[mid]
         if row.get("removed"):
@@ -1494,6 +1519,17 @@ class Hub:
             holder = self.taken.get(mid)
             if holder and holder != to:
                 raise HubError("task #%s is held by %s; they give it back with hub_update todo" % (mid, holder))
+            key = self.claim_key(mid)
+        if self.sync is not None and not holder:
+            # As with hub_take: two machines assigning the same task at once must agree on one.
+            settled = self.sync.claim_task(mid, to, key=key)
+            if settled != to:
+                with self.lock:
+                    self.taken[mid] = settled
+                    self._save()
+                    self._changed()
+                raise HubError("task #%s was just taken by %s" % (mid, settled))
+        with self.lock:
             msg = self._append(lead, to, "Task #%s is yours: %s" % (mid, self.sheet[mid]["title"]), "assign", task=mid)
             self._changed()
             return msg

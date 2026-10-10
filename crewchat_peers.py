@@ -23,6 +23,7 @@ devices on your tailnet reach it through `tailscale serve`. The shared key is th
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import socket
 import sys
@@ -249,17 +250,21 @@ class PeerSync:
     def state_changed(self):
         pass
 
-    def claim_task(self, task, agent):
+    def claim_task(self, task, agent, key=None):
+        """Who gets a task: settled by the machine it was posted on, under its claim key (the task's
+        id, or a new key each time it was given back)."""
         with self.hub.lock:
             msg = next((m for m in self.hub.messages if m["id"] == task), None)
-        origin = (msg or {}).get("origin") or self.device_id
+            row = getattr(self.hub, "sheet", {}).get(task) or {}
+        origin = (msg or {}).get("origin") or row.get("origin") or self.device_id
         if origin == self.device_id:
-            return self.mesh.claim(task, agent)
+            return self.mesh.claim(key or task, agent)
         member = self.mesh.members().get(origin)
         if member is None:
             raise crewchat.HubError("task #%s came from a machine that has left the chat" % task)
         try:
-            return self._call(member, "/peer/claim", {"id": task, "agent": agent}, timeout=15)["holder"]
+            return self._call(member, "/peer/claim", {"id": task, "agent": agent, "key": key or task},
+                              timeout=15)["holder"]
         except (PeerError, KeyError) as e:
             raise crewchat.HubError("cannot reach %s, the machine task #%s was posted on (%s). Try again when "
                                     "it is back." % (member["name"], task, e))
@@ -404,14 +409,18 @@ class PeerSync:
             return 200, local.read_bytes()
         if path == "/peer/claim":
             task = crewchat.clean_id(body.get("id", ""))
+            key = str(body.get("key") or task)
+            if key != task and not re.match(r"^%s@\d{1,6}$" % re.escape(task), key):
+                return 400, {"error": "bad claim key"}
             with self.hub.lock:
-                ours = any(m["id"] == task and m.get("origin") == self.device_id for m in self.hub.messages)
+                ours = any(m["id"] == task and m.get("origin") == self.device_id for m in self.hub.messages) or (
+                    (getattr(self.hub, "sheet", {}).get(task) or {}).get("origin") == self.device_id)
             if not ours:
                 return 404, {"error": "task #%s was not posted here" % task}
             agent = str(body.get("agent") or "")
             if not crewchat.NAME_RE.match(agent):
                 return 400, {"error": "bad agent name"}
-            return 200, {"holder": self.mesh.claim(task, agent)}
+            return 200, {"holder": self.mesh.claim(key, agent)}
         if path == "/peer/rekey":
             secret = str(body.get("secret") or "")
             if len(secret) < 32:

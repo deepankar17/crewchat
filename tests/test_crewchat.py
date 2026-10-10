@@ -1771,6 +1771,33 @@ class Lifecycle(Base):
         self.assertEqual(e.exception.code, 403)
         self.assertIn("The task sheet, in order:", cli("tasks"))
 
+    def test_a_project_folder_removed_by_hand_stops_working(self):
+        entry = crewchat.create_project("short-lived")
+        project = crewchat.Projects()
+        self.assertIsNotNone(project.get(entry["id"]))
+        shutil.rmtree(entry["root"])
+        self.assertIsNone(project.get(entry["id"]))
+
+    def test_a_skill_file_cannot_name_a_drive_or_leave_its_folder(self):
+        for bad in ("C:foo", "a\\b", "../x", "/etc/x"):
+            with self.assertRaises(crewchat.HubError, msg=bad):
+                self.hub.add_skill("guarded", {"SKILL.md": "x", bad: "y"})
+        self.assertNotIn("guarded", crewchat.project_skills(crewchat.home()))
+
+    def test_a_task_given_back_is_claimed_under_a_new_key(self):
+        tid = self.say("all", "changes hands", "task")
+        self.assertEqual(self.hub.claim_key(tid), tid)
+        a, a_name = self.agent()
+        a.text("hub_take", id=tid)
+        a.text("hub_update", id=tid, status="todo", note="back")
+        self.assertEqual(self.hub.claim_key(tid), tid + "@1")
+        # Only its holder gives a task back: anyone else's "todo" is refused, and the key stays.
+        b, b_name = self.agent()
+        a.text("hub_take", id=tid)
+        self.assertIn("you do not hold task #%s" % tid, b.text("hub_update", id=tid, status="todo", note="not mine"))
+        self.assertEqual(self.hub.claim_key(tid), tid + "@1")
+        self.assertEqual(self.hub.taken[tid], a_name)
+
     def test_areas_overlap_by_path_prefix(self):
         self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
         self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))
