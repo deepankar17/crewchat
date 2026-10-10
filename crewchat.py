@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -78,6 +78,7 @@ FAIL_LIMIT = 10  # bad tokens or codes from one address ...
 FAIL_WINDOW = 600  # ... within this many seconds lock it out for the rest of the window.
 CODE_TTL = 120  # owner sign-in code
 INVITE_TTL = 600  # join code
+START_RETRY = 600  # how long a launched agent may ask again with its start key, if the answer was lost
 START_TTL = 1800  # a start key: an agent the owner launched from the chat page, until it checks in
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 SESSION_TTL = 30 * 24 * 3600
@@ -566,6 +567,7 @@ class Hub:
         self.starts = {}  # start key -> {name, role, task, expires}: agents being launched (memory only)
         self.remote = {}  # device id -> {"device": name, "agents": [rows], "updated": time} (cloud sync)
         self.sync = None  # set by crewchat_cloud when cloud sync is on
+        self.redeemed = {}  # start key -> {note, until}: a retry after a lost answer gets the same one
         self.chat_key = ""  # the project's key for this machine's folders ("" for the first project)
         self.machine_root = None  # where this machine's settings are, if not in this project's folder
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
@@ -1133,9 +1135,21 @@ class Hub:
         """A launched agent checking in with its start key. Returns (name, note for the agent)."""
         with self.lock:
             spec = self.starts.pop(key, None)
-            if spec is None or spec["expires"] < time.time():
+            done = self.redeemed.get(key) if spec is None else None
+            if done and done["until"] > time.time() and key in self.links and self.links[key] in self.agents \
+                    and self.agents[self.links[key]]["place"] == self.sessions[sid]["place"]:
+                retry = True
+            elif spec is None or spec["expires"] < time.time():
                 raise HubError("that start key is unknown or has expired; carry on, and call hub_agents to "
                                "see who is here")
+            else:
+                retry = False
+        if retry:
+            # The first answer was lost on the way (a connection reset) and the tool asked again: the
+            # same answer, and this connection is the same agent (as a resumed session would be).
+            name, _ = self.link(sid, key)
+            return name, done["note"]
+        with self.lock:
             name = self.agent_for(sid)
             # The launch gave the session's hooks this same key (CREWCHAT_LINK_KEY): tie it to the
             # agent, so its messages reach it at the end of each turn. A rename carries it along.
@@ -1160,7 +1174,10 @@ class Hub:
                                                                        "are" if len(waiting) > 1 else "is"))
         else:
             notes.append("Check hub_inbox, and tell Owner with hub_send that you are ready.")
-        return name, " ".join(notes)
+        note = " ".join(notes)
+        with self.lock:
+            self.redeemed[key] = {"note": note, "until": time.time() + START_RETRY}
+        return name, note
 
     # Roles and teamwork ----------------------------------------------------------------------
     def roles(self):
@@ -5519,8 +5536,9 @@ function renderProjects(list, current) {
   if (menu === document.activeElement) return;  // open: do not rebuild it under the pointer
   menu.replaceChildren(...list.map((p) => {
     const fresh = p.id !== current && p.last > seen(p.id);
-    // \u21c4: shared with your other machines (stage 1: the first project only).
-    const option = new Option(p.name + (p.linked ? " \u21c4" : "") + (fresh ? "  \u2022 new" : ""), p.id);
+    // Shared with your linked machines (for now the first project only), said in words.
+    const option = new Option(p.name + (p.linked ? " (shared)" : "") + (fresh ? "  \u2022 new" : ""), p.id);
+    if (p.linked) option.title = "Shared with your linked machines: their agents and messages are here too";
     option.selected = p.id === current;
     return option;
   }));

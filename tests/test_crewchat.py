@@ -658,9 +658,19 @@ class Launching(Base):
         hooked = crewchat.post_json(self.base + "/api/hook", token, {"key": key})
         self.assertEqual(hooked.get("agent"), "docs-writer")
         self.assertNotIn("link", hooked)
-        # A start key works once.
-        again = Session(self.base, token).call("hub_link", key=key)["content"][0]["text"]
+        # The answer can be lost on the way (a connection reset), and the agent's tool retries: the
+        # same session, or a new connection from the same folder, gets the same answer and agent.
+        self.assertIn("You are docs-writer", session.text("hub_link", key=key))
+        retry = Session(self.base, token)
+        self.assertIn("Your role's instructions and your first task are in hub_inbox", retry.text("hub_link", key=key))
+        self.assertEqual(retry.me, "docs-writer")
+        # A start key works for that one agent only: another folder cannot use it.
+        place, other = self.join_place("elsewhere-launch")
+        again = Session(self.base, other).call("hub_link", key=key)["content"][0]["text"]
         self.assertIn("unknown or has expired", again)
+        with self.hub.lock:
+            self.hub.redeemed[key]["until"] = 0  # ten minutes on, it is spent for good
+        self.assertIn("unknown or has expired", Session(self.base, token).text("hub_link", key=key))
 
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
