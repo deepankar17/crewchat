@@ -322,6 +322,64 @@ class Sync(unittest.TestCase):
         c.stop()
 
 
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class FreshStart(unittest.TestCase):
+    def test_when_the_last_machine_leaves_the_next_one_founds_the_account_afresh(self):
+        store = cloud.MemoryStore()
+        a, b = Machine(store, "mac"), Machine(store, "windows")
+        a.account.approve("windows", expect_fp=b.device.fp)
+        wait_until(lambda: b.device.ready, message="the approval")
+        a.say("all", "before anyone leaves")
+        wait_until(lambda: b.has("before anyone leaves"))
+        b.account.remove(b.device.id)  # one machine leaves: the account carries on
+        self.assertIsNotNone(store.get("meta/account"))
+        a.account.remove(a.device.id)  # the last one leaves: nothing anyone can read is left
+        self.assertEqual([p for p in store.docs if not p.startswith("meta/")], [])
+        self.assertIsNone(store.get("meta/account"))
+        self.assertIsNone(store.get("meta/trust"))
+        c = Machine(store, "new-laptop")
+        self.assertEqual(c.result, "founded")  # not left waiting for an approval no one can give
+        self.assertTrue(c.device.ready)
+        for m in (a, b, c):
+            m.stop()
+
+    def test_an_account_whose_last_machine_left_without_clearing_it_is_founded_afresh(self):
+        store = cloud.MemoryStore()
+        a = Machine(store, "mac")
+        a.say("all", "left behind")
+        wait_until(lambda: any(p.startswith("messages/") for p in store.docs), message="the publish")
+        a.stop()
+        # What crewchat 0.11.0 left, or a reset cut off: no trusted device, the rest still there.
+        a.account._change_trust(lambda devices: {})
+        store.delete("devices/" + a.device.id)
+        c = Machine(store, "new-laptop")
+        self.assertEqual(c.result, "founded")
+        self.assertTrue(c.device.ready)
+        self.assertEqual([p for p in store.docs if p.startswith("messages/")], [])
+        c.stop()
+
+
+class FirestoreImport(unittest.TestCase):
+    """What `crewchat cloud` says when Google's library cannot be loaded."""
+
+    def test_a_missing_library_says_how_to_install_it(self):
+        e = ModuleNotFoundError("No module named 'google'", name="google")
+        self.assertIn('pip install "crewchat[cloud]"', cloud.firestore_import_error(e))
+
+    def test_smart_app_control_says_to_use_a_signed_python(self):
+        e = ImportError("DLL load failed while importing _overlapped: "
+                        "An Application Control policy has blocked this file.")
+        msg = cloud.firestore_import_error(e)
+        self.assertIn("Smart App Control", msg)
+        self.assertIn("--python-preference only-system", msg)
+
+    def test_any_other_failure_shows_the_error(self):
+        e = ImportError("DLL load failed while importing cygrpc: something else")
+        msg = cloud.firestore_import_error(e)
+        self.assertIn("cygrpc", msg)
+        self.assertNotIn("pip install", msg)
+
+
 def tearDownModule():
     shutil.rmtree(TMP, ignore_errors=True)
 

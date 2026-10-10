@@ -114,6 +114,9 @@ crewchat cloud remove laptop     # drop one; the others switch to a new key it n
 crewchat cloud logout
 ```
 
+When the last machine logs out, no one holds the account key any more: its data is cleared from
+Firestore, and the next machine to log in founds the account again.
+
 Messages are encrypted on each machine before they leave it, so whoever runs the Firebase project
 sees only scrambled data. They are deleted from Firestore once every machine has them, and after
 24 hours at the latest, so a machine that is off for longer misses them. The design, and why:
