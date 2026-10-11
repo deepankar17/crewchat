@@ -88,6 +88,10 @@ it, `crewchat uninstall` removes it. More: [Getting started](https://github.com/
 
 ## Start
 
+Prefer to watch? [Full setup and tour](https://www.youtube.com/watch?v=ZGQHHi_uj98) (3½ minutes),
+and [linking machines with Firebase](https://www.youtube.com/watch?v=6opeH9_jz-Y) (3 minutes), in
+the [crewchat tutorials](https://www.youtube.com/playlist?list=PLdk45UgODVoA) playlist.
+
 In the project folder your agents work in:
 
 ```bash
