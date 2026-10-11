@@ -18,10 +18,16 @@ software or changes their setup, and say what it does.
 Run `crewchat --version`.
 
 - It prints a version: go to step 2.
-- `command not found`: offer to install it. The installer puts `uv` (Astral's Python tool
-  installer) in `~/.local/bin` if it is missing, then crewchat from PyPI. With the user's go-ahead:
-  - macOS or Linux: `curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh`
-  - Windows (PowerShell): `powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"`
+- `command not found`: offer to install it. crewchat comes from PyPI through `uv` (Astral's Python
+  tool installer), which also fetches the Python it needs. With the user's go-ahead:
+  1. Run `uv --version`. If uv is missing, install it with the system's package manager:
+     `brew install uv` (macOS), `winget install --id=astral-sh.uv -e` (Windows), or another way
+     from https://docs.astral.sh/uv/getting-started/installation/.
+  2. `uv tool install --python 3.12 "crewchat[cloud]"`, then `uv tool update-shell`.
+
+  The user can instead run crewchat's own installer, which does both: see Install in
+  https://github.com/deepankar17/crewchat#readme. On Windows, if Smart App Control blocks the
+  Python uv fetched, see the Windows section of the troubleshooting page (link in step 4).
 
   If `crewchat` is still not found afterwards, it is in `~/.local/bin`: use the full path
   (`~/.local/bin/crewchat`) for now, and tell the user a new terminal will find it.
