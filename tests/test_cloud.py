@@ -446,6 +446,10 @@ class SharedProjects(unittest.TestCase):
         a4.send(crewchat.OWNER, "all", "late but shared")
         wait_until(lambda: any(m["text"] == "late but shared" for m in b4.messages), message="the late project")
 
+    def test_the_chat_page_says_cloud_sync(self):
+        link = crewchat.link_info(self.a.hub)
+        self.assertEqual((link["via"], link["me"], link["approved"]), ("cloud", "mac", True))
+
     def test_project_names_never_reach_the_cloud(self):
         self.hub(self.a, "solo").send(crewchat.OWNER, "all", "a secret project")
         wait_until(lambda: any("/messages/" in p and p.startswith("spaces/") for p in self.store.docs),

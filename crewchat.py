@@ -2508,6 +2508,7 @@ COMMANDS = [
 RUNNABLE = {usage: run for _group, rows in COMMANDS for usage, _text, run in rows if run}
 RUN_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:@-]{0,63}$")  # a typed value: no options, no paths
 RUN_TIMEOUT = 60
+RUN_SLOTS = threading.BoundedSemaphore(2)  # commands run from the page at once (a double tap, two tabs)
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
@@ -2541,6 +2542,8 @@ def run_listed_command(usage, values=None, chat=""):
         argv += ["--chat", chat]
     env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
+    if not RUN_SLOTS.acquire(blocking=False):
+        raise HubError("two commands are still running; wait for one to finish")
     try:
         done = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env, cwd=str(home()),
@@ -2549,6 +2552,8 @@ def run_listed_command(usage, values=None, chat=""):
         return {"code": -1, "output": "Still running after %d seconds, so it was stopped." % RUN_TIMEOUT}
     except OSError as e:
         raise HubError("could not run it: %s" % e)
+    finally:
+        RUN_SLOTS.release()
     text = done.stdout.rstrip()
     if done.stderr.strip():
         text = (text + "\n" if text else "") + done.stderr.rstrip()
@@ -2556,27 +2561,9 @@ def run_listed_command(usage, values=None, chat=""):
 
 
 def link_info(hub, shared=True):
-    """How this machine reaches the others, for the page: over Tailscale (each linked machine and
-    whether it answers), with cloud sync through Firestore (online, approved), or not at all."""
-    sync = getattr(hub, "sync", None)
-    if sync is None:
-        return {"via": "none"}
-    mesh = getattr(sync, "mesh", None)
-    if mesh is not None:
-        reachable = getattr(sync, "reachable", None) or (lambda mid: mid in (getattr(sync, "shared_with", ()) or ()))
-        try:
-            members, me, my_id = mesh.members(), mesh.me.get("name", ""), mesh.me.get("id")
-        except Exception:  # peers.json being rewritten: say it is linked, without the list
-            members, me, my_id = {}, "", None
-        machines = sorted(({"name": m.get("name", ""), "online": bool(reachable(mid))}
-                           for mid, m in members.items() if mid != my_id),
-                          key=lambda m: m["name"].lower())
-        return {"via": "tailscale", "me": me, "machines": machines, "shared": shared}
-    device = getattr(sync, "device", None)
-    if device is not None:
-        return {"via": "cloud", "me": getattr(device, "name", ""), "online": bool(getattr(sync, "online", False)),
-                "approved": bool(getattr(device, "ready", False)), "shared": shared}
-    return {"via": "linked", "shared": shared}
+    """How this machine reaches the others, for the page: the link says (over Tailscale, with cloud
+    sync through Firestore), or not at all."""
+    return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
 POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
@@ -2998,12 +2985,11 @@ class Handler(BaseHTTPRequestHandler):
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
+            linked = lambda hub: hub.sync is not None and hub.sync.shared  # noqa: E731
             # Tailscale, cloud sync (Firestore) or none: machines link as a whole, through the first project.
             primary = self.projects.primary
-            data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub,
-                                     shared=self.hub.sync is not None and getattr(self.hub.sync, "shared", True))
-            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(),
-                                 "linked": p.hub.sync is not None and getattr(p.hub.sync, "shared", True)}
+            data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub, shared=linked(self.hub))
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": linked(p.hub)}
                                 for p in self.projects.all()]
             self._json(200, data)
         else:
@@ -3795,6 +3781,10 @@ class ProjectLink:
     @property
     def shared(self):
         return self.chat is None or bool(self.shared_with)
+
+    def link_status(self):
+        """What the chat page shows about this link (link_info adds whether the project is shared)."""
+        return {"via": "linked"}
 
     def share(self, hub, name):
         """Link another project of this machine: with the same-named project on the others."""
@@ -5992,9 +5982,8 @@ async function postJSON(path, body) {
 }
 
 // The task sheet: every task of the project, in order, with who holds it.
-// Chat, Task sheet or Commands (a true/false from older code means the sheet or the chat).
+// Chat, Task sheet or Commands.
 function showView(view) {
-  if (view === true) view = "tasks"; else if (!view) view = "chat";
   $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
   $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
   for (const name of ["chat", "tasks", "commands"]) {
@@ -6063,58 +6052,43 @@ function renderCommands() {
   for (const group of commandGroups || []) {
     const rows = group.commands.filter((c) => !want || (c.usage + " " + c.text).toLowerCase().includes(want));
     if (!rows.length) continue;
-    const box = document.createElement("div");
-    box.className = "cmd-group";
-    const h = document.createElement("h3");
-    h.textContent = group.group;
-    box.append(h);
-    for (const c of rows) box.append(commandRow(c));
+    const box = el("div", "cmd-group");
+    box.append(el("h3", "", group.group), ...rows.map(commandRow));
     list.append(box);
   }
-  if (!list.children.length) list.innerHTML = '<p class="tasks-help">No command matches.</p>';
+  if (!list.children.length) list.append(el("p", "tasks-help", "No command matches."));
 }
 function commandRow(c) {
-  const row = document.createElement("div");
-  row.className = "cmd";
-  const top = document.createElement("div");
-  top.className = "top";
-  const code = document.createElement("code");
-  code.className = "u";
-  code.textContent = "crewchat " + c.usage;
-  top.append(code);
+  const row = el("div", "cmd"), top = el("div", "top"), out = el("pre");
+  out.hidden = true;
+  top.append(el("code", "u", "crewchat " + c.usage));
   const inputs = {};
   for (const name of c.needs || []) {
-    const input = document.createElement("input");
+    const input = el("input");
     input.placeholder = name.toLowerCase();
     input.setAttribute("aria-label", name.toLowerCase() + " for crewchat " + c.usage);
     inputs[name] = input;
     top.append(input);
   }
-  const copy = document.createElement("button");
+  const values = () => Object.fromEntries(Object.entries(inputs).map(([name, input]) => [name, input.value.trim()]));
+  // The command as typed in a terminal, with the values filled in where they were given.
+  const filled = () => { const v = values(); return "crewchat " + c.usage.replace(/\b[A-Z]+\b/g, (n) => v[n] || n); };
+  const copy = el("button", "", "Copy");
   copy.type = "button";
-  copy.textContent = "Copy";
   copy.addEventListener("click", async () => {
-    let text = "crewchat " + c.usage;
-    for (const [name, input] of Object.entries(inputs)) if (input.value.trim()) text = text.replace(name, input.value.trim());
-    try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
+    try { await navigator.clipboard.writeText(filled()); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
     setTimeout(() => { copy.textContent = "Copy"; }, 1500);
   });
   top.append(copy);
-  const out = document.createElement("pre");
-  out.hidden = true;
   if (c.run) {
-    const run = document.createElement("button");
+    const run = el("button", "run", "Run");
     run.type = "button";
-    run.className = "run";
-    run.textContent = "Run";
     run.addEventListener("click", async () => {
-      const values = {};
-      for (const [name, input] of Object.entries(inputs)) values[name] = input.value.trim();
-      if (c.ask && !confirm("Run crewchat " + c.usage.replace(/\{?([A-Z]+)\}?/g, (m, n) => values[n] || m) + " on the host?")) return;
+      if (c.ask && !confirm("Run " + filled() + " on the host?")) return;
       run.disabled = true; run.textContent = "Running…";
       out.hidden = false; out.className = ""; out.textContent = "";
       try {
-        const res = await postJSON("/api/run", { usage: c.usage, values });
+        const res = await postJSON("/api/run", { usage: c.usage, values: values() });
         out.textContent = res.output;
         if (res.code !== 0) out.className = "bad";
       } catch (e) {
@@ -6125,9 +6099,7 @@ function commandRow(c) {
     });
     top.append(run);
   }
-  const p = document.createElement("p");
-  p.textContent = c.text;
-  row.append(top, p, out);
+  row.append(top, el("p", "", c.text), out);
   return row;
 }
 $("cmd-filter").addEventListener("input", () => { if (commandGroups) renderCommands(); });

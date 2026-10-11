@@ -893,32 +893,27 @@ class CommandsTab(Base):
         self.assertEqual(data["link"], {"via": "none"})
         self.assertIn(b'id="link"', self.raw("/", opener=opener)[1])
 
-    def test_link_info_names_tailscale_or_cloud(self):
-        class Mesh:
-            me = {"id": "a1", "name": "mac"}
-
-            def members(self):
-                return {"a1": {"name": "mac"}, "b2": {"name": "Windows-PC"}}
-
-        class Peers:
-            mesh = Mesh()
-
-            def reachable(self, mid):
-                return mid == "b2"
-
-        class Device:
-            name, ready = "mac", True
-
-        class Cloud:
-            device, online = Device(), True
+    def test_link_info_says_what_the_link_reports(self):
+        class Link:
+            def link_status(self):
+                return {"via": "cloud", "me": "mac", "online": True, "approved": True}
 
         hub = lambda sync: type("Hub", (), {"sync": sync})()  # noqa: E731
-        self.assertEqual(crewchat.link_info(hub(Peers())), {
-            "via": "tailscale", "me": "mac", "shared": True,
-            "machines": [{"name": "Windows-PC", "online": True}]})
-        self.assertEqual(crewchat.link_info(hub(Cloud()), shared=False),
+        self.assertEqual(crewchat.link_info(hub(Link()), shared=False),
                          {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False})
         self.assertEqual(crewchat.link_info(hub(None)), {"via": "none"})
+
+    def test_every_runnable_command_parses(self):
+        """A Run button that no longer matches the command line would only fail when tapped."""
+        parser = crewchat.build_parser()
+        for usage, spec in crewchat.RUNNABLE.items():
+            argv = [("laptop" if part == "{NAME}" else "6b56 fa65 a4af 57c4" if part.startswith("{") else part)
+                    for part in spec["argv"]] + (["--chat", "demo"] if spec.get("chat") else [])
+            with contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    parser.parse_args(argv)
+                except SystemExit:
+                    self.fail("the page runs `crewchat %s`, which does not parse" % " ".join(argv))
 
     def test_commands_need_the_owner(self):
         self.assertEqual(self.raw("/api/commands")[0], 401)
