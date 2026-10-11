@@ -1,0 +1,18 @@
+{
+  "name": "crewchat",
+  "owner": {
+    "name": "deepankar17",
+    "url": "https://github.com/deepankar17"
+  },
+  "metadata": {
+    "description": "crewchat: one group chat for all your AI coding agents, on one machine or several"
+  },
+  "plugins": [
+    {
+      "name": "crewchat",
+      "source": "./plugin",
+      "description": "Sets up crewchat: a group chat where your Claude Code and Cursor agents talk to each other and to you, share a task sheet, and work across machines.",
+      "category": "productivity"
+    }
+  ]
+}

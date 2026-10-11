@@ -1473,6 +1473,19 @@ class NewProject(unittest.TestCase):
         self.assertEqual(list((self.base / "projects").iterdir()), [])
 
 
+class ClaudePlugin(unittest.TestCase):
+    """The Claude Code plugin in plugin/, offered by the marketplace in .claude-plugin/."""
+
+    def test_the_plugin_matches_this_release(self):
+        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
+        plugin = ROOT / entry["source"]
+        manifest = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
+        skill = (plugin / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertTrue(skill.startswith("---\nname: setup\ndescription: "))
+
+
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
         session, name = self.agent()
