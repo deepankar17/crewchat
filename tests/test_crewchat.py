@@ -1,4 +1,5 @@
 """End-to-end tests: a real server on a free port, a throwaway home folder, real HTTP."""
+import argparse
 import base64
 import contextlib
 import http.cookiejar
@@ -926,7 +927,8 @@ class CommandsTab(Base):
         groups = json.loads(body)["groups"]
         rows = {c["usage"]: c for g in groups for c in g["commands"]}
         self.assertTrue(rows["projects"]["run"])
-        self.assertFalse(rows["uninstall [--purge]"]["run"])
+        self.assertFalse(rows["uninstall [--yes] [--purge]"]["run"])
+        self.assertIn("service install [--keep-awake]", rows)
         approve = rows["cloud approve NAME --fingerprint FINGERPRINT"]
         self.assertEqual((approve["needs"], approve["ask"]), (["NAME", "FINGERPRINT"], True))
         # The page refuses a cross-site POST, like every other owner action.
@@ -934,20 +936,38 @@ class CommandsTab(Base):
                                 {"Content-Type": "application/json", "Origin": "https://evil.example"}, opener)
         self.assertEqual(status, 403)
 
-    def test_every_command_is_listed(self):
-        listed = {c["usage"].split()[0] for g in crewchat.commands_catalog() for c in g["commands"]}
-        source = (ROOT / "crewchat.py").read_text(encoding="utf-8")
-        parser_names = set(re.findall(r'sub\.add_parser\("([a-z]+)"', source))
-        internal = {"hook", "stdio", "setup", "resume"}
-        self.assertEqual(parser_names - internal - listed, set())
+    def test_every_command_action_and_option_is_listed(self):
+        """The Commands tab lists everything the command line takes: each command, each of its actions
+        (service install, tasks assign, ...) and each of its options (--keep-awake, ...)."""
+        usages = [c["usage"] for g in crewchat.commands_catalog() for c in g["commands"]]
+        words = lambda usage: set(re.split(r"[\s\[\]|]+", usage)) - {""}  # noqa: E731
+        sub = next(a for a in crewchat.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
+        missing = []
+        for name, parser in sub.choices.items():
+            if name == "hook":  # run by the hooks themselves
+                continue
+            mine = [words(u) for u in usages if u.split()[0] == name]
+            if not mine:
+                missing.append(name)
+                continue
+            for action in parser._actions:
+                if action.help == argparse.SUPPRESS or isinstance(action, argparse._HelpAction):
+                    continue
+                wanted = [o for o in action.option_strings if o.startswith("--") and o != "--chat"][:1]
+                if not action.option_strings and action.choices:
+                    wanted = list(action.choices)
+                for word in wanted:
+                    if not any(word in w for w in mine):
+                        missing.append("%s %s" % (name, word))
+        self.assertEqual(missing, [], "add these to COMMANDS in crewchat.py")
 
     def test_runs_listed_commands_only(self):
         status, answer = self.run_cmd({"usage": "projects"})
         self.assertEqual((status, answer["code"]), (200, 0), answer)
         self.assertIn("Demo", answer["output"])
-        status, answer = self.run_cmd({"usage": "tasks"})
+        status, answer = self.run_cmd({"usage": "tasks [list]"})
         self.assertEqual((status, answer["code"]), (200, 0), answer)
-        for usage in ("uninstall [--purge]", "stop", "uninstall", "projects; rm -rf /", ""):
+        for usage in ("uninstall [--yes] [--purge]", "stop", "uninstall", "projects; rm -rf /", ""):
             self.assertEqual(self.run_cmd({"usage": usage})[0], 400, usage)
         approve = "cloud approve NAME --fingerprint FINGERPRINT"
         for name in ("", "--purge", "../x", "a" * 80, "x\ny"):

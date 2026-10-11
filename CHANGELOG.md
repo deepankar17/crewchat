@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.1
+
+- The chat page's Commands tab lists every command with all its actions and options:
+  `service install [--keep-awake]`, `start --keep-awake`, `setup`, `resume`, `rules set`, `skills add`,
+  every `tasks` action, `listen` and `hooks`, `cloud login --again`, `stdio` and the rest. A test now
+  fails if the command line gains an action or option the tab does not list.
+
 ## 0.13.0
 
 **The chat page shows how machines are linked, and every command.**

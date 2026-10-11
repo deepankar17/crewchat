@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -2438,61 +2438,99 @@ PAGE_HEADERS = {
 # uninstall are never run from the page: a stray tap on a phone must not undo a setup.
 COMMANDS = [
     ("Getting going", [
-        ("start [FOLDER]", "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to run again.", None),
+        ("start [FOLDER] [--place NAME] [--client all|claude|cursor] [--chat PROJECT]",
+         "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to "
+         "run again. --place labels the folder in agent names; --chat puts it in that project (made if there is none).", None),
+        ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open]",
+         "The first time: the chat's name and local port. --no-service runs the server until you log out instead of "
+         "at every login; --keep-awake (macOS) keeps the machine from sleeping while crewchat runs; --no-open does "
+         "not open this page.", None),
         ("connect [tailscale|cloud]", "Link this machine with your others. Without an argument it explains both ways and asks.", None),
+        ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N]",
+         "Change settings: the chat's name, the local port, the address other machines use, and how many turns in "
+         "a row an agent may take on other agents' messages before only you can wake it (default 10).", None),
     ]),
     ("The server", [
-        ("serve [--port PORT]", "Run the server in a terminal.", None),
-        ("service install", "Start the server at every login, and now.", None),
+        ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
+        ("service install [--keep-awake]", "Start the server at every login, and now. --keep-awake (macOS) keeps the "
+         "machine from sleeping while crewchat runs, so your phone and other machines can reach it.", None),
         ("service status", "Is start-at-login installed, and is the server running.", {"argv": ["service", "status"]}),
         ("service restart", "Restart the server, for example after an upgrade.", None),
         ("service uninstall", "Stop starting at login.", None),
         ("stop", "Stop the server now.", None),
         ("restart", "Start the server again, or restart a running one.", None),
-        ("update [--version X]", "Install the latest release and restart the server on it.", None),
-        ("uninstall [--purge]", "Remove crewchat: the server, login start, hooks and the program.", None),
+        ("resume", "After an upgrade (the installers run it): start the server again, and at login unless you turned that off.", None),
+        ("update [--version X]", "Install the latest release (or X) and restart the server on it.", None),
+        ("uninstall [--yes] [--purge]", "Remove crewchat: the server, login start, hooks and the program. Asks before "
+         "deleting your chats (--yes does not ask; --purge deletes them).", None),
     ]),
     ("Talking and agents", [
-        ("say TEXT", "Post as you to everyone (--to NAME for one agent, --task for a task, --file PATH to share files).", None),
+        ("say [--to NAME] [--task] [--file PATH] TEXT", "Post as you: to everyone, to one agent (--to), as a task "
+         "for the agents to take (--task), with files (--file, 20 MB each, as many as you like).", None),
         ("agents", "Who is in the chat right now.", {"argv": ["agents"], "chat": True}),
-        ("agent add [NAME]", "Open a new agent session on the host (the + Add an agent button does the same).", None),
+        ("agent add [NAME] [--role ROLE] [--task TEXT] [--tool claude|cursor] [--folder FOLDER] [--accept-edits]",
+         "Open a new agent session on this machine, with its role and first task, in a connected folder; "
+         "--accept-edits lets Claude Code edit files without asking (+ Add an agent does the same).", None),
         ("agent rename OLD NEW", "Rename an agent.", None),
-        ("agent remove NAME", "Drop an agent from the chat.", None),
+        ("agent remove NAME", "Drop an agent from the chat (a running session comes back under a new name).", None),
     ]),
     ("Teams", [
         ("role AGENT ROLE", "Give an agent a role (none takes it away); the menu on an agent's card does the same.", None),
-        ("roles", "List the roles.", {"argv": ["roles"], "chat": True}),
-        ("roles add NAME --prompt TEXT", "Add your own role, or replace a built-in one.", None),
+        ("roles [list]", "List the roles.", {"argv": ["roles"], "chat": True}),
+        ("roles show NAME", "A role's instructions.", None),
+        ("roles add NAME --prompt TEXT [--title TITLE]", "Add your own role, or replace a built-in one.", None),
+        ("roles add NAME --file FILE", "The same, reading the instructions from a file.", None),
         ("roles remove NAME", "Remove one of your roles.", None),
     ]),
     ("Projects, rules, skills and the task sheet", [
         ("projects", "This machine's projects and their folders.", {"argv": ["projects"]}),
-        ("rules", "The project's guide for its agents.", {"argv": ["rules"], "chat": True}),
-        ("rules set TEXT", "The owner's rules for the project (Edit next to Project rules does the same).", None),
-        ("skills", "Skills shared with every agent of the project.", {"argv": ["skills"], "chat": True}),
-        ("tasks", "The task sheet.", {"argv": ["tasks"], "chat": True}),
-        ("tasks add TEXT", "Put a task on the sheet (the Task sheet tab does the same).", None),
+        ("rules [print]", "The project's guide for its agents.", {"argv": ["rules"], "chat": True}),
+        ("rules show", "The owner's rules for the project.", None),
+        ("rules set TEXT", "Set the owner's rules: agents get them at once (Edit next to Project rules does the same).", None),
+        ("rules set --file FILE", "The same, from a file.", None),
+        ("rules clear", "Remove the owner's rules.", None),
+        ("skills [list]", "Skills shared with every agent of the project.", {"argv": ["skills"], "chat": True}),
+        ("skills add PATH [--name NAME]", "Share a skill (a SKILL.md, or a folder holding one) with every agent.", None),
+        ("skills remove NAME", "Stop sharing a skill.", None),
+        ("tasks [list]", "The task sheet.", {"argv": ["tasks"], "chat": True}),
+        ("tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]",
+         "Put a task on the sheet: what it waits for, the files it touches, the machine it needs, who gets it.", None),
+        ("tasks assign ID AGENT", "Give a task to an agent.", None),
+        ("tasks move ID up|down|top", "Reorder the sheet.", None),
+        ("tasks done|todo|blocked ID [NOTE]", "Settle a task (todo puts it back on the sheet).", None),
+        ("tasks remove ID", "Take a task off the sheet.", None),
     ]),
     ("Project folders", [
-        ("listen on|off|default|status", "How long agents in a folder wait for messages after each turn (run it in that folder).", None),
-        ("hooks off|on|status", "Keep a folder's sessions out of the chat, or let them back in (run it in that folder).", None),
+        ("listen on [--minutes N] [--project FOLDER]", "Agents in this folder wait up to N minutes (1 to 55) for messages after each turn.", None),
+        ("listen off [--project FOLDER]", "Check once at the end of each turn, then go idle.", None),
+        ("listen default [--project FOLDER]", "Claude Code waits 30 minutes, Cursor checks once.", None),
+        ("listen status [--project FOLDER]", "Show the setting.", None),
+        ("hooks off [--project FOLDER]", "Keep a folder's sessions out of the chat: no request to join, no messages handed over.", None),
+        ("hooks on [--project FOLDER]", "Let them back in.", None),
+        ("hooks status [--project FOLDER]", "Show the setting.", None),
         ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
         ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
-        ("invite", "A join command for another folder, with a single-use code (10 minutes).", {"argv": ["invite"], "chat": True, "ask": True}),
-        ("join --url URL --code CODE", "Connect a folder to a chat (run it in that folder).", None),
+        ("invite [--local] [--place NAME] [--client all|claude|cursor|generic] [--url URL]",
+         "A join command for another folder, with a single-use code (10 minutes).", {"argv": ["invite"], "chat": True, "ask": True}),
+        ("join --url URL --code CODE [--place NAME] [--client all|claude|cursor|generic] [--project FOLDER]",
+         "Connect a folder to a chat, with the command from an invite (run it in that folder).", None),
     ]),
     ("Several machines over Tailscale", [
-        ("peers invite", "A join command for another machine (sets up this machine's tailnet address the first time).", {"argv": ["peers", "invite"], "ask": True}),
-        ("peers join URL CODE", "Link this machine, with the command from an invite (run it on that machine).", None),
+        ("peers invite [--name NAME] [--url URL]", "A join command for another machine (sets up this machine's tailnet "
+         "address the first time).", {"argv": ["peers", "invite"], "ask": True}),
+        ("peers join URL CODE [--name NAME] [--url URL]", "Link this machine, with the command from an invite (run it on that machine).", None),
         ("peers status", "Linked machines, and which are reachable.", {"argv": ["peers", "status"]}),
-        ("peers remove NAME", "Drop a machine and change the shared key.", None),
-        ("peers leave", "Unlink this machine.", None),
+        ("peers remove NAME [--yes]", "Drop a machine and change the shared key (asks first; --yes does not).", None),
+        ("peers leave [--yes]", "Unlink this machine (asks first; --yes does not).", None),
     ]),
     ("Several machines with cloud sync (Firestore)", [
         ("cloud setup --web-config FILE --oauth-client FILE", "Point this machine at your Firebase project.", None),
-        ("cloud login", "Sign in with Google; the first machine founds the account.", None),
+        ("cloud setup --project-id ID --api-key KEY --client-id ID --client-secret SECRET",
+         "The same, with the values typed in instead of the two files.", None),
+        ("cloud login [--device NAME] [--again]", "Sign in with Google; the first machine founds the account. --again signs in afresh.", None),
         ("cloud status", "This machine's state and fingerprint.", {"argv": ["cloud", "status"]}),
         ("cloud devices", "The machines on the account.", {"argv": ["cloud", "devices"]}),
         ("cloud approve NAME --fingerprint FINGERPRINT", "Let a waiting machine in: type the fingerprint the new machine shows (`crewchat cloud status` there).",
@@ -2501,8 +2539,10 @@ COMMANDS = [
         ("cloud logout", "Sign this machine out.", None),
         ("cloud rules", "Print the Firestore security rules.", {"argv": ["cloud", "rules"]}),
     ]),
-    ("One host", [
+    ("One host, and other tools", [
         ("url [ADDRESS]", "Show (or set) the address other machines use to reach this host.", {"argv": ["url"]}),
+        ("stdio [--project FOLDER] [--url URL] [--token TOKEN]",
+         "crewchat's tools over standard input and output, for MCP clients that only start local programs.", None),
     ]),
 ]
 RUNNABLE = {usage: run for _group, rows in COMMANDS for usage, _text, run in rows if run}
@@ -5890,7 +5930,8 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
   <section id="commands" hidden aria-label="Commands">
     <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
       host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
-      are only for the terminal.</p>
+      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
+      than the one of the folder you are in.</p>
     <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
     <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
   </section>
