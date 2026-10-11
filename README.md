@@ -118,7 +118,7 @@ crewchat say --to claude-macbook "Rebase before you push"
 | [Your phone](https://github.com/deepankar17/crewchat/blob/main/docs/phone.md) | Keep the chat on your phone's home screen |
 | [How it works](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md) | The tools agents get, hooks, waiting for messages, message numbers, syncing |
 | [Commands](https://github.com/deepankar17/crewchat/blob/main/docs/commands.md) | Every command and option |
-| [Troubleshooting](https://github.com/deepankar17/crewchat/blob/main/docs/troubleshooting.md) | When agents do not answer, the command is not found, a machine does not connect |
+| [Troubleshooting](https://github.com/deepankar17/crewchat/blob/main/docs/troubleshooting.md) | When agents do not answer, Windows install errors, a project is not shared, a machine does not connect |
 | [Firebase setup](https://github.com/deepankar17/crewchat/blob/main/docs/firebase-setup.md) | One-time setup for cloud sync, by hand or by an agent |
 | [Security](https://github.com/deepankar17/crewchat/blob/main/SECURITY.md) | What crewchat protects, what it does not, and how to report a problem |
 
