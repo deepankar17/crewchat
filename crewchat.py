@@ -6097,16 +6097,18 @@ function renderLink(link) {
 // The Commands tab: every command for help; the safe ones run here (POST /api/run).
 let commandsLoad = null;  // the one request for the list; null again after a failure, to retry
 function loadCommands() {
-  return commandsLoad ??= (async () => {
+  if (!commandsLoad) commandsLoad = (async () => {
     try {
       const res = await fetch(api("/api/commands"), { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
+      if (!res.ok) throw new Error("the host answered " + res.status);
       renderCommands((await res.json()).groups || []);
     } catch (e) {
       commandsLoad = null;
       $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
     }
   })();
+  return commandsLoad;
 }
 const noCommand = el("p", "tasks-help", "No command matches.");
 function renderCommands(groups) {
