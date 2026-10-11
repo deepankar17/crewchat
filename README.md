@@ -184,3 +184,5 @@ servers on free ports with throwaway home folders. See [CONTRIBUTING.md](https:/
 ## Licence
 
 MIT. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE).
+
+<!-- mcp-name: io.github.deepankar17/crewchat -->

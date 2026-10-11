@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.13.2
 
 - **A Claude Code plugin**, for finding and setting up crewchat from Claude Code:
   `/plugin install crewchat --marketplace deepankar17/crewchat`. Its `setup` skill installs
   crewchat (asking first) and connects the project folder when you ask for it. It adds no tools or
   hooks of its own, so sessions in other projects are not touched; connected folders work as
   before.
+- **In the official MCP Registry**, as `io.github.deepankar17/crewchat`: each release is listed
+  there by the release workflow (`server.json`).
 
 ## 0.13.1
 

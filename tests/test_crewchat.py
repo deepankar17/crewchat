@@ -1485,6 +1485,14 @@ class ClaudePlugin(unittest.TestCase):
         skill = (plugin / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill.startswith("---\nname: setup\ndescription: "))
 
+    def test_the_mcp_registry_entry_matches_this_release(self):
+        entry = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))
+        self.assertEqual(entry["version"], crewchat.__version__)
+        self.assertEqual([(p["identifier"], p["version"]) for p in entry["packages"]], [("crewchat", crewchat.__version__)])
+        self.assertLessEqual(len(entry["description"]), 100)
+        # The registry checks that the PyPI description (README.md) names the entry.
+        self.assertIn("<!-- mcp-name: %s -->" % entry["name"], (ROOT / "README.md").read_text(encoding="utf-8"))
+
 
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
