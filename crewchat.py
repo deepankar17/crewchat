@@ -5731,6 +5731,12 @@ form, #banner { flex: none; }
 #update a { color: inherit; }
 #update button { border: 0; background: none; color: inherit; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
 .empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 7px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+#switching { font-size: 13px; color: var(--ink); margin: 0 0 14px; }
+body.switching main { opacity: 0.45; pointer-events: none; transition: opacity 0.15s; }
 .day { text-align: center; color: var(--muted); font-size: 12px; margin: 18px 0 10px; }
 .msg { margin: 0 0 12px; max-width: 86%; }
 .msg .meta { font-size: 12.5px; color: var(--muted); margin-bottom: 3px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
@@ -5866,6 +5872,7 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
   <h1>__LOGO__<span id="project">crewchat</span><select id="projects" aria-label="Project" hidden></select></h1>
   <p class="sub">Everything your agents say to each other, live.</p>
   <p id="link" class="linkline" hidden></p>
+  <p id="switching" role="status" hidden></p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
   <section id="setup" aria-label="What this project's agents learn">
@@ -5913,7 +5920,7 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
     <button type="button" id="view-tasks" aria-pressed="false">Task sheet <span id="tasks-count"></span></button>
     <button type="button" id="view-commands" aria-pressed="false">Commands</button>
   </nav>
-  <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
+  <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Task sheet">
     <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
       what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
@@ -5987,7 +5994,22 @@ function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "ch
 
 // Several projects: a menu to switch, marking the ones with messages since you last looked there.
 document.addEventListener("change", (e) => {
-  if (e.target && e.target.id === "projects") location.href = "/?chat=" + encodeURIComponent(e.target.value);
+  if (!e.target || e.target.id !== "projects") return;
+  // The page reloads for the other project: say so at once, so the old chat is not taken for the new one.
+  const name = e.target.selectedOptions[0] ? e.target.selectedOptions[0].text.replace(/\s*\(shared\).*$/, "") : "";
+  const note = $("switching");
+  note.replaceChildren(el("span", "spinner"), "Opening " + name + "…");
+  note.hidden = false;
+  e.target.disabled = true;
+  document.body.classList.add("switching");
+  location.href = "/?chat=" + encodeURIComponent(e.target.value);
+});
+// Back to this page from the browser's history: it comes back as it was left, mid-switch.
+window.addEventListener("pageshow", (e) => {
+  if (!e.persisted) return;
+  document.body.classList.remove("switching");
+  $("switching").hidden = true;
+  $("projects").disabled = false;
 });
 function seen(id, last) {
   try {
@@ -6521,6 +6543,7 @@ async function loop() {
       const mine = data.messages.some((m) => m.from === "Owner");
       renderAgents();
       addMessages(data.messages, first);
+      if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the agents below.";
       refreshDynamic();
       // Scroll last: the agent cards and read receipts above change the list's height.
       if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;
