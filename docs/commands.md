@@ -5,9 +5,10 @@ Every `crewchat` command. `crewchat COMMAND --help` shows the same options.
 The chat page has them too: its **Commands** tab lists every command, with **Copy** to paste one
 into a terminal on the host. Commands that only show something (`status`, `tasks`, `peers status`,
 `cloud devices` and the like), and a few that hand out a code (`invite`, `peers invite`,
-`ui --print`, `cloud approve`), also have **Run**: the host runs it and the page shows what it
-printed. The page asks before running one that changes something. Commands that remove, unlink,
-stop or uninstall are never run from the page, so a stray tap on a phone cannot undo a setup.
+`ui --print`), also have **Run**: the host runs it and the page shows what it printed. The page
+asks before running one that hands out a code. Commands that change your setup (remove, unlink,
+stop, uninstall, `cloud approve` with its fingerprint check) are never run from the page, so a
+stray tap on a phone cannot undo a setup.
 
 - [Getting going](#getting-going)
 - [The server](#the-server)
