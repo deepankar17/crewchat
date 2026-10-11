@@ -901,7 +901,10 @@ class CommandsTab(Base):
                 return {"a1": {"name": "mac"}, "b2": {"name": "Windows-PC"}}
 
         class Peers:
-            mesh, shared_with = Mesh(), {"b2"}
+            mesh = Mesh()
+
+            def reachable(self, mid):
+                return mid == "b2"
 
         class Device:
             name, ready = "mac", True
@@ -929,7 +932,8 @@ class CommandsTab(Base):
         rows = {c["usage"]: c for g in groups for c in g["commands"]}
         self.assertTrue(rows["projects"]["run"])
         self.assertFalse(rows["uninstall [--purge]"]["run"])
-        self.assertEqual((rows["cloud approve NAME"]["needs"], rows["cloud approve NAME"]["ask"]), (["NAME"], True))
+        approve = rows["cloud approve NAME --fingerprint FINGERPRINT"]
+        self.assertEqual((approve["needs"], approve["ask"]), (["NAME", "FINGERPRINT"], True))
         # The page refuses a cross-site POST, like every other owner action.
         status, _, _ = self.raw("/api/run", b'{"usage": "projects"}',
                                 {"Content-Type": "application/json", "Origin": "https://evil.example"}, opener)
@@ -950,8 +954,20 @@ class CommandsTab(Base):
         self.assertEqual((status, answer["code"]), (200, 0), answer)
         for usage in ("uninstall [--purge]", "stop", "uninstall", "projects; rm -rf /", ""):
             self.assertEqual(self.run_cmd({"usage": usage})[0], 400, usage)
+        approve = "cloud approve NAME --fingerprint FINGERPRINT"
         for name in ("", "--purge", "../x", "a" * 80, "x\ny"):
-            self.assertEqual(self.run_cmd({"usage": "cloud approve NAME", "values": {"NAME": name}})[0], 400, name)
+            values = {"NAME": name, "FINGERPRINT": "6b56 fa65 a4af 57c4"}
+            self.assertEqual(self.run_cmd({"usage": approve, "values": values})[0], 400, name)
+        self.assertEqual(self.run_cmd({"usage": approve, "values": {"NAME": "laptop"}})[0], 400)  # no fingerprint
+        argv = []
+        real = crewchat.subprocess.run
+        try:  # the page passes both values, so the command never stops to ask at a terminal it lacks
+            crewchat.subprocess.run = lambda cmd, **kw: argv.extend(cmd) or type("Done", (), {
+                "stdout": "", "stderr": "", "returncode": 0})()
+            crewchat.run_listed_command(approve, {"NAME": "laptop", "FINGERPRINT": "6b56 fa65 a4af 57c4"})
+        finally:
+            crewchat.subprocess.run = real
+        self.assertEqual(argv[-5:], ["cloud", "approve", "laptop", "--fingerprint", "6b56 fa65 a4af 57c4"])
 
 class Joining(Base):
     def project(self):

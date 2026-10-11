@@ -229,6 +229,10 @@ class PeerSync(crewchat.ProjectLink):
         self.stopped = threading.Event()
         self.removed_me = False
 
+    def reachable(self, mid):
+        """Is this member answering: it has a puller and its last pulls worked (the chat page's dot)."""
+        return mid in self.threads and self.failures.get(mid, 0) < OFFLINE_AFTER
+
     def _key(self, key):
         """Cursors and claims are kept per project: the first project's under the plain key."""
         return key if self.chat is None else "%s|%s" % (self.chat, key)

@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -2495,7 +2495,8 @@ COMMANDS = [
         ("cloud login", "Sign in with Google; the first machine founds the account.", None),
         ("cloud status", "This machine's state and fingerprint.", {"argv": ["cloud", "status"]}),
         ("cloud devices", "The machines on the account.", {"argv": ["cloud", "devices"]}),
-        ("cloud approve NAME", "Let a waiting machine in. Check its fingerprint first (cloud devices).", {"argv": ["cloud", "approve", "{NAME}"], "ask": True}),
+        ("cloud approve NAME --fingerprint FINGERPRINT", "Let a waiting machine in: type the fingerprint the new machine shows (`crewchat cloud status` there).",
+         {"argv": ["cloud", "approve", "{NAME}", "--fingerprint", "{FINGERPRINT}"], "ask": True}),
         ("cloud remove NAME", "Drop a machine and change the account key.", None),
         ("cloud logout", "Sign this machine out.", None),
         ("cloud rules", "Print the Firestore security rules.", {"argv": ["cloud", "rules"]}),
@@ -2562,12 +2563,12 @@ def link_info(hub, shared=True):
         return {"via": "none"}
     mesh = getattr(sync, "mesh", None)
     if mesh is not None:
-        reachable = set(getattr(sync, "shared_with", ()) or ())
+        reachable = getattr(sync, "reachable", None) or (lambda mid: mid in (getattr(sync, "shared_with", ()) or ()))
         try:
             members, me, my_id = mesh.members(), mesh.me.get("name", ""), mesh.me.get("id")
         except Exception:  # peers.json being rewritten: say it is linked, without the list
             members, me, my_id = {}, "", None
-        machines = sorted(({"name": m.get("name", ""), "online": mid in reachable}
+        machines = sorted(({"name": m.get("name", ""), "online": bool(reachable(mid))}
                            for mid, m in members.items() if mid != my_id),
                           key=lambda m: m["name"].lower())
         return {"via": "tailscale", "me": me, "machines": machines, "shared": shared}
