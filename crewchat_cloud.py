@@ -72,7 +72,7 @@ NOT_INSTALLED = ("which this install does not have. Run the installer again with
 def space_id(root, name):
     """The Firestore folder of a project besides the first, from its name (lower case) and the
     account's own folder (root), so the same name is the same space on every machine."""
-    return hashlib.sha256(("crewchat|space|%s|%s" % (root, name)).encode()).hexdigest()[:24]
+    return crewchat.sha("crewchat|space|%s|%s" % (root, name))[:24]
 
 
 def need_crypto():
@@ -760,7 +760,7 @@ class Account:
 # --------------------------------------------------------------------------------------------
 # Sync: the Hub on one side, the store on the other
 # --------------------------------------------------------------------------------------------
-class CloudSync:
+class CloudSync(crewchat.ProjectLink):
     """Plugs into the Hub as hub.sync: publishes what happens here, applies what arrives.
 
     Projects: the first project's CloudSync is the machine's link (the account, its devices and
@@ -769,20 +769,17 @@ class CloudSync:
     and a project one machine lacks stays on the other."""
 
     def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None):
-        self.hub = hub
+        self._init_projects(hub, chat)
         self.store = store
         self.device = device
         self.account = Account(store, device)
         self.device_id = device.id
         self.ttl = ttl_hours * 3600
         self.log = log or (lambda text: sys.stderr.write("%s cloud %s\n" % (crewchat.now_iso(), text)))
-        self.chat = chat  # a project's name; None for the first project, which is the machine's link
         self.space = space_id(self._root(), chat) if chat is not None else None
         self.base = "spaces/%s/" % self.space if chat is not None else ""  # where its collections are
-        self.projects = {}  # the machine's link only: project name -> its CloudSync
-        self.projects_lock = threading.Lock()
-        self.shared_with = set()  # other machines that publish to this project
         self.marked = False  # spaces/{space} written, so that a reset finds this project's documents
+        self.marks_sent = (None, 0)  # (synced_to, when) last written to the space's marks/
         self.outbox = queue.Queue()
         self.stop_event = threading.Event()
         self.dirty = threading.Event()
@@ -799,10 +796,6 @@ class CloudSync:
             hub.device = device.name
             hub.sync = self
 
-    @property
-    def shared(self):
-        return self.chat is None or bool(self.shared_with)
-
     def _all(self):
         """This link and every project's."""
         with self.projects_lock:
@@ -810,7 +803,6 @@ class CloudSync:
 
     # Wiring ----------------------------------------------------------------------------------
     def start(self):
-        since = max(time.time() - self.ttl, float(self.marks.get("synced_to", 0)) - 120)
         if self.chat is None:
             self.account.refresh()
         else:
@@ -819,6 +811,7 @@ class CloudSync:
                 self.hub.announce_shared(self.chat, adopted)
                 self.marks["announced"] = True
                 self._save_marks()
+        since = max(time.time() - self.ttl, float(self.marks.get("synced_to", 0)) - 120)
         self.unsubscribe = [
             self.store.listen(self.base + "messages", self._on_messages, since=("created", since)),
             self.store.listen(self.base + "state", self._on_state),
@@ -846,31 +839,16 @@ class CloudSync:
             for project in self._all()[1:]:
                 project.stop()
 
-    def share(self, hub, name):
-        """Sync another project of this machine: with the same-named project on the others."""
-        name = str(name).strip().lower()
-        with self.projects_lock:
-            if self.chat is not None or self.stop_event.is_set() or name in self.projects or hub.sync is not None:
-                return self.projects.get(name)
-            sync = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
-            self.projects[name] = sync
-        return sync.start()
+    def stopping(self):
+        return self.stop_event.is_set()
 
-    def unshare(self, name):
-        with self.projects_lock:
-            sync = self.projects.pop(str(name).strip().lower(), None)
-        if sync is not None:
-            sync.detach()
+    def _project_link(self, hub, name):
+        return CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
 
-    def detach(self):
-        """A project stops being synced: leave its hub as if it never had been."""
-        self.stop()
-        with self.hub.lock:
-            if self.hub.sync is self:
-                self.hub.sync = None
-                self.hub.device = ""
-        for device_id in list(self.hub.remote):
-            self.hub.drop_remote(device_id)
+    def _drop(self, device_id):
+        """Another machine is gone from this project (left it, removed, or no longer trusted)."""
+        self.shared_with.discard(device_id)
+        self.hub.drop_remote(device_id)
 
     def _save_marks(self):
         write_private(self.marks_file, json.dumps(self.marks))
@@ -899,7 +877,7 @@ class CloudSync:
     def _root(self):
         return getattr(self.store, "root", "users/memory/")
 
-    def _uid(self):
+    def _scope(self):
         """What every sealed document of this project is bound to: the account's folder and the
         project's space, so a document cannot be moved to another account or project."""
         return self._root() + self.base
@@ -914,7 +892,7 @@ class CloudSync:
             self._mark_space()
         payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind") if k in msg}
         payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
-        doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._uid(), msg["id"], self.device_id), payload)
+        doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._scope(), msg["id"], self.device_id), payload)
         doc["created"] = SERVER_TIME
         self.store.set(self.base + "messages/" + msg["id"], doc)
         if msg["seq"] > int(self.marks.get("published", 0)):
@@ -926,11 +904,11 @@ class CloudSync:
         signature = json.dumps([{k: v for k, v in r.items() if k != "seen"} for r in rows], sort_keys=True)
         now = time.time()
         changed = signature != self.state_sig
-        seen_due = rows and now - self.state_seen_at >= SEEN_EVERY
+        seen_due = rows and self.shared and now - self.state_seen_at >= SEEN_EVERY  # read only by others
         heartbeat_due = rows and now - self.state_sent_at >= HEARTBEAT
         if not (changed or seen_due or heartbeat_due) or now - self.state_sent_at < STATE_DEBOUNCE:
             return changed  # try again later if something is pending
-        doc = self._seal("crewchat|%s|state|%s|%%s" % (self._uid(), self.device_id),
+        doc = self._seal("crewchat|%s|state|%s|%%s" % (self._scope(), self.device_id),
                          {"device": self.device.name, "agents": rows})
         doc["updated"] = SERVER_TIME
         self.store.set(self.base + "state/" + self.device_id, doc)
@@ -984,10 +962,15 @@ class CloudSync:
         project keeps its marks in devices/; another in its space's marks/, where only the machines
         that have the project write, so one that lacks it holds nothing back."""
         marks = "devices" if self.chat is None else self.base + "marks"
-        self._mark_space()
-        self.store.set(marks + "/" + self.device_id, {"seen": SERVER_TIME,
-                                                     "synced_to": float(self.marks.get("synced_to", 0))}, merge=True)
         now = time.time()
+        synced_to = float(self.marks.get("synced_to", 0))
+        if not self.marked:
+            self._mark_space()
+        # A project's marks are written when they move, or every few hours: `seen` only has to be
+        # younger than the retention for this machine to count.
+        if self.chat is None or self.marks_sent[0] != synced_to or now - self.marks_sent[1] > self.ttl / 6:
+            self.store.set(marks + "/" + self.device_id, {"seen": SERVER_TIME, "synced_to": synced_to}, merge=True)
+            self.marks_sent = (synced_to, now)
         trusted = self.device.trust.get("devices", {})
         docs = dict(self.store.list(marks))
         reach = [float(docs[i].get("synced_to") or 0) for i in trusted
@@ -1008,7 +991,7 @@ class CloudSync:
         if not self.device.ready:
             raise crewchat.HubError("this machine is not approved for cloud sync yet")
         task_id = key or task_id
-        aad = "crewchat|%s|task|%s|%%s" % (self._uid(), task_id)
+        aad = "crewchat|%s|task|%s|%%s" % (self._scope(), task_id)
         try:
             doc = self._seal(aad, {"agent": agent})
             doc["created"] = SERVER_TIME
@@ -1035,7 +1018,7 @@ class CloudSync:
                 continue
             created = float(doc.get("created") or 0)
             if doc.get("dev") != self.device_id:
-                aad = "crewchat|%s|msg|%s|%%s|%s" % (self._uid(), doc_id, doc.get("dev"))
+                aad = "crewchat|%s|msg|%s|%%s|%s" % (self._scope(), doc_id, doc.get("dev"))
                 try:
                     payload = self._open(aad, doc)
                 except KeyError:
@@ -1066,14 +1049,15 @@ class CloudSync:
             if device_id == self.device_id:
                 continue
             if kind == "removed" or not self.device.trusted(device_id):
-                self.shared_with.discard(device_id)
-                self.hub.drop_remote(device_id)
+                self._drop(device_id)
                 continue
             try:
-                payload = self._open("crewchat|%s|state|%s|%%s" % (self._uid(), device_id), doc)
+                payload = self._open("crewchat|%s|state|%s|%%s" % (self._scope(), device_id), doc)
             except Exception:
                 continue
-            self.shared_with.add(device_id)
+            if device_id not in self.shared_with:
+                self.shared_with.add(device_id)
+                self.dirty.set()  # a machine just joined this project: tell it who is here now
             self.hub.set_remote(device_id, payload.get("device", ""), payload.get("agents", []),
                                 doc.get("updated") or time.time())
 
@@ -1085,8 +1069,7 @@ class CloudSync:
                     self._after_keys()
             elif kind == "removed":
                 for sync in self._all():
-                    sync.shared_with.discard(device_id)
-                    sync.hub.drop_remote(device_id)
+                    sync._drop(device_id)
 
     def _on_meta(self, changes):
         for kind, doc_id, doc in changes:
@@ -1098,8 +1081,7 @@ class CloudSync:
                 for sync in self._all():
                     for device_id in list(sync.hub.remote):
                         if device_id not in trusted:
-                            sync.shared_with.discard(device_id)
-                            sync.hub.drop_remote(device_id)
+                            sync._drop(device_id)
                 if self.device.id not in trusted and self.device.keys:
                     self.log("this machine was removed from the account; cloud sync stops")
                     self.stop()

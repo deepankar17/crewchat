@@ -207,7 +207,7 @@ class Mesh:
 # --------------------------------------------------------------------------------------------
 # Sync
 # --------------------------------------------------------------------------------------------
-class PeerSync:
+class PeerSync(crewchat.ProjectLink):
     """Plugs into the Hub as hub.sync: the hub's own messages are served to members that pull
     them; messages and rosters pulled from members are handed to the hub.
 
@@ -217,11 +217,8 @@ class PeerSync:
     chat, and a project one machine lacks stays on the other."""
 
     def __init__(self, hub, mesh, log=None, chat=None):
-        self.hub, self.mesh = hub, mesh
-        self.chat = chat  # a project's name; None for the first project, which is the machine's link
-        self.projects = {}  # the machine's link only: project name -> its PeerSync
-        self.projects_lock = threading.Lock()  # one PeerSync per project, however many requests ask at once
-        self.shared_with = set()  # members that have this project
+        self._init_projects(hub, chat)
+        self.mesh = mesh
         self.wake = {}  # member id -> Event: it asked us for this project, so ask it again now
         self.log = log or (lambda text: globals()["log"](text))
         self.device_id = mesh.me["id"]
@@ -235,10 +232,6 @@ class PeerSync:
     def _key(self, key):
         """Cursors and claims are kept per project: the first project's under the plain key."""
         return key if self.chat is None else "%s|%s" % (self.chat, key)
-
-    @property
-    def shared(self):
-        return self.chat is None or bool(self.shared_with)
 
     def start(self):
         hub, me = self.hub, self.mesh.me
@@ -273,20 +266,6 @@ class PeerSync:
         for project in projects:
             project.detach()
 
-    def detach(self):
-        """A project's link ends: stop it, and leave its hub as if it had never been linked (so it can
-        be shared again, under a new name too)."""
-        self.stop()
-        with self.hub.lock:
-            if self.hub.sync is self:
-                self.hub.sync = None
-                self.hub.device = ""
-        self._drop_remotes()
-
-    def _drop_remotes(self):
-        for mid in list(self.hub.remote):
-            self.hub.drop_remote(mid)
-
     def _wake(self, mid):
         """The Event that wakes this project's puller for a member (made on first use)."""
         event = self.wake.get(mid)
@@ -294,21 +273,11 @@ class PeerSync:
             event = self.wake[mid] = threading.Event()
         return event
 
-    def share(self, hub, name):
-        """Link another project of this machine: with the same-named project on each member."""
-        name = str(name).strip().lower()
-        with self.projects_lock:
-            if self.chat is not None or self.stopped.is_set() or name in self.projects or hub.sync is not None:
-                return self.projects.get(name)
-            sync = PeerSync(hub, self.mesh, self.log, chat=name)
-            self.projects[name] = sync
-            return sync.start()
+    def stopping(self):
+        return self.stopped.is_set()
 
-    def unshare(self, name):
-        with self.projects_lock:
-            sync = self.projects.pop(str(name).strip().lower(), None)
-        if sync is not None:
-            sync.detach()
+    def _project_link(self, hub, name):
+        return PeerSync(hub, self.mesh, self.log, chat=name)
 
     def _member_joined(self, mid, name):
         """A machine joined the link (by code, by its own request, or heard of from another member):
