@@ -2,10 +2,9 @@
 
 ## Unreleased
 
-- **The plugin is for Cursor too.** The same `setup` skill, from the Cursor Marketplace
-  (`/add-plugin crewchat`, once it is listed), with Cursor's manifest in `plugin/.cursor-plugin/`.
-  Like the Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the
-  folder.
+- **The plugin is ready for Cursor too**, for the Cursor Marketplace: Cursor's manifest in
+  `plugin/.cursor-plugin/`, the same `setup` skill (its steps now cover a Cursor chat). Like the
+  Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the folder.
 
 ## 0.13.4
 

@@ -1473,35 +1473,31 @@ class NewProject(unittest.TestCase):
         self.assertEqual(list((self.base / "projects").iterdir()), [])
 
 
-class ClaudePlugin(unittest.TestCase):
-    """The plugin in plugin/: for Claude Code (marketplace in .claude-plugin/) and for Cursor
-    (marketplace in .cursor-plugin/), with the same setup skill."""
+class Plugin(unittest.TestCase):
+    """The plugin in plugin/, offered to Claude Code (.claude-plugin/) and Cursor (.cursor-plugin/)."""
 
     def test_the_plugin_matches_this_release(self):
-        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
-        entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
-        plugin = ROOT / entry["source"]
-        manifest = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
-        skill = (plugin / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+        manifests = {}
+        for client in (".claude-plugin", ".cursor-plugin"):
+            with self.subTest(client):
+                market = json.loads((ROOT / client / "marketplace.json").read_text(encoding="utf-8"))
+                entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
+                self.assertEqual(entry["source"], "./plugin")
+                plugin = ROOT / entry["source"]
+                manifests[client] = manifest = json.loads((plugin / client / "plugin.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["name"], "crewchat")
+                # Setup only: `crewchat start` writes each folder's MCP config and hooks, with its
+                # token; a plugin shipping them too would connect sessions twice, in every project.
+                self.assertFalse({"hooks", "rules", "mcpServers"} & set(manifest))
+                self.assertFalse((plugin / "mcp.json").exists() or (plugin / ".mcp.json").exists()
+                                 or (plugin / "hooks").exists())
+        skill = (ROOT / "plugin" / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill.startswith("---\nname: setup\ndescription: "))
-
-    def test_the_cursor_plugin_matches_this_release(self):
-        market = json.loads((ROOT / ".cursor-plugin" / "marketplace.json").read_text(encoding="utf-8"))
-        entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
-        plugin = ROOT / entry["source"]
-        manifest = json.loads((plugin / ".cursor-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
-        # Cursor's review: relative paths inside the plugin, no ".." and no absolute ones.
-        for path in (entry["source"], manifest["logo"]):
-            self.assertFalse(path.startswith("/") or ".." in Path(path).parts, path)
-        self.assertTrue((plugin / manifest["logo"]).is_file())
-        # The same setup skill as Claude Code's, and nothing that would connect a session twice:
-        # `crewchat start` writes the folder's MCP config and hooks itself.
-        self.assertTrue((plugin / "skills" / "setup" / "SKILL.md").is_file())
-        for extra in ("hooks", "rules", "mcpServers"):
-            self.assertNotIn(extra, manifest)
-        self.assertFalse((plugin / "mcp.json").exists() or (plugin / "hooks").exists())
+        claude, cursor = manifests[".claude-plugin"], manifests[".cursor-plugin"]
+        self.assertEqual(claude["version"], crewchat.__version__)
+        self.assertNotIn("version", cursor)  # optional for Cursor, so not one more place to bump
+        self.assertEqual({k: v for k, v in cursor.items() if k != "logo"}, {k: v for k, v in claude.items() if k != "version"})
+        self.assertEqual((ROOT / "plugin" / cursor["logo"]).read_bytes(), (ROOT / "docs" / "images" / "logo.svg").read_bytes())
 
     def test_the_mcp_registry_entry_matches_this_release(self):
         entry = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))

@@ -1,9 +1,9 @@
 {
   "name": "crewchat",
-  "version": "0.13.4",
   "description": "Sets up crewchat: one group chat for all your AI coding agents. Claude Code and Cursor sessions talk to each other and to you, share a task sheet with one taker per task, and work across your machines.",
   "author": {
-    "name": "deepankar17"
+    "name": "deepankar17",
+    "url": "https://github.com/deepankar17"
   },
   "homepage": "https://github.com/deepankar17/crewchat",
   "repository": "https://github.com/deepankar17/crewchat",
