@@ -298,9 +298,9 @@ carries two things you set per project:
 ## Upgrade and uninstall
 
 **Upgrade:** `crewchat update` installs the latest release and starts the server again on it.
-The chat page and the server's log say when a newer crewchat is out: the server asks GitHub for
-the latest release once a day, sending nothing about you or your chat
-(`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).
+The chat page, the server's log and every command you type in a terminal say when a newer
+crewchat is out: the server asks GitHub for the latest release every 6 hours, sending nothing
+about you or your chat (`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).
 
 **Stop:** `crewchat stop` stops the server; agents keep working but cannot reach the chat until
 `crewchat restart`, or your next login if it starts at login.

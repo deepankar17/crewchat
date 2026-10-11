@@ -1771,6 +1771,33 @@ class Lifecycle(Base):
         self.assertEqual(crewchat.version_tuple("v1.2.3"), (1, 2, 3))
         self.assertEqual(crewchat.version_tuple("nightly"), ())
 
+    def test_a_command_typed_in_a_terminal_says_a_newer_release_is_out(self):
+        class Terminal(io.StringIO):
+            def isatty(self):
+                return True
+
+        def told(command, terminal=True, env=None):
+            out = Terminal() if terminal else io.StringIO()
+            with mock.patch.object(crewchat.sys, "stderr", out), mock.patch.dict(os.environ, env or {}):
+                if not env:
+                    os.environ.pop("CREWCHAT_NO_UPDATE_CHECK", None)
+                crewchat.tell_update(command)
+            return out.getvalue()
+
+        path = crewchat.home() / "update.json"
+        try:
+            path.write_text(json.dumps({"latest": "99.0.0"}))
+            self.assertIn("crewchat 99.0.0 is available", told("agents"))
+            self.assertIn("run `crewchat update`", told("tasks"))
+            self.assertEqual(told("agents", terminal=False), "")  # captured: scripts, the page's Run, CI
+            for command in ("hook", "stdio", "serve", "update", "start", "status"):
+                self.assertEqual(told(command), "", command)
+            self.assertEqual(told("agents", env={"CREWCHAT_NO_UPDATE_CHECK": "1"}), "")
+            path.write_text(json.dumps({"latest": crewchat.__version__}))
+            self.assertEqual(told("agents"), "")
+        finally:
+            path.unlink()
+
     def test_a_newer_release_reaches_the_page(self):
         path = crewchat.home() / "update.json"
         try:

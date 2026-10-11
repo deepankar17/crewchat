@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.13.3"
+__version__ = "0.13.4"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -4949,7 +4949,10 @@ def cmd_service(args):
 # --------------------------------------------------------------------------------------------
 RELEASES = "https://github.com/deepankar17/crewchat/releases"
 LATEST_API = os.environ.get("CREWCHAT_UPDATE_URL") or "https://api.github.com/repos/deepankar17/crewchat/releases/latest"
-UPDATE_EVERY = 24 * 3600
+UPDATE_EVERY = 6 * 3600  # how often the running server asks GitHub for the latest release
+# Commands after which no "newer crewchat" line is printed: run by agents' tools or scripts (hook,
+# stdio, serve), about the update itself, or printing it already (start, status).
+NO_UPDATE_NOTICE = ("hook", "stdio", "serve", "update", "uninstall", "resume", "start", "status")
 
 
 def version_tuple(text):
@@ -4980,9 +4983,26 @@ def check_for_update():
     return newer_version()
 
 
+def tell_update(command):
+    """After a command typed in a terminal: one line on stderr if a newer crewchat is out, from the
+    server's last check (nothing is fetched here). Not when the output is captured (scripts, the
+    chat page's Run, CI), nor with CREWCHAT_NO_UPDATE_CHECK=1."""
+    if command in NO_UPDATE_NOTICE or os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
+        return
+    try:
+        if not sys.stderr.isatty():
+            return
+    except (AttributeError, ValueError):
+        return
+    newer = newer_version()
+    if newer:
+        sys.stderr.write("\ncrewchat %s is available (this is %s): run `crewchat update`.\n" % (newer, __version__))
+
+
 def update_checks(projects):
-    """The server's daily check for a newer crewchat: logged once per version, and shown on the
-    chat page. CREWCHAT_NO_UPDATE_CHECK=1 turns it off."""
+    """The server's check for a newer crewchat, every UPDATE_EVERY: logged once per version, shown on
+    the chat page, and after commands typed in a terminal (tell_update). CREWCHAT_NO_UPDATE_CHECK=1
+    turns it off."""
     told = ""
     while True:
         try:
@@ -6904,6 +6924,7 @@ def main(argv=None):
     elif args.fn not in (cmd_start, cmd_hook):
         CURRENT_CHAT = chat_of_folder(Path.cwd())
     args.fn(args)
+    tell_update(getattr(args, "cmd", ""))
 
 
 if __name__ == "__main__":
