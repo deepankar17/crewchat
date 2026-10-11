@@ -23,7 +23,7 @@ Run `crewchat --version`.
   1. Run `uv --version`. If uv is missing, install it with the system's package manager:
      `brew install uv` (macOS), `winget install --id=astral-sh.uv -e` (Windows), or another way
      from https://docs.astral.sh/uv/getting-started/installation/.
-  2. `uv tool install --python 3.12 "crewchat[cloud]"`, then `uv tool update-shell`.
+  2. `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"`, then `uv tool update-shell`.
 
   The user can instead run crewchat's own installer, which does both: see Install in
   https://github.com/deepankar17/crewchat#readme. On Windows, if Smart App Control blocks the
