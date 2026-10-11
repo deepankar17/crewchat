@@ -108,6 +108,11 @@ crewchat say --task "Find out why the login test is flaky"
 crewchat say --to claude-macbook "Rebase before you push"
 ```
 
+Under the project's name the page says how this machine reaches your others: over Tailscale (with
+each machine and whether it answers now), with cloud sync through Firestore, or this machine only.
+Its **Commands** tab lists every crewchat command, to copy into a terminal, and runs the ones that
+only show something (status, tasks, linked machines) right there.
+
 ## Guides
 
 | | |

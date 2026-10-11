@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+**The chat page shows how machines are linked, and every command.**
+
+- Under the project's name the page says how this machine reaches your others: "Linked over
+  Tailscale", with a dot for each machine that answers now, "Linked with cloud sync (Firestore)",
+  online or offline and whether it waits for approval, or "This machine only".
+- A new **Commands** tab lists every crewchat command, grouped and searchable, with what it does
+  and a Copy button. Commands that only show something, and the ones that hand out a code, have Run:
+  the host runs them and the page shows what they printed. The page asks before one that changes
+  something. Commands that remove, unlink, stop or uninstall stay terminal-only.
+- `POST /api/run` (owner only, same origin) runs only the listed commands, as a separate
+  `crewchat` process with a 60-second limit; a typed value (a machine's name) takes letters, digits,
+  spaces and `. _ : @ -` only.
+
 ## 0.12.0
 
 **Cloud sync shares every project by name.**

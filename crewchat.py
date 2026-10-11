@@ -2429,7 +2429,156 @@ PAGE_HEADERS = {
     "Referrer-Policy": "same-origin",
     "Cache-Control": "no-store",
 }
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin")
+# --------------------------------------------------------------------------------------------
+# The chat page's Commands tab: every command, for help, and the safe ones to run from the page
+# --------------------------------------------------------------------------------------------
+# (usage, what it does, how the page runs it or None). A run is the argv to pass, "{NAME}" for a
+# value the owner types, "chat" for commands that act on the project the page shows, and "ask"
+# for ones that change something, so the page asks first. Commands that remove, unlink, stop or
+# uninstall are never run from the page: a stray tap on a phone must not undo a setup.
+COMMANDS = [
+    ("Getting going", [
+        ("start [FOLDER]", "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to run again.", None),
+        ("connect [tailscale|cloud]", "Link this machine with your others. Without an argument it explains both ways and asks.", None),
+        ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
+        ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
+    ]),
+    ("The server", [
+        ("serve [--port PORT]", "Run the server in a terminal.", None),
+        ("service install", "Start the server at every login, and now.", None),
+        ("service status", "Is start-at-login installed, and is the server running.", {"argv": ["service", "status"]}),
+        ("service restart", "Restart the server, for example after an upgrade.", None),
+        ("service uninstall", "Stop starting at login.", None),
+        ("stop", "Stop the server now.", None),
+        ("restart", "Start the server again, or restart a running one.", None),
+        ("update [--version X]", "Install the latest release and restart the server on it.", None),
+        ("uninstall [--purge]", "Remove crewchat: the server, login start, hooks and the program.", None),
+    ]),
+    ("Talking and agents", [
+        ("say TEXT", "Post as you to everyone (--to NAME for one agent, --task for a task, --file PATH to share files).", None),
+        ("agents", "Who is in the chat right now.", {"argv": ["agents"], "chat": True}),
+        ("agent add [NAME]", "Open a new agent session on the host (the + Add an agent button does the same).", None),
+        ("agent rename OLD NEW", "Rename an agent.", None),
+        ("agent remove NAME", "Drop an agent from the chat.", None),
+    ]),
+    ("Teams", [
+        ("role AGENT ROLE", "Give an agent a role (none takes it away); the menu on an agent's card does the same.", None),
+        ("roles", "List the roles.", {"argv": ["roles"], "chat": True}),
+        ("roles add NAME --prompt TEXT", "Add your own role, or replace a built-in one.", None),
+        ("roles remove NAME", "Remove one of your roles.", None),
+    ]),
+    ("Projects, rules, skills and the task sheet", [
+        ("projects", "This machine's projects and their folders.", {"argv": ["projects"]}),
+        ("rules", "The project's guide for its agents.", {"argv": ["rules"], "chat": True}),
+        ("rules set TEXT", "The owner's rules for the project (Edit next to Project rules does the same).", None),
+        ("skills", "Skills shared with every agent of the project.", {"argv": ["skills"], "chat": True}),
+        ("tasks", "The task sheet.", {"argv": ["tasks"], "chat": True}),
+        ("tasks add TEXT", "Put a task on the sheet (the Task sheet tab does the same).", None),
+    ]),
+    ("Project folders", [
+        ("listen on|off|default|status", "How long agents in a folder wait for messages after each turn (run it in that folder).", None),
+        ("hooks off|on|status", "Keep a folder's sessions out of the chat, or let them back in (run it in that folder).", None),
+        ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
+        ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
+        ("invite", "A join command for another folder, with a single-use code (10 minutes).", {"argv": ["invite"], "chat": True, "ask": True}),
+        ("join --url URL --code CODE", "Connect a folder to a chat (run it in that folder).", None),
+    ]),
+    ("Several machines over Tailscale", [
+        ("peers invite", "A join command for another machine (sets up this machine's tailnet address the first time).", {"argv": ["peers", "invite"], "ask": True}),
+        ("peers join URL CODE", "Link this machine, with the command from an invite (run it on that machine).", None),
+        ("peers status", "Linked machines, and which are reachable.", {"argv": ["peers", "status"]}),
+        ("peers remove NAME", "Drop a machine and change the shared key.", None),
+        ("peers leave", "Unlink this machine.", None),
+    ]),
+    ("Several machines with cloud sync (Firestore)", [
+        ("cloud setup --web-config FILE --oauth-client FILE", "Point this machine at your Firebase project.", None),
+        ("cloud login", "Sign in with Google; the first machine founds the account.", None),
+        ("cloud status", "This machine's state and fingerprint.", {"argv": ["cloud", "status"]}),
+        ("cloud devices", "The machines on the account.", {"argv": ["cloud", "devices"]}),
+        ("cloud approve NAME", "Let a waiting machine in. Check its fingerprint first (cloud devices).", {"argv": ["cloud", "approve", "{NAME}"], "ask": True}),
+        ("cloud remove NAME", "Drop a machine and change the account key.", None),
+        ("cloud logout", "Sign this machine out.", None),
+        ("cloud rules", "Print the Firestore security rules.", {"argv": ["cloud", "rules"]}),
+    ]),
+    ("One host", [
+        ("url [ADDRESS]", "Show (or set) the address other machines use to reach this host.", {"argv": ["url"]}),
+    ]),
+]
+RUNNABLE = {usage: run for _group, rows in COMMANDS for usage, _text, run in rows if run}
+RUN_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:@-]{0,63}$")  # a typed value: no options, no paths
+RUN_TIMEOUT = 60
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def commands_catalog():
+    """The Commands tab: groups of {usage, text, run, needs, ask}."""
+    return [{"group": group, "commands": [
+        {"usage": usage, "text": text, "run": bool(run), "ask": bool(run and run.get("ask")),
+         "needs": [part[1:-1] for part in (run or {}).get("argv", []) if part.startswith("{")]}
+        for usage, text, run in rows]} for group, rows in COMMANDS]
+
+
+def run_listed_command(usage, values=None, chat=""):
+    """Run one of the page's runnable commands as `crewchat ...` and return {code, output}. Only the
+    listed commands, with typed values checked; a separate process, so a slow or failing command
+    cannot hold up the server."""
+    spec = RUNNABLE.get(usage)
+    if spec is None:
+        raise HubError("that command cannot be run from the page; copy it into a terminal")
+    values = values if isinstance(values, dict) else {}
+    argv = []
+    for part in spec["argv"]:
+        if part.startswith("{"):
+            name = part[1:-1]
+            value = str(values.get(name) or "").strip()
+            if not RUN_VALUE.match(value):
+                raise HubError("type the %s first (letters, digits, spaces, . _ : @ -)" % name.lower())
+            argv.append(value)
+        else:
+            argv.append(part)
+    if spec.get("chat") and chat:
+        argv += ["--chat", chat]
+    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
+    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
+    try:
+        done = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env, cwd=str(home()),
+                              creationflags=flags, encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        return {"code": -1, "output": "Still running after %d seconds, so it was stopped." % RUN_TIMEOUT}
+    except OSError as e:
+        raise HubError("could not run it: %s" % e)
+    text = done.stdout.rstrip()
+    if done.stderr.strip():
+        text = (text + "\n" if text else "") + done.stderr.rstrip()
+    return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
+
+
+def link_info(hub, shared=True):
+    """How this machine reaches the others, for the page: over Tailscale (each linked machine and
+    whether it answers), with cloud sync through Firestore (online, approved), or not at all."""
+    sync = getattr(hub, "sync", None)
+    if sync is None:
+        return {"via": "none"}
+    mesh = getattr(sync, "mesh", None)
+    if mesh is not None:
+        reachable = set(getattr(sync, "shared_with", ()) or ())
+        try:
+            members, me, my_id = mesh.members(), mesh.me.get("name", ""), mesh.me.get("id")
+        except Exception:  # peers.json being rewritten: say it is linked, without the list
+            members, me, my_id = {}, "", None
+        machines = sorted(({"name": m.get("name", ""), "online": mid in reachable}
+                           for mid, m in members.items() if mid != my_id),
+                          key=lambda m: m["name"].lower())
+        return {"via": "tailscale", "me": me, "machines": machines, "shared": shared}
+    device = getattr(sync, "device", None)
+    if device is not None:
+        return {"via": "cloud", "me": getattr(device, "name", ""), "online": bool(getattr(sync, "online", False)),
+                "approved": bool(getattr(device, "ready", False)), "shared": shared}
+    return {"via": "linked", "shared": shared}
+
+
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -2825,6 +2974,11 @@ class Handler(BaseHTTPRequestHandler):
             if not self._use_asked():
                 return
             self._json(200, launch_options(self.hub.machine_config(), self.roster.root, self.hub.chat_key))
+        elif url.path == "/api/commands":
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return
+            self._json(200, {"groups": commands_catalog()})
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -2843,6 +2997,10 @@ class Handler(BaseHTTPRequestHandler):
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
+            # Tailscale, cloud sync (Firestore) or none: machines link as a whole, through the first project.
+            primary = self.projects.primary
+            data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub,
+                                     shared=self.hub.sync is not None and getattr(self.hub.sync, "shared", True))
             data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(),
                                  "linked": p.hub.sync is not None and getattr(p.hub.sync, "shared", True)}
                                 for p in self.projects.all()]
@@ -3122,6 +3280,15 @@ class Handler(BaseHTTPRequestHandler):
         if path in PEER_PATHS:
             self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
+            return
+        if path == "/api/run":
+            if not self._owner_request() or not self._use_asked():
+                return
+            data = self._object(raw)
+            try:
+                self._json(200, run_listed_command(str(data.get("usage") or ""), data.get("values"), self.project.id))
+            except HubError as e:
+                self._json(400, {"error": str(e)})
             return
         if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
             if not self._owner_request():
@@ -5579,7 +5746,26 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
   padding: 6px 10px; font-weight: 600; }
 #views button.on { color: var(--ink); border-bottom-color: var(--accent); }
 #tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-#tasks[hidden], #log[hidden] { display: none; }
+#tasks[hidden], #log[hidden], #commands[hidden] { display: none; }
+#commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
+#cmd-filter { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; color: var(--ink); font: inherit; font-size: 14px; margin-bottom: 12px; }
+.cmd-group h3 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; font-weight: 650; }
+.cmd { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 9px 11px; margin-bottom: 6px; }
+.cmd .top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cmd code.u { font-size: 13.5px; font-weight: 600; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.cmd p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+.cmd button { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
+.cmd button.run { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.cmd input { font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; width: 9em; }
+.cmd pre { margin: 8px 0 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+  font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.cmd pre.bad { border-color: var(--err); }
+.linkline { font-size: 12.5px; color: var(--muted); margin: -10px 0 14px; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.linkline b { color: var(--ink); font-weight: 650; }
+.linkline .m { white-space: nowrap; }
+.linkline .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--line); margin-right: 4px; vertical-align: 1px; }
+.linkline .dot.on { background: var(--ok); }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .task-form input { flex: 1 1 120px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
@@ -5648,6 +5834,7 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
 <aside>
   <h1>__LOGO__<span id="project">crewchat</span><select id="projects" aria-label="Project" hidden></select></h1>
   <p class="sub">Everything your agents say to each other, live.</p>
+  <p id="link" class="linkline" hidden></p>
   <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
   <div id="agents"></div>
   <section id="setup" aria-label="What this project's agents learn">
@@ -5693,6 +5880,7 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
   <nav id="views" aria-label="View">
     <button type="button" id="view-chat" class="on" aria-pressed="true">Chat</button>
     <button type="button" id="view-tasks" aria-pressed="false">Task sheet <span id="tasks-count"></span></button>
+    <button type="button" id="view-commands" aria-pressed="false">Commands</button>
   </nav>
   <div id="log" aria-live="polite"><p class="empty" id="empty">No messages yet. Say something to the agents below.</p></div>
   <section id="tasks" hidden aria-label="Task sheet">
@@ -5707,6 +5895,13 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
       <button id="t-add">Add</button>
     </form>
     <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+  <section id="commands" hidden aria-label="Commands">
+    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
+      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
+      are only for the terminal.</p>
+    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
+    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
   </section>
   <form id="form">
     <div class="row">
@@ -5796,14 +5991,145 @@ async function postJSON(path, body) {
 }
 
 // The task sheet: every task of the project, in order, with who holds it.
-function showView(tasks) {
-  $("log").hidden = tasks; $("tasks").hidden = !tasks; $("form").hidden = tasks;
-  $("view-chat").classList.toggle("on", !tasks); $("view-tasks").classList.toggle("on", tasks);
-  $("view-chat").setAttribute("aria-pressed", String(!tasks)); $("view-tasks").setAttribute("aria-pressed", String(tasks));
-  try { sessionStorage.setItem("crewchat-view", tasks ? "tasks" : "chat"); } catch (e) {}
+// Chat, Task sheet or Commands (a true/false from older code means the sheet or the chat).
+function showView(view) {
+  if (view === true) view = "tasks"; else if (!view) view = "chat";
+  $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
+  $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
+  for (const name of ["chat", "tasks", "commands"]) {
+    $("view-" + name).classList.toggle("on", view === name);
+    $("view-" + name).setAttribute("aria-pressed", String(view === name));
+  }
+  if (view === "commands") loadCommands();
+  try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
-$("view-chat").addEventListener("click", () => showView(false));
-$("view-tasks").addEventListener("click", () => showView(true));
+$("view-chat").addEventListener("click", () => showView("chat"));
+$("view-tasks").addEventListener("click", () => showView("tasks"));
+$("view-commands").addEventListener("click", () => showView("commands"));
+
+// How this machine reaches your others: over Tailscale, with cloud sync (Firestore), or not at all.
+function renderLink(link) {
+  const line = $("link");
+  if (!link) { line.hidden = true; return; }
+  const parts = [];
+  const dot = (on, label, title) => {
+    const m = el("span", "m");
+    if (title) m.title = title;
+    m.append(el("span", "dot" + (on ? " on" : "")), label);
+    return m;
+  };
+  if (link.via === "tailscale") {
+    parts.push(el("b", "", "Linked over Tailscale"));
+    for (const m of link.machines || [])
+      parts.push(dot(m.online, m.name, m.online ? "Reachable now" : "Not reachable just now"));
+    if (!(link.machines || []).length) parts.push("no other machines yet");
+  } else if (link.via === "cloud") {
+    parts.push(el("b", "", "Linked with cloud sync (Firestore)"));
+    parts.push(dot(link.online, link.online ? "online" : "offline"));
+    if (!link.approved) parts.push("waiting for approval on another machine");
+  } else if (link.via === "linked") {
+    parts.push(el("b", "", "Linked with your other machines"));
+  } else {
+    parts.push("This machine only");
+  }
+  if (link.via !== "none" && link.shared === false) parts.push("(this project stays on this machine)");
+  line.replaceChildren();
+  parts.forEach((part, i) => { if (i) line.append(" "); line.append(part); });
+  line.title = link.via === "tailscale" ? "Each machine is reached directly through your private Tailscale network"
+    : link.via === "cloud" ? "Messages travel encrypted through your own Firebase project (Firestore)"
+    : link.via === "none" ? "crewchat connect links another machine, over Tailscale or with cloud sync" : "";
+  line.hidden = false;
+}
+
+// The Commands tab: every command for help; the safe ones run here (POST /api/run).
+let commandGroups = null;
+async function loadCommands() {
+  if (commandGroups) return;
+  try {
+    const res = await fetch(api("/api/commands"), { cache: "no-store" });
+    if (res.status === 401) { location.href = "/login"; return; }
+    commandGroups = (await res.json()).groups || [];
+  } catch (e) {
+    $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
+    return;
+  }
+  renderCommands();
+}
+function renderCommands() {
+  const want = $("cmd-filter").value.trim().toLowerCase();
+  const list = $("cmd-list");
+  list.replaceChildren();
+  for (const group of commandGroups || []) {
+    const rows = group.commands.filter((c) => !want || (c.usage + " " + c.text).toLowerCase().includes(want));
+    if (!rows.length) continue;
+    const box = document.createElement("div");
+    box.className = "cmd-group";
+    const h = document.createElement("h3");
+    h.textContent = group.group;
+    box.append(h);
+    for (const c of rows) box.append(commandRow(c));
+    list.append(box);
+  }
+  if (!list.children.length) list.innerHTML = '<p class="tasks-help">No command matches.</p>';
+}
+function commandRow(c) {
+  const row = document.createElement("div");
+  row.className = "cmd";
+  const top = document.createElement("div");
+  top.className = "top";
+  const code = document.createElement("code");
+  code.className = "u";
+  code.textContent = "crewchat " + c.usage;
+  top.append(code);
+  const inputs = {};
+  for (const name of c.needs || []) {
+    const input = document.createElement("input");
+    input.placeholder = name.toLowerCase();
+    input.setAttribute("aria-label", name.toLowerCase() + " for crewchat " + c.usage);
+    inputs[name] = input;
+    top.append(input);
+  }
+  const copy = document.createElement("button");
+  copy.type = "button";
+  copy.textContent = "Copy";
+  copy.addEventListener("click", async () => {
+    let text = "crewchat " + c.usage;
+    for (const [name, input] of Object.entries(inputs)) if (input.value.trim()) text = text.replace(name, input.value.trim());
+    try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
+    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  });
+  top.append(copy);
+  const out = document.createElement("pre");
+  out.hidden = true;
+  if (c.run) {
+    const run = document.createElement("button");
+    run.type = "button";
+    run.className = "run";
+    run.textContent = "Run";
+    run.addEventListener("click", async () => {
+      const values = {};
+      for (const [name, input] of Object.entries(inputs)) values[name] = input.value.trim();
+      if (c.ask && !confirm("Run crewchat " + c.usage.replace(/\{?([A-Z]+)\}?/g, (m, n) => values[n] || m) + " on the host?")) return;
+      run.disabled = true; run.textContent = "Running…";
+      out.hidden = false; out.className = ""; out.textContent = "";
+      try {
+        const res = await postJSON("/api/run", { usage: c.usage, values });
+        out.textContent = res.output;
+        if (res.code !== 0) out.className = "bad";
+      } catch (e) {
+        out.textContent = e.message; out.className = "bad";
+      } finally {
+        run.disabled = false; run.textContent = "Run";
+      }
+    });
+    top.append(run);
+  }
+  const p = document.createElement("p");
+  p.textContent = c.text;
+  row.append(top, p, out);
+  return row;
+}
+$("cmd-filter").addEventListener("input", () => { if (commandGroups) renderCommands(); });
 async function taskOp(body) {
   try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
 }
@@ -5862,7 +6188,7 @@ $("task-form").addEventListener("submit", async (event) => {
   await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
   for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
 });
-try { if (sessionStorage.getItem("crewchat-view") === "tasks") showView(true); } catch (e) {}
+try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 function renderSetup(rules, skills) {
@@ -6173,6 +6499,7 @@ async function loop() {
         if (!state.missed) document.title = state.title;
       }
       renderProjects(data.projects, data.chat);
+      renderLink(data.link);
       renderSetup(data.rules, data.skills);
       renderSheet(data.sheet || []);
       const log = $("log");

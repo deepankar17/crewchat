@@ -878,6 +878,81 @@ class ChatPage(Base):
         self.assertIn(b"serviceWorker.register('/sw.js')", self.raw("/", opener=opener)[1])
 
 
+class CommandsTab(Base):
+    """The chat page's connection line and Commands tab (help for every command, and Run for the safe ones)."""
+
+    def run_cmd(self, body, headers=None):
+        status, raw, _ = self.raw("/api/run", json.dumps(body).encode(),
+                                  dict({"Authorization": "Bearer " + self.owner, "Content-Type": "application/json"},
+                                       **(headers or {})))
+        return status, json.loads(raw)
+
+    def test_poll_says_how_machines_are_linked(self):
+        opener, _ = self.owner_browser()
+        data = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
+        self.assertEqual(data["link"], {"via": "none"})
+        self.assertIn(b'id="link"', self.raw("/", opener=opener)[1])
+
+    def test_link_info_names_tailscale_or_cloud(self):
+        class Mesh:
+            me = {"id": "a1", "name": "mac"}
+
+            def members(self):
+                return {"a1": {"name": "mac"}, "b2": {"name": "Windows-PC"}}
+
+        class Peers:
+            mesh, shared_with = Mesh(), {"b2"}
+
+        class Device:
+            name, ready = "mac", True
+
+        class Cloud:
+            device, online = Device(), True
+
+        hub = lambda sync: type("Hub", (), {"sync": sync})()  # noqa: E731
+        self.assertEqual(crewchat.link_info(hub(Peers())), {
+            "via": "tailscale", "me": "mac", "shared": True,
+            "machines": [{"name": "Windows-PC", "online": True}]})
+        self.assertEqual(crewchat.link_info(hub(Cloud()), shared=False),
+                         {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False})
+        self.assertEqual(crewchat.link_info(hub(None)), {"via": "none"})
+
+    def test_commands_need_the_owner(self):
+        self.assertEqual(self.raw("/api/commands")[0], 401)
+        self.assertEqual(self.raw("/api/commands", headers={"Authorization": "Bearer " + self.token})[0], 401)
+        place = {"Authorization": "Bearer " + self.token, "Content-Type": "application/json"}
+        self.assertEqual(self.raw("/api/run", b'{"usage": "projects"}', place)[0], 403)
+        opener, _ = self.owner_browser()
+        status, body, _ = self.raw("/api/commands", opener=opener)
+        self.assertEqual(status, 200)
+        groups = json.loads(body)["groups"]
+        rows = {c["usage"]: c for g in groups for c in g["commands"]}
+        self.assertTrue(rows["projects"]["run"])
+        self.assertFalse(rows["uninstall [--purge]"]["run"])
+        self.assertEqual((rows["cloud approve NAME"]["needs"], rows["cloud approve NAME"]["ask"]), (["NAME"], True))
+        # The page refuses a cross-site POST, like every other owner action.
+        status, _, _ = self.raw("/api/run", b'{"usage": "projects"}',
+                                {"Content-Type": "application/json", "Origin": "https://evil.example"}, opener)
+        self.assertEqual(status, 403)
+
+    def test_every_command_is_listed(self):
+        listed = {c["usage"].split()[0] for g in crewchat.commands_catalog() for c in g["commands"]}
+        source = (ROOT / "crewchat.py").read_text(encoding="utf-8")
+        parser_names = set(re.findall(r'sub\.add_parser\("([a-z]+)"', source))
+        internal = {"hook", "stdio", "setup", "resume"}
+        self.assertEqual(parser_names - internal - listed, set())
+
+    def test_runs_listed_commands_only(self):
+        status, answer = self.run_cmd({"usage": "projects"})
+        self.assertEqual((status, answer["code"]), (200, 0), answer)
+        self.assertIn("Demo", answer["output"])
+        status, answer = self.run_cmd({"usage": "tasks"})
+        self.assertEqual((status, answer["code"]), (200, 0), answer)
+        for usage in ("uninstall [--purge]", "stop", "uninstall", "projects; rm -rf /", ""):
+            self.assertEqual(self.run_cmd({"usage": usage})[0], 400, usage)
+        for name in ("", "--purge", "../x", "a" * 80, "x\ny"):
+            self.assertEqual(self.run_cmd({"usage": "cloud approve NAME", "values": {"NAME": name}})[0], 400, name)
+
 class Joining(Base):
     def project(self):
         folder = Path(tempfile.mkdtemp(prefix="project-", dir=TMP))
