@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.12.0
+
+**Cloud sync shares every project by name.**
+
+- With cloud sync, as over Tailscale since 0.11, a project on one machine and a project with the
+  same name on another are one chat: agents, messages and the task sheet (one taker per task). Start
+  `t3` on the Mac and on Windows and it is one project. The first projects stay shared with each
+  other, whatever their names; a project only one machine has stays on it. A project made later is
+  shared at once, and the project menu says "(shared)" once another machine has it.
+- Each project has its own space in Firestore, named by a hash of the project's name, so the name
+  itself is not stored there. Its messages are encrypted with the same account key as before.
+- When a project becomes shared, its open tasks go with it as history, and the chat says so, as
+  over Tailscale. Earlier messages stay on the machine they were written on.
+- A machine on 0.11 still syncs only the first project; update every machine to share the others.
+- Removing a machine, and the last logout, clear its data in every project's space too.
+
 ## 0.11.3
 
 - After a `crewchat start` that failed on 0.11.1 or older (the Windows "Access is denied" fixed in

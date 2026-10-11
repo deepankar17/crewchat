@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.11.3"
+__version__ = "0.12.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1314,6 +1314,16 @@ class Hub:
             self._rewrite_log(rename, {m["id"]: m for m in moved})
             self._changed()
             return rename
+
+    def announce_shared(self, name, adopted):
+        """Say in the chat, once, that this project is now shared with the same-named project on the
+        other machines (adopted: the open tasks that went with it, from adopt_open_tasks)."""
+        with self.lock:
+            self._event("This project is now shared with your other machines that have a project called %s. "
+                        "From now on its messages reach them; earlier ones stay on each machine%s." % (
+                            name, ", except the %d open task%s on the sheet, shared too" % (
+                                len(adopted), "" if len(adopted) == 1 else "s") if adopted else ""))
+            self._changed()
 
     def _rewrite_log(self, rename, moved):
         """messages.jsonl after adopt_open_tasks: references renamed, the moved messages at the end."""
@@ -3612,8 +3622,8 @@ SHARE_LOCK = threading.Lock()  # one share_projects at a time: each acts on the 
 
 
 def share_projects(projects):
-    """Over Tailscale, link every project besides the first with the same-named project on the
-    other machines (the first projects are linked with each other, whatever their names)."""
+    """Link every project besides the first with the same-named project on the other machines, over
+    Tailscale or cloud sync (the first projects are linked with each other, whatever their names)."""
     with SHARE_LOCK:
         link = projects.primary.hub.sync
         if not hasattr(link, "share"):
@@ -3648,6 +3658,7 @@ def cmd_serve(args):
         try:
             import crewchat_cloud
             crewchat_cloud.start(server.RequestHandlerClass.hub)
+            link_projects(server.RequestHandlerClass.projects)
         except Exception as e:  # the local chat keeps working without the cloud
             sys.stderr.write("%s cloud sync is off: %s\n" % (now_iso(), e))
     elif config.get("peers"):

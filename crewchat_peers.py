@@ -252,12 +252,7 @@ class PeerSync:
                     first_time = True
         adopted = hub.adopt_open_tasks(me["tag"], self.device_id) if hasattr(hub, "adopt_open_tasks") else {}
         if first_time:
-            with hub.lock:
-                hub._event("This project is now shared with your other machines that have a project called %s. "
-                           "From now on its messages reach them; earlier ones stay on each machine%s." % (
-                               self.chat, ", except the %d open task%s on the sheet, shared too" % (
-                                   len(adopted), "" if len(adopted) == 1 else "s") if adopted else ""))
-                hub._changed()
+            hub.announce_shared(self.chat, adopted)
         with hub.lock:
             hub.prefix, hub.device, hub.sync = me["tag"], me["name"], self
             # Tasks posted here before a restart keep their first taker.

@@ -73,7 +73,8 @@ class Machine:
         self.device.create(name)
         self.account = cloud.Account(self.link, self.device)
         self.result = self.account.register()
-        self.hub = crewchat.Hub(crewchat.Roster(self.root))
+        self.projects = crewchat.Projects(self.root)
+        self.hub = self.projects.primary.hub
         self.sync = cloud.CloudSync(self.hub, self.link, self.device, log=lambda text: None).start()
 
     def agent(self, client="claude"):
@@ -357,6 +358,116 @@ class FreshStart(unittest.TestCase):
         self.assertTrue(c.device.ready)
         self.assertEqual([p for p in store.docs if p.startswith("messages/")], [])
         c.stop()
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class SharedProjects(unittest.TestCase):
+    """Projects besides the first are shared by name over cloud sync too: t3 on the Mac and t3 on
+    Windows are one chat."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.store = cloud.MemoryStore()
+        cls.a, cls.b = Machine(cls.store, "mac"), Machine(cls.store, "windows")
+        cls.a.account.approve("windows", expect_fp=cls.b.device.fp)
+        wait_until(lambda: cls.b.device.ready, message="the approval")
+        for m, names in ((cls.a, ("t3", "solo")), (cls.b, ("t3", "other"))):
+            for name in names:
+                crewchat.create_project(name, m.root)
+            m.projects.refresh()
+            crewchat.link_projects(m.projects)
+
+    @classmethod
+    def tearDownClass(cls):
+        for m in (cls.a, cls.b):
+            m.stop()
+
+    def hub(self, machine, name):
+        return machine.projects.get(crewchat.project_id(name)).hub
+
+    def test_a_project_with_the_same_name_is_one_chat(self):
+        a3, b3 = self.hub(self.a, "t3"), self.hub(self.b, "t3")
+        writer = a3.agent_for(a3.open_session("mac", "claude"))
+        reader = b3.agent_for(b3.open_session("windows", "claude"))
+        wait_until(lambda: any(r["agent"] == writer for r in b3.rows()), message="windows' t3 to see the mac's agent")
+        a3.send(writer, "all", "hello t3")
+        wait_until(lambda: any(m["text"] == "hello t3" for m in b3.messages), message="windows' t3 to get it")
+        self.assertIn("hello t3", [m["text"] for m in b3.inbox(reader, 0, True)])
+        self.assertTrue(any("now shared" in m["text"] for m in a3.messages))  # the chat says so, once
+        b3.send(reader, "all", "and back")
+        wait_until(lambda: any(m["text"] == "and back" for m in a3.messages), message="the mac's t3 to get the reply")
+        # Nothing crosses into another project, either way.
+        self.a.say("all", "first project only")
+        wait_until(lambda: self.b.has("first project only"), message="the first projects")
+        time.sleep(0.3)
+        self.assertFalse(any(m["text"] == "first project only" for m in b3.messages))
+        self.assertFalse(self.b.has("hello t3"))
+
+    def test_one_task_one_taker_in_a_shared_project(self):
+        a3, b3 = self.hub(self.a, "t3"), self.hub(self.b, "t3")
+        x = a3.agent_for(a3.open_session("mac", "claude"))
+        y = b3.agent_for(b3.open_session("windows", "claude"))
+        task = a3.add_row(crewchat.OWNER, "one owner for this")
+        wait_until(lambda: task["id"] in b3.sheet, message="the task on windows' sheet")
+        results = {}
+
+        def take(hub, agent):
+            try:
+                hub.take(agent, task["id"])
+                results[agent] = "won"
+            except crewchat.HubError as e:
+                results[agent] = str(e)
+        threads = [threading.Thread(target=take, args=pair) for pair in ((a3, x), (b3, y))]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        winners = [k for k, v in results.items() if v == "won"]
+        self.assertEqual(len(winners), 1, results)
+        for hub in (a3, b3):
+            wait_until(lambda: hub.taken.get(task["id"]) == winners[0], message="both to agree")
+        self.assertNotIn(task["id"], self.a.hub.taken)  # the first project's claims are apart
+
+    def test_a_project_only_one_machine_has_stays_there_and_is_not_marked_shared(self):
+        solo = self.hub(self.a, "solo")
+        solo.send(crewchat.OWNER, "all", "only on the mac")
+        wait_until(lambda: self.hub(self.a, "t3").sync.shared, message="t3 to be shared")
+        time.sleep(0.3)
+        self.assertFalse(solo.sync.shared)
+        for name in ("t3", "other"):
+            self.assertFalse(any(m["text"] == "only on the mac" for m in self.hub(self.b, name).messages))
+
+    def test_a_project_made_later_is_shared_at_once(self):
+        for m in (self.a, self.b):
+            crewchat.create_project("late", m.root)
+            m.projects.all()  # the server notices the new folder on its next request
+        a4, b4 = self.hub(self.a, "late"), self.hub(self.b, "late")
+        a4.send(crewchat.OWNER, "all", "late but shared")
+        wait_until(lambda: any(m["text"] == "late but shared" for m in b4.messages), message="the late project")
+
+    def test_project_names_never_reach_the_cloud(self):
+        self.hub(self.a, "solo").send(crewchat.OWNER, "all", "a secret project")
+        wait_until(lambda: any("/messages/" in p and p.startswith("spaces/") for p in self.store.docs),
+                   message="a project's message in the cloud")
+        for path in list(self.store.docs):
+            for name in ("t3", "solo", "other", "late"):
+                self.assertNotIn(name, path)
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class SharedProjectsReset(unittest.TestCase):
+    def test_the_last_logout_clears_every_project_too(self):
+        store = cloud.MemoryStore()
+        a = Machine(store, "mac")
+        crewchat.create_project("t3", a.root)
+        a.projects.refresh()
+        crewchat.link_projects(a.projects)
+        a.projects.get("t3").hub.send(crewchat.OWNER, "all", "in t3")
+        wait_until(lambda: any(p.startswith("spaces/") and "/messages/" in p for p in store.docs),
+                   message="t3's message in the cloud")
+        a.stop()
+        a.account.remove(a.device.id)
+        self.assertEqual(list(store.docs), [])
 
 
 class FirestoreImport(unittest.TestCase):
