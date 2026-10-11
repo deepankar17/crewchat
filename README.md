@@ -73,6 +73,16 @@ powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercont
 Windows Defender's automatic detection sometimes takes that one line (a script downloaded and run
 at once) for a trojan, `Commando.A!ml`, and stops it; then use uv.
 
+**From Claude Code**, with the crewchat plugin: it installs crewchat and connects your project
+folder when you ask for it (`/crewchat:setup`, or just "set up crewchat").
+
+```
+/plugin install crewchat --marketplace deepankar17/crewchat
+```
+
+On Claude Code before 2.1.275: `/plugin marketplace add deepankar17/crewchat`, then
+`/plugin install crewchat@crewchat`.
+
 Already have uv? `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes. Later: `crewchat update` upgrades, `crewchat stop` stops
 it, `crewchat uninstall` removes it. More: [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
 

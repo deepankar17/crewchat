@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **A Claude Code plugin**, for finding and setting up crewchat from Claude Code:
+  `/plugin install crewchat --marketplace deepankar17/crewchat`. Its `setup` skill installs
+  crewchat (asking first) and connects the project folder when you ask for it. It adds no tools or
+  hooks of its own, so sessions in other projects are not touched; connected folders work as
+  before.
+
 ## 0.13.1
 
 - The chat page's Commands tab lists every command with all its actions and options:
