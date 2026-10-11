@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.13.2"
+__version__ = "0.13.3"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
