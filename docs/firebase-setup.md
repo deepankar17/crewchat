@@ -8,6 +8,9 @@ once. This page covers that setup two ways:
 - [With an agent](#with-an-agent): give the prompt below to Claude (or any agent that can use
   your browser) and it does the console work for you.
 
+A [3-minute video](https://www.youtube.com/watch?v=6opeH9_jz-Y) shows the whole setup, from a new
+Firebase project to a second machine approved.
+
 Either way you end up with two files, which every machine then uses:
 
 | File | Contents | Secret? |
