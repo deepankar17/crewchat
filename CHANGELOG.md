@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.13.4
+
+- Every command you type in a terminal ends with one line when a newer crewchat is out:
+  "crewchat X is available (this is Y): run `crewchat update`". Before, only `crewchat start` and
+  `crewchat status` said so. It goes to stderr and only to a terminal, so scripts, the chat page's
+  Run and CI never see it; `CREWCHAT_NO_UPDATE_CHECK=1` turns it off.
+- The server checks for a new release every 6 hours instead of once a day, for that line and the
+  chat page's banner.
+
 ## 0.13.3
 
 - Searching the Commands tab hides the rows that do not match instead of drawing them again, so a
