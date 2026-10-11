@@ -2562,7 +2562,7 @@ def link_info(hub, shared=True):
     if getattr(sync, "mesh", None) is not None:  # Tailscale (crewchat_peers.PeerSync)
         import crewchat_peers
         members, my_id = sync.mesh.members(), sync.mesh.me.get("id")
-        states = crewchat_peers.member_states(sync, hub)
+        states = crewchat_peers.member_states(sync, hub, members)
         machines = sorted(({"name": m.get("name", ""), "state": states.get(mid, "connecting")}
                            for mid, m in members.items() if mid != my_id), key=lambda m: m["name"].lower())
         return {"via": "tailscale", "me": sync.mesh.me.get("name", ""), "machines": machines, "shared": shared}
@@ -6028,9 +6028,10 @@ function renderLink(link) {
 }
 
 // The Commands tab: every command for help; the safe ones run here (POST /api/run).
-let commandGroups = null;
+let commandGroups = null, commandsLoading = false;
 async function loadCommands() {
-  if (commandGroups) return;
+  if (commandGroups || commandsLoading) return;
+  commandsLoading = true;
   try {
     const res = await fetch(api("/api/commands"), { cache: "no-store" });
     if (res.status === 401) { location.href = "/login"; return; }
@@ -6038,6 +6039,8 @@ async function loadCommands() {
   } catch (e) {
     $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
     return;
+  } finally {
+    commandsLoading = false;
   }
   renderCommands();
 }

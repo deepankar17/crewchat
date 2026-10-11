@@ -603,11 +603,11 @@ class PeerSync(crewchat.ProjectLink):
         return told, missed
 
 
-def member_states(sync, hub):
+def member_states(sync, hub, members=None):
     """Each linked machine's state as this one sees it: online (heard from lately), offline (failed
     in a row) or connecting. `peers status` and the chat page's connection line both show this."""
     now, states = time.time(), {}
-    for mid in sync.mesh.members():
+    for mid in sync.mesh.members() if members is None else members:
         remote = hub.remote.get(mid)
         if sync.failures.get(mid, 0) >= OFFLINE_AFTER:
             states[mid] = "offline"
