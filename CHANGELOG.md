@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.3
 
 - Searching the Commands tab hides the rows that do not match instead of drawing them again, so a
   command's output and any value typed in a row stay when the search is cleared.
