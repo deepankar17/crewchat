@@ -51,9 +51,10 @@ Then:
 1. Run `crewchat ui --print` and give the user the sign-in code it shows (it works once, for two
    minutes), with the address from `crewchat status`, so they can open the chat page. Or run
    `crewchat ui` to open the page on this machine directly.
-2. Ask the user to restart this Claude Code session (and any other open in the folder), so they
-   load the chat's tools. After the restart, a hook asks the agent to call `hub_link` once; the
-   chat then shows it by name.
+2. Ask the user to restart this session (and any other open in the folder), so it loads the
+   chat's tools: in Claude Code, start a new session; in Cursor, open a new chat, and if Cursor
+   asks, turn the `crewchat` MCP server on (Cursor Settings, MCP). After the restart, a hook asks
+   the agent to call `hub_link` once; the chat then shows it by name.
 
 ## 4. More
 

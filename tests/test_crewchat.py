@@ -1474,7 +1474,8 @@ class NewProject(unittest.TestCase):
 
 
 class ClaudePlugin(unittest.TestCase):
-    """The Claude Code plugin in plugin/, offered by the marketplace in .claude-plugin/."""
+    """The plugin in plugin/: for Claude Code (marketplace in .claude-plugin/) and for Cursor
+    (marketplace in .cursor-plugin/), with the same setup skill."""
 
     def test_the_plugin_matches_this_release(self):
         market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
@@ -1484,6 +1485,23 @@ class ClaudePlugin(unittest.TestCase):
         self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
         skill = (plugin / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill.startswith("---\nname: setup\ndescription: "))
+
+    def test_the_cursor_plugin_matches_this_release(self):
+        market = json.loads((ROOT / ".cursor-plugin" / "marketplace.json").read_text(encoding="utf-8"))
+        entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
+        plugin = ROOT / entry["source"]
+        manifest = json.loads((plugin / ".cursor-plugin" / "plugin.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
+        # Cursor's review: relative paths inside the plugin, no ".." and no absolute ones.
+        for path in (entry["source"], manifest["logo"]):
+            self.assertFalse(path.startswith("/") or ".." in Path(path).parts, path)
+        self.assertTrue((plugin / manifest["logo"]).is_file())
+        # The same setup skill as Claude Code's, and nothing that would connect a session twice:
+        # `crewchat start` writes the folder's MCP config and hooks itself.
+        self.assertTrue((plugin / "skills" / "setup" / "SKILL.md").is_file())
+        for extra in ("hooks", "rules", "mcpServers"):
+            self.assertNotIn(extra, manifest)
+        self.assertFalse((plugin / "mcp.json").exists() or (plugin / "hooks").exists())
 
     def test_the_mcp_registry_entry_matches_this_release(self):
         entry = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))

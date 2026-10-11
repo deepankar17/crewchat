@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- **The plugin is for Cursor too.** The same `setup` skill, from the Cursor Marketplace
+  (`/add-plugin crewchat`, once it is listed), with Cursor's manifest in `plugin/.cursor-plugin/`.
+  Like the Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the
+  folder.
+
 ## 0.13.4
 
 - Every command you type in a terminal ends with one line when a newer crewchat is out:

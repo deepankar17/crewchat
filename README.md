@@ -83,6 +83,9 @@ folder when you ask for it (`/crewchat:setup`, or just "set up crewchat").
 On Claude Code before 2.1.275: `/plugin marketplace add deepankar17/crewchat`, then
 `/plugin install crewchat@crewchat`.
 
+**From Cursor**, with the same plugin from the Cursor Marketplace: `/add-plugin crewchat` in a
+Cursor chat, then ask it to set up crewchat.
+
 Already have uv? `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Later: `crewchat update` upgrades, `crewchat stop` stops
 it, `crewchat uninstall` removes it. More: [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
 
