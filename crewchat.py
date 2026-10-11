@@ -6298,6 +6298,7 @@ async function openLaunch() {
       option.title = t.missing || "";
       return option;
     }));
+    $("l-edits-row").hidden = $("l-tool").value !== "claude";  // the rebuilt list may pick another tool
     const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
     opts.tools = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));

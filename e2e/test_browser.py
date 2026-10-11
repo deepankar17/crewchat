@@ -232,6 +232,13 @@ class Page(unittest.TestCase):
         self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
                               ".map(e => e.id || e.className)"), [])
         c.click("#l-cancel")
+        # Opened again, the list starts on its first tool: the box shows exactly when that is Claude Code.
+        c.js("document.getElementById('l-tool').replaceChildren()")  # so that the wait below sees the new list
+        c.click("#add-agent")
+        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list again")
+        self.assertEqual(c.js("document.getElementById('l-edits-row').hidden"),
+                         c.js("document.getElementById('l-tool').value !== 'claude'"))
+        c.click("#l-cancel")
         self.assertEqual(c.errors, [])
 
     def test_phone_and_dark_mode(self):
