@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
 **The chat page shows how machines are linked, and every command.**
 
@@ -14,6 +14,9 @@
 - `POST /api/run` (owner only, same origin) runs only the listed commands, as a separate
   `crewchat` process with a 60-second limit; a typed value (a machine's name) takes letters, digits,
   spaces and `. _ : @ -` only.
+- Approving a machine from the page asks for the fingerprint the new machine shows, as the
+  terminal does, and the Tailscale dots show which machines answer (both found in review before
+  the release).
 
 ## 0.12.0
 

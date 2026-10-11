@@ -313,6 +313,11 @@ class Projects(unittest.TestCase):
         for name in ("t2", "other"):
             self.assertFalse(any(m["text"] == "only on alpha" for m in self.hub(self.b, name).messages))
 
+    def test_the_chat_page_shows_the_other_machine_reachable(self):
+        eventually(lambda: [m["online"] for m in crewchat.link_info(self.a.hub)["machines"]] == [True],
+                   what="the chat page to show beta reachable")
+        self.assertEqual(crewchat.link_info(self.a.hub)["via"], "tailscale")
+
     def test_a_project_made_later_is_linked_at_once(self):
         for m in (self.a, self.b):
             crewchat.create_project("late", m.root)

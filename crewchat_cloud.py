@@ -842,6 +842,9 @@ class CloudSync(crewchat.ProjectLink):
     def stopping(self):
         return self.stop_event.is_set()
 
+    def link_status(self):
+        return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
+
     def _project_link(self, hub, name):
         return CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
 
