@@ -2465,15 +2465,26 @@ COMMANDS = [
         ("role AGENT ROLE", "Give an agent a role (none takes it away); the menu on an agent's card does the same.", None),
         ("roles", "List the roles.", {"argv": ["roles"], "chat": True}),
         ("roles add NAME --prompt TEXT", "Add your own role, or replace a built-in one.", None),
+        ("roles show NAME", "A role's instructions.", None),
         ("roles remove NAME", "Remove one of your roles.", None),
     ]),
     ("Projects, rules, skills and the task sheet", [
         ("projects", "This machine's projects and their folders.", {"argv": ["projects"]}),
         ("rules", "The project's guide for its agents.", {"argv": ["rules"], "chat": True}),
+        ("rules show", "Only the owner's rules, without the rest of the guide.", {"argv": ["rules", "show"], "chat": True}),
         ("rules set TEXT", "The owner's rules for the project (Edit next to Project rules does the same).", None),
+        ("rules clear", "Remove the owner's rules.", None),
         ("skills", "Skills shared with every agent of the project.", {"argv": ["skills"], "chat": True}),
+        ("skills add PATH [--name NAME]", "Share a skill (a folder with SKILL.md, or a .md file) with every agent of the project.", None),
+        ("skills remove NAME", "Stop sharing a skill.", None),
         ("tasks", "The task sheet.", {"argv": ["tasks"], "chat": True}),
         ("tasks add TEXT", "Put a task on the sheet (the Task sheet tab does the same).", None),
+        ("tasks assign ID AGENT", "Give a task to an agent.", None),
+        ("tasks move ID up|down|top", "Change a task's place in the order.", None),
+        ("tasks done ID [NOTE]", "Mark a task done.", None),
+        ("tasks todo ID [NOTE]", "Give a task back: open again, with no taker.", None),
+        ("tasks blocked ID [NOTE]", "Mark a task blocked, with why.", None),
+        ("tasks remove ID", "Take a task off the sheet.", None),
     ]),
     ("Project folders", [
         ("listen on|off|default|status", "How long agents in a folder wait for messages after each turn (run it in that folder).", None),
@@ -2495,7 +2506,7 @@ COMMANDS = [
         ("cloud login", "Sign in with Google; the first machine founds the account.", None),
         ("cloud status", "This machine's state and fingerprint.", {"argv": ["cloud", "status"]}),
         ("cloud devices", "The machines on the account.", {"argv": ["cloud", "devices"]}),
-        ("cloud approve NAME", "Let a waiting machine in. Check its fingerprint first (cloud devices).", {"argv": ["cloud", "approve", "{NAME}"], "ask": True}),
+        ("cloud approve NAME", "Let a waiting machine in, after checking its fingerprint (cloud devices).", None),
         ("cloud remove NAME", "Drop a machine and change the account key.", None),
         ("cloud logout", "Sign this machine out.", None),
         ("cloud rules", "Print the Firestore security rules.", {"argv": ["cloud", "rules"]}),
@@ -2505,77 +2516,58 @@ COMMANDS = [
     ]),
 ]
 RUNNABLE = {usage: run for _group, rows in COMMANDS for usage, _text, run in rows if run}
-RUN_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._:@-]{0,63}$")  # a typed value: no options, no paths
 RUN_TIMEOUT = 60
-ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+RUN_ONE = threading.Semaphore(1)  # one command from the page at a time
 
 
 def commands_catalog():
-    """The Commands tab: groups of {usage, text, run, needs, ask}."""
+    """The Commands tab: groups of {usage, text, run, ask}."""
     return [{"group": group, "commands": [
-        {"usage": usage, "text": text, "run": bool(run), "ask": bool(run and run.get("ask")),
-         "needs": [part[1:-1] for part in (run or {}).get("argv", []) if part.startswith("{")]}
+        {"usage": usage, "text": text, "run": bool(run), "ask": bool(run and run.get("ask"))}
         for usage, text, run in rows]} for group, rows in COMMANDS]
 
 
-def run_listed_command(usage, values=None, chat=""):
+def run_listed_command(usage, chat):
     """Run one of the page's runnable commands as `crewchat ...` and return {code, output}. Only the
-    listed commands, with typed values checked; a separate process, so a slow or failing command
-    cannot hold up the server."""
+    listed commands, exactly as listed (nothing typed on the page reaches the command line), one at
+    a time, in a separate process so that a slow or failing command cannot hold up the server."""
     spec = RUNNABLE.get(usage)
     if spec is None:
         raise HubError("that command cannot be run from the page; copy it into a terminal")
-    values = values if isinstance(values, dict) else {}
-    argv = []
-    for part in spec["argv"]:
-        if part.startswith("{"):
-            name = part[1:-1]
-            value = str(values.get(name) or "").strip()
-            if not RUN_VALUE.match(value):
-                raise HubError("type the %s first (letters, digits, spaces, . _ : @ -)" % name.lower())
-            argv.append(value)
-        else:
-            argv.append(part)
-    if spec.get("chat") and chat:
-        argv += ["--chat", chat]
-    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
-    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
+    argv = spec["argv"] + (["--chat", chat] if spec.get("chat") else [])
+    if not RUN_ONE.acquire(blocking=False):
+        raise HubError("another command is still running; try again when it has finished")
     try:
-        done = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env, cwd=str(home()),
-                              creationflags=flags, encoding="utf-8", errors="replace")
+        done = subprocess.run(self_command() + argv, stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=RUN_TIMEOUT, env=dict(os.environ, CREWCHAT_NO_UPDATE_CHECK="1"),
+                              cwd=str(home()), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                              text=True, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         return {"code": -1, "output": "Still running after %d seconds, so it was stopped." % RUN_TIMEOUT}
     except OSError as e:
         raise HubError("could not run it: %s" % e)
-    text = done.stdout.rstrip()
-    if done.stderr.strip():
-        text = (text + "\n" if text else "") + done.stderr.rstrip()
-    return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
+    finally:
+        RUN_ONE.release()
+    text = "\n".join(part.rstrip() for part in (done.stdout, done.stderr) if part.strip())
+    return {"code": done.returncode, "output": text[:20000] or "(no output)"}
 
 
 def link_info(hub, shared=True):
     """How this machine reaches the others, for the page: over Tailscale (each linked machine and
-    whether it answers), with cloud sync through Firestore (online, approved), or not at all."""
-    sync = getattr(hub, "sync", None)
+    its state, as `peers status` shows it), with cloud sync through Firestore (online, approved), or
+    not at all. `hub` is the first project's: machines link through it."""
+    sync = hub.sync
     if sync is None:
         return {"via": "none"}
-    mesh = getattr(sync, "mesh", None)
-    if mesh is not None:
-        reachable = set(getattr(sync, "shared_with", ()) or ())
-        try:
-            members, me, my_id = mesh.members(), mesh.me.get("name", ""), mesh.me.get("id")
-        except Exception:  # peers.json being rewritten: say it is linked, without the list
-            members, me, my_id = {}, "", None
-        machines = sorted(({"name": m.get("name", ""), "online": mid in reachable}
-                           for mid, m in members.items() if mid != my_id),
-                          key=lambda m: m["name"].lower())
-        return {"via": "tailscale", "me": me, "machines": machines, "shared": shared}
-    device = getattr(sync, "device", None)
-    if device is not None:
-        return {"via": "cloud", "me": getattr(device, "name", ""), "online": bool(getattr(sync, "online", False)),
-                "approved": bool(getattr(device, "ready", False)), "shared": shared}
-    return {"via": "linked", "shared": shared}
+    if getattr(sync, "mesh", None) is not None:  # Tailscale (crewchat_peers.PeerSync)
+        import crewchat_peers
+        members, my_id = sync.mesh.members(), sync.mesh.me.get("id")
+        states = crewchat_peers.member_states(sync, hub)
+        machines = sorted(({"name": m.get("name", ""), "state": states.get(mid, "connecting")}
+                           for mid, m in members.items() if mid != my_id), key=lambda m: m["name"].lower())
+        return {"via": "tailscale", "me": sync.mesh.me.get("name", ""), "machines": machines, "shared": shared}
+    return {"via": "cloud", "me": sync.device.name, "online": bool(sync.online),  # crewchat_cloud.CloudSync
+            "approved": bool(sync.device.ready), "shared": shared}
 
 
 POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
@@ -2998,8 +2990,7 @@ class Handler(BaseHTTPRequestHandler):
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
             # Tailscale, cloud sync (Firestore) or none: machines link as a whole, through the first project.
-            primary = self.projects.primary
-            data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub,
+            data["link"] = link_info(self.projects.primary.hub,
                                      shared=self.hub.sync is not None and getattr(self.hub.sync, "shared", True))
             data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(),
                                  "linked": p.hub.sync is not None and getattr(p.hub.sync, "shared", True)}
@@ -3281,20 +3272,12 @@ class Handler(BaseHTTPRequestHandler):
             self._use(self.projects.primary)  # linked machines share the first project
             self._peer(path, raw)
             return
-        if path == "/api/run":
-            if not self._owner_request() or not self._use_asked():
-                return
-            data = self._object(raw)
-            try:
-                self._json(200, run_listed_command(str(data.get("usage") or ""), data.get("values"), self.project.id))
-            except HubError as e:
-                self._json(400, {"error": str(e)})
-            return
-        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
+        if path in ("/api/send", "/api/role", "/api/launch", "/api/rules", "/api/skills", "/api/task", "/api/run"):
             if not self._owner_request():
                 return
             action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/launch": self._launch,
-                      "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}[path]
+                      "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
+                      "/api/run": lambda d: run_listed_command(str(d.get("usage") or ""), self.project.id)}[path]
             try:
                 self._json(200, action(self._object(raw)))
             except HubError as e:
@@ -5746,7 +5729,7 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
   padding: 6px 10px; font-weight: 600; }
 #views button.on { color: var(--ink); border-bottom-color: var(--accent); }
 #tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-#tasks[hidden], #log[hidden], #commands[hidden] { display: none; }
+#tasks[hidden], #log[hidden], #commands[hidden], .cmd[hidden], .cmd-group[hidden], #cmd-list > p[hidden] { display: none; }
 #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
 #cmd-filter { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 10px; color: var(--ink); font: inherit; font-size: 14px; margin-bottom: 12px; }
@@ -5757,7 +5740,6 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
 .cmd p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
 .cmd button { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
 .cmd button.run { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.cmd input { font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; width: 9em; }
 .cmd pre { margin: 8px 0 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
   font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
 .cmd pre.bad { border-color: var(--err); }
@@ -5991,12 +5973,13 @@ async function postJSON(path, body) {
 }
 
 // The task sheet: every task of the project, in order, with who holds it.
-// Chat, Task sheet or Commands (a true/false from older code means the sheet or the chat).
+// Chat, Task sheet or Commands.
+const VIEWS = ["chat", "tasks", "commands"];
 function showView(view) {
-  if (view === true) view = "tasks"; else if (!view) view = "chat";
+  if (!VIEWS.includes(view)) view = "chat";
   $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
   $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
-  for (const name of ["chat", "tasks", "commands"]) {
+  for (const name of VIEWS) {
     $("view-" + name).classList.toggle("on", view === name);
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
@@ -6008,8 +5991,13 @@ $("view-tasks").addEventListener("click", () => showView("tasks"));
 $("view-commands").addEventListener("click", () => showView("commands"));
 
 // How this machine reaches your others: over Tailscale, with cloud sync (Firestore), or not at all.
+const MACHINE_STATE = { online: "Reachable now", connecting: "Connecting", offline: "Not reachable just now" };
+let shownLink = "";
 function renderLink(link) {
   const line = $("link");
+  const key = JSON.stringify(link || null);
+  if (key === shownLink) return;  // the poll sends it every time; it seldom changes
+  shownLink = key;
   if (!link) { line.hidden = true; return; }
   const parts = [];
   const dot = (on, label, title) => {
@@ -6021,23 +6009,21 @@ function renderLink(link) {
   if (link.via === "tailscale") {
     parts.push(el("b", "", "Linked over Tailscale"));
     for (const m of link.machines || [])
-      parts.push(dot(m.online, m.name, m.online ? "Reachable now" : "Not reachable just now"));
+      parts.push(dot(m.state === "online", m.name, MACHINE_STATE[m.state] || m.state));
     if (!(link.machines || []).length) parts.push("no other machines yet");
+    line.title = "Each machine is reached directly through your private Tailscale network";
   } else if (link.via === "cloud") {
     parts.push(el("b", "", "Linked with cloud sync (Firestore)"));
     parts.push(dot(link.online, link.online ? "online" : "offline"));
     if (!link.approved) parts.push("waiting for approval on another machine");
-  } else if (link.via === "linked") {
-    parts.push(el("b", "", "Linked with your other machines"));
+    line.title = "Messages travel encrypted through your own Firebase project (Firestore)";
   } else {
     parts.push("This machine only");
+    line.title = "crewchat connect links another machine, over Tailscale or with cloud sync";
   }
-  if (link.via !== "none" && link.shared === false) parts.push("(this project stays on this machine)");
+  if (link.shared === false) parts.push("(this project stays on this machine)");
   line.replaceChildren();
   parts.forEach((part, i) => { if (i) line.append(" "); line.append(part); });
-  line.title = link.via === "tailscale" ? "Each machine is reached directly through your private Tailscale network"
-    : link.via === "cloud" ? "Messages travel encrypted through your own Firebase project (Firestore)"
-    : link.via === "none" ? "crewchat connect links another machine, over Tailscale or with cloud sync" : "";
   line.hidden = false;
 }
 
@@ -6056,64 +6042,60 @@ async function loadCommands() {
   renderCommands();
 }
 function renderCommands() {
-  const want = $("cmd-filter").value.trim().toLowerCase();
   const list = $("cmd-list");
   list.replaceChildren();
-  for (const group of commandGroups || []) {
-    const rows = group.commands.filter((c) => !want || (c.usage + " " + c.text).toLowerCase().includes(want));
-    if (!rows.length) continue;
-    const box = document.createElement("div");
-    box.className = "cmd-group";
-    const h = document.createElement("h3");
-    h.textContent = group.group;
-    box.append(h);
-    for (const c of rows) box.append(commandRow(c));
+  for (const group of commandGroups) {
+    const box = el("div", "cmd-group");
+    box.append(el("h3", "", group.group));
+    for (const c of group.commands) {
+      const row = commandRow(c);
+      row.dataset.find = (c.usage + " " + c.text).toLowerCase();
+      box.append(row);
+    }
     list.append(box);
   }
-  if (!list.children.length) list.innerHTML = '<p class="tasks-help">No command matches.</p>';
+  list.append(el("p", "tasks-help", "No command matches."));
+  filterCommands();
+}
+// Typing in the search box hides what does not match; rows keep any output they show.
+function filterCommands() {
+  const want = $("cmd-filter").value.trim().toLowerCase();
+  let any = false;
+  for (const box of $("cmd-list").querySelectorAll(".cmd-group")) {
+    let shown = 0;
+    for (const row of box.querySelectorAll(".cmd")) {
+      row.hidden = !!want && !row.dataset.find.includes(want);
+      if (!row.hidden) shown++;
+    }
+    box.hidden = !shown;
+    any = any || shown > 0;
+  }
+  const none = $("cmd-list").querySelector(":scope > p.tasks-help");
+  if (none) none.hidden = any;
 }
 function commandRow(c) {
-  const row = document.createElement("div");
-  row.className = "cmd";
-  const top = document.createElement("div");
-  top.className = "top";
-  const code = document.createElement("code");
-  code.className = "u";
-  code.textContent = "crewchat " + c.usage;
-  top.append(code);
-  const inputs = {};
-  for (const name of c.needs || []) {
-    const input = document.createElement("input");
-    input.placeholder = name.toLowerCase();
-    input.setAttribute("aria-label", name.toLowerCase() + " for crewchat " + c.usage);
-    inputs[name] = input;
-    top.append(input);
-  }
-  const copy = document.createElement("button");
+  const row = el("div", "cmd");
+  const top = el("div", "top");
+  const text = "crewchat " + c.usage;
+  top.append(el("code", "u", text));
+  const copy = el("button", "", "Copy");
   copy.type = "button";
-  copy.textContent = "Copy";
   copy.addEventListener("click", async () => {
-    let text = "crewchat " + c.usage;
-    for (const [name, input] of Object.entries(inputs)) if (input.value.trim()) text = text.replace(name, input.value.trim());
     try { await navigator.clipboard.writeText(text); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
     setTimeout(() => { copy.textContent = "Copy"; }, 1500);
   });
   top.append(copy);
-  const out = document.createElement("pre");
+  const out = el("pre");
   out.hidden = true;
   if (c.run) {
-    const run = document.createElement("button");
+    const run = el("button", "run", "Run");
     run.type = "button";
-    run.className = "run";
-    run.textContent = "Run";
     run.addEventListener("click", async () => {
-      const values = {};
-      for (const [name, input] of Object.entries(inputs)) values[name] = input.value.trim();
-      if (c.ask && !confirm("Run crewchat " + c.usage.replace(/\{?([A-Z]+)\}?/g, (m, n) => values[n] || m) + " on the host?")) return;
+      if (c.ask && !confirm("Run " + text + " on the host?")) return;
       run.disabled = true; run.textContent = "Running…";
       out.hidden = false; out.className = ""; out.textContent = "";
       try {
-        const res = await postJSON("/api/run", { usage: c.usage, values });
+        const res = await postJSON("/api/run", { usage: c.usage });
         out.textContent = res.output;
         if (res.code !== 0) out.className = "bad";
       } catch (e) {
@@ -6124,12 +6106,10 @@ function commandRow(c) {
     });
     top.append(run);
   }
-  const p = document.createElement("p");
-  p.textContent = c.text;
-  row.append(top, p, out);
+  row.append(top, el("p", "", c.text), out);
   return row;
 }
-$("cmd-filter").addEventListener("input", () => { if (commandGroups) renderCommands(); });
+$("cmd-filter").addEventListener("input", () => { if (commandGroups) filterCommands(); });
 async function taskOp(body) {
   try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
 }
@@ -6188,7 +6168,7 @@ $("task-form").addEventListener("submit", async (event) => {
   await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
   for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
 });
-try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
+try { const v = sessionStorage.getItem("crewchat-view"); if (v && v !== "chat") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 function renderSetup(rules, skills) {

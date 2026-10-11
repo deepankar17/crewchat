@@ -894,14 +894,18 @@ class CommandsTab(Base):
         self.assertIn(b'id="link"', self.raw("/", opener=opener)[1])
 
     def test_link_info_names_tailscale_or_cloud(self):
+        import crewchat_peers
+
         class Mesh:
             me = {"id": "a1", "name": "mac"}
 
             def members(self):
-                return {"a1": {"name": "mac"}, "b2": {"name": "Windows-PC"}}
+                return {"a1": {"name": "mac"}, "b2": {"name": "Windows-PC"}, "c3": {"name": "box"},
+                        "d4": {"name": "Laptop"}}
 
-        class Peers:
-            mesh, shared_with = Mesh(), {"b2"}
+        class Peers:  # the machine link: shared_with stays empty on it, so it says nothing of who answers
+            mesh, shared_with = Mesh(), set()
+            failures = {"c3": crewchat_peers.OFFLINE_AFTER}
 
         class Device:
             name, ready = "mac", True
@@ -909,10 +913,14 @@ class CommandsTab(Base):
         class Cloud:
             device, online = Device(), True
 
-        hub = lambda sync: type("Hub", (), {"sync": sync})()  # noqa: E731
-        self.assertEqual(crewchat.link_info(hub(Peers())), {
+        def hub(sync, remote=None):
+            return type("Hub", (), {"sync": sync, "remote": remote or {}})()
+
+        # The same states as `peers status`: heard from lately, failing, or not yet heard from.
+        self.assertEqual(crewchat.link_info(hub(Peers(), {"b2": {"updated": time.time()}})), {
             "via": "tailscale", "me": "mac", "shared": True,
-            "machines": [{"name": "Windows-PC", "online": True}]})
+            "machines": [{"name": "box", "state": "offline"}, {"name": "Laptop", "state": "connecting"},
+                         {"name": "Windows-PC", "state": "online"}]})
         self.assertEqual(crewchat.link_info(hub(Cloud()), shared=False),
                          {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False})
         self.assertEqual(crewchat.link_info(hub(None)), {"via": "none"})
@@ -929,18 +937,29 @@ class CommandsTab(Base):
         rows = {c["usage"]: c for g in groups for c in g["commands"]}
         self.assertTrue(rows["projects"]["run"])
         self.assertFalse(rows["uninstall [--purge]"]["run"])
-        self.assertEqual((rows["cloud approve NAME"]["needs"], rows["cloud approve NAME"]["ask"]), (["NAME"], True))
+        self.assertTrue(rows["invite"]["ask"])
+        self.assertFalse(rows["cloud approve NAME"]["run"])  # it needs the fingerprint checked: a terminal's job
         # The page refuses a cross-site POST, like every other owner action.
         status, _, _ = self.raw("/api/run", b'{"usage": "projects"}',
                                 {"Content-Type": "application/json", "Origin": "https://evil.example"}, opener)
         self.assertEqual(status, 403)
 
     def test_every_command_is_listed(self):
-        listed = {c["usage"].split()[0] for g in crewchat.commands_catalog() for c in g["commands"]}
-        source = (ROOT / "crewchat.py").read_text(encoding="utf-8")
-        parser_names = set(re.findall(r'sub\.add_parser\("([a-z]+)"', source))
+        usages = [c["usage"] for g in crewchat.commands_catalog() for c in g["commands"]]
+        listed = {u.split()[0] for u in usages}
+        sub = next(a for a in crewchat.build_parser()._actions if a.choices and "start" in a.choices)
         internal = {"hook", "stdio", "setup", "resume"}
-        self.assertEqual(parser_names - internal - listed, set())
+        self.assertEqual(set(sub.choices) - internal - listed, set())
+        # and each action of a command (tasks done, skills add, ...), the default one aside
+        missing = []
+        for name, parser in sub.choices.items():
+            for action in parser._actions:
+                if action.dest in ("action", "mode") and action.choices:
+                    for choice in action.choices:
+                        if choice != action.default and not any(
+                                u.startswith(name + " ") and choice in re.split(r"[ |]", u) for u in usages):
+                            missing.append(name + " " + choice)
+        self.assertEqual(missing, [])
 
     def test_runs_listed_commands_only(self):
         status, answer = self.run_cmd({"usage": "projects"})
@@ -948,10 +967,16 @@ class CommandsTab(Base):
         self.assertIn("Demo", answer["output"])
         status, answer = self.run_cmd({"usage": "tasks"})
         self.assertEqual((status, answer["code"]), (200, 0), answer)
-        for usage in ("uninstall [--purge]", "stop", "uninstall", "projects; rm -rf /", ""):
+        for usage in ("uninstall [--purge]", "stop", "uninstall", "projects; rm -rf /", "", "cloud approve NAME"):
             self.assertEqual(self.run_cmd({"usage": usage})[0], 400, usage)
-        for name in ("", "--purge", "../x", "a" * 80, "x\ny"):
-            self.assertEqual(self.run_cmd({"usage": "cloud approve NAME", "values": {"NAME": name}})[0], 400, name)
+        # One at a time: a second Run while one is going is refused, not queued.
+        self.assertTrue(crewchat.RUN_ONE.acquire(blocking=False))
+        try:
+            status, answer = self.run_cmd({"usage": "projects"})
+            self.assertEqual(status, 400)
+            self.assertIn("still running", answer["error"])
+        finally:
+            crewchat.RUN_ONE.release()
 
 class Joining(Base):
     def project(self):

@@ -603,6 +603,21 @@ class PeerSync(crewchat.ProjectLink):
         return told, missed
 
 
+def member_states(sync, hub):
+    """Each linked machine's state as this one sees it: online (heard from lately), offline (failed
+    in a row) or connecting. `peers status` and the chat page's connection line both show this."""
+    now, states = time.time(), {}
+    for mid in sync.mesh.members():
+        remote = hub.remote.get(mid)
+        if sync.failures.get(mid, 0) >= OFFLINE_AFTER:
+            states[mid] = "offline"
+        elif remote and now - remote["updated"] < PULL_WAIT * 3:
+            states[mid] = "online"
+        else:
+            states[mid] = "connecting"
+    return states
+
+
 def admin(hub, root, op, data):
     """The owner's peer operations, run inside the server (see crewchat.Handler._admin)."""
     sync = hub.sync if isinstance(hub.sync, PeerSync) else None
@@ -617,16 +632,7 @@ def admin(hub, root, op, data):
     if op == "peer-invite":
         return {"code": sync.new_invite()}
     if op == "peers-status":
-        now, states = time.time(), {}
-        for mid in sync.mesh.members():
-            remote = hub.remote.get(mid)
-            if sync.failures.get(mid, 0) >= OFFLINE_AFTER:
-                states[mid] = {"state": "offline"}
-            elif remote and now - remote["updated"] < PULL_WAIT * 3:
-                states[mid] = {"state": "online"}
-            else:
-                states[mid] = {"state": "connecting"}
-        return {"members": states}
+        return {"members": {mid: {"state": state} for mid, state in member_states(sync, hub).items()}}
     if op == "peer-remove":
         told, missed = sync.remove(str(data.get("id") or ""))
         return {"told": told, "missed": missed}
