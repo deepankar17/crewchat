@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Searching the Commands tab hides the rows that do not match instead of drawing them again, so a
+  command's output and any value typed in a row stay when the search is cleared.
+- Hidden parts of the page stay hidden: the connection line when there is none, and "Let it edit
+  files without asking", which is for Claude Code only, when another tool is picked.
+- The install commands in the README and guides ask uv for crewchat's latest index
+  (`--refresh-package crewchat`), so right after a release they no longer install the version before.
+
 ## 0.13.2
 
 - **A Claude Code plugin**, for finding and setting up crewchat from Claude Code:

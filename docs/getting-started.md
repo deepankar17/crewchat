@@ -32,7 +32,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```bash
-uv tool install --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
 **Windows** (PowerShell), with uv: install it, open a new PowerShell window (so `uv` is found),
@@ -43,7 +43,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 ```
 
 ```powershell
-uv tool install --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
 or in one line:
@@ -57,8 +57,8 @@ downloaded and run at once) for a trojan, `Commando.A!ml`, and stops it. uv's ow
 widely used and trusted, and after it nothing is downloaded and run: crewchat comes from PyPI like
 any Python package. If Defender stops the one line, use uv.
 
-With uv already installed, on any system, `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
-libraries (about 70 MB): `uv tool install --python 3.12 crewchat`.
+With uv already installed, on any system, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
+libraries (about 70 MB): `uv tool install --refresh-package crewchat --python 3.12 crewchat`.
 
 The one-line installers:
 

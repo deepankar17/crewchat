@@ -5783,7 +5783,7 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
   padding: 6px 10px; font-weight: 600; }
 #views button.on { color: var(--ink); border-bottom-color: var(--accent); }
 #tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-#tasks[hidden], #log[hidden], #commands[hidden] { display: none; }
+[hidden] { display: none !important; }  /* also where a rule gives the element its own display (.linkline, label.check) */
 #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
 #cmd-filter { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 10px; color: var(--ink); font: inherit; font-size: 14px; margin-bottom: 12px; }
@@ -6095,34 +6095,43 @@ function renderLink(link) {
 }
 
 // The Commands tab: every command for help; the safe ones run here (POST /api/run).
-let commandGroups = null;
-async function loadCommands() {
-  if (commandGroups) return;
-  try {
-    const res = await fetch(api("/api/commands"), { cache: "no-store" });
-    if (res.status === 401) { location.href = "/login"; return; }
-    commandGroups = (await res.json()).groups || [];
-  } catch (e) {
-    $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
-    return;
-  }
-  renderCommands();
+let commandsLoad = null;  // the one request for the list; null again after a failure, to retry
+function loadCommands() {
+  if (!commandsLoad) commandsLoad = (async () => {
+    try {
+      const res = await fetch(api("/api/commands"), { cache: "no-store" });
+      if (res.status === 401) { location.href = "/login"; return; }
+      if (!res.ok) throw new Error("the host answered " + res.status);
+      renderCommands((await res.json()).groups || []);
+    } catch (e) {
+      commandsLoad = null;
+      $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
+    }
+  })();
+  return commandsLoad;
 }
-function renderCommands() {
-  const want = $("cmd-filter").value.trim().toLowerCase();
+const noCommand = el("p", "tasks-help", "No command matches.");
+function renderCommands(groups) {
   const list = $("cmd-list");
   list.replaceChildren();
-  for (const group of commandGroups || []) {
-    const rows = group.commands.filter((c) => !want || (c.usage + " " + c.text).toLowerCase().includes(want));
-    if (!rows.length) continue;
+  for (const group of groups) {
     const box = el("div", "cmd-group");
-    box.append(el("h3", "", group.group), ...rows.map(commandRow));
+    box.append(el("h3", "", group.group), ...group.commands.map(commandRow));
     list.append(box);
   }
-  if (!list.children.length) list.append(el("p", "tasks-help", "No command matches."));
+  list.append(noCommand);
+  filterCommands();
+}
+// The search box hides what does not match; rows keep what was typed in them and any output.
+function filterCommands() {
+  const want = $("cmd-filter").value.trim().toLowerCase(), list = $("cmd-list");
+  for (const row of list.querySelectorAll(".cmd")) row.hidden = !!want && !row.dataset.find.includes(want);
+  for (const box of list.querySelectorAll(".cmd-group")) box.hidden = !box.querySelector(".cmd:not([hidden])");
+  noCommand.hidden = !!list.querySelector(".cmd:not([hidden])");
 }
 function commandRow(c) {
   const row = el("div", "cmd"), top = el("div", "top"), out = el("pre");
+  row.dataset.find = (c.usage + " " + c.text).toLowerCase();
   out.hidden = true;
   top.append(el("code", "u", "crewchat " + c.usage));
   const inputs = {};
@@ -6165,7 +6174,7 @@ function commandRow(c) {
   row.append(top, el("p", "", c.text), out);
   return row;
 }
-$("cmd-filter").addEventListener("input", () => { if (commandGroups) renderCommands(); });
+$("cmd-filter").addEventListener("input", filterCommands);
 async function taskOp(body) {
   try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
 }
@@ -6289,6 +6298,7 @@ async function openLaunch() {
       option.title = t.missing || "";
       return option;
     }));
+    $("l-edits-row").hidden = $("l-tool").value !== "claude";  // the rebuilt list may pick another tool
     const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
     opts.tools = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));

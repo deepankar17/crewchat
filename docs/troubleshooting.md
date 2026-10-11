@@ -64,7 +64,7 @@ running, remove the install and install again:
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*crewchat*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 uv tool uninstall crewchat
-uv tool install --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
 If `uv tool uninstall` fails too, delete the folder instead:
