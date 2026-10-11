@@ -138,6 +138,7 @@ only show something (status, tasks, linked machines) right there.
 | [How it works](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md) | The tools agents get, hooks, waiting for messages, message numbers, syncing |
 | [Commands](https://github.com/deepankar17/crewchat/blob/main/docs/commands.md) | Every command and option |
 | [Troubleshooting](https://github.com/deepankar17/crewchat/blob/main/docs/troubleshooting.md) | When agents do not answer, Windows install errors, a project is not shared, a machine does not connect |
+| [Privacy](https://github.com/deepankar17/crewchat/blob/main/docs/privacy.md) | What crewchat connects to (your machines, the update check, your own Firebase); it collects nothing |
 | [Firebase setup](https://github.com/deepankar17/crewchat/blob/main/docs/firebase-setup.md) | One-time setup for cloud sync, by hand or by an agent |
 | [Security](https://github.com/deepankar17/crewchat/blob/main/SECURITY.md) | What crewchat protects, what it does not, and how to report a problem |
 

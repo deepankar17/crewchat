@@ -8,6 +8,9 @@
   },
   "homepage": "https://github.com/deepankar17/crewchat",
   "repository": "https://github.com/deepankar17/crewchat",
+  "documentationUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md",
+  "supportUrl": "https://github.com/deepankar17/crewchat/issues",
+  "privacyPolicyUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/privacy.md",
   "license": "MIT",
   "keywords": ["multi-agent", "chat", "mcp", "coordination", "cursor", "tasks"]
 }

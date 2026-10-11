@@ -1473,6 +1473,9 @@ class NewProject(unittest.TestCase):
         self.assertEqual(list((self.base / "projects").iterdir()), [])
 
 
+CLAUDE_LINKS = ("documentationUrl", "supportUrl", "privacyPolicyUrl")
+
+
 class Plugin(unittest.TestCase):
     """The plugin in plugin/, offered to Claude Code (.claude-plugin/) and Cursor (.cursor-plugin/)."""
 
@@ -1498,8 +1501,12 @@ class Plugin(unittest.TestCase):
         self.assertNotIn("version", cursor)  # optional for Cursor, so not one more place to bump
         # Cursor's schema has author {name, email}: no url.
         self.assertEqual(cursor["author"], {"name": claude["author"]["name"]})
+        # Claude's directory reads the documentation, support and privacy links from the manifest.
         self.assertEqual({k: v for k, v in cursor.items() if k not in ("logo", "author")},
-                         {k: v for k, v in claude.items() if k not in ("version", "author")})
+                         {k: v for k, v in claude.items() if k not in ("version", "author") + CLAUDE_LINKS})
+        for key in CLAUDE_LINKS:
+            self.assertTrue(claude[key].startswith("https://github.com/deepankar17/crewchat/"))
+        self.assertTrue((ROOT / "docs" / "privacy.md").is_file())
         self.assertEqual((ROOT / "plugin" / cursor["logo"]).read_bytes(), (ROOT / "docs" / "images" / "logo.svg").read_bytes())
 
     def test_the_mcp_registry_entry_matches_this_release(self):
