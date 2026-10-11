@@ -71,6 +71,12 @@ Everything lives under the account's own ID:
 | `users/{uid}/messages/{id}` | Sending device, key ID, nonce, ciphertext, server timestamp | Only the envelope; the content is encrypted |
 | `users/{uid}/tasks/{taskMessageId}` | Which device took the task, encrypted agent name | Device ID only |
 | `users/{uid}/state/{deviceId}` | That device's roster, statuses and read positions, encrypted | No |
+| `users/{uid}/spaces/{space}/...` | A project besides the first: its own `messages`, `tasks` and `state` as above, and `marks/{deviceId}` (how far each machine has read it) | The space is a hash of the project's name and the account, so the name is not stored |
+
+The first projects of all machines use the top-level collections, whatever their names. Every
+other project is shared by name: machines that have a project with the same name use the same
+space, and a machine without it never reads or writes there. Each sealed document is bound to its
+space, so it cannot be moved to another project.
 
 Encrypted content includes who a message is from and to, its text, agent names and status lines.
 What Firestore can see: that an account has N devices, when they are active, and how many
@@ -217,5 +223,8 @@ Firestore, including offline and reconnect cases. A smaller set runs against a r
   begin a transaction. Updates to the trusted-device list use a conditional write instead (write
   only if the document is unchanged since it was read; retry otherwise), which gives the same
   guarantee. Task claims use a create that fails if the document exists.
+- **Every project, by name (0.12).** Like Tailscale linking since 0.11, cloud sync shares every
+  project besides the first with the same-named project on the other machines, each in its own
+  space. A project's name could be guessed from its space by trying names, but is not stored.
 - **Trusted list carries public keys.** Each machine verifies list updates against the keys it
   already trusts, not against keys read from Firestore.

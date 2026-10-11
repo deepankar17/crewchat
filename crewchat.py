@@ -49,7 +49,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "0.11.3"
+__version__ = "0.12.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1314,6 +1314,16 @@ class Hub:
             self._rewrite_log(rename, {m["id"]: m for m in moved})
             self._changed()
             return rename
+
+    def announce_shared(self, name, adopted):
+        """Say in the chat, once, that this project is now shared with the same-named project on the
+        other machines (adopted: the open tasks that went with it, from adopt_open_tasks)."""
+        with self.lock:
+            self._event("This project is now shared with your other machines that have a project called %s. "
+                        "From now on its messages reach them; earlier ones stay on each machine%s." % (
+                            name, ", except the %d open task%s on the sheet, shared too" % (
+                                len(adopted), "" if len(adopted) == 1 else "s") if adopted else ""))
+            self._changed()
 
     def _rewrite_log(self, rename, moved):
         """messages.jsonl after adopt_open_tasks: references renamed, the moved messages at the end."""
@@ -3601,6 +3611,53 @@ def cmd_start(args):
         print("Agents on your other machines too? Run `crewchat start` there, then `crewchat connect`.")
 
 
+class ProjectLink:
+    """What the Tailscale and cloud links (crewchat_peers.PeerSync, crewchat_cloud.CloudSync) share
+    about projects. The first project's link is the machine's and keeps `projects` (name -> that
+    project's link); every other project's link has `chat`, its name. A subclass sets these in
+    __init__ (_init_projects) and provides stop(), stopping() and _project_link(hub, name)."""
+
+    def _init_projects(self, hub, chat):
+        self.hub = hub
+        self.chat = chat  # a project's name; None for the first project, which is the machine's link
+        self.projects = {}  # the machine's link only: project name -> its link
+        self.projects_lock = threading.Lock()  # one link per project, however many requests ask at once
+        self.shared_with = set()  # other machines that have this project
+
+    @property
+    def shared(self):
+        return self.chat is None or bool(self.shared_with)
+
+    def share(self, hub, name):
+        """Link another project of this machine: with the same-named project on the others."""
+        name = str(name).strip().lower()
+        with self.projects_lock:
+            if self.chat is not None or self.stopping() or name in self.projects or hub.sync is not None:
+                return self.projects.get(name)
+            link = self.projects[name] = self._project_link(hub, name)
+            return link.start()
+
+    def unshare(self, name):
+        with self.projects_lock:
+            link = self.projects.pop(str(name).strip().lower(), None)
+        if link is not None:
+            link.detach()
+
+    def detach(self):
+        """A project's link ends: stop it, and leave its hub as if it had never been linked (so it can
+        be shared again, under a new name too)."""
+        self.stop()
+        with self.hub.lock:
+            if self.hub.sync is self:
+                self.hub.sync = None
+                self.hub.device = ""
+        self._drop_remotes()
+
+    def _drop_remotes(self):
+        for device_id in list(self.hub.remote):
+            self.hub.drop_remote(device_id)
+
+
 def link_projects(projects):
     """Link this machine's projects with the same-named ones on the other machines, now and
     whenever projects appear or go."""
@@ -3612,8 +3669,8 @@ SHARE_LOCK = threading.Lock()  # one share_projects at a time: each acts on the 
 
 
 def share_projects(projects):
-    """Over Tailscale, link every project besides the first with the same-named project on the
-    other machines (the first projects are linked with each other, whatever their names)."""
+    """Link every project besides the first with the same-named project on the other machines, over
+    Tailscale or cloud sync (the first projects are linked with each other, whatever their names)."""
     with SHARE_LOCK:
         link = projects.primary.hub.sync
         if not hasattr(link, "share"):
@@ -3648,6 +3705,7 @@ def cmd_serve(args):
         try:
             import crewchat_cloud
             crewchat_cloud.start(server.RequestHandlerClass.hub)
+            link_projects(server.RequestHandlerClass.projects)
         except Exception as e:  # the local chat keeps working without the cloud
             sys.stderr.write("%s cloud sync is off: %s\n" % (now_iso(), e))
     elif config.get("peers"):

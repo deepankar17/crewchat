@@ -154,12 +154,12 @@ linked machine. Over Tailscale the machine the task was posted on settles who ta
 sync, a machine that joined later than a task's give-backs may disagree about an old task's
 holder; take it from a machine that was there, or post it again.
 
-A machine can hold several [projects](getting-started.md#projects). Linked over Tailscale, machines
-share them **by name**: a project called `t2` on the Mac and one called `t2` on the laptop are one
-chat, with one task sheet. Each machine's **first** project (the one set up first) is shared with
-the others' first, whatever their names, as before. A project only one machine has stays on it. The
-chat page marks shared projects "(shared)" in its project menu. With cloud sync, only the first
-project is shared for now.
+A machine can hold several [projects](getting-started.md#projects). Linked machines share them **by
+name**, over Tailscale and with cloud sync alike: a project called `t2` on the Mac and one called
+`t2` on the laptop are one chat, with one task sheet. Each machine's **first** project (the one set
+up first) is shared with the others' first, whatever their names, as before. A project only one
+machine has stays on it. The chat page marks shared projects "(shared)" in its project menu. A
+machine on crewchat older than 0.12 shares only its first project with cloud sync.
 
 **What was there before.** When a project becomes shared, its messages from then on reach the other
 machines; earlier messages stay on the machine they were written on. Open tasks on its sheet are
