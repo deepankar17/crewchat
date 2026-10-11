@@ -199,6 +199,28 @@ class Page(unittest.TestCase):
         c.click("#view-chat")
         self.assertEqual(c.errors, [])
 
+    def test_the_commands_tab_and_the_connection_line(self):
+        c = self.chrome
+        c.until("!document.getElementById('link').hidden", what="the connection line")
+        self.assertIn("This machine only", c.js("document.getElementById('link').innerText"))
+        c.click("#view-commands")
+        c.until("document.querySelectorAll('#cmd-list .cmd').length > 40", what="the commands")
+        row = "[...document.querySelectorAll('#cmd-list .cmd')].find(r => r.querySelector('code').innerText === 'crewchat projects')"
+        c.js(row + ".querySelector('button.run').click()")
+        c.until("!%s.querySelector('pre').hidden && %s.querySelector('pre').innerText.length > 0" % (row, row),
+                timeout=60, what="what projects printed")
+        self.assertEqual(c.js(row + ".querySelector('pre').className"), "", c.js(row + ".querySelector('pre').innerText"))
+        # Searching hides rows; clearing the search brings them back with their output still there.
+        shown = "[...document.querySelectorAll('#cmd-list .cmd')].filter(r => !r.hidden).length"
+        everything = c.js(shown)
+        c.type_into("#cmd-filter", "task sheet")
+        c.until("%s < %d" % (shown, everything), what="the search to hide rows")
+        c.js("const f = document.getElementById('cmd-filter'); f.value = ''; f.dispatchEvent(new Event('input'))")
+        self.assertEqual(c.js(shown), everything)
+        self.assertFalse(c.js(row + ".querySelector('pre').hidden"))
+        c.click("#view-chat")
+        self.assertEqual(c.errors, [])
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:
