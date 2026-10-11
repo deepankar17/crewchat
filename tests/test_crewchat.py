@@ -1473,17 +1473,34 @@ class NewProject(unittest.TestCase):
         self.assertEqual(list((self.base / "projects").iterdir()), [])
 
 
-class ClaudePlugin(unittest.TestCase):
-    """The Claude Code plugin in plugin/, offered by the marketplace in .claude-plugin/."""
+class Plugin(unittest.TestCase):
+    """The plugin in plugin/, offered to Claude Code (.claude-plugin/) and Cursor (.cursor-plugin/)."""
 
     def test_the_plugin_matches_this_release(self):
-        market = json.loads((ROOT / ".claude-plugin" / "marketplace.json").read_text(encoding="utf-8"))
-        entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
-        plugin = ROOT / entry["source"]
-        manifest = json.loads((plugin / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8"))
-        self.assertEqual((manifest["name"], manifest["version"]), ("crewchat", crewchat.__version__))
-        skill = (plugin / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
+        manifests = {}
+        for client in (".claude-plugin", ".cursor-plugin"):
+            with self.subTest(client):
+                market = json.loads((ROOT / client / "marketplace.json").read_text(encoding="utf-8"))
+                entry = next(p for p in market["plugins"] if p["name"] == "crewchat")
+                self.assertEqual(entry["source"], "./plugin")
+                plugin = ROOT / entry["source"]
+                manifests[client] = manifest = json.loads((plugin / client / "plugin.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["name"], "crewchat")
+                # Setup only: `crewchat start` writes each folder's MCP config and hooks, with its
+                # token; a plugin shipping them too would connect sessions twice, in every project.
+                self.assertFalse({"hooks", "rules", "mcpServers"} & set(manifest))
+                self.assertFalse((plugin / "mcp.json").exists() or (plugin / ".mcp.json").exists()
+                                 or (plugin / "hooks").exists())
+        skill = (ROOT / "plugin" / "skills" / "setup" / "SKILL.md").read_text(encoding="utf-8")
         self.assertTrue(skill.startswith("---\nname: setup\ndescription: "))
+        claude, cursor = manifests[".claude-plugin"], manifests[".cursor-plugin"]
+        self.assertEqual(claude["version"], crewchat.__version__)
+        self.assertNotIn("version", cursor)  # optional for Cursor, so not one more place to bump
+        # Cursor's schema has author {name, email}: no url.
+        self.assertEqual(cursor["author"], {"name": claude["author"]["name"]})
+        self.assertEqual({k: v for k, v in cursor.items() if k not in ("logo", "author")},
+                         {k: v for k, v in claude.items() if k not in ("version", "author")})
+        self.assertEqual((ROOT / "plugin" / cursor["logo"]).read_bytes(), (ROOT / "docs" / "images" / "logo.svg").read_bytes())
 
     def test_the_mcp_registry_entry_matches_this_release(self):
         entry = json.loads((ROOT / "server.json").read_text(encoding="utf-8"))

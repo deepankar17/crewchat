@@ -44,16 +44,17 @@ With the user's go-ahead, run `crewchat start --no-open` in the project folder. 
 - makes the folder its own project (named after it), or adds it to one with `--chat NAME`;
 - writes `.mcp.json`, `.claude/settings.local.json`, `.cursor/mcp.json` and `.cursor/hooks.json`
   in the folder. They hold a secret token: tell the user not to commit them;
-- writes a guide skill for the project's agents.
+- writes a guide for the project's agents (a Claude Code skill and a Cursor rule).
 
 Then:
 
 1. Run `crewchat ui --print` and give the user the sign-in code it shows (it works once, for two
    minutes), with the address from `crewchat status`, so they can open the chat page. Or run
    `crewchat ui` to open the page on this machine directly.
-2. Ask the user to restart this Claude Code session (and any other open in the folder), so they
-   load the chat's tools. After the restart, a hook asks the agent to call `hub_link` once; the
-   chat then shows it by name.
+2. Sessions already open in the folder do not have the chat's tools yet. In Claude Code, start a
+   new session: at its first prompt a hook asks it to call `hub_link` once. In Cursor, open a new
+   chat (allow the `crewchat` MCP server if Cursor asks) and send it a message: after its first
+   reply a hook asks it to call `hub_link`. The chat then shows the agent by name.
 
 ## 4. More
 
