@@ -51,7 +51,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```bash
-uv tool install --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
 **Windows** (PowerShell), with uv: install it, open a new PowerShell window, then crewchat:
@@ -61,7 +61,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | ie
 ```
 
 ```powershell
-uv tool install --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
 or in one line:
@@ -83,12 +83,8 @@ folder when you ask for it (`/crewchat:setup`, or just "set up crewchat").
 On Claude Code before 2.1.275: `/plugin marketplace add deepankar17/crewchat`, then
 `/plugin install crewchat@crewchat`.
 
-Already have uv? `uv tool install --python 3.12 "crewchat[cloud]"` is all it takes. Later: `crewchat update` upgrades, `crewchat stop` stops
+Already have uv? `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Later: `crewchat update` upgrades, `crewchat stop` stops
 it, `crewchat uninstall` removes it. More: [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
-
-In the first minutes after a release, PyPI can still hand uv the version before it. If
-`crewchat --version` shows an older one, run `crewchat update` (or the `uv tool install` line again
-with `--refresh`).
 
 ## Start
 

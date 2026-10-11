@@ -221,6 +221,19 @@ class Page(unittest.TestCase):
         c.click("#view-chat")
         self.assertEqual(c.errors, [])
 
+    def test_what_is_hidden_is_not_shown(self):
+        c = self.chrome
+        # "Let it edit files without asking" is for Claude Code only; its label has a display of its own.
+        c.click("#add-agent")
+        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list")
+        c.js("const t = document.getElementById('l-tool'); t.value = [...t.options].find(o => o.value !== 'claude').value;"
+             "t.dispatchEvent(new Event('change'))")
+        self.assertTrue(c.js("document.getElementById('l-edits-row').hidden"))
+        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
+                              ".map(e => e.id || e.className)"), [])
+        c.click("#l-cancel")
+        self.assertEqual(c.errors, [])
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:

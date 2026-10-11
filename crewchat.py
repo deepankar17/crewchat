@@ -5783,7 +5783,7 @@ label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
   padding: 6px 10px; font-weight: 600; }
 #views button.on { color: var(--ink); border-bottom-color: var(--accent); }
 #tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-#tasks[hidden], #log[hidden], #commands[hidden], .cmd[hidden], .cmd-group[hidden], #cmd-list > p[hidden] { display: none; }
+[hidden] { display: none !important; }  /* also where a rule gives the element its own display (.linkline, label.check) */
 #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
 #cmd-filter { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
   padding: 8px 10px; color: var(--ink); font: inherit; font-size: 14px; margin-bottom: 12px; }
@@ -6061,12 +6061,8 @@ $("view-tasks").addEventListener("click", () => showView("tasks"));
 $("view-commands").addEventListener("click", () => showView("commands"));
 
 // How this machine reaches your others: over Tailscale, with cloud sync (Firestore), or not at all.
-let shownLink = "";
 function renderLink(link) {
   const line = $("link");
-  const key = JSON.stringify(link || null);
-  if (key === shownLink) return;  // the poll sends it every time; it seldom changes
-  shownLink = key;
   if (!link) { line.hidden = true; return; }
   const parts = [];
   const dot = (on, label, title) => {
@@ -6099,56 +6095,41 @@ function renderLink(link) {
 }
 
 // The Commands tab: every command for help; the safe ones run here (POST /api/run).
-let commandGroups = null, commandsLoading = false;
-async function loadCommands() {
-  if (commandGroups || commandsLoading) return;
-  commandsLoading = true;
-  try {
-    const res = await fetch(api("/api/commands"), { cache: "no-store" });
-    if (res.status === 401) { location.href = "/login"; return; }
-    commandGroups = (await res.json()).groups || [];
-  } catch (e) {
-    $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
-    return;
-  } finally {
-    commandsLoading = false;
-  }
-  renderCommands();
+let commandsLoad = null;  // the one request for the list; null again after a failure, to retry
+function loadCommands() {
+  return commandsLoad ??= (async () => {
+    try {
+      const res = await fetch(api("/api/commands"), { cache: "no-store" });
+      if (res.status === 401) { location.href = "/login"; return; }
+      renderCommands((await res.json()).groups || []);
+    } catch (e) {
+      commandsLoad = null;
+      $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
+    }
+  })();
 }
-function renderCommands() {
+const noCommand = el("p", "tasks-help", "No command matches.");
+function renderCommands(groups) {
   const list = $("cmd-list");
   list.replaceChildren();
-  for (const group of commandGroups) {
+  for (const group of groups) {
     const box = el("div", "cmd-group");
-    box.append(el("h3", "", group.group));
-    for (const c of group.commands) {
-      const row = commandRow(c);
-      row.dataset.find = (c.usage + " " + c.text).toLowerCase();
-      box.append(row);
-    }
+    box.append(el("h3", "", group.group), ...group.commands.map(commandRow));
     list.append(box);
   }
-  list.append(el("p", "tasks-help", "No command matches."));
+  list.append(noCommand);
   filterCommands();
 }
 // The search box hides what does not match; rows keep what was typed in them and any output.
 function filterCommands() {
-  const want = $("cmd-filter").value.trim().toLowerCase();
-  let any = false;
-  for (const box of $("cmd-list").querySelectorAll(".cmd-group")) {
-    let shown = 0;
-    for (const row of box.querySelectorAll(".cmd")) {
-      row.hidden = !!want && !row.dataset.find.includes(want);
-      if (!row.hidden) shown++;
-    }
-    box.hidden = !shown;
-    any = any || shown > 0;
-  }
-  const none = $("cmd-list").querySelector(":scope > p.tasks-help");
-  if (none) none.hidden = any;
+  const want = $("cmd-filter").value.trim().toLowerCase(), list = $("cmd-list");
+  for (const row of list.querySelectorAll(".cmd")) row.hidden = !!want && !row.dataset.find.includes(want);
+  for (const box of list.querySelectorAll(".cmd-group")) box.hidden = !box.querySelector(".cmd:not([hidden])");
+  noCommand.hidden = !!list.querySelector(".cmd:not([hidden])");
 }
 function commandRow(c) {
   const row = el("div", "cmd"), top = el("div", "top"), out = el("pre");
+  row.dataset.find = (c.usage + " " + c.text).toLowerCase();
   out.hidden = true;
   top.append(el("code", "u", "crewchat " + c.usage));
   const inputs = {};
@@ -6191,7 +6172,7 @@ function commandRow(c) {
   row.append(top, el("p", "", c.text), out);
   return row;
 }
-$("cmd-filter").addEventListener("input", () => { if (commandGroups) filterCommands(); });
+$("cmd-filter").addEventListener("input", filterCommands);
 async function taskOp(body) {
   try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
 }

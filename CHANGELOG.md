@@ -4,9 +4,10 @@
 
 - Searching the Commands tab hides the rows that do not match instead of drawing them again, so a
   command's output and any value typed in a row stay when the search is cleared.
-- The connection line is drawn again only when it changes, not on every message.
-- The README says what to do when, in the first minutes after a release, uv still installs the
-  version before it.
+- Hidden parts of the page stay hidden: the connection line when there is none, and "Let it edit
+  files without asking", which is for Claude Code only, when another tool is picked.
+- The install commands in the README and guides ask uv for crewchat's latest index
+  (`--refresh-package crewchat`), so right after a release they no longer install the version before.
 
 ## 0.13.2
 

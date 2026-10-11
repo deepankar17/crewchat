@@ -21,7 +21,7 @@ fail() { printf 'crewchat installer: %s\n' "$*" >&2; exit 1; }
 
 case "$(uname -s)" in
   Darwin|Linux) ;;
-  *) fail "this script is for macOS and Linux. On Windows, install uv (https://docs.astral.sh/uv/), then: uv tool install --python 3.12 \"crewchat[cloud]\"" ;;
+  *) fail "this script is for macOS and Linux. On Windows, install uv (https://docs.astral.sh/uv/), then: uv tool install --refresh-package crewchat --python 3.12 \"crewchat[cloud]\"" ;;
 esac
 
 # Where to install from, in order: PyPI, the release's package file on GitHub, its source archive
