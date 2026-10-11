@@ -1496,7 +1496,10 @@ class Plugin(unittest.TestCase):
         claude, cursor = manifests[".claude-plugin"], manifests[".cursor-plugin"]
         self.assertEqual(claude["version"], crewchat.__version__)
         self.assertNotIn("version", cursor)  # optional for Cursor, so not one more place to bump
-        self.assertEqual({k: v for k, v in cursor.items() if k != "logo"}, {k: v for k, v in claude.items() if k != "version"})
+        # Cursor's schema has author {name, email}: no url.
+        self.assertEqual(cursor["author"], {"name": claude["author"]["name"]})
+        self.assertEqual({k: v for k, v in cursor.items() if k not in ("logo", "author")},
+                         {k: v for k, v in claude.items() if k not in ("version", "author")})
         self.assertEqual((ROOT / "plugin" / cursor["logo"]).read_bytes(), (ROOT / "docs" / "images" / "logo.svg").read_bytes())
 
     def test_the_mcp_registry_entry_matches_this_release(self):
