@@ -393,7 +393,8 @@ class SharedProjects(unittest.TestCase):
         a3.send(writer, "all", "hello t3")
         wait_until(lambda: any(m["text"] == "hello t3" for m in b3.messages), message="windows' t3 to get it")
         self.assertIn("hello t3", [m["text"] for m in b3.inbox(reader, 0, True)])
-        self.assertTrue(any("now shared" in m["text"] for m in a3.messages))  # the chat says so, once
+        for hub in (a3, b3):  # each machine's chat says so, once
+            self.assertEqual(sum("now shared" in m["text"] for m in hub.messages), 1)
         b3.send(reader, "all", "and back")
         wait_until(lambda: any(m["text"] == "and back" for m in a3.messages), message="the mac's t3 to get the reply")
         # Nothing crosses into another project, either way.

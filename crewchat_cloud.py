@@ -791,10 +791,6 @@ class CloudSync(crewchat.ProjectLink):
         self.unsubscribe = []
         self.marks_file = device.dir / ("sync.json" if chat is None else "sync-%s.json" % self.space)
         self.marks = read_json(self.marks_file, {"published": 0, "synced_to": 0})
-        with hub.lock:
-            hub.prefix = device.tag
-            hub.device = device.name
-            hub.sync = self
 
     def _all(self):
         """This link and every project's."""
@@ -807,10 +803,14 @@ class CloudSync(crewchat.ProjectLink):
             self.account.refresh()
         else:
             adopted = self.hub.adopt_open_tasks(self.device.tag, self.device_id)
-            if not self.marks.get("announced"):
+            if not self.marks.get("announced"):  # before the hub is bound: the notice is for this machine
                 self.hub.announce_shared(self.chat, adopted)
                 self.marks["announced"] = True
                 self._save_marks()
+        with self.hub.lock:
+            self.hub.prefix = self.device.tag
+            self.hub.device = self.device.name
+            self.hub.sync = self
         since = max(time.time() - self.ttl, float(self.marks.get("synced_to", 0)) - 120)
         self.unsubscribe = [
             self.store.listen(self.base + "messages", self._on_messages, since=("created", since)),
@@ -948,14 +948,16 @@ class CloudSync(crewchat.ProjectLink):
 
     def _ticker(self):
         last_housekeeping = 0
-        while not self.stop_event.wait(30):
-            self.dirty.set()
+        while True:  # housekeeping at once, so the others count this machine from the start
             if time.time() - last_housekeeping >= HOUSEKEEPING:
                 last_housekeeping = time.time()
                 try:
                     self.housekeeping()
                 except Exception as e:
                     self.log("housekeeping skipped (%s)" % e)
+            if self.stop_event.wait(30):
+                return
+            self.dirty.set()
 
     def housekeeping(self):
         """Tell the others how far this machine has read, and delete what everyone has. The first
