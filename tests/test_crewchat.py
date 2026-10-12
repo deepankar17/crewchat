@@ -2042,6 +2042,93 @@ class Lifecycle(Base):
         self.assertEqual(self.hub.claim_key(tid), tid + "@1")
         self.assertEqual(self.hub.taken[tid], a_name)
 
+    def later(self, minutes):
+        """The clock, minutes from now (for the hub's own calls; other threads see it too, briefly)."""
+        then = time.time() + minutes * 60
+        return mock.patch.object(crewchat.time, "time", lambda: then)
+
+    def test_a_task_whose_holder_goes_silent_is_reclaimed(self):
+        hub = self.hub
+        tid = self.say("all", "goes quiet", "task")
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        a.text("hub_take", id=tid)
+        self.assertIn("This project: tasks stay with their holder", cli("tasks", "reclaim"))
+        with self.later(600):
+            hub.sheet_rows()
+        self.assertEqual(hub.taken[tid], a_name)  # off unless the owner sets it
+        with self.assertRaises(SystemExit):
+            cli("tasks", "reclaim", "5")  # too short to tell a crash from a long build
+        self.assertIn("silent for 60 min", cli("tasks", "reclaim", "60"))
+        try:
+            with self.later(59):
+                hub.sheet_rows()
+            self.assertEqual(hub.taken[tid], a_name)
+            with self.later(61):
+                row = next(r for r in hub.sheet_rows() if r["id"] == tid)
+            # Like giving it back: on the sheet again, under a new claim key, and said in the chat.
+            self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", a_name))
+            self.assertEqual(hub.claim_key(tid), tid + "@1")
+            self.assertIn("crewchat -> all: [UPDATE on #%s: given back] Task #%s reclaimed from %s (silent for 61 min)"
+                          % (tid, tid, a_name), b.text("hub_history"))
+            self.assertIn("reclaimed from %s" % a_name, cli("tasks"))
+            # Back from its silence, the agent is told; it may take the task again while it is free.
+            self.assertIn("reclaimed from you while you were silent; it is back on the sheet",
+                          a.text("hub_update", id=tid, status="done", note="finished"))
+            self.assertIn("is yours", b.text("hub_take", id=tid))
+            self.assertIn("%s holds it now" % b_name, a.text("hub_update", id=tid, status="in_progress", note="still on it"))
+            self.assertIn("already taken by " + b_name, a.text("hub_take", id=tid))
+            row = next(r for r in hub.sheet_rows() if r["id"] == tid)
+            self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("doing", b_name, a_name))
+        finally:
+            cli("tasks", "reclaim", "off")
+        self.assertEqual(hub.roster.reclaim, 0)
+
+    def test_reclaim_waits_for_a_listening_holder_and_follows_a_tasks_own_setting(self):
+        hub = self.hub
+        long = self.say("all", "a long build", "task")
+        quick = self.say("all", "a quick fix", "task")
+        blocked = self.say("all", "needs the owner", "task")
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        c, c_name = self.agent()
+        a.text("hub_take", id=long)
+        b.text("hub_take", id=quick)
+        c.text("hub_take", id=blocked)
+        c.text("hub_update", id=blocked, status="blocked", note="which colour?")
+        self.assertIn("Task #%s: tasks stay with their holder" % long, cli("tasks", "reclaim", "off", long))
+        cli("tasks", "reclaim", "30", quick)
+        self.assertIn("never reclaimed", cli("tasks"))
+        with self.later(45):
+            hub.sheet_rows()
+        self.assertEqual((hub.taken.get(long), hub.taken.get(quick)), (a_name, None))
+        self.assertIn("follows the project's setting", cli("tasks", "reclaim", "default", long))
+        cli("tasks", "reclaim", "20")
+        try:
+            hub.waiting[a_name] = 1  # its hook is waiting for messages right now: it is there
+            try:
+                with self.later(45):
+                    hub.sheet_rows()
+            finally:
+                del hub.waiting[a_name]
+            self.assertEqual(hub.taken.get(long), a_name)
+            self.assertEqual(hub.taken.get(blocked), c_name)  # blocked waits for a person, not its holder
+            # With several machines, only the one the task was posted on reclaims it.
+            hub.sheet[long]["origin"] = "elsewhere"
+            hub.sync = mock.Mock(device_id="here", shared=False)
+            try:
+                with self.later(45):
+                    hub.sheet_rows()
+            finally:
+                hub.sync = None
+                hub.sheet[long]["origin"] = ""
+            self.assertEqual(hub.taken.get(long), a_name)
+            with self.later(45):
+                hub.sheet_rows()
+            self.assertIsNone(hub.taken.get(long))
+        finally:
+            cli("tasks", "reclaim", "off")
+
     def test_areas_overlap_by_path_prefix(self):
         self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
         self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))

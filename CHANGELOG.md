@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **A task whose agent goes silent can go back on the sheet** ([#25](https://github.com/deepankar17/crewchat/issues/25)).
+  `crewchat tasks reclaim 60` (minutes, off by default) reclaims a task whose holder has shown no
+  sign of life for that long: no tool calls, no hooks, no messages. It works like giving the task
+  back (a new claim key, so claims across machines stay consistent) and is never silent: a
+  "Task #N reclaimed from X (silent for N min)" line in the chat, and "reclaimed from X" on the
+  sheet. An agent that comes back is told who holds the task now. Blocked tasks and tasks ready
+  for review are never reclaimed. One task can have its own time or none (`crewchat tasks reclaim
+  off A12`). With several machines, the machine the task was posted on reclaims it.
 - **The plugin is ready for Cursor too**, for the Cursor Marketplace: Cursor's manifest in
   `plugin/.cursor-plugin/`, the same `setup` skill (its steps now cover a Cursor chat). Like the
   Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the folder.

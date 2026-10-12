@@ -112,6 +112,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat tasks move ID up\|down\|top` | Reorder |
 | `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |
 | `crewchat tasks remove ID` | Take a task off the sheet |
+| `crewchat tasks reclaim [MINUTES\|off\|default] [ID]` | Put a task back on the sheet when its holder is silent this long, for the project or one task ([details](getting-started.md#the-task-sheet)) |
 
 ## Project folders
 

@@ -92,9 +92,10 @@ ONLINE_SECS = 900  # an agent heard from this recently counts as online
 FORGET_HOURS = 24  # an agent silent this long drops off the roster
 REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offline (cloud sync)
 REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
+RECLAIM_MINUTES = (10, 7 * 24 * 60)  # a task's holder may be silent this long before it is reclaimed: least, most
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed")  # optional message fields, kept when messages travel between machines
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
 ROLES = {
@@ -347,6 +348,7 @@ class Roster:
         self._stamp = None
         self.project = ""
         self.forget = FORGET_HOURS * 3600
+        self.reclaim = 0  # seconds a task's holder may be silent before the task is reclaimed; 0: never
         self.tokens = {}  # sha256(token) -> ("owner", None) or ("place", name)
         self.refresh()
 
@@ -371,6 +373,10 @@ class Roster:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
         except (TypeError, ValueError):
             self.forget = FORGET_HOURS * 3600
+        try:
+            self.reclaim = int(config.get("reclaim_minutes") or 0) * 60  # 0: silent holders keep their tasks
+        except (TypeError, ValueError):
+            self.reclaim = 0
         self.tokens = {}
         owner = read_token(OWNER, self.root) or read_token(OWNER)  # projects/<id> use the machine's
         if owner:
@@ -600,6 +606,7 @@ class Hub:
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
         self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
+        self.reclaimed = {}  # task id -> the agent it was last reclaimed from (silent too long)
         self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
@@ -617,6 +624,7 @@ class Hub:
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
+        self.started = time.time()  # nobody can be heard while the server is down (memory only)
         self._load()
 
     # Persistence ---------------------------------------------------------------------------
@@ -663,6 +671,7 @@ class Hub:
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
         self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
         self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
+        self.reclaimed = {str(k): str(v) for k, v in data.get("reclaimed", {}).items()}
         self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
@@ -687,7 +696,7 @@ class Hub:
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
-            "renamed": self.renamed,
+            "renamed": self.renamed, "reclaimed": self.reclaimed,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -768,10 +777,15 @@ class Hub:
             self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
             if msg["status"] == "todo":
                 # Given back: on the sheet for anyone again. Every machine counts the same messages,
-                # so all of them settle the next claim under the same new key.
+                # so all of them settle the next claim under the same new key. A reclaim (its holder
+                # was silent too long) is one too, sent by the machine the task was posted on.
                 self.claim_gen[msg["task"]] = self.claim_gen.get(msg["task"], 0) + 1
-                if self.taken.get(msg["task"]) in (msg["from"], None) or msg["from"] == OWNER:
+                holder = self.taken.get(msg["task"])
+                reclaim = msg["from"] == SERVER_NAME and msg.get("reclaimed")
+                if holder in (msg["from"], None) or msg["from"] == OWNER or (reclaim and holder == reclaim):
                     self.taken.pop(msg["task"], None)
+                if reclaim:
+                    self.reclaimed[msg["task"]] = reclaim
             self._save()
         elif kind == "assign" and msg.get("task") in self.sheet:
             self.taken.setdefault(msg["task"], msg["to"])
@@ -782,6 +796,8 @@ class Hub:
                 row["order"] = float(msg["order"])
             if msg.get("status") == "removed":
                 row["removed"] = True
+            if msg.get("reclaim"):
+                row["reclaim"] = "" if msg["reclaim"] == "default" else msg["reclaim"]
             self._save()
         if kind == "task" and msg["id"] not in self.sheet:
             title = " ".join(str(msg["text"]).split())
@@ -973,6 +989,7 @@ class Hub:
                     row["agent"] = new
             self.links = {k: (new if v == name else v) for k, v in self.links.items()}
             self.taken = {k: (new if v == name else v) for k, v in self.taken.items()}
+            self.reclaimed = {k: (new if v == name else v) for k, v in self.reclaimed.items()}
             self._event("%s is now %s" % (name, new))
             self._save()
             self._changed()
@@ -1398,6 +1415,10 @@ class Hub:
             raise HubError("status must be one of: %s" % ", ".join(STATUSES))
         with self.lock:
             task = self._task(mid)
+            if self.reclaimed.get(mid) == agent and self.taken.get(mid) != agent:
+                now = self.taken.get(mid)
+                raise HubError("task #%s was reclaimed from you while you were silent; %s" % (
+                    mid, "%s holds it now" % now if now else "it is back on the sheet: hub_take it to carry on"))
             if status == "todo" and agent != OWNER and self.taken.get(mid) != agent:
                 # Only a release by its holder (or the owner) is real: a stray one would move the
                 # task's claim key on every machine while someone still holds it.
@@ -1429,6 +1450,7 @@ class Hub:
             task = self._task(mid)
             if task["to"] not in ("all", agent):
                 raise HubError("task #%s was given to %s" % (mid, task["to"]))
+            self._reclaim_silent()
             holder = self.taken.get(mid)
             if holder == agent:
                 return task
@@ -1625,6 +1647,7 @@ class Hub:
         """The sheet, in order: dicts with id, title, status, holder, ... For view "next", only the
         rows agent may take now; "mine", the ones it holds."""
         with self.lock:
+            self._reclaim_silent()
             rows = []
             for mid, row in sorted(self.sheet.items(), key=lambda kv: kv[1]["order"]):
                 status = self._row_status(mid)
@@ -1638,8 +1661,10 @@ class Hub:
                     continue
                 if status == "todo" and any(d in self.sheet and self._row_status(d) != "done" for d in row["depends"]):
                     status = "waiting"  # shown so: it cannot start before what it waits for is done
+                gone = self.reclaimed.get(mid, "")
                 rows.append(dict(row, id=mid, status=status, holder=self.taken.get(mid) or "",
-                                 note=(self.progress.get(mid) or {}).get("by", "")))
+                                 note=(self.progress.get(mid) or {}).get("by", ""),
+                                 reclaimed=gone if gone != self.taken.get(mid) else ""))
             return rows
 
     def add_row(self, sender, title, depends="", areas="", where="", to="all"):
@@ -1730,6 +1755,87 @@ class Hub:
             self._append(OWNER, to, note or {"todo": "Back on the sheet.", "done": "Done.", "blocked": "Blocked."}[status],
                          "update", task=mid, status=status)
             self._changed()
+
+    def _reclaim_after(self, row):
+        """Seconds a row's holder may be silent before the row is reclaimed (0: never): its own
+        setting, or else the project's."""
+        own = str(row.get("reclaim") or "")
+        if own == "off":
+            return 0
+        return int(own) * 60 if own.isdigit() else self.roster.reclaim
+
+    def _last_heard(self, name):
+        """When an agent last showed a sign of life: a tool call, a hook (a listening one counts as
+        now), or a message. Never before this server started: it heard nobody while it was down.
+        Caller holds the lock."""
+        if self.waiting.get(name):
+            return time.time()
+        heard = max(self.started, (self.agents.get(name) or {}).get("seen", 0))
+        for dev in self.remote.values():
+            for row in dev["agents"]:
+                if row["agent"] == name:  # published at most every REMOTE_SEEN_SLACK seconds
+                    heard = max(heard, float(row.get("seen") or 0) + REMOTE_SEEN_SLACK)
+        for msg in reversed(self.messages):
+            if msg["ts"] <= heard:
+                break
+            if msg["from"] == name:
+                return msg["ts"]
+        return heard
+
+    def _reclaim_silent(self):
+        """Put the tasks whose holder has been silent too long back on the sheet, the way giving one
+        back does (a new claim key), with a line in the chat for everyone. Only the machine a task
+        was posted on decides, so no two machines reclaim it at once. Caller holds the lock."""
+        now = time.time()
+        for mid, holder in list(self.taken.items()):
+            row = self.sheet.get(mid)
+            if row is None or self._row_status(mid) != "doing":
+                continue
+            limit = self._reclaim_after(row)
+            if not limit or (self.sync is not None and row.get("origin") != self.sync.device_id):
+                continue
+            silent = now - self._last_heard(holder)
+            if silent < limit:
+                continue
+            self._append(SERVER_NAME, "all", "Task #%s reclaimed from %s (silent for %d min): back on the sheet." % (
+                mid, holder, silent // 60), "update", task=mid, status="todo", reclaimed=holder)
+            self._changed()
+
+    def set_reclaim(self, value, mid=None):
+        """The owner sets how long a holder may be silent before its task is reclaimed: minutes, or
+        "off", for the project or one task ("default" puts a task back on the project's).
+        Returns the setting now, as text; with no value, only the project's."""
+        value = str(value or "").strip().lower()
+        if not value and not mid:
+            return str(self.roster.reclaim // 60) if self.roster.reclaim else "off"
+        least, most = RECLAIM_MINUTES
+        if value.isdigit() and not least <= int(value) <= most:
+            raise HubError("reclaim after %d to %d minutes, or off" % (least, most))
+        if not (value.isdigit() or value == "off" or (mid and value == "default")):
+            raise HubError("reclaim after a number of minutes, or off%s" % (", or default" if mid else ""))
+        value = str(int(value)) if value.isdigit() else value
+        if mid:
+            mid = self._id(mid)
+            with self.lock:
+                if mid not in self.sheet:
+                    raise HubError("#%s is not on the task sheet" % mid)
+                self._append(OWNER, "all", "", "plan", task=mid, reclaim=value)
+                self._reclaim_silent()
+                self._changed()
+            return value
+        config = load_config(self.roster.root)
+        if value == "off":
+            config.pop("reclaim_minutes", None)
+        else:
+            config["reclaim_minutes"] = int(value)
+        save_config(config, self.roster.root)
+        self.roster.refresh()
+        with self.lock:
+            self._event("A task whose holder is silent for %s min goes back on the sheet." % value if value != "off"
+                        else "Tasks stay with their holder however long it is silent.")
+            self._reclaim_silent()
+            self._changed()
+        return value
 
     def last_seq(self):
         """The newest message's seq, for the page's "new in other projects" marks."""
@@ -2330,6 +2436,10 @@ def sheet_line(row):
     extra = ["from %s" % row["from"]]
     if row["holder"]:
         extra.append("held by %s" % row["holder"])
+    if row.get("reclaimed"):
+        extra.append("reclaimed from %s" % row["reclaimed"])
+    if row.get("reclaim"):
+        extra.append("never reclaimed" if row["reclaim"] == "off" else "reclaimed after %s min of silence" % row["reclaim"])
     if row["depends"]:
         extra.append("waits for " + ", ".join("#" + d for d in row["depends"]))
     if row["areas"]:
@@ -2502,6 +2612,9 @@ COMMANDS = [
         ("tasks move ID up|down|top", "Reorder the sheet.", None),
         ("tasks done|todo|blocked ID [NOTE]", "Settle a task (todo puts it back on the sheet).", None),
         ("tasks remove ID", "Take a task off the sheet.", None),
+        ("tasks reclaim [MINUTES|off|default] [ID]",
+         "Put a task back on the sheet when its holder is silent this long (no tool calls, no hooks): for the "
+         "project, or one task (default: as the project). Off unless set; with no value, shows it.", None),
     ]),
     ("Project folders", [
         ("listen on [--minutes N] [--project FOLDER]", "Agents in this folder wait up to N minutes (1 to 55) for messages after each turn.", None),
@@ -3084,7 +3197,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
 
     def _task_op(self, data):
-        """The owner on the task sheet: add, assign, move, settle (todo, done, blocked) or remove a task."""
+        """The owner on the task sheet: add, assign, move, settle (todo, done, blocked) or remove a task,
+        or set how long a silent holder keeps one (reclaim)."""
         op, task = data.get("op"), data.get("task")
         if op == "add":
             to = data.get("to") or "all"
@@ -3099,8 +3213,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.owner_status(task, data.get("status"), str(data.get("note") or ""))
         elif op == "remove":
             self.hub.plan_change(task, status="removed")
+        elif op == "reclaim":
+            return {"reclaim": self.hub.set_reclaim(data.get("minutes"), task or None)}
         else:
-            raise HubError("op is add, assign, move, status or remove")
+            raise HubError("op is add, assign, move, status, remove or reclaim")
         return {"ok": True}
 
     def _rules(self, data):
@@ -5427,8 +5543,10 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   done, nobody else is in its files, and it suits your machine. Work you find (a bug, a follow-up,
   a missing piece) goes on the sheet with `hub_task_add`, with what it waits for (`depends`), the
   files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
-  finish a task? Give it back with `hub_update` status `todo` and a note. The lead hands out tasks
-  already on the sheet with `hub_assign` and only `task`.
+  finish a task? Give it back with `hub_update` status `todo` and a note. If the owner set a reclaim
+  time, a task whose holder is silent that long (no tool calls) goes back on the sheet; waiting on
+  someone's answer, mark it `blocked`. The lead hands out tasks already on the sheet with
+  `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_update`.
@@ -5622,6 +5740,19 @@ def cmd_tasks(args):
         out = owner_call("/api/task", {"op": "add", "title": " ".join(args.rest), "depends": args.depends or "",
                                        "areas": args.areas or "", "where": args.where or "", "to": args.to or "all"})
         print("Task #%s is on the sheet." % out["id"])
+        return
+    if args.action == "reclaim":
+        value, task = (args.rest + ["", ""])[:2]
+        if task and not value:
+            die("usage: crewchat tasks reclaim [MINUTES|off|default] [ID]")
+        out = owner_call("/api/task", {"op": "reclaim", "minutes": value, "task": task})["reclaim"]
+        whose = "Task #%s" % task.lstrip("#") if task else "This project"
+        if out == "off":
+            print("%s: tasks stay with their holder however long it is silent." % whose)
+        elif out == "default":
+            print("%s follows the project's setting again." % whose)
+        else:
+            print("%s: a task goes back on the sheet when its holder is silent for %s min." % (whose, out))
         return
     if not args.rest:
         die("usage: crewchat tasks %s ID%s" % (args.action, " AGENT" if args.action == "assign" else
@@ -6219,6 +6350,7 @@ function renderSheet(rows) {
     if (r.areas.length) meta.push("files " + r.areas.join(", "));
     if (r.where) meta.push("on " + r.where);
     if (r.to !== "all") meta.push("for " + r.to);
+    if (r.reclaimed) meta.push("reclaimed from " + r.reclaimed);
     meta.push("from " + (r.from === "Owner" ? "you" : r.from));
     what.append(el("div", "meta", meta.join(" · ")));
     tr.append(what);
@@ -6845,10 +6977,12 @@ def build_parser():
     p.add_argument("--file", help="set: read the rules from this file")
     p.set_defaults(fn=cmd_rules)
 
-    p = sub.add_parser("tasks", help="the project's task sheet: list, add, assign, move, done, todo, blocked, remove")
+    p = sub.add_parser("tasks", help="the project's task sheet: list, add, assign, move, done, todo, blocked, remove, "
+                                     "reclaim")
     p.add_argument("action", nargs="?", default="list",
-                   choices=["list", "add", "assign", "move", "done", "todo", "blocked", "remove"])
-    p.add_argument("rest", nargs="*", help="add: the work; assign: ID AGENT; move: ID up|down|top; others: ID [note]")
+                   choices=["list", "add", "assign", "move", "done", "todo", "blocked", "remove", "reclaim"])
+    p.add_argument("rest", nargs="*", help="add: the work; assign: ID AGENT; move: ID up|down|top; "
+                                           "reclaim: [MINUTES|off|default] [ID]; others: ID [note]")
     p.add_argument("--depends", help="add: task numbers it waits for (A12,A14)")
     p.add_argument("--areas", help="add: path prefixes it changes (app/login/,docs/)")
     p.add_argument("--where", help="add: the machine or place it needs")
