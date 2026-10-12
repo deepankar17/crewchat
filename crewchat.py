@@ -760,9 +760,11 @@ class Hub:
         """What a message changes besides the chat, wherever it was written. Caller holds the lock.
         Roles and task progress travel as messages, so they work across machines too."""
         kind = msg["kind"]
-        if kind in ("take", "assign") and (self.sheet.get(msg.get("task")) or {}).get("reclaimed") == (
-                msg["from"] if kind == "take" else msg["to"]):
-            del self.sheet[msg["task"]]["reclaimed"]  # it has the task again
+        if kind in ("take", "assign"):
+            row = self.sheet.get(msg.get("task")) or {}
+            if row.get("reclaimed") == (msg["from"] if kind == "take" else msg["to"]):
+                del row["reclaimed"]  # the agent it was reclaimed from has it again
+                self._save()
         if kind == "take" and msg.get("task") and msg["task"] not in self.taken:
             self.taken[msg["task"]] = msg["from"]
             self._save()
@@ -801,7 +803,7 @@ class Hub:
                 row["reclaim"] = msg["reclaim"]
             self._save()
         elif kind == "plan" and not msg.get("task") and msg.get("reclaim"):
-            self.reclaim = int(msg["reclaim"]) if msg["reclaim"].isdigit() else 0  # the project's setting
+            self.reclaim = int(msg["reclaim"]) if msg["reclaim"].isdecimal() else 0  # the project's setting
             self._save()
         if kind == "task" and msg["id"] not in self.sheet:
             title = " ".join(str(msg["text"]).split())
@@ -1766,7 +1768,7 @@ class Hub:
         own = row.get("reclaim", "")
         if own == "off":
             return 0
-        return int(own if own.isdigit() else self.reclaim) * 60
+        return int(own if own.isdecimal() else self.reclaim) * 60
 
     def _last_heard(self, name, limit):
         """When an agent last showed a sign of life: a tool call, a hook (a listening one counts as
@@ -1812,6 +1814,15 @@ class Hub:
         if changed:
             self._changed()
 
+    def reclaim_note(self, mid=None):
+        """What an agent holding a task (or any, without mid) must know about reclaiming, or ''."""
+        with self.lock:
+            limit = self._reclaim_after(self.sheet.get(mid) or {}) if mid else self.reclaim * 60
+        if not limit:
+            return ""
+        return (" A task goes back on the sheet when its holder shows no sign of life (a crewchat tool call or "
+                "hook) for %d min: during long work, send hub_update status=in_progress now and then." % (limit // 60))
+
     def reclaim_silent(self):
         """The server's regular check (every RECLAIM_EVERY seconds)."""
         with self.lock:
@@ -1827,7 +1838,7 @@ class Hub:
             with self.lock:
                 return str(self.reclaim) if self.reclaim else "off"
         least, most = RECLAIM_MINUTES
-        if value.isdigit():
+        if value.isdecimal():
             value = str(int(value))
             if not least <= int(value) <= most:
                 raise HubError("reclaim after %d to %d minutes, or off" % (least, most))
@@ -2372,7 +2383,7 @@ def call_tool(hub, sid, name, args, owner=False):
         mid = clean_id(args.get("id"))
         hub.take(me, mid)
         return ("Task #%s is yours and everyone has been told. Before any other work, send hub_update "
-                "id=%s status=in_progress with one line on your plan; then start." % (mid, mid))
+                "id=%s status=in_progress with one line on your plan; then start.%s" % (mid, mid, hub.reclaim_note(mid)))
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -2397,7 +2408,8 @@ def call_tool(hub, sid, name, args, owner=False):
                     "with hub_task_add.", "mine": "You hold no task.", "all": "The task sheet is empty."}[view]
         head = {"next": "Tasks you may take now, top first (hub_take the first one):",
                 "mine": "Your tasks:", "all": "The task sheet, in order:"}[view]
-        return head + "\n" + "\n".join(sheet_line(r) for r in rows)
+        note = hub.reclaim_note().strip()
+        return head + "\n" + "\n".join(sheet_line(r) for r in rows) + ("\n" + note if note else "")
     if name == "hub_task_add":
         msg = hub.add_row(me, args.get("title"), args.get("depends", ""), args.get("areas", ""), args.get("where", ""))
         if args.get("take") and not owner:
@@ -2620,7 +2632,7 @@ COMMANDS = [
         ("tasks done|todo|blocked ID [NOTE]", "Settle a task (todo puts it back on the sheet).", None),
         ("tasks remove ID", "Take a task off the sheet.", None),
         ("tasks reclaim [MINUTES|off|default] [ID]",
-         "Put a task back on the sheet when its holder is silent this long (no tool calls, no hooks): for the "
+         "Put a task back on the sheet when its holder is silent this long (no crewchat tool calls, no hooks): for the "
          "project, or one task (default: as the project). Off unless set; with no value, shows it.", None),
     ]),
     ("Project folders", [
@@ -5563,8 +5575,9 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   a missing piece) goes on the sheet with `hub_task_add`, with what it waits for (`depends`), the
   files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
   finish a task? Give it back with `hub_update` status `todo` and a note. If the owner set a reclaim
-  time, a task whose holder is silent that long (no tool calls) goes back on the sheet; waiting on
-  someone's answer, mark it `blocked`. The lead hands out tasks already on the sheet with
+  time (`hub_tasks` says so), a task whose holder shows no sign of life that long (no crewchat tool
+  call or hook) goes back on the sheet: in long work, send `hub_update` `in_progress` now and then;
+  waiting on someone's answer, mark it `blocked`. The lead hands out tasks already on the sheet with
   `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
