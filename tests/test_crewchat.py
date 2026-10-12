@@ -2055,17 +2055,18 @@ class Lifecycle(Base):
         a.text("hub_take", id=tid)
         self.assertIn("This project: tasks stay with their holder", cli("tasks", "reclaim"))
         with self.later(600):
-            hub.sheet_rows()
+            hub.reclaim_silent()
         self.assertEqual(hub.taken[tid], a_name)  # off unless the owner sets it
         with self.assertRaises(SystemExit):
             cli("tasks", "reclaim", "5")  # too short to tell a crash from a long build
         self.assertIn("silent for 60 min", cli("tasks", "reclaim", "60"))
         try:
             with self.later(59):
-                hub.sheet_rows()
+                hub.reclaim_silent()
             self.assertEqual(hub.taken[tid], a_name)
             with self.later(61):
-                row = next(r for r in hub.sheet_rows() if r["id"] == tid)
+                hub.reclaim_silent()
+            row = next(r for r in hub.sheet_rows() if r["id"] == tid)
             # Like giving it back: on the sheet again, under a new claim key, and said in the chat.
             self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", a_name))
             self.assertEqual(hub.claim_key(tid), tid + "@1")
@@ -2080,9 +2081,14 @@ class Lifecycle(Base):
             self.assertIn("already taken by " + b_name, a.text("hub_take", id=tid))
             row = next(r for r in hub.sheet_rows() if r["id"] == tid)
             self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("doing", b_name, a_name))
+            # Once it has the task again, it reports on it as before.
+            b.text("hub_update", id=tid, status="todo", note="over to you")
+            self.assertIn("is yours", a.text("hub_take", id=tid))
+            self.assertIn("marked done", a.text("hub_update", id=tid, status="done", note="finished"))
+            self.assertEqual(next(r for r in hub.sheet_rows() if r["id"] == tid)["reclaimed"], "")
         finally:
             cli("tasks", "reclaim", "off")
-        self.assertEqual(hub.roster.reclaim, 0)
+        self.assertEqual(hub.reclaim, 0)
 
     def test_reclaim_waits_for_a_listening_holder_and_follows_a_tasks_own_setting(self):
         hub = self.hub
@@ -2100,7 +2106,7 @@ class Lifecycle(Base):
         cli("tasks", "reclaim", "30", quick)
         self.assertIn("never reclaimed", cli("tasks"))
         with self.later(45):
-            hub.sheet_rows()
+            hub.reclaim_silent()
         self.assertEqual((hub.taken.get(long), hub.taken.get(quick)), (a_name, None))
         self.assertIn("follows the project's setting", cli("tasks", "reclaim", "default", long))
         cli("tasks", "reclaim", "20")
@@ -2108,7 +2114,7 @@ class Lifecycle(Base):
             hub.waiting[a_name] = 1  # its hook is waiting for messages right now: it is there
             try:
                 with self.later(45):
-                    hub.sheet_rows()
+                    hub.reclaim_silent()
             finally:
                 del hub.waiting[a_name]
             self.assertEqual(hub.taken.get(long), a_name)
@@ -2118,14 +2124,17 @@ class Lifecycle(Base):
             hub.sync = mock.Mock(device_id="here", shared=False)
             try:
                 with self.later(45):
-                    hub.sheet_rows()
+                    hub.reclaim_silent()
             finally:
                 hub.sync = None
                 hub.sheet[long]["origin"] = ""
             self.assertEqual(hub.taken.get(long), a_name)
-            with self.later(45):
-                hub.sheet_rows()
-            self.assertIsNone(hub.taken.get(long))
+            with self.later(45):  # taking it does not wait for the server's next check
+                self.assertIn("is yours", b.text("hub_take", id=long))
+            self.assertEqual(hub.sheet[long]["reclaimed"], a_name)
+            # The project's setting is a message, so one set on another machine applies here too.
+            hub.ingest({"id": "other-machine-1", "from": "Owner", "to": "all", "kind": "plan", "text": "", "reclaim": "45"})
+            self.assertIn("silent for 45 min", cli("tasks", "reclaim"))
         finally:
             cli("tasks", "reclaim", "off")
 

@@ -294,7 +294,8 @@ crewchat tasks reclaim default A12 # back to the project's time
 crewchat tasks reclaim off         # turn it off; with no value, shows the setting
 ```
 
-With several machines, the machine a task was posted on reclaims it, with its own setting.
+The setting reaches every linked machine. The machine a task was posted on reclaims it, so while that
+machine is off, its tasks stay with their holders.
 
 ## What agents learn: rules and skills
 

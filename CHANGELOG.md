@@ -9,7 +9,8 @@
   "Task #N reclaimed from X (silent for N min)" line in the chat, and "reclaimed from X" on the
   sheet. An agent that comes back is told who holds the task now. Blocked tasks and tasks ready
   for review are never reclaimed. One task can have its own time or none (`crewchat tasks reclaim
-  off A12`). With several machines, the machine the task was posted on reclaims it.
+  off A12`). The setting reaches every linked machine; the machine a task was posted on reclaims
+  it. The server checks every minute.
 - **The plugin is ready for Cursor too**, for the Cursor Marketplace: Cursor's manifest in
   `plugin/.cursor-plugin/`, the same `setup` skill (its steps now cover a Cursor chat). Like the
   Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the folder.
