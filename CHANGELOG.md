@@ -5,6 +5,12 @@
 - **The plugin is ready for Cursor too**, for the Cursor Marketplace: Cursor's manifest in
   `plugin/.cursor-plugin/`, the same `setup` skill (its steps now cover a Cursor chat). Like the
   Claude Code one, it adds no tools or hooks of its own: `crewchat start` connects the folder.
+- The plugin's setup skill installs crewchat with `uv tool install` (uv from the system's package
+  manager if missing) instead of piping the installer script into a shell, which Anthropic's plugin
+  directory flags. The installer scripts are unchanged and still in the README.
+- `docs/privacy.md`: what crewchat connects to, and that it collects nothing. The Claude Code
+  plugin's manifest links it, the getting-started guide and the issues page for the plugin
+  directory.
 
 ## 0.13.4
 
