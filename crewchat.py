@@ -2415,7 +2415,7 @@ def call_tool(hub, sid, name, args, owner=False):
         if args.get("take") and not owner:
             hub.take(me, msg["id"])
             return ("Task #%s is on the sheet and yours. Send hub_update id=%s status=in_progress with your plan, "
-                    "then start." % (msg["id"], msg["id"]))
+                    "then start.%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"])))
         return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if owner:
         raise HubError("only agents have a status and a name")
