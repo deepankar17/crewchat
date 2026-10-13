@@ -1294,6 +1294,14 @@ class Hub:
         return place is not None and any(p == place and folder_chat(config, path) == self.chat_key
                                          for path, p in (config.get("folders") or {}).items())
 
+    def agent_folders(self, agent):
+        """The project folders on this machine that an agent works in (its place's folders)."""
+        with self.lock:
+            place = (self.agents.get(agent) or {}).get("place")
+        config = self.machine_config()
+        return [Path(path) for path, p in sorted((config.get("folders") or {}).items())
+                if place is not None and p == place and folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
+
     def machine_config(self):
         """This machine's settings (its folders, tools, port), wherever this project is kept."""
         root = getattr(self, "machine_root", None)
@@ -2410,7 +2418,7 @@ def call_tool(hub, sid, name, args, owner=False):
             # The paths would be read here, on the host, not where the agent is.
             raise HubError("files can only be shared from folders on the chat's own machine; this folder is "
                            "connected from another machine. Put the text in the message instead.")
-        files = [share_file(hub, path) for path in args.get("files") or []]
+        files = [share_file(hub, path, None if owner else me) for path in args.get("files") or []]
         msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
     if name == "hub_file":
@@ -2545,8 +2553,9 @@ def inside_any(path, folders):
     return False
 
 
-def share_file(hub, path):
-    """An agent shares a file from this machine (hub_send files)."""
+def share_file(hub, path, agent=None):
+    """An agent shares a file from this machine (hub_send files): only from its own project folder.
+    agent is None for the owner, who may share any file."""
     if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
         raise HubError("files must be absolute paths on this machine")
     # An agent can be talked into sharing crewchat's keys, which agents on linked machines could then
@@ -2558,6 +2567,12 @@ def share_file(hub, path):
     homes = {home().resolve(), hub.roster.root.resolve()}
     if inside_any(path, homes):
         raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % name)
+    # Nothing from elsewhere on the machine either (~/.ssh, ~/.aws, another project's .env): what an
+    # agent shares must be in its project, where copying it in is the agent's own visible step.
+    folders = hub.agent_folders(agent) if agent is not None else None
+    if folders is not None and not inside_any(path, folders):
+        raise HubError("%s is outside your project folder (%s), so it cannot be shared. Copy it into the project "
+                       "first if the owner should see it." % (name, ", ".join(str(f) for f in folders) or "none here"))
     try:
         if path.stat().st_size > MAX_UPLOAD:
             raise HubError("%s is too big: %s at most" % (name, human_size(MAX_UPLOAD)))

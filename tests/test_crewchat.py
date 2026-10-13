@@ -563,6 +563,15 @@ class Files(Base):
         self.assertEqual(other.call("hub_file", id=fid)["content"][1]["data"], base64.b64encode(PNG).decode())
         self.assertIn("absolute paths", session.text("hub_send", to=other_name, text="x", files=["bug.png"]))
         self.assertIn("cannot read", session.text("hub_send", to=other_name, text="x", files=[str(shot) + ".gone"]))
+        # Only from the agent's own project folder: not ~/.ssh, not another folder on the machine.
+        elsewhere = Path(tempfile.mkdtemp(dir=TMP)) / "id_rsa"
+        elsewhere.write_text("not a real key")
+        self.assertIn("outside your project folder", session.text("hub_send", to=other_name, text="x",
+                                                                  files=[str(elsewhere)]))
+        doc = shot.parent / "notes" / "../notes.txt"
+        (shot.parent / "notes").mkdir()
+        (shot.parent / "notes.txt").write_text("plan")
+        self.assertIn("with 1 file(s)", session.text("hub_send", to=other_name, text="x", files=[str(doc)]))
 
     def test_an_agent_cannot_share_crewchats_keys(self):
         # Agents on linked machines can open a shared file, so a talked-into agent must not leak a token.
