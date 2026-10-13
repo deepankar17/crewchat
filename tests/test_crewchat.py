@@ -146,7 +146,7 @@ class Protocol(Base):
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
                                                       "hub_status", "hub_history", "hub_rename", "hub_file", "hub_role",
                                                       "hub_tasks", "hub_task_add", "hub_assign", "hub_update",
-                                                      "hub_link"])
+                                                      "hub_ask", "hub_answer", "hub_link"])
 
     def test_json_rpc_edges(self):
         session = Session(self.base, self.token)
@@ -328,6 +328,84 @@ class Messaging(Base):
         self.assertIn("%s -> Owner: a question" % self.a_name, cli("say", "--to", self.a_name, "an answer") and
                       self.b.text("hub_history"))
         self.assertIn("Owner -> you: an answer", self.a.text("hub_inbox"))
+
+
+class Advisor(Base):
+    """An agent with the advisor role answers the others' hub_ask questions, which wait for it."""
+
+    def role(self, agent, role):
+        return crewchat.post_json(self.base + "/api/role", self.owner, {"agent": agent, "role": role})
+
+    def ask_in_background(self, session, **arguments):
+        out = {}
+        thread = threading.Thread(target=lambda: out.update(session.call("hub_ask", **arguments)))
+        thread.start()
+        return thread, out
+
+    def test_an_agent_asks_the_advisor_and_gets_the_answer_back(self):
+        dev, dev_name = self.agent()
+        self.assertIn("this chat has no advisor", dev.text("hub_ask", question="Which approach?"))
+        adv, adv_name = self.agent()
+        self.role(adv_name, "advisor")
+        try:
+            self.assertIn("You are the advisor", adv.text("hub_inbox"))
+            thread, out = self.ask_in_background(dev, question="Cache in memory or on disk? It restarts often.")
+            deadline = time.time() + 10
+            inbox = ""
+            while "[QUESTION]" not in inbox and time.time() < deadline:
+                inbox += adv.text("hub_inbox", wait_seconds=1)
+            self.assertIn("%s -> you: [QUESTION] Cache in memory or on disk?" % dev_name, inbox)
+            ask_id = re.search(r"hub_answer id=(\w+)", inbox).group(1)
+            self.assertIn("a verdict is for a question about a task", adv.text("hub_answer", id=ask_id, text="x",
+                                                                                 verdict="approve"))
+            self.assertIn("Answered #%s" % ask_id, adv.text("hub_answer", id=ask_id, text="On disk: it restarts."))
+            thread.join(10)
+            self.assertIn("%s answered" % adv_name, out["content"][0]["text"])
+            self.assertIn("On disk: it restarts.", out["content"][0]["text"])
+            # Handed back by hub_ask, so not news in the inbox; still in the chat for everyone.
+            self.assertNotIn("On disk: it restarts.", dev.text("hub_inbox"))
+            self.assertIn("[ANSWER to #%s] On disk" % ask_id, dev.text("hub_history"))
+            self.assertIn("only an agent with the advisor role", dev.text("hub_answer", id=ask_id, text="me too"))
+            self.assertIn("not a question asked with hub_ask", adv.text("hub_answer", id="0", text="x"))
+        finally:
+            self.role(adv_name, "none")
+
+    def test_a_question_without_an_answer_in_time_comes_to_the_inbox(self):
+        dev, dev_name = self.agent()
+        adv, adv_name = self.agent()
+        self.role(adv_name, "advisor")
+        try:
+            question, answer = self.hub.ask(dev_name, "Quick one?", wait=0)
+            self.assertIsNone(answer)
+            adv.text("hub_answer", id=question["id"], text="Later answer")
+            self.assertIn("Later answer", dev.text("hub_inbox"))
+        finally:
+            self.role(adv_name, "none")
+
+    def test_the_advisor_check_before_done(self):
+        dev, dev_name = self.agent()
+        adv, adv_name = self.agent()
+        task = self.say(dev_name, "Ship the cache", "task")
+        dev.call("hub_take", id=task)
+        set_check = lambda value: crewchat.post_json(self.base + "/api/task", self.owner,  # noqa: E731
+                                                     {"op": "advisor", "value": value})["advisor"]
+        self.assertEqual(set_check(""), "off")
+        self.assertEqual(set_check("on"), "on")
+        try:
+            self.assertIn("The chat has no advisor yet", dev.text("hub_update", id=task, status="done"))
+            self.role(adv_name, "advisor")
+            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            question, _ = self.hub.ask(dev_name, "Done? Tests pass.", task=task, wait=0)
+            adv.text("hub_answer", id=question["id"], text="Add a test for expiry.", verdict="changes")
+            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            question, _ = self.hub.ask(dev_name, "Added the expiry test.", task=task, wait=0)
+            adv.text("hub_answer", id=question["id"], text="Good.", verdict="approve")
+            self.assertIn("marked done", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("[QUESTION before done, task #%s]" % task, dev.text("hub_history"))
+        finally:
+            self.assertEqual(set_check("off"), "off")
+            self.role(adv_name, "none")
+        self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
 
 
 class Tasks(Base):
