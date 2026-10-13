@@ -882,13 +882,54 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove or listen", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen or stop", self.op(op="kick", agent=name)["error"])
+
+    def stand_in(self, name, app="terminal"):
+        """A real process that looks like the agent's claude (it is sleep), recorded as its session."""
+        proc = subprocess.Popen(["claude", "60"], executable="/bin/sleep")
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        started = crewchat.process_table()[proc.pid][1]
+        self.hub.agents[name]["session"] = {"id": "sess-0002-abc", "pid": proc.pid, "started": started, "app": app,
+                                            "tool": "claude", "folder": "/tmp", "since": time.time()}
+        crewchat._PROCESSES[0] = 0.0  # as _keep_session does for a newly reported session
+        return proc
+
+    @unittest.skipIf(os.name == "nt", "a stand-in process with another name needs POSIX exec")
+    def test_stop_ends_the_agents_process_and_frees_its_tasks(self):
+        session, name = self.agent()
+        task = self.say("all", "held when stopped", "task")
+        session.call("hub_take", id=task)
+        proc = self.stand_in(name)
+        self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
+        self.assertEqual(self.op(op="stop", agent=name), {"ok": True})
+        proc.wait(timeout=5)
+        row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
+        self.assertEqual((row["status"], row["reclaimed"]), ("todo", name))
+        self.assertIn(name, self.names())  # stopped, not removed
+        self.assertFalse(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
+        self.assertIn("is not running", self.op(op="stop", agent=name)["error"])
+
+    @unittest.skipIf(os.name == "nt", "a stand-in process with another name needs POSIX exec")
+    def test_stop_does_not_touch_a_reused_process_number(self):
+        _, name = self.agent()
+        proc = self.stand_in(name)
+        self.hub.agents[name]["session"]["started"] = "Mon Jan  1 00:00:00 2024"  # another process had that number
+        self.assertIn("is not running", self.op(op="stop", agent=name)["error"])
+        self.assertIsNone(proc.poll())
+        other = subprocess.Popen(["sleep", "60"])  # the right start time, but not an agent's command
+        self.addCleanup(other.kill)
+        self.hub.agents[name]["session"].update(pid=other.pid, started=crewchat.process_table()[other.pid][1])
+        self.assertIn("is not running", self.op(op="stop", agent=name)["error"])
+        self.assertIsNone(other.poll())
+        _, never = self.agent()
+        self.assertIn("no session recorded for %s" % never, self.op(op="stop", agent=never)["error"])
 
     def test_an_agent_on_another_machine_is_changed_there(self):
         self.hub.set_remote("dev-x", "laptop", [{"agent": "far-away", "client": "cursor", "place": "x", "seen": 1,
                                                  "listen": "on"}], 1)
         try:
-            for body in ({"op": "rename", "new": "near"}, {"op": "remove"}, {"op": "listen", "mode": "on"}):
+            for body in ({"op": "rename", "new": "near"}, {"op": "remove"}, {"op": "listen", "mode": "on"},
+                         {"op": "stop"}):
                 self.assertIn("runs on laptop", self.op(agent="far-away", **body)["error"])
             self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == "far-away")["listen"], "on")  # shown here
         finally:

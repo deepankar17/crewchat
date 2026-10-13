@@ -36,6 +36,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -1017,11 +1018,7 @@ class Hub:
     def remove(self, name):
         with self.lock:
             self._local_agent(name, "remove")
-            # What it held goes back on the sheet, the way a reclaim does (a new claim key everywhere).
-            for mid, holder in list(self.taken.items()):
-                if holder == name and mid in self.sheet and self._row_status(mid) not in ("done", "removed"):
-                    self._append(SERVER_NAME, "all", "Task #%s is back on the sheet: %s was removed." % (mid, name),
-                                 "update", task=mid, status="todo", reclaimed=name)
+            self._free_tasks(name, "was removed")
             self._forget(name, "was removed by the owner")
             self._save()
             self._changed()
@@ -1074,7 +1071,8 @@ class Hub:
             {"agent": n, "client": a["client"], "place": a["place"], "seen": a["seen"],
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
-             "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", "")}
+             "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
+             "session": self._session_state(a)}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1093,6 +1091,14 @@ class Hub:
                     "role": str(row.get("role") or ""), "listen": str(row.get("listen") or ""),
                 })
         return rows
+
+    def _session_state(self, agent):
+        """What a card shows about a local agent's session: where it runs, and whether it still does."""
+        session = agent.get("session")
+        if not session:
+            return None
+        return {"app": session.get("app", "terminal"), "running": process_running(session, recent_process_table()),
+                "since": session.get("stopped") or session.get("since", 0), "tool": session.get("tool", "claude")}
 
     def rows(self):
         with self.lock:
@@ -1978,6 +1984,39 @@ class Hub:
             out["listen"] = listen  # the hook waits this long in all, whatever its folder says
         return out
 
+    def _free_tasks(self, name, why):
+        """Put what an agent held back on the sheet, the way a reclaim does (a new claim key
+        everywhere). Caller holds the lock."""
+        for mid, holder in list(self.taken.items()):
+            if holder == name and mid in self.sheet and self._row_status(mid) not in ("done", "removed"):
+                self._append(SERVER_NAME, "all", "Task #%s is back on the sheet: %s %s." % (mid, name, why),
+                             "update", task=mid, status="todo", reclaimed=name)
+
+    def _session_of(self, name, verb):
+        """A local agent's recorded session, or a HubError. Caller holds the lock."""
+        session = self._local_agent(name, verb).get("session")
+        if not session:
+            raise HubError("no session recorded for %s: it has not checked in since crewchat could record it" % name)
+        return session
+
+    def stop_agent(self, name):
+        """The owner stops an agent's session from its card. It stays on the roster; what it held
+        goes back on the sheet."""
+        with self.lock:
+            session = dict(self._session_of(name, "stop"))
+        if not process_running(session):
+            raise HubError("%s is not running" % name)
+        if not stop_process(session["pid"]):
+            raise HubError("could not stop %s" % name)
+        _PROCESSES[0] = 0.0  # the cards see it gone on their next look
+        with self.lock:
+            if name in self.agents and self.agents[name].get("session"):
+                self.agents[name]["session"]["stopped"] = time.time()
+            self._free_tasks(name, "was stopped")
+            self._event("Owner stopped %s" % name)
+            self._save()
+            self._changed()
+
     def _keep_session(self, name, session):
         """Which session and process an agent is, as its hook reported it (once per session).
         Caller holds the lock."""
@@ -1993,6 +2032,7 @@ class Hub:
             kept["permissions"] = old.get("permissions", "ask") if old.get("id") == kept["id"] else (
                 self.agents[name].get("permissions", "ask"))
             self.agents[name]["session"] = kept
+            _PROCESSES[0] = 0.0  # a new process: the cards look again
             self._save()
 
     def _listen_override(self, name):
@@ -3370,8 +3410,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.remove(name)
         elif op == "listen":
             self.hub.set_listen(name, data.get("mode"))
+        elif op == "stop":
+            self.hub.stop_agent(name)
         else:
-            raise HubError("op is rename, remove or listen")
+            raise HubError("op is rename, remove, listen or stop")
         return {"ok": True}
 
     def _role(self, data):
@@ -4938,6 +4980,16 @@ def process_table():
     return table
 
 
+_PROCESSES = [0.0, {}]  # when, process_table(): the chat page's cards ask often
+
+
+def recent_process_table(max_age=5):
+    """process_table(), at most max_age seconds old (the cards' "running" on every page poll)."""
+    if time.time() - _PROCESSES[0] > max_age:
+        _PROCESSES[:] = [time.time(), process_table()]
+    return _PROCESSES[1]
+
+
 def agent_process(client, table=None):
     """The agent's own process, as its hook finds it among its ancestors: {"pid", "started", "app"}
     ("claude-app" under the Claude desktop app, else "terminal"), or None."""
@@ -4955,6 +5007,29 @@ def agent_process(client, table=None):
             app = "claude-app"
         pid = parent
     return dict(found, app=app) if found else None
+
+
+def process_running(session, table=None):
+    """Is the agent's recorded process still running: the same number, the same start time, and an
+    agent's command (so a number the system gave to another process is never mistaken for it)?"""
+    try:
+        pid, started, tool = int(session["pid"]), str(session["started"]), session.get("tool", "claude")
+    except (KeyError, TypeError, ValueError):
+        return False
+    table = process_table() if table is None else table
+    row = table.get(pid)
+    return bool(row and row[1] == started and AGENT_COMMAND.get(tool, AGENT_COMMAND["claude"]).search(row[2]))
+
+
+def stop_process(pid):
+    """Ask a process (and on Windows its children) to end. Returns whether the signal was sent."""
+    try:
+        if os.name == "nt":
+            return subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, timeout=30).returncode == 0
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def session_report(client, session, project):
