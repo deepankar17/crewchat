@@ -29,6 +29,7 @@ See README.md for the full guide.
 """
 import argparse
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -2481,38 +2482,59 @@ def sheet_line(row):
 
 
 def stored_tokens(roots):
-    """Every token kept under these crewchat folders (the owner's, and each place's)."""
+    """Every token kept under these crewchat folders (the owner's, and each place's), as bytes."""
     found = set()
     for root in roots:
-        for path in list(root.glob("tokens/*.token")) + list(root.glob("projects/*/tokens/*.token")):
+        for path in itertools.chain(root.glob("tokens/*.token"), root.glob("projects/*/tokens/*.token")):
             try:
-                token = path.read_text(encoding="utf-8").strip()
+                token = path.read_bytes().strip()
             except OSError:
                 continue
-            if len(token) >= 20:
+            if len(token) >= 20:  # an empty or hand-made stub must not match every file
                 found.add(token)
     return found
+
+
+def inside_any(path, folders):
+    """Is path one of these folders or inside one? By file identity, so case and aliases do not matter."""
+    marks = []
+    for folder in folders:
+        try:
+            marks.append(os.stat(folder))
+        except OSError:
+            pass
+    for part in (path, *path.parents):
+        try:
+            here = os.stat(part)
+        except OSError:
+            continue
+        if any(os.path.samestat(here, mark) for mark in marks):
+            return True
+    return False
 
 
 def share_file(hub, path):
     """An agent shares a file from this machine (hub_send files)."""
     if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
         raise HubError("files must be absolute paths on this machine")
-    path = Path(path).expanduser()
     # An agent can be talked into sharing crewchat's keys, which agents on linked machines could then
     # open: nothing from crewchat's own folders, and nothing that holds one of its tokens (.mcp.json).
+    # Resolved once and read from there, so a symlink cannot point elsewhere after the check. Folders
+    # are compared by identity, not by name: a path in another case (macOS, Windows) is the same folder.
+    name = Path(path).name
+    path = Path(path).expanduser().resolve()
     homes = {home().resolve(), hub.roster.root.resolve()}
-    if any(path.resolve() == h or h in path.resolve().parents for h in homes):
-        raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % path.name)
+    if inside_any(path, homes):
+        raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % name)
     try:
         if path.stat().st_size > MAX_UPLOAD:
-            raise HubError("%s is too big: %s at most" % (path.name, human_size(MAX_UPLOAD)))
+            raise HubError("%s is too big: %s at most" % (name, human_size(MAX_UPLOAD)))
         data = path.read_bytes()
     except OSError as e:
         raise HubError("cannot read %s (%s)" % (path, e.strerror or e))
-    if any(token.encode("utf-8") in data for token in stored_tokens(homes)):
-        raise HubError("%s contains a crewchat token, so it cannot be shared" % path.name)
-    return hub.add_file(path.name, data)
+    if any(token in data for token in stored_tokens(homes)):
+        raise HubError("%s contains a crewchat token, so it cannot be shared" % name)
+    return hub.add_file(name, data)
 
 
 def open_shared_file(hub, fid):
