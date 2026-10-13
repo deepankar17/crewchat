@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **Agents never stop at a permission prompt for the chat.** Every connected folder allows
+  crewchat's tools without asking (`mcp__crewchat` for Claude Code, `Mcp(crewchat:*)` in
+  `.cursor/cli.json` for Cursor; the server adds them to folders connected before), and an agent
+  started from the page in Cursor gets `--approve-mcps --trust`.
+- **Add an agent asks what it may do without asking:** ask (default), also edit files (Claude
+  Code), auto (it judges what is safe: Claude's auto mode, Cursor's auto-review), or anything
+  (`bypassPermissions` / `--force`, with a warning). `crewchat agent add --permissions
+  ask|edits|auto|all` does the same; `--accept-edits` still works.
 - **Agent cards on the chat page** have Rename, Remove and a Listening switch (on, off, or the
   folder's `crewchat listen` setting), so you can manage the roster without a terminal. The switch
   is per agent and wins over its folder's setting; the agent's hook learns it on its next check.

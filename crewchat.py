@@ -1208,16 +1208,19 @@ class Hub:
             self.starts[key] = {"name": name, "role": role, "task": task, "expires": now + START_TTL}
             return key
 
-    def launch(self, tool, folder, name="", role="", task="", accept_edits=False):
+    def launch(self, tool, folder, name="", role="", task="", permissions="ask"):
         """Open a new agent session in a connected folder on this machine; it checks in with a
-        start key and gets this name, role and first task."""
+        start key and gets this name, role and first task, and may do what permissions says
+        without asking (LAUNCH_PERMISSIONS)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
+        if permissions not in LAUNCH_PERMISSIONS[tool]:
+            raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("that folder is not connected to this chat on this machine")
         key = self.new_start(name, role, task)
         try:
-            launch_agent(tool, folder, key, accept_edits, self.home)
+            launch_agent(tool, folder, key, permissions, self.home)
         except (HubError, OSError) as e:
             with self.lock:
                 self.starts.pop(key, None)
@@ -2685,7 +2688,8 @@ COMMANDS = [
         ("say [--to NAME] [--task] [--file PATH] TEXT", "Post as you: to everyone, to one agent (--to), as a task "
          "for the agents to take (--task), with files (--file, 20 MB each, as many as you like).", None),
         ("agents", "Who is in the chat right now.", {"argv": ["agents"], "chat": True}),
-        ("agent add [NAME] [--role ROLE] [--task TEXT] [--tool claude|cursor] [--folder FOLDER] [--accept-edits]",
+        ("agent add [NAME] [--role ROLE] [--task TEXT] [--tool claude|cursor] [--folder FOLDER] [--accept-edits] "
+         "[--permissions ask|edits|auto|all]",
          "Open a new agent session on this machine, with its role and first task, in a connected folder; "
          "--accept-edits lets Claude Code edit files without asking (+ Add an agent does the same).", None),
         ("agent rename OLD NEW", "Rename an agent.", None),
@@ -3354,8 +3358,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _launch(self, data):
         """Add an agent: a new agent session on this machine."""
+        permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
         self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
-                        data.get("task"), bool(data.get("accept_edits")))
+                        data.get("task"), permissions)
         return {"ok": True}
 
     def _admin(self, raw):
@@ -3815,6 +3820,13 @@ def joined_place(project, config=None, root=None):
 
 # Agents launched from the chat page ---------------------------------------------------------
 LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent")}
+# What an agent started from the chat page may do without asking, per tool: the command-line options.
+# Cursor's agent always gets --approve-mcps --trust, so crewchat's MCP server and the folder never stop it.
+LAUNCH_PERMISSIONS = {
+    "claude": {"ask": [], "edits": ["--permission-mode", "acceptEdits"], "auto": ["--permission-mode", "auto"],
+               "all": ["--permission-mode", "bypassPermissions"]},
+    "cursor": {"ask": [], "auto": ["--auto-review"], "all": ["--force"]},
+}
 # Where these tools usually live: the server may run with a short PATH (started at login).
 TOOL_DIRS = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
              "~/bin", "%APPDATA%/npm", "%LOCALAPPDATA%/Programs/cursor-agent")
@@ -3879,10 +3891,10 @@ def launch_options(config, root=None, chat=""):
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
-def launch_command(exe, tool, key, accept_edits=False):
-    """The agent's command line. Only the fixed prompt and the key reach it: no text typed on
-    the chat page is ever passed to a shell."""
-    options = ["--permission-mode", "acceptEdits"] if tool == "claude" and accept_edits else []
+def launch_command(exe, tool, key, permissions="ask"):
+    """The agent's command line. Only the fixed prompt, the key and fixed options reach it: no text
+    typed on the chat page is ever passed to a shell."""
+    options = (["--approve-mcps", "--trust"] if tool == "cursor" else []) + LAUNCH_PERMISSIONS[tool][permissions]
     return [exe] + options + [LAUNCH_PROMPT % key]
 
 
@@ -3898,13 +3910,13 @@ def macos_script(folder, command, key):
     ]) + "\n"
 
 
-def launch_agent(tool, folder, key, accept_edits=False, root=None):
+def launch_agent(tool, folder, key, permissions="ask", root=None):
     """Open a terminal window on this machine with a new agent session in folder."""
     exe = find_tool(tool, load_config(root))
     if not exe:
         raise HubError("%s is not installed here, or crewchat cannot find it. Run `crewchat start` once in a "
                        "terminal where it works." % LAUNCH_TOOLS[tool][0])
-    command = launch_command(exe, tool, key, accept_edits)
+    command = launch_command(exe, tool, key, permissions)
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
@@ -4219,7 +4231,7 @@ def cmd_agent(args):
         folder = str(Path(args.folder or ".").resolve())
         owner_call("/api/launch", {"tool": args.tool, "folder": folder, "name": args.name or "",
                                    "role": args.role or "", "task": args.task or "",
-                                   "accept_edits": args.accept_edits})
+                                   "permissions": args.permissions or ("edits" if args.accept_edits else "ask")})
         print("Opened a new %s session in %s. It joins the chat in a moment%s." % (
             LAUNCH_TOOLS[args.tool][0], folder, " as %s" % args.name if args.name else ""))
         return
@@ -4533,8 +4545,28 @@ def install_claude(project, url, token):
     return [".mcp.json", ".claude/settings.local.json"]
 
 
+CLAUDE_ALLOW = "mcp__" + SERVER_NAME  # every crewchat tool, in Claude Code's permission rules
+CURSOR_ALLOW = "Mcp(%s:*)" % SERVER_NAME  # the same in Cursor's
+
+
+def allow_rule(data, rule, add=True):
+    """Add crewchat's rule to (or take it out of) a settings file's permissions.allow list."""
+    allow = [r for r in (data.get("permissions") or {}).get("allow") or [] if r != rule]
+    if add:
+        allow.append(rule)
+    if allow:
+        data.setdefault("permissions", {})["allow"] = allow
+    elif isinstance(data.get("permissions"), dict):
+        data["permissions"].pop("allow", None)
+        if not data["permissions"]:
+            del data["permissions"]
+
+
 def set_claude_hooks(settings):
-    """crewchat's hooks in Claude Code settings, replacing its own older ones and keeping the user's."""
+    """crewchat's hooks in Claude Code settings, replacing its own older ones and keeping the user's,
+    and its tools allowed without asking (an agent stuck on a permission prompt misses the chat)."""
+    if CLAUDE_ALLOW not in (settings.get("permissions") or {}).get("allow", []):
+        allow_rule(settings, CLAUDE_ALLOW)
     hooks = settings.setdefault("hooks", {})
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
@@ -4556,7 +4588,19 @@ def install_cursor(project, url, token):
     hooks = read_json(hooks_path)
     set_cursor_hooks(hooks)
     write_json(hooks_path, hooks)
-    return [".cursor/mcp.json", ".cursor/hooks.json"]
+    allow_cursor_tools(project)
+    return [".cursor/mcp.json", ".cursor/hooks.json", ".cursor/cli.json"]
+
+
+def allow_cursor_tools(project):
+    """crewchat's tools allowed without asking in the folder's Cursor agent settings (.cursor/cli.json)."""
+    path = Path(project) / ".cursor" / "cli.json"
+    data = read_json(path)
+    if CURSOR_ALLOW not in (data.get("permissions") or {}).get("allow", []):
+        allow_rule(data, CURSOR_ALLOW)
+        write_json(path, data)
+        return True
+    return False
 
 
 def set_cursor_hooks(hooks):
@@ -4580,9 +4624,14 @@ def update_hooks(folder):
             if is_our_hook(json.dumps(data.get("hooks") or {})):  # else not connected by crewchat, or taken out
                 setter(data)
         return change
-    return [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
-                                    (".cursor/hooks.json", set_cursor_hooks))
-            if not tracked_by_git(folder, rel) and edit_json(folder / rel, ours_then(setter))]
+    changed = [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
+                                       (".cursor/hooks.json", set_cursor_hooks))
+               if not tracked_by_git(folder, rel) and edit_json(folder / rel, ours_then(setter))]
+    if (is_our_hook(json.dumps(read_json(folder / ".cursor" / "hooks.json"))) and not tracked_by_git(folder, ".cursor/cli.json")
+            and allow_cursor_tools(folder)):
+        git_exclude(folder, [".cursor/cli.json"])  # as when the folder joined
+        changed.append(".cursor/cli.json")
+    return changed
 
 
 def tracked_by_git(folder, rel):
@@ -5618,6 +5667,12 @@ def disconnect_folder(project):
         if not hooks:
             data.pop("hooks", None)
 
+    def claude_allow(data):
+        allow_rule(data, CLAUDE_ALLOW, add=False)
+
+    def cursor_allow(data):
+        allow_rule(data, CURSOR_ALLOW, add=False)
+
     def cursor_hooks(data):
         hooks = data.get("hooks") or {}
         for event in list(hooks):
@@ -5634,6 +5689,8 @@ def disconnect_folder(project):
     edit(".claude/settings.local.json", claude_settings)
     edit(".cursor/mcp.json", servers)
     edit(".cursor/hooks.json", cursor_hooks)
+    edit(".claude/settings.local.json", claude_allow)
+    edit(".cursor/cli.json", cursor_allow)
     for name in (".crewchat-listen", ".crewchat-hooks"):
         try:
             (project / name).unlink()
@@ -6106,6 +6163,7 @@ body.switching main { opacity: 0.45; pointer-events: none; transition: opacity 0
 .agent .badge { font-size: 11px; font-weight: 650; border: 1px solid currentColor; border-radius: 99px; padding: 0 6px; color: var(--muted); white-space: nowrap; }
 .agent .badge.lead { color: var(--accent); }
 .agent .rolepick { margin-top: 6px; font-size: 12px; padding: 2px 6px; max-width: 100%; }
+#l-perms-note { margin: 4px 0 0; font-size: 12px; } #l-perms-note.warn { color: var(--err); }
 .agent .acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
 .agent .acts button, .agent .acts select { font-size: 12px; padding: 2px 6px; }
 .sys b { font-weight: 650; }
@@ -6244,7 +6302,8 @@ button.link { background: none; border: 0; padding: 0; color: var(--accent); fon
       <label for="l-name">Name (optional)</label><input type="text" id="l-name" maxlength="32" placeholder="for example docs-writer" autocomplete="off">
       <label for="l-role">Role</label><select id="l-role"></select>
       <label for="l-task">First task (optional)</label><textarea id="l-task" maxlength="4000" placeholder="for example: Write a user guide for the settings screen"></textarea>
-      <label class="check" id="l-edits-row"><input type="checkbox" id="l-edits"> Let it edit files without asking (Claude Code)</label>
+      <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
+      <p class="meta" id="l-perms-note"></p>
     </div>
     <div id="launch-note" role="status"></div>
     <div class="buttons"><button type="button" class="secondary" id="l-cancel">Cancel</button><button type="submit" id="l-start">Start</button></div>
@@ -6645,7 +6704,7 @@ async function openLaunch() {
       option.title = t.missing || "";
       return option;
     }));
-    $("l-edits-row").hidden = $("l-tool").value !== "claude";  // the rebuilt list may pick another tool
+    showPermissions();  // the rebuilt list may pick another tool
     const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
     opts.tools = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
@@ -6663,6 +6722,27 @@ async function openLaunch() {
   }
 }
 
+// What a new agent may do without asking, per tool. crewchat's own tools are always allowed.
+const PERMISSIONS = {
+  claude: [["ask", "Use crewchat; ask before anything else"], ["edits", "Also edit files"],
+           ["auto", "Also run what Claude judges safe (auto mode)"], ["all", "Do anything (no prompts at all)"]],
+  cursor: [["ask", "Use crewchat; ask before anything else"], ["auto", "Also run what Cursor judges safe (auto-review)"],
+           ["all", "Run any command (--force)"]],
+};
+function showPermissions() {
+  const pick = $("l-perms"), keep = pick.value, tool = $("l-tool").value;
+  const options = PERMISSIONS[tool] || PERMISSIONS.claude;
+  if (pick.dataset.tool !== tool) {
+    pick.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+    pick.dataset.tool = tool;
+    pick.value = options.some(([value]) => value === keep) ? keep : "ask";
+  }
+  $("l-perms-note").textContent = pick.value === "all"
+    ? "Careful: it will run commands and change files with nobody watching. Use it in a folder you can restore (git), on a machine without secrets it could leak."
+    : "When it needs something else, it asks in its terminal window.";
+  $("l-perms-note").className = pick.value === "all" ? "meta warn" : "meta";
+}
+
 async function startAgent(event) {
   event.preventDefault();
   const note = $("launch-note");
@@ -6670,7 +6750,7 @@ async function startAgent(event) {
   note.textContent = "Starting…";
   try {
     await postJSON("/api/launch", { tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(),
-                                    role: $("l-role").value, task: $("l-task").value.trim(), accept_edits: $("l-edits").checked });
+                                    role: $("l-role").value, task: $("l-task").value.trim(), permissions: $("l-perms").value });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
     $("l-name").value = ""; $("l-task").value = "";
     setTimeout(() => $("launch").close(), 4000);
@@ -7048,7 +7128,8 @@ $("form").addEventListener("submit", async (e) => {
 $("add-agent").addEventListener("click", openLaunch);
 $("launch-form").addEventListener("submit", startAgent);
 $("l-cancel").addEventListener("click", () => $("launch").close());
-$("l-tool").addEventListener("change", () => { $("l-edits-row").hidden = $("l-tool").value !== "claude"; });
+$("l-tool").addEventListener("change", showPermissions);
+$("l-perms").addEventListener("change", showPermissions);
 
 setInterval(() => { state.now += 30; renderAgents(); }, 30000);
 loop();
@@ -7131,6 +7212,8 @@ def build_parser():
     p.add_argument("--tool", choices=sorted(LAUNCH_TOOLS), default="claude", help="add: which agent (default claude)")
     p.add_argument("--folder", help="add: a connected project folder on this machine (default: this folder)")
     p.add_argument("--accept-edits", action="store_true", help="add, Claude Code: let it edit files without asking")
+    p.add_argument("--permissions", choices=["ask", "edits", "auto", "all"],
+                   help="add: what it may do without asking: ask (default), edits (Claude Code), auto, all")
     p.set_defaults(fn=cmd_agent)
 
     p = sub.add_parser("places", help="list the folders that have joined")

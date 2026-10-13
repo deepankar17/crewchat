@@ -110,13 +110,14 @@ you. A task you gave straight to one agent reports to you, even when there is a 
 
 <img src="images/demo-add-agent.gif" width="760" alt="Add an agent is clicked; the name docs-writer, the Docs role and a first task are filled in; Start; the new agent joins the list and says hello in the chat.">
 
-<img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder notes-app, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. A box to let it edit files without asking, and Cancel and Start buttons.">
+<img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder notes-app, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. What it may do without asking, and Cancel and Start buttons.">
 
 1. Pick the agent (Claude Code, or Cursor's agent) and a project folder. The menu offers folders
    on the host machine that `crewchat start` has connected.
 2. Give it a name (optional, for example `docs-writer`), a role, and a first task (optional, for
    example "Write a guide for the settings screen").
-3. **Start.** A terminal window opens on the host with the new session. It joins the chat under
+3. Choose what it may do **without asking** (below).
+4. **Start.** A terminal window opens on the host with the new session. It joins the chat under
    that name and role, with the task already assigned to it.
 
 What happens when you press **Start**:
@@ -127,16 +128,31 @@ From a terminal on the host:
 
 ```bash
 crewchat agent add docs-writer --role docs --task "Write a guide for the settings screen"
-crewchat agent add tester --role qa --tool cursor --folder ~/code/my-app
+crewchat agent add tester --role qa --tool cursor --folder ~/code/my-app --permissions auto
 ```
+
+**What it may do without asking.** crewchat's own tools never ask, in any connected folder: its
+folder allows them (`mcp__crewchat` in `.claude/settings.local.json`, `Mcp(crewchat:*)` in
+`.cursor/cli.json`), so an agent never sits on a permission prompt for the chat. Cursor's agent is
+also started with `--approve-mcps --trust`. Beyond that, pick one:
+
+| Choice | Claude Code | Cursor's agent |
+|---|---|---|
+| Ask before anything else (default) | | |
+| Also edit files | `--permission-mode acceptEdits` | (not offered) |
+| Also run what it judges safe | `--permission-mode auto` | `--auto-review` |
+| Do anything | `--permission-mode bypassPermissions` | `--force` |
+
+**Do anything** runs commands and changes files with nobody watching: use it in a folder you can
+restore (git), on a machine without secrets it could leak. From a terminal: `--permissions
+ask|edits|auto|all` (`--accept-edits` still means `edits`).
 
 Things to know:
 
 - **It opens on the machine that hosts the page.** On a phone, it opens on the computer you are
   connected to. Starting an agent on another linked machine is not possible yet.
-- **It uses your normal permissions** for that tool, so it asks in its window before running
-  commands or editing files. Tick **Let it edit files without asking** (Claude Code) to allow file
-  edits; it still asks before running commands.
+- **When it needs a permission you did not give, it asks in its window.** Allow-and-deny from the
+  chat page is planned.
 - **Answer its first questions in its window.** For example, Claude Code asks whether you trust a
   folder it has not opened before.
 - **The session gets only a one-time key** on its command line. Its name, role and task reach it
