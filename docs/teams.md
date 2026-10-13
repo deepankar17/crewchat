@@ -93,10 +93,16 @@ The advisor sees only what the asking agent sends it (the goal, what it tried, t
 change), not that agent's session. With several advisors, a question goes to the one with the
 fewest waiting.
 
+Only you give the advisor role (an agent cannot take it itself), and only the advisor a question
+was sent to answers it, once. An advisor on another linked machine is asked too.
+
 **Check before done (optional).** `crewchat tasks advisor on` lets a task be marked done only
-after the advisor approves it: the agent asks with `hub_ask` and the task's number, and the
-advisor answers with a verdict, approve or changes. You can always mark a task done yourself.
-`crewchat tasks advisor off` turns it off again; it is off unless you set it.
+after the advisor approves it: the agent holding the task asks with `hub_ask` and the task's
+number, and the advisor answers with a verdict, approve or changes. Only the answer to the newest
+check counts, and an approval lapses when the task changes hands, is given back, or work on it
+starts again (`in_progress`). The sheet shows `advisor: approved` or `changes needed` on the task.
+You can always mark a task done yourself. `crewchat tasks advisor off` turns it off again; it is
+off unless you set it.
 
 ## The task sheet and the lead
 

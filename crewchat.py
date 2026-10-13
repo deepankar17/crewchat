@@ -100,6 +100,7 @@ ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at mo
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
 EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor")  # optional message fields, kept when messages travel between machines
+VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
 ROLES = {
@@ -617,7 +618,6 @@ class Hub:
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
         self.reclaim = None  # minutes a holder may be silent before its task is reclaimed (0: never; None: RECLAIM_DEFAULT), set by a "plan" message
         self.advisor_check = False  # a task can be marked done only after the advisor approves it, set by a "plan" message
-        self.handed = set()  # advisor answers already returned by hub_ask: not news in the asker's inbox
         self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
@@ -777,6 +777,14 @@ class Hub:
         """What a message changes besides the chat, wherever it was written. Caller holds the lock.
         Roles and task progress travel as messages, so they work across machines too."""
         kind = msg["kind"]
+        row = self.sheet.get(msg.get("task")) if msg.get("task") else None
+        if row is not None and row.get("check") and (kind in ("take", "assign") or (
+                kind == "update" and msg.get("status") in ("todo", "in_progress"))):
+            # A new holder, a task given back or reclaimed, or work started again: the advisor's
+            # verdict was on work that is no longer the work, so the next done needs a new check.
+            row.pop("check", None)
+            row.pop("verdict", None)
+            self._save()
         if kind in ("take", "assign"):
             row = self.sheet.get(msg.get("task")) or {}
             if row.get("reclaimed") == (msg["from"] if kind == "take" else msg["to"]):
@@ -819,6 +827,18 @@ class Hub:
             elif msg.get("reclaim"):
                 row["reclaim"] = msg["reclaim"]
             self._save()
+        elif kind == "ask" and msg.get("task") in self.sheet:
+            row = self.sheet[msg["task"]]  # the task's newest check before done; an older answer no longer counts
+            row["check"], row["verdict"] = msg["id"], ""
+            self._save()
+        elif kind == "answer" and msg.get("task") in self.sheet and msg.get("verdict") in VERDICTS:
+            row = self.sheet[msg["task"]]
+            ask = next((m for m in reversed(self.messages) if m["id"] == msg.get("answers") and m["kind"] == "ask"), None)
+            # Only an answer to the newest check, from the advisor it was asked of (or the owner), settles it.
+            if row.get("check") == msg.get("answers") and (msg["from"] == OWNER or (
+                    ask is not None and msg["from"] == ask["to"] and msg["from"] != ask["from"])):
+                row["verdict"] = msg["verdict"]
+                self._save()
         elif kind == "plan" and not msg.get("task") and msg.get("advisor"):
             self.advisor_check = msg["advisor"] == "on"  # the project's setting
             self._save()
@@ -1131,7 +1151,6 @@ class Hub:
             m for m in self.messages
             if m["seq"] > cur and m["kind"] not in ("event", "plan") and m["from"] != name and m["to"] in (name, "all")
             and not m.get("history")  # from before the chat was linked: on the page and the sheet, never news
-            and m["id"] not in self.handed  # an advisor's answer hub_ask already returned
         ]
 
     def send(self, sender, to, text, kind="msg", files=None):
@@ -1417,6 +1436,9 @@ class Hub:
             roles = self.roles()
             if role and role not in roles:
                 raise HubError("no role called %s. Roles: %s" % (role, ", ".join(sorted(roles))))
+            if role == "advisor" and by == agent and by != OWNER:
+                # Its verdicts let tasks be marked done: an agent may not make itself the advisor.
+                raise HubError("only the owner gives the advisor role")
             old = self._lead() if role == "lead" else None
             if old and old != agent:
                 self._append(by, old, "You are no longer the lead: %s is. Carry on with the work you have; "
@@ -1450,18 +1472,19 @@ class Hub:
     # answer (hub_answer). Questions and answers are ordinary messages, so they travel between
     # machines and the owner reads them. The advisor sees only what the asker sends.
     def _advisors(self):
-        """The agents with the advisor role. Caller holds the lock."""
-        return sorted(n for n, a in self.agents.items() if a.get("role") == "advisor")
+        """The agents with the advisor role, here or on another machine. Caller holds the lock."""
+        local = {n for n, a in self.agents.items() if a.get("role") == "advisor"}
+        remote = {row["agent"] for dev in self.remote.values() for row in dev["agents"]
+                  if row.get("role") == "advisor" and row["agent"] not in self.agents}
+        return sorted(local | remote)
 
     def _answer_to(self, ask_id):
         """The advisor's answer to a question, or None. Caller holds the lock."""
         return next((m for m in reversed(self.messages) if m["kind"] == "answer" and m.get("answers") == ask_id), None)
 
     def _approved(self, mid):
-        """Did the advisor's latest verdict on this task approve it? Caller holds the lock."""
-        verdict = next((m["verdict"] for m in reversed(self.messages)
-                        if m["kind"] == "answer" and m.get("task") == mid and m.get("verdict")), "")
-        return verdict == "approve"
+        """Has the advisor approved the task's latest check before done? Caller holds the lock."""
+        return (self.sheet.get(mid) or {}).get("verdict") == "approve"
 
     def ask(self, agent, question, task=None, to=None, wait=MAX_WAIT):
         """An agent asks the advisor and waits up to wait seconds for the answer. Returns (question
@@ -1477,6 +1500,8 @@ class Hub:
             if task not in (None, ""):
                 mid = self._id(task)
                 self._task(mid)
+                if self.taken.get(mid) != agent:
+                    raise HubError("only the agent holding task #%s asks for its check before done" % mid)
             advisors = [a for a in self._advisors() if a != agent]
             if to:
                 if to not in advisors:
@@ -1487,8 +1512,9 @@ class Hub:
                                "the chat page, or crewchat role NAME advisor)")
             else:  # the advisor with the fewest questions waiting
                 waiting = {a: 0 for a in advisors}
+                answered = {m.get("answers") for m in self.messages if m["kind"] == "answer"}
                 for m in self.messages:
-                    if m["kind"] == "ask" and m["to"] in waiting and self._answer_to(m["id"]) is None:
+                    if m["kind"] == "ask" and m["to"] in waiting and m["id"] not in answered:
                         waiting[m["to"]] += 1
                 to = min(advisors, key=lambda a: (waiting[a], a))
             msg = self._append(agent, to, question, "ask", task=mid)
@@ -1498,8 +1524,6 @@ class Hub:
             while answer is None and time.time() < deadline:
                 self.lock.wait(timeout=max(0.0, deadline - time.time()))
                 answer = self._answer_to(msg["id"])
-            if answer is not None:
-                self.handed.add(answer["id"])
             return msg, answer
 
     def answer(self, advisor, ask_id, text, verdict=""):
@@ -1510,18 +1534,23 @@ class Hub:
             raise HubError("the answer is empty")
         if len(text) > MAX_TEXT:
             raise HubError("the answer is too long: %d characters at most" % MAX_TEXT)
-        if verdict not in ("", None, "approve", "changes"):
+        verdict = verdict or ""
+        if verdict and verdict not in VERDICTS:
             raise HubError("verdict is approve or changes")
         with self.lock:
             ask = next((m for m in reversed(self.messages) if m["id"] == ask_id and m["kind"] == "ask"), None)
             if ask is None:
                 raise HubError("#%s is not a question asked with hub_ask" % ask_id)
-            if advisor != OWNER and (self.agents.get(advisor) or {}).get("role") != "advisor":
-                raise HubError("only an agent with the advisor role answers questions; you have another role")
+            if advisor != OWNER and advisor == ask["from"]:
+                raise HubError("you cannot answer your own question")
+            if advisor != OWNER and advisor != ask["to"]:
+                raise HubError("#%s was asked of %s; only they (or Owner) answer it" % (ask_id, ask["to"]))
+            if self._answer_to(ask_id) is not None:
+                raise HubError("#%s is already answered" % ask_id)
             if verdict and not ask.get("task"):
                 raise HubError("a verdict is for a question about a task; this one names none")
             msg = self._append(advisor, ask["from"], text, "answer", task=ask.get("task"), answers=ask_id,
-                               verdict=verdict or "")
+                               verdict=verdict)
             self._changed()
             return msg
 
@@ -1557,9 +1586,10 @@ class Hub:
                 raise HubError("you do not hold task #%s, so you cannot give it back%s" % (
                     mid, " (%s holds it)" % self.taken[mid] if self.taken.get(mid) else ""))
             if status == "done" and agent != OWNER and self.advisor_check and not self._approved(mid):
-                raise HubError("this project has the advisor check before done: send hub_ask with task=%s, what you "
-                               "did and how you tested it, and mark it done once the advisor approves%s" % (
-                                   mid, "" if self._advisors() else ". The chat has no advisor yet: tell Owner"))
+                missing = "" if self._advisors() else ". The chat has no advisor yet: tell Owner"
+                raise HubError("this project has the advisor check before done: the holder sends hub_ask with task=%s, "
+                               "what was done and how it was tested, and the task is done once the advisor approves%s"
+                               % (mid, missing))
             lead = self._lead()
             direct = task["from"] == OWNER and task["to"] == agent
             if lead and lead != agent and not direct:
@@ -2189,8 +2219,7 @@ def fmt(msg, viewer=None):
             after = "\n    -> Answer it with hub_answer id=%s%s." % (
                 msg["id"], " and a verdict (approve or changes)" if msg.get("task") else "")
     elif msg["kind"] == "answer":
-        tag = "[ANSWER to #%s%s] " % (msg.get("answers"), {"approve": ", approved", "changes": ", changes needed"}
-                                      .get(msg.get("verdict"), ""))
+        tag = "[ANSWER to #%s%s] " % (msg.get("answers"), ", " + VERDICTS[msg["verdict"]] if msg.get("verdict") in VERDICTS else "")
     files = "".join("\n    [file %s: %s, %s, %s; open it with hub_file]" % (
         f["id"], f["name"], f["type"], human_size(f["size"])) for f in msg.get("files") or [])
     return "%s %s -> %s: %s%s%s%s" % (stamp, msg["from"], to, tag, msg["text"], files, after)
@@ -2521,7 +2550,7 @@ TOOLS = [
             "properties": {
                 "id": {"type": ["string", "integer"], "description": "The question's number."},
                 "text": {"type": "string", "maxLength": MAX_TEXT, "description": "Your advice."},
-                "verdict": {"type": "string", "enum": ["approve", "changes"],
+                "verdict": {"type": "string", "enum": list(VERDICTS),
                             "description": "For a question about a task: approve, or changes (say what is missing)."},
             },
             "required": ["id", "text"],
@@ -2634,7 +2663,7 @@ def call_tool(hub, sid, name, args, owner=False):
         if answer is None:
             return ("Asked %s (#%s). No answer yet: it comes to your inbox (hub_inbox with wait_seconds). Carry "
                     "on with what does not depend on it." % (question["to"], question["id"]))
-        verdict = {"approve": " Verdict: approved.", "changes": " Verdict: changes needed."}.get(answer.get("verdict"), "")
+        verdict = " Verdict: %s." % VERDICTS[answer["verdict"]] if answer.get("verdict") in VERDICTS else ""
         return "%s answered (#%s):%s\n\n%s" % (answer["from"], answer["id"], verdict, answer["text"])
     if name == "hub_status":
         text = args.get("text")
@@ -2674,6 +2703,8 @@ def sheet_line(row):
         extra.append("held by %s" % row["holder"])
     if row.get("reclaimed"):
         extra.append("reclaimed from %s" % row["reclaimed"])
+    if row.get("check"):
+        extra.append("advisor: %s" % VERDICTS.get(row.get("verdict"), "asked"))
     if row.get("reclaim"):
         extra.append("never reclaimed" if row["reclaim"] == "off" else "reclaimed after %s min of silence" % row["reclaim"])
     if row["depends"]:

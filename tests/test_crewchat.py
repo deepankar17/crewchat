@@ -362,10 +362,10 @@ class Advisor(Base):
             thread.join(10)
             self.assertIn("%s answered" % adv_name, out["content"][0]["text"])
             self.assertIn("On disk: it restarts.", out["content"][0]["text"])
-            # Handed back by hub_ask, so not news in the inbox; still in the chat for everyone.
-            self.assertNotIn("On disk: it restarts.", dev.text("hub_inbox"))
-            self.assertIn("[ANSWER to #%s] On disk" % ask_id, dev.text("hub_history"))
-            self.assertIn("only an agent with the advisor role", dev.text("hub_answer", id=ask_id, text="me too"))
+            # Also in the inbox (it is never lost if the asker stopped waiting), and in the chat.
+            self.assertIn("[ANSWER to #%s] On disk" % ask_id, dev.text("hub_inbox"))
+            self.assertIn("you cannot answer your own question", dev.text("hub_answer", id=ask_id, text="me too"))
+            self.assertIn("is already answered", adv.text("hub_answer", id=ask_id, text="again"))
             self.assertIn("not a question asked with hub_ask", adv.text("hub_answer", id="0", text="x"))
         finally:
             self.role(adv_name, "none")
@@ -382,6 +382,30 @@ class Advisor(Base):
         finally:
             self.role(adv_name, "none")
 
+    def test_only_the_advisor_asked_answers_and_agents_cannot_make_themselves_advisor(self):
+        dev, dev_name = self.agent()
+        (adv, adv_name), (other, other_name) = self.agent(), self.agent()
+        self.role(adv_name, "advisor")
+        self.role(other_name, "advisor")
+        try:
+            self.assertIn("only the owner gives the advisor role", dev.text("hub_role", role="advisor"))
+            question, _ = self.hub.ask(dev_name, "Which one?", to=adv_name, wait=0)
+            self.assertIn("only they (or Owner) answer it", other.text("hub_answer", id=question["id"], text="x"))
+            self.assertIn("Answered", adv.text("hub_answer", id=question["id"], text="This one."))
+        finally:
+            self.role(adv_name, "none")
+            self.role(other_name, "none")
+
+    def test_an_advisor_on_another_machine_is_asked(self):
+        dev, dev_name = self.agent()
+        self.hub.remote["laptop-device"] = {"device": "laptop", "updated": time.time(),
+                                            "agents": [{"agent": "claude-laptop", "role": "advisor"}]}
+        try:
+            question, _ = self.hub.ask(dev_name, "Remote advice?", wait=0)
+            self.assertEqual(question["to"], "claude-laptop")
+        finally:
+            del self.hub.remote["laptop-device"]
+
     def test_the_advisor_check_before_done(self):
         dev, dev_name = self.agent()
         adv, adv_name = self.agent()
@@ -395,10 +419,23 @@ class Advisor(Base):
             self.assertIn("The chat has no advisor yet", dev.text("hub_update", id=task, status="done"))
             self.role(adv_name, "advisor")
             self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            bystander, _ = self.agent()
+            self.assertIn("only the agent holding task", bystander.text("hub_ask", question="Done?", task=task))
             question, _ = self.hub.ask(dev_name, "Done? Tests pass.", task=task, wait=0)
             adv.text("hub_answer", id=question["id"], text="Add a test for expiry.", verdict="changes")
             self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
             question, _ = self.hub.ask(dev_name, "Added the expiry test.", task=task, wait=0)
+            # A late answer to an older check does not count: only the newest check does.
+            old, _ = question, None
+            question, _ = self.hub.ask(dev_name, "Final round.", task=task, wait=0)
+            adv.text("hub_answer", id=old["id"], text="Good.", verdict="approve")
+            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            adv.text("hub_answer", id=question["id"], text="Good.", verdict="approve")
+            self.assertIn("advisor: approved", dev.text("hub_tasks", view="all"))
+            # Work started again: the approval was on other work, so it no longer counts.
+            dev.text("hub_update", id=task, status="in_progress", note="one more fix")
+            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            question, _ = self.hub.ask(dev_name, "Fixed.", task=task, wait=0)
             adv.text("hub_answer", id=question["id"], text="Good.", verdict="approve")
             self.assertIn("marked done", dev.text("hub_update", id=task, status="done"))
             self.assertIn("[QUESTION before done, task #%s]" % task, dev.text("hub_history"))
