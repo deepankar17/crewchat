@@ -2120,7 +2120,7 @@ class Hub:
             return False
         asked[name] = time.time()
         self._asked = asked
-        return True
+        return self.on_this_machine(name)  # a process number means nothing elsewhere (_keep_session)
 
     def _keep_session(self, name, session):
         """Which session and process an agent is, as its hook reported it (once per session, and
