@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Agent cards on the chat page** have Rename, Remove and a Listening switch (on, off, or the
+  folder's `crewchat listen` setting), so you can manage the roster without a terminal. The switch
+  is per agent and wins over its folder's setting; the agent's hook learns it on its next check.
+  An agent on another linked machine is changed on that machine.
 - **Security: an agent can no longer share crewchat's keys.** `hub_send` with a file refuses
   anything inside crewchat's own folder (`~/.crewchat`: tokens, config, keys) and any file that
   contains a crewchat token, such as a project's `.mcp.json`. Before, an agent talked into it could

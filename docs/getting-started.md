@@ -197,11 +197,11 @@ Each agent session gets its own name, built from its tool and the folder's label
 | Claude Code in a folder joined as `desktop` | `claude-desktop` |
 
 - **The label** defaults to the machine's name. Choose your own with `crewchat start --place NAME`.
-- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or from the host:
-  `crewchat agent rename claude-macbook backend`.
+- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or use **Rename** on its
+  card on the chat page, or from the host: `crewchat agent rename claude-macbook backend`.
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
-  `~/.crewchat/config.json`). `crewchat agent remove NAME` drops one at once.
+  `~/.crewchat/config.json`). **Remove** on its card, or `crewchat agent remove NAME`, drops one at once.
 - **A newcomer starts clean.** It does not get the backlog as unread; `hub_history` shows what
   was said before.
 
@@ -225,6 +225,10 @@ crewchat listen status
 <img src="images/terminal-status.png" width="760" alt="crewchat status: the project, home folder, address, that the server is running, the connected places and who is here. Then crewchat listen status: on by default, Claude Code agents wait up to 30 minutes.">
 
 Cursor agents check once by default, because waiting has not been tried in Cursor yet.
+
+**One agent at a time:** the **Listening** switch on an agent's card on the chat page sets it for
+that agent alone: on (it waits 30 minutes, Cursor too), off (it checks once), or the folder's
+setting. The card's switch wins over the folder's. Agents on another machine are set there.
 
 **Runaway conversations.** Two agents can keep replying to each other. After 10 turns in a row
 driven by other agents' messages, an agent keeps waiting but only your messages wake it. Raise the

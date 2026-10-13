@@ -790,6 +790,45 @@ class Linking(Base):
         self.assertEqual(ctx.exception.code, 403)
 
 
+class AgentCards(Base):
+    """The owner's actions on an agent's card: rename, remove, listening."""
+
+    def op(self, **body):
+        try:
+            return crewchat.post_json(self.base + "/api/agent", self.owner, body)
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read())
+
+    def test_rename_remove_and_listening(self):
+        session, name = self.agent()
+        self.assertEqual(self.op(op="listen", agent=name, mode="off"), {"ok": True})
+        self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["listen"], "off")
+        self.assertEqual(self.op(op="rename", agent=name, new="page-named"), {"ok": True})
+        self.assertIn("page-named", self.names())
+        self.assertEqual(self.hub.agents["page-named"]["listen"], "off")  # the setting goes with the name
+        self.assertIn("reserved", self.op(op="rename", agent="page-named", new="Owner")["error"])
+        self.assertIn("listening is on, off or default", self.op(op="listen", agent="page-named", mode="loud")["error"])
+        self.assertEqual(self.op(op="remove", agent="page-named"), {"ok": True})
+        self.assertNotIn("page-named", self.names())
+        self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
+        self.assertIn("op is rename, remove or listen", self.op(op="kick", agent=name)["error"])
+
+    def test_an_agent_on_another_machine_is_changed_there(self):
+        self.hub.set_remote("dev-x", "laptop", [{"agent": "far-away", "client": "cursor", "place": "x", "seen": 1}], 1)
+        try:
+            for body in ({"op": "rename", "new": "near"}, {"op": "remove"}, {"op": "listen", "mode": "on"}):
+                self.assertIn("runs on laptop", self.op(agent="far-away", **body)["error"])
+        finally:
+            self.hub.drop_remote("dev-x")
+
+    def test_the_page_needs_the_owner(self):
+        _, name = self.agent()
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            crewchat.post_json(self.base + "/api/agent", self.token, {"op": "remove", "agent": name})
+        self.assertIn(caught.exception.code, (401, 403))
+        self.assertIn(name, self.names())
+
+
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
         status, _, headers = self.raw("/")
@@ -1172,6 +1211,22 @@ class Hooks(Base):
         self.hook("claude", "tool", {"session_id": "busy-turn"})
         self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
         self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
+
+    def test_listening_set_on_the_chat_page_wins_over_the_folder(self):
+        session, name = self.linked("page-listen")
+        agent = lambda **body: crewchat.post_json(self.base + "/api/agent", self.owner, body)  # noqa: E731
+        agent(op="listen", agent=name, mode="on")
+        threading.Timer(2, lambda: self.say(name, "worth the wait")).start()
+        began = time.time()
+        out = self.hook("claude", "stop", {"session_id": "page-listen"}, listen="0")  # the folder says check once
+        self.assertIn("worth the wait", out)
+        self.assertGreater(time.time() - began, 1.5)  # it waited for the message
+        agent(op="listen", agent=name, mode="off")
+        began = time.time()
+        self.assertEqual(self.hook("claude", "stop", {"session_id": "page-listen"}, listen="600"), "")
+        self.assertLess(time.time() - began, 10)  # the folder says wait ten minutes; the page says no
+        agent(op="listen", agent=name, mode="default")
+        self.assertEqual(self.hub.agents[name]["listen"], "")
 
     def test_a_launched_cursor_agent_is_alive_before_its_first_turn_ends(self):
         key = self.hub.new_start()
