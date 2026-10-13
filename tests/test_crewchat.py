@@ -763,6 +763,56 @@ class Launching(Base):
         self.assertIn((["/x/cursor-agent", "mcp", "enable", "crewchat"], str(self.folder)), calls)
         self.assertFalse(any("--approve-mcps" in " ".join(map(str, c[0])) for c in calls))
 
+    def closed_session(self, app="terminal", tool="claude"):
+        """An agent whose recorded session is closed (its process number is free)."""
+        _, name = self.agent()
+        self.hub.agents[name]["session"] = {"id": "sess-0003-abc", "pid": 999999, "started": "x", "app": app,
+                                            "tool": tool, "folder": str(self.folder), "since": 1.0,
+                                            "permissions": "edits"}
+        self.hub.links["link-" + name] = name  # as its hooks' hub_link left it
+        return name
+
+    def reopened(self, **body):
+        opened = []
+        with mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                               opened.append((folder, command, key, title))):
+            out = crewchat.post_json(self.base + "/api/agent", self.owner, dict({"op": "reopen"}, **body))
+        return out, opened
+
+    def test_reopen_resumes_the_same_conversation_with_its_own_key(self):
+        name = self.closed_session()
+        key = next(k for k, v in self.hub.links.items() if v == name)
+        out, opened = self.reopened(agent=name)
+        self.assertEqual(out, {"ok": True})
+        folder, command, used, title = opened[0]
+        self.assertEqual((folder, used, title), (str(self.folder), key, name))  # its own key: same name, no relink
+        self.assertEqual(command[-2:], ["--resume", "sess-0003-abc"])
+        self.assertIn("acceptEdits", command)  # the permissions it was started with
+        self.assertIn("Owner reopened %s" % name, self.hub_history())
+        # An agent whose link was lost still comes back as itself: a new key tied to its name.
+        self.hub.links = {k: v for k, v in self.hub.links.items() if v != name}
+        _, opened = self.reopened(agent=name)
+        self.assertEqual(self.hub.links[opened[0][2]], name)
+
+    def test_reopen_is_refused_while_it_runs(self):
+        name = self.closed_session()
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: True):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                self.reopened(agent=name)
+        self.assertIn("still running", json.loads(caught.exception.read())["error"])
+
+    def test_reopen_from_the_claude_app_says_where_it_opens(self):
+        name = self.closed_session(app="claude-app")
+        self.reopened(agent=name)
+        self.assertIn("in a Terminal window", self.hub_history())
+
+    def test_the_window_is_titled_with_the_agents_name(self):
+        script = crewchat.macos_script("/tmp/x", ["/x/claude"], "start-0123456789abcdef", title="it's me")
+        self.assertIn("printf '\\033]0;%s\\007' 'it'\"'\"'s me'", script)
+
+    def hub_history(self):
+        return "\n".join(m["text"] for m in self.hub.messages[-5:])
+
     def test_the_launch_command_carries_no_typed_text(self):
         command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", "edits")
         self.assertEqual(command[:3], ["/x/claude", "--permission-mode", "acceptEdits"])
@@ -882,7 +932,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen or stop", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop or reopen", self.op(op="kick", agent=name)["error"])
 
     def stand_in(self, name, app="terminal"):
         """A real process that looks like the agent's claude (it is sleep), recorded as its session."""
@@ -929,7 +979,7 @@ class AgentCards(Base):
                                                  "listen": "on"}], 1)
         try:
             for body in ({"op": "rename", "new": "near"}, {"op": "remove"}, {"op": "listen", "mode": "on"},
-                         {"op": "stop"}):
+                         {"op": "stop"}, {"op": "reopen"}):
                 self.assertIn("runs on laptop", self.op(agent="far-away", **body)["error"])
             self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == "far-away")["listen"], "on")  # shown here
         finally:

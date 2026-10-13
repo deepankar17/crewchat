@@ -2017,6 +2017,32 @@ class Hub:
             self._save()
             self._changed()
 
+    def reopen_agent(self, name, model=None):
+        """The owner reopens an agent's own conversation in a terminal window on this machine: same
+        memory, same name (its hooks get its own link key), same permissions."""
+        with self.lock:
+            session = dict(self._session_of(name, "reopen"))
+        if process_running(session):
+            raise HubError("%s is still running: stop it first" % name)
+        folder, tool = session.get("folder", ""), session.get("tool", "claude")
+        if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
+            raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
+        permissions = session.get("permissions") if session.get("permissions") in LAUNCH_PERMISSIONS[tool] else "ask"
+        exe, base = agent_tool(tool, folder, permissions, self.home)
+        command = resume_command(exe, tool, session["id"], permissions, base, model)
+        with self.lock:
+            key = next((k for k, v in self.links.items() if v == name), None)
+            if key is None:  # its link was lost: a new one, tied to the same name
+                key = secrets.token_urlsafe(12)
+                self.links[key] = name
+                self._save()
+        open_terminal(folder, command, key, title=name, root=self.home)
+        with self.lock:
+            self._event("Owner reopened %s%s%s" % (
+                name, " on %s" % model if model else "",
+                " in a Terminal window (it was in the Claude app)" if session.get("app") == "claude-app" else ""))
+            self._changed()
+
     def _keep_session(self, name, session):
         """Which session and process an agent is, as its hook reported it (once per session).
         Caller holds the lock."""
@@ -3412,8 +3438,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.set_listen(name, data.get("mode"))
         elif op == "stop":
             self.hub.stop_agent(name)
+        elif op == "reopen":
+            self.hub.reopen_agent(name)
         else:
-            raise HubError("op is rename, remove, listen or stop")
+            raise HubError("op is rename, remove, listen, stop or reopen")
         return {"ok": True}
 
     def _role(self, data):
@@ -3970,11 +3998,12 @@ def launch_command(exe, tool, key, permissions="ask", base=None):
     return [exe] + options + [LAUNCH_PROMPT % key]
 
 
-def macos_script(folder, command, key):
+def macos_script(folder, command, key, title=""):
     return "\n".join([
         "#!/bin/sh",
         "# Opened by crewchat to start an agent. It deletes itself.",
         'rm -f "$0"',
+    ] + (["printf '\\033]0;%%s\\007' %s" % shlex.quote(title)] if title else []) + [  # the window's title
         "cd %s || exit 1" % shlex.quote(str(folder)),
         'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
         "export CREWCHAT_LINK_KEY=%s" % shlex.quote(key),  # its hooks link with the same key
@@ -4003,8 +4032,9 @@ def fit_options(help_text, tool, permissions):
     return [o for o in LAUNCH_BASE[tool] if o in help_text], missing
 
 
-def launch_agent(tool, folder, key, permissions="ask", root=None):
-    """Open a terminal window on this machine with a new agent session in folder."""
+def agent_tool(tool, folder, permissions, root=None):
+    """The tool's program and the base options this copy knows, ready to start in folder (Cursor's
+    agent gets crewchat's MCP server approved there). HubError if it cannot do what is asked."""
     exe = find_tool(tool, load_config(root))
     if not exe:
         raise HubError("%s is not installed here, or crewchat cannot find it. Run `crewchat start` once in a "
@@ -4013,16 +4043,35 @@ def launch_agent(tool, folder, key, permissions="ask", root=None):
     if missing:
         raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
             LAUNCH_TOOLS[tool][0], " ".join(missing)))
-    command = launch_command(exe, tool, key, permissions, base)
     if tool == "cursor":
         try:  # approve crewchat's MCP server alone, not every server the folder lists (--approve-mcps)
             subprocess.run([exe, "mcp", "enable", SERVER_NAME], cwd=str(folder), capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass  # it asks in its window instead
+    return exe, base
+
+
+def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
+    """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
+    if not SESSION_RE.match(str(session)):
+        raise HubError("that session cannot be reopened")
+    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
+    return [exe] + options + (["--model", model] if model else []) + ["--resume", session]
+
+
+def launch_agent(tool, folder, key, permissions="ask", root=None):
+    """Open a terminal window on this machine with a new agent session in folder."""
+    exe, base = agent_tool(tool, folder, permissions, root)
+    open_terminal(folder, launch_command(exe, tool, key, permissions, base), key, root=root)
+
+
+def open_terminal(folder, command, key, title="", root=None):
+    """Run an agent's command in a new terminal window on this machine, in folder, its hooks given
+    key (CREWCHAT_LINK_KEY); title names the window where the terminal allows."""
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(macos_script(folder, command, key), encoding="utf-8")
+        script.write_text(macos_script(folder, command, key, title), encoding="utf-8")
         os.chmod(script, 0o700)
         out = run(["open", str(script)])
         if out.returncode != 0:
