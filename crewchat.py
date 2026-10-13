@@ -604,7 +604,7 @@ class Hub:
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
         self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
-        self.reclaim = RECLAIM_DEFAULT  # minutes a holder may be silent before its task is reclaimed (0: never); a "plan" message sets it
+        self.reclaim = None  # minutes a holder may be silent before its task is reclaimed (0: never; None: RECLAIM_DEFAULT), set by a "plan" message
         self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
@@ -669,7 +669,7 @@ class Hub:
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
         self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
         self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
-        self.reclaim = int(data["reclaim"]) if isinstance(data.get("reclaim"), int) else RECLAIM_DEFAULT
+        self.reclaim = data.get("reclaim") if isinstance(data.get("reclaim"), int) else None
         self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
@@ -1533,15 +1533,12 @@ class Hub:
         return [Path(path) for path, place in sorted((config.get("folders") or {}).items())
                 if folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
 
-    def refresh_guides(self, hooks=False):
-        """Rewrite the guide and skills in every folder of the project on this machine (with hooks,
-        bring its crewchat hooks up to date too: at server start, after an upgrade)."""
+    def refresh_guides(self):
+        """Rewrite the guide and skills in every folder of the project on this machine."""
         done = 0
         for folder in self.project_folders():
             try:
                 write_guides(folder, self.roster.root)
-                if hooks:
-                    update_hooks(folder)
                 done += 1
             except OSError as e:
                 sys.stderr.write("%s could not update crewchat's guide in %s: %s\n" % (now_iso(), folder, e))
@@ -1773,7 +1770,11 @@ class Hub:
         own = row.get("reclaim", "")
         if own == "off":
             return 0
-        return int(own if own.isdecimal() else self.reclaim) * 60
+        return int(own if own.isdecimal() else self._project_reclaim()) * 60
+
+    def _project_reclaim(self):
+        """The project's reclaim time in minutes (0: off)."""
+        return RECLAIM_DEFAULT if self.reclaim is None else self.reclaim
 
     def _last_heard(self, name, limit):
         """When an agent last showed a sign of life: a tool call, a hook (a listening one counts as
@@ -1798,7 +1799,7 @@ class Hub:
         """Put the tasks whose holder has been silent too long (or only that one) back on the sheet,
         the way giving one back does (a new claim key), with a line in the chat for everyone. Only
         the machine a task was posted on decides, so no two reclaim it at once. Caller holds the lock."""
-        if not self.reclaim and not any(row.get("reclaim") for row in self.sheet.values()):
+        if not self._project_reclaim() and not any(row.get("reclaim") for row in self.sheet.values()):
             return
         held = list(self.taken.items())
         if only is not None:
@@ -1822,7 +1823,7 @@ class Hub:
     def reclaim_note(self, mid=None):
         """What an agent holding a task (or any, without mid) must know about reclaiming, or ''."""
         with self.lock:
-            limit = self._reclaim_after(self.sheet.get(mid) or {}) if mid else self.reclaim * 60
+            limit = self._reclaim_after(self.sheet.get(mid) or {}) if mid else self._project_reclaim() * 60
         if not limit:
             return ""
         return (" A task goes back on the sheet when its holder shows no sign of life (no tool call, no hook) for "
@@ -1841,7 +1842,7 @@ class Hub:
         value = str(value or "").strip().lower()
         if not value and not mid:
             with self.lock:
-                return str(self.reclaim) if self.reclaim else "off"
+                return str(self._project_reclaim() or "off")
         least, most = RECLAIM_MINUTES
         if value.isdecimal():
             value = str(int(value))
@@ -1909,16 +1910,11 @@ class Hub:
         with self.lock:
             name = self.links.get(key)
             agent = self.agents.get(name) if name else None
-            if event == "tool":
-                # A tool call: a sign of life (for reclaiming tasks), nothing to hand over.
-                if agent is not None and agent["place"] == place:
-                    agent["seen"] = time.time()
-                    if not self.waiting.get(name) and self.activity.get(name, ("",))[0] != "working":
-                        self.activity[name] = ("working", agent["seen"])
-                        self._changed()
-                return {}
             if agent is None or agent["place"] != place:
                 return {"link": True}
+            if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
+                self.touch(name, active=True)
+                return {}
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -4065,8 +4061,7 @@ def cmd_serve(args):
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
         threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
-    for project in server.RequestHandlerClass.projects.all():  # after an upgrade: the new guide and hooks
-        project.hub.refresh_guides(hooks=True)
+    threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4493,24 +4488,33 @@ def set_cursor_hooks(hooks):
 def update_hooks(folder):
     """Bring crewchat's hooks in a connected folder up to this version's (new events, this copy's
     command), leaving the user's own hooks and the folder's token alone. Returns what changed."""
-    folder, changed = Path(folder), []
-    for rel, setter, groups_of in ((".claude/settings.local.json", set_claude_hooks,
-                                    lambda hooks: [h for g in hooks for h in g.get("hooks", [])]),
-                                   (".cursor/hooks.json", set_cursor_hooks, lambda hooks: hooks)):
-        path = folder / rel
-        if not path.is_file():
-            continue
-        data = read_json(path)
-        hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
-        if not any(is_our_hook(str(h.get("command", ""))) for entries in hooks.values() if isinstance(entries, list)
-                   for h in groups_of(entries) if isinstance(h, dict)):
-            continue  # not connected by crewchat, or its hooks were taken out: leave it
-        before = json.dumps(data, sort_keys=True)
-        setter(data)
-        if json.dumps(data, sort_keys=True) != before:
-            write_json(path, data)
-            changed.append(rel)
-    return changed
+    folder = Path(folder)
+
+    def ours_then(setter):
+        def change(data):
+            if is_our_hook(json.dumps(data.get("hooks") or {})):  # else not connected by crewchat, or taken out
+                setter(data)
+        return change
+    return [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
+                                    (".cursor/hooks.json", set_cursor_hooks))
+            if edit_json(folder / rel, ours_then(setter))]
+
+
+def edit_json(path, change):
+    """Apply change(data) to a JSON file and write it back only if that changed something; one
+    left empty (but a version) is deleted. Returns whether the file changed."""
+    data = read_json(path)
+    if not data:
+        return False
+    before = json.dumps(data, sort_keys=True)
+    change(data)
+    if json.dumps(data, sort_keys=True) == before:
+        return False
+    if any(v not in ({}, [], None) for k, v in data.items() if k != "version"):
+        write_json(path, data)
+    else:
+        path.unlink()
+    return True
 
 
 def cmd_join(args):
@@ -4684,17 +4688,19 @@ def run_hook(client, event):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    project = find_project(client)
-    config = client_config(project, client) if project else None
-    if config is None or hooks_off(project):
-        return  # this project is not connected to a crewchat, or its hooks are switched off
-    base, token = config
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
+    if event == "tool" and (not state.get("key") or time.time() - float(state.get("alive") or 0) < ALIVE_EVERY):
+        return  # after every tool call: return at once unless a minute passed (and it has linked)
+    project = find_project(client)
+    config = client_config(project, client) if project else None
+    if config is None or hooks_off(project):
+        return  # this project is not connected to a crewchat, or its hooks are switched off
+    base, token = config
     # The link key names this agent session to the server. The agent ties it to its chat identity
     # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
     # A session started from the chat page was given its start key: it links with that one. Only
@@ -4719,13 +4725,10 @@ def run_hook(client, event):
                                           "ignored": ignored, "alive": state.get("alive", 0)}))
 
     if event == "tool":
-        # The agent used a tool: tell the server it is alive, at most every ALIVE_EVERY seconds, so
-        # a long turn without a crewchat tool does not look silent. Never waits, never delivers.
-        if not state.get("key") or time.time() - float(state.get("alive") or 0) < ALIVE_EVERY:
-            return
+        # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
+        # above), so a long turn without a crewchat tool does not look silent. Never waits or delivers.
         state["alive"] = time.time()
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(state))
+        save(chain, pending, asks)
         post_json(base + "/api/hook", token, {"key": key, "event": "tool"}, timeout=5)
         return
 
@@ -5218,6 +5221,18 @@ def update_checks(projects):
         time.sleep(UPDATE_EVERY)
 
 
+def upgrade_folders(projects):
+    """At server start (so after every upgrade): each connected folder gets this version's guide and
+    crewchat hooks. Only what changed is written."""
+    for project in projects.all():
+        for folder in project.hub.project_folders():
+            try:
+                write_guides(folder, project.roster.root)
+                update_hooks(folder)
+            except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
+                sys.stderr.write("%s could not update crewchat's files in %s: %s\n" % (now_iso(), folder, e))
+
+
 def reclaim_checks(projects):
     """Every RECLAIM_EVERY seconds, each project puts back the tasks of holders silent too long."""
     while True:
@@ -5476,20 +5491,8 @@ def disconnect_folder(project):
     changed = []
 
     def edit(rel, change):
-        path = project / rel
-        data = read_json(path)
-        if not data:
-            return
-        before = json.dumps(data, sort_keys=True)
-        change(data)
-        if json.dumps(data, sort_keys=True) == before:
-            return
-        rest = {k: v for k, v in data.items() if v not in ({}, [], None) and k != "version"}
-        if rest:
-            write_json(path, data)
-        else:
-            path.unlink()
-        changed.append(rel)
+        if edit_json(project / rel, change):
+            changed.append(rel)
 
     def servers(data):
         (data.get("mcpServers") or {}).pop(SERVER_NAME, None)

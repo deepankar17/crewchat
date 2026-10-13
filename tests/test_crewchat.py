@@ -2135,7 +2135,7 @@ class Lifecycle(Base):
         self.assertEqual(crewchat.Hub(hub.roster).reclaim, 0)  # off stays off after a restart
         fresh = Path(tempfile.mkdtemp(prefix="fresh-", dir=TMP))
         crewchat.save_config({"project": "fresh"}, fresh)
-        self.assertEqual(crewchat.Hub(crewchat.Roster(fresh)).reclaim, crewchat.RECLAIM_DEFAULT)  # never set
+        self.assertEqual(crewchat.Hub(crewchat.Roster(fresh))._project_reclaim(), crewchat.RECLAIM_DEFAULT)  # never set
 
     def test_reclaim_waits_for_a_listening_holder_and_follows_a_tasks_own_setting(self):
         hub = self.hub
