@@ -279,18 +279,18 @@ crewchat tasks done A12                                # or todo (back on the sh
 
 A message you post as a task also goes on the sheet.
 
-**When an agent goes silent.** A crashed session keeps its task until someone gives it back. To
-have crewchat do that, set a reclaim time: a task whose holder has shown no sign of life for that
-long (no crewchat tool calls, no hooks; a hook waiting for messages counts as alive) goes back on the sheet,
+**When an agent goes silent.** A crashed session would keep its task until someone gave it back,
+so crewchat reclaims it: a task whose holder has shown no sign of life for 60 minutes (no tool
+call, no hook; a hook waiting for messages counts as alive) goes back on the sheet,
 the way giving it back does, with a line in the chat: "Task #A12 reclaimed from claude-macbook
 (silent for 61 min)". The sheet keeps "reclaimed from claude-macbook" on the row, and if that agent
 comes back and reports on the task, it is told who holds it now. Blocked tasks and tasks ready for
-review are never reclaimed: they wait for a person. An agent busy in one long turn (editing and
-building without a crewchat tool) looks silent too, so agents are told the time when they take a
-task and send `hub_update` now and then; give a task that runs long its own time, or none.
+review are never reclaimed: they wait for a person. Every tool call an agent makes counts (its
+hooks tell the server, at most once a minute), but one command that runs longer than the reclaim
+time looks like silence: give such a task its own time, or none.
 
 ```bash
-crewchat tasks reclaim 60          # for the project, in minutes (10 to 10080); off by default
+crewchat tasks reclaim 120         # for the project, in minutes (10 to 10080); 60 unless set
 crewchat tasks reclaim off A12     # never for this task (a long build), or 240 A12 for its own time
 crewchat tasks reclaim default A12 # back to the project's time
 crewchat tasks reclaim off         # turn it off; with no value, shows the setting

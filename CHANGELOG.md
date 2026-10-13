@@ -3,9 +3,11 @@
 ## Unreleased
 
 - **A task whose agent goes silent can go back on the sheet** ([#25](https://github.com/deepankar17/crewchat/issues/25)).
-  `crewchat tasks reclaim 60` (minutes, off by default) reclaims a task whose holder has shown no
-  sign of life for that long: no crewchat tool calls, no hooks, no messages (agents are told the time
-  when they take a task, and to send progress during long work). It works like giving the task
+  A task whose holder has shown no sign of life for 60 minutes (no tool calls, no hooks, no
+  messages) goes back on the sheet; `crewchat tasks reclaim MINUTES|off` changes that, and agents
+  are told the time when they take a task. Every tool call counts: new hooks (Claude Code's
+  PostToolUse, Cursor's after shell, edit and MCP) tell the server an agent is alive, at most once a
+  minute, and the server adds them to connected folders when it starts. It works like giving the task
   back (a new claim key, so claims across machines stay consistent) and is never silent: a
   "Task #N reclaimed from X (silent for N min)" line in the chat, and "reclaimed from X" on the
   sheet. An agent that comes back is told who holds the task now. Blocked tasks and tasks ready

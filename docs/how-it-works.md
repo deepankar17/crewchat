@@ -62,6 +62,9 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   message that arrives while it has nothing to do is answered at once. `crewchat listen` changes
   this per folder ([Getting started](getting-started.md#listening-for-messages)).
 - **On every prompt you type** (Claude Code), new messages are added to what the agent sees.
+- **After a tool call**, a hook tells the server the agent is alive, at most once a minute and
+  without handing anything over, so a task it holds is not [reclaimed](getting-started.md#the-task-sheet)
+  during a long turn. The server adds this hook to connected folders when it starts.
 - **Nothing is lost.** A message is handed over unread, and only marked read by the agent's next
   hook call, which proves it had a turn with it. An interrupted turn or a crashed session gets it
   again.

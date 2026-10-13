@@ -94,6 +94,8 @@ REMOTE_STALE_SECS = 25 * 60  # another machine silent this long counts as offlin
 REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 RECLAIM_MINUTES = (10, 7 * 24 * 60)  # a task's holder may be silent this long before it is reclaimed: least, most
 RECLAIM_EVERY = 60  # seconds between the server's checks for silent holders
+RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
+ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
 EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed")  # optional message fields, kept when messages travel between machines
@@ -602,7 +604,7 @@ class Hub:
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_update on it
         self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
-        self.reclaim = 0  # minutes a task's holder may be silent before it is reclaimed (0: never), set by a "plan" message
+        self.reclaim = None  # minutes a holder may be silent before its task is reclaimed (0: never; None: RECLAIM_DEFAULT), set by a "plan" message
         self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
@@ -667,7 +669,7 @@ class Hub:
         self.progress = {str(k): v for k, v in data.get("progress", {}).items() if isinstance(v, dict)}
         self.sheet = {str(k): v for k, v in data.get("sheet", {}).items() if isinstance(v, dict)}
         self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
-        self.reclaim = int(data.get("reclaim") or 0)
+        self.reclaim = data.get("reclaim") if isinstance(data.get("reclaim"), int) else None
         self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
@@ -1768,7 +1770,11 @@ class Hub:
         own = row.get("reclaim", "")
         if own == "off":
             return 0
-        return int(own if own.isdecimal() else self.reclaim) * 60
+        return int(own if own.isdecimal() else self._project_reclaim()) * 60
+
+    def _project_reclaim(self):
+        """The project's reclaim time in minutes (0: off)."""
+        return RECLAIM_DEFAULT if self.reclaim is None else self.reclaim
 
     def _last_heard(self, name, limit):
         """When an agent last showed a sign of life: a tool call, a hook (a listening one counts as
@@ -1793,7 +1799,7 @@ class Hub:
         """Put the tasks whose holder has been silent too long (or only that one) back on the sheet,
         the way giving one back does (a new claim key), with a line in the chat for everyone. Only
         the machine a task was posted on decides, so no two reclaim it at once. Caller holds the lock."""
-        if not self.reclaim and not any(row.get("reclaim") for row in self.sheet.values()):
+        if not self._project_reclaim() and not any(row.get("reclaim") for row in self.sheet.values()):
             return
         held = list(self.taken.items())
         if only is not None:
@@ -1817,11 +1823,11 @@ class Hub:
     def reclaim_note(self, mid=None):
         """What an agent holding a task (or any, without mid) must know about reclaiming, or ''."""
         with self.lock:
-            limit = self._reclaim_after(self.sheet.get(mid) or {}) if mid else self.reclaim * 60
+            limit = self._reclaim_after(self.sheet.get(mid) or {}) if mid else self._project_reclaim() * 60
         if not limit:
             return ""
-        return (" A task goes back on the sheet when its holder shows no sign of life (a crewchat tool call or "
-                "hook) for %d min: during long work, send hub_update status=in_progress now and then." % (limit // 60))
+        return (" A task goes back on the sheet when its holder shows no sign of life (no tool call, no hook) for "
+                "%d min; a single command that runs longer counts as silence." % (limit // 60))
 
     def reclaim_silent(self):
         """The server's regular check (every RECLAIM_EVERY seconds)."""
@@ -1836,7 +1842,7 @@ class Hub:
         value = str(value or "").strip().lower()
         if not value and not mid:
             with self.lock:
-                return str(self.reclaim) if self.reclaim else "off"
+                return str(self._project_reclaim() or "off")
         least, most = RECLAIM_MINUTES
         if value.isdecimal():
             value = str(int(value))
@@ -1897,7 +1903,8 @@ class Hub:
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
         """What an agent's hook asks: are there messages for the session with this link key?
-        event is "prompt" (its user typed) or "stop" (it finished a turn)."""
+        event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
+        only a sign of life)."""
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
         with self.lock:
@@ -1905,6 +1912,9 @@ class Hub:
             agent = self.agents.get(name) if name else None
             if agent is None or agent["place"] != place:
                 return {"link": True}
+            if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
+                self.touch(name, active=True)
+                return {}
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -2632,8 +2642,8 @@ COMMANDS = [
         ("tasks done|todo|blocked ID [NOTE]", "Settle a task (todo puts it back on the sheet).", None),
         ("tasks remove ID", "Take a task off the sheet.", None),
         ("tasks reclaim [MINUTES|off|default] [ID]",
-         "Put a task back on the sheet when its holder is silent this long (no crewchat tool calls, no hooks): for the "
-         "project, or one task (default: as the project). Off unless set; with no value, shows it.", None),
+         "Put a task back on the sheet when its holder is silent this long (no tool calls, no hooks): for the "
+         "project (60 min unless set), or one task (default: as the project). With no value, shows it.", None),
     ]),
     ("Project folders", [
         ("listen on [--minutes N] [--project FOLDER]", "Agents in this folder wait up to N minutes (1 to 55) for messages after each turn.", None),
@@ -3473,7 +3483,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
-                event = "prompt" if data.get("event") == "prompt" else "stop"
+                event = data.get("event") if data.get("event") in ("prompt", "tool") else "stop"
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
                 out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped)
@@ -4051,6 +4061,7 @@ def cmd_serve(args):
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
         threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4432,16 +4443,22 @@ def install_claude(project, url, token):
     enabled = settings.setdefault("enabledMcpjsonServers", [])
     if SERVER_NAME not in enabled:
         enabled.append(SERVER_NAME)
+    set_claude_hooks(settings)
+    write_json(settings_path, settings)
+    return [".mcp.json", ".claude/settings.local.json"]
+
+
+def set_claude_hooks(settings):
+    """crewchat's hooks in Claude Code settings, replacing its own older ones and keeping the user's."""
     hooks = settings.setdefault("hooks", {})
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
-                                                 "statusMessage": "Waiting for crewchat messages"})):
+                                                 "statusMessage": "Waiting for crewchat messages"}),
+                               ("PostToolUse", "tool", {"timeout": 10})):  # a sign of life
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
         groups.append({"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]})
         hooks[event] = groups
-    write_json(settings_path, settings)
-    return [".mcp.json", ".claude/settings.local.json"]
 
 
 def install_cursor(project, url, token):
@@ -4452,12 +4469,62 @@ def install_cursor(project, url, token):
     write_json(project / ".cursor" / "mcp.json", config, private=True)
     hooks_path = project / ".cursor" / "hooks.json"
     hooks = read_json(hooks_path)
-    hooks.setdefault("version", 1)
-    stop = [h for h in hooks.setdefault("hooks", {}).get("stop", []) if not is_our_hook(h.get("command", ""))]
-    stop.append({"command": hook_command("cursor", "stop"), "timeout": MAX_LISTEN + 100})
-    hooks["hooks"]["stop"] = stop
+    set_cursor_hooks(hooks)
     write_json(hooks_path, hooks)
     return [".cursor/mcp.json", ".cursor/hooks.json"]
+
+
+def set_cursor_hooks(hooks):
+    """crewchat's hooks in Cursor's hooks.json, replacing its own older ones and keeping the user's:
+    stop hands over messages, the others tell the server the agent is alive (tool calls)."""
+    hooks.setdefault("version", 1)
+    for event, name, timeout in (("stop", "stop", MAX_LISTEN + 100), ("afterShellExecution", "tool", 10),
+                                 ("afterFileEdit", "tool", 10), ("afterMCPExecution", "tool", 10)):
+        kept = [h for h in hooks.setdefault("hooks", {}).get(event, []) if not is_our_hook(h.get("command", ""))]
+        kept.append({"command": hook_command("cursor", name), "timeout": timeout})
+        hooks["hooks"][event] = kept
+
+
+def update_hooks(folder):
+    """Bring crewchat's hooks in a connected folder up to this version's (new events, this copy's
+    command), leaving the user's own hooks and the folder's token alone. Returns what changed."""
+    folder = Path(folder)
+
+    def ours_then(setter):
+        def change(data):
+            if is_our_hook(json.dumps(data.get("hooks") or {})):  # else not connected by crewchat, or taken out
+                setter(data)
+        return change
+    return [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
+                                    (".cursor/hooks.json", set_cursor_hooks))
+            if not tracked_by_git(folder, rel) and edit_json(folder / rel, ours_then(setter))]
+
+
+def tracked_by_git(folder, rel):
+    """Is this file committed in the folder's repository? Then only `crewchat start` there changes
+    it, not an upgrade behind the owner's back."""
+    try:
+        return subprocess.run(["git", "-C", str(folder), "ls-files", "--error-unmatch", rel], capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def edit_json(path, change):
+    """Apply change(data) to a JSON file and write it back only if that changed something; one
+    left empty (but a version) is deleted. Returns whether the file changed."""
+    data = read_json(path)
+    if not data:
+        return False
+    before = json.dumps(data, sort_keys=True)
+    change(data)
+    if json.dumps(data, sort_keys=True) == before:
+        return False
+    if any(v not in ({}, [], None) for k, v in data.items() if k != "version"):
+        write_json(path, data)
+    else:
+        path.unlink()
+    return True
 
 
 def cmd_join(args):
@@ -4631,17 +4698,19 @@ def run_hook(client, event):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    project = find_project(client)
-    config = client_config(project, client) if project else None
-    if config is None or hooks_off(project):
-        return  # this project is not connected to a crewchat, or its hooks are switched off
-    base, token = config
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
+    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY:
+        return  # after every tool call: return at once unless a minute passed
+    project = find_project(client)
+    config = client_config(project, client) if project else None
+    if config is None or hooks_off(project):
+        return  # this project is not connected to a crewchat, or its hooks are switched off
+    base, token = config
     # The link key names this agent session to the server. The agent ties it to its chat identity
     # by calling hub_link once; a resumed conversation keeps its key and so gets its name back.
     # A session started from the chat page was given its start key: it links with that one. Only
@@ -4663,7 +4732,15 @@ def run_hook(client, event):
     def save(chain, pending, asks):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
-                                          "ignored": ignored}))
+                                          "ignored": ignored, "alive": state.get("alive", 0)}))
+
+    if event == "tool":
+        # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
+        # above), so a long turn without a crewchat tool does not look silent. Never waits or delivers.
+        state["alive"] = time.time()
+        save(chain, pending, asks)
+        post_json(base + "/api/hook", token, {"key": key, "event": "tool"}, timeout=5)
+        return
 
     if event == "prompt":
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
@@ -5154,6 +5231,18 @@ def update_checks(projects):
         time.sleep(UPDATE_EVERY)
 
 
+def upgrade_folders(projects):
+    """At server start (so after every upgrade): each connected folder gets this version's guide and
+    crewchat hooks. Only what changed is written."""
+    for project in projects.all():
+        for folder in project.hub.project_folders():
+            try:
+                write_guides(folder, project.roster.root)
+                update_hooks(folder)
+            except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
+                sys.stderr.write("%s could not update crewchat's files in %s: %s\n" % (now_iso(), folder, e))
+
+
 def reclaim_checks(projects):
     """Every RECLAIM_EVERY seconds, each project puts back the tasks of holders silent too long."""
     while True:
@@ -5412,20 +5501,8 @@ def disconnect_folder(project):
     changed = []
 
     def edit(rel, change):
-        path = project / rel
-        data = read_json(path)
-        if not data:
-            return
-        before = json.dumps(data, sort_keys=True)
-        change(data)
-        if json.dumps(data, sort_keys=True) == before:
-            return
-        rest = {k: v for k, v in data.items() if v not in ({}, [], None) and k != "version"}
-        if rest:
-            write_json(path, data)
-        else:
-            path.unlink()
-        changed.append(rel)
+        if edit_json(project / rel, change):
+            changed.append(rel)
 
     def servers(data):
         (data.get("mcpServers") or {}).pop(SERVER_NAME, None)
@@ -5454,11 +5531,12 @@ def disconnect_folder(project):
 
     def cursor_hooks(data):
         hooks = data.get("hooks") or {}
-        stop = [h for h in hooks.get("stop", []) if not is_our_hook(h.get("command", ""))]
-        if stop:
-            hooks["stop"] = stop
-        else:
-            hooks.pop("stop", None)
+        for event in list(hooks):
+            kept = [h for h in hooks[event] if not is_our_hook(h.get("command", ""))]
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
         if not hooks:
             data.pop("hooks", None)
 
@@ -5574,11 +5652,10 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   done, nobody else is in its files, and it suits your machine. Work you find (a bug, a follow-up,
   a missing piece) goes on the sheet with `hub_task_add`, with what it waits for (`depends`), the
   files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
-  finish a task? Give it back with `hub_update` status `todo` and a note. If the owner set a reclaim
-  time (`hub_tasks` says so), a task whose holder shows no sign of life that long (no crewchat tool
-  call or hook) goes back on the sheet: in long work, send `hub_update` `in_progress` now and then;
-  waiting on someone's answer, mark it `blocked`. The lead hands out tasks already on the sheet with
-  `hub_assign` and only `task`.
+  finish a task? Give it back with `hub_update` status `todo` and a note. A task whose holder shows
+  no sign of life (no tool call, no hook) for the project's reclaim time (`hub_tasks` says it) goes
+  back on the sheet; waiting on someone's answer, mark it `blocked`. The lead hands out tasks
+  already on the sheet with `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_update`.
@@ -7064,7 +7141,7 @@ def build_parser():
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=["claude", "cursor"])
-    p.add_argument("event", choices=["prompt", "stop"])
+    p.add_argument("event", choices=["prompt", "stop", "tool"])
     p.set_defaults(fn=cmd_hook)
     return parser
 
