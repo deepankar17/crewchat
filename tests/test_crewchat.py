@@ -769,7 +769,8 @@ class Launching(Base):
             returncode=0, stdout="--trust --approve-mcps", stderr="")
         with mock.patch.object(crewchat, "find_tool", lambda tool, config: "/x/cursor-agent"), \
                 mock.patch.object(crewchat.subprocess, "run", fake), mock.patch.object(crewchat, "run", fake), \
-                mock.patch.object(crewchat.subprocess, "Popen", lambda *a, **kw: calls.append((a[0], kw.get("cwd")))):
+                mock.patch.object(crewchat.subprocess, "Popen", lambda *a, **kw: calls.append((a[0], kw.get("cwd")))), \
+                mock.patch.object(crewchat.shutil, "which", lambda name: "/usr/bin/" + name):  # Linux: a terminal
             self.real_launch_agent("cursor", str(self.folder), "start-0123456789abcdef", "ask", self.hub.home)
         self.assertIn((["/x/cursor-agent", "mcp", "enable", "crewchat"], str(self.folder)), calls)
         self.assertFalse(any("--approve-mcps" in " ".join(map(str, c[0])) for c in calls))
