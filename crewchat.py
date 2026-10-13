@@ -2043,6 +2043,27 @@ class Hub:
                 " in a Terminal window (it was in the Claude app)" if session.get("app") == "claude-app" else ""))
             self._changed()
 
+    def switch_model(self, name, model):
+        """The owner switches an agent to another model: its session is stopped (its tasks stay
+        its own) and reopened on that model, same conversation."""
+        with self.lock:
+            session = dict(self._session_of(name, "switch"))
+        tool = session.get("tool", "claude")
+        exe = find_tool(tool, load_config(self.home))
+        if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, exe or "")]:
+            raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
+        if process_running(session):
+            if not stop_process(session["pid"]):
+                raise HubError("could not stop %s" % name)
+            for _ in range(40):  # up to 10 s for it to end
+                if not process_running(session):
+                    break
+                time.sleep(0.25)
+            else:
+                raise HubError("%s did not stop; try again" % name)
+            _PROCESSES[0] = 0.0
+        self.reopen_agent(name, model)
+
     def _keep_session(self, name, session):
         """Which session and process an agent is, as its hook reported it (once per session).
         Caller holds the lock."""
@@ -3440,8 +3461,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.stop_agent(name)
         elif op == "reopen":
             self.hub.reopen_agent(name)
+        elif op == "model":
+            self.hub.switch_model(name, data.get("model"))
         else:
-            raise HubError("op is rename, remove, listen, stop or reopen")
+            raise HubError("op is rename, remove, listen, stop, reopen or model")
         return {"ok": True}
 
     def _role(self, data):
@@ -3985,9 +4008,12 @@ TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
 def launch_options(config, root=None, chat=""):
     """What the chat page's "Add an agent" offers on this machine, for one project. A tool that
     is not installed is listed with how to get it (Cursor's app alone has no command-line agent)."""
-    tools = [dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()]},
-                  **({} if find_tool(t, config) else {"missing": TOOL_HINTS[t]}))
-             for t, (label, _) in LAUNCH_TOOLS.items()]
+    tools = []
+    for t, (label, _) in LAUNCH_TOOLS.items():
+        exe = find_tool(t, config)
+        tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
+                           "models": tool_models(t, exe) if exe else []},
+                          **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
@@ -4049,6 +4075,32 @@ def agent_tool(tool, folder, permissions, root=None):
         except (OSError, subprocess.SubprocessError):
             pass  # it asks in its window instead
     return exe, base
+
+
+CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
+                 ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
+MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_MODELS = {}  # exe -> (when, models): Cursor's list takes a few seconds to fetch
+
+
+def tool_models(tool, exe):
+    """The models an agent tool can be switched to: [[id, label], ...]. Claude Code takes its
+    aliases; Cursor's agent lists its own (`cursor-agent models`), kept for 10 minutes."""
+    if tool == "claude":
+        return CLAUDE_MODELS
+    when, models = _MODELS.get(exe, (0, None))
+    if models is None or time.time() - when > 600:
+        try:
+            out = subprocess.run([exe, "models"], capture_output=True, text=True, timeout=60).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        models = []
+        for line in out.splitlines():
+            model, sep, label = line.strip().partition(" - ")
+            if sep and MODEL_RE.match(model):
+                models.append([model, label.strip()])
+        _MODELS[exe] = (time.time(), models)
+    return models
 
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None):

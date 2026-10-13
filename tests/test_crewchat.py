@@ -806,6 +806,46 @@ class Launching(Base):
         self.reopened(agent=name)
         self.assertIn("in a Terminal window", self.hub_history())
 
+    def test_switch_model_stops_then_reopens_with_the_model(self):
+        name = self.closed_session()
+        session = Session(self.base, self.token)  # it holds a task, which a model switch must not free
+        session.call("hub_link", key="link-" + name)
+        task = self.say("all", "kept across the switch", "task")
+        session.call("hub_take", id=task)
+        steps, running = [], [True]
+        def stop(pid):
+            steps.append("stop")
+            running[0] = False
+            return True
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
+                mock.patch.object(crewchat, "stop_process", stop), \
+                mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["opus", "Opus"], ["sonnet", "Sonnet"]]), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                                  steps.append(command)):
+            crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
+        self.assertEqual(steps[0], "stop")
+        self.assertEqual(steps[1][-4:], ["--model", "sonnet", "--resume", "sess-0003-abc"])
+        self.assertEqual(self.hub.taken.get(task), name)  # still its task
+        self.assertIn("Owner reopened %s on sonnet" % name, self.hub_history())
+
+    def test_switch_model_refuses_a_model_the_tool_does_not_list(self):
+        name = self.closed_session()
+        with mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["opus", "Opus"]]):
+            for bad in ("opus; rm -rf ~", "gpt-9"):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": bad})
+                self.assertIn("no model", json.loads(caught.exception.read())["error"])
+
+    def test_models_come_from_the_tool(self):
+        listing = "Available models\n\nauto - Auto (current, default)\ngpt-5.3-codex - Codex 5.3\n" \
+                  "claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking\nnot a model line\n"
+        with mock.patch.object(crewchat.subprocess, "run", lambda *a, **kw: mock.Mock(stdout=listing, returncode=0)):
+            crewchat._MODELS.clear()
+            self.assertEqual(crewchat.tool_models("cursor", "/x/cursor-agent"),
+                             [["auto", "Auto (current, default)"], ["gpt-5.3-codex", "Codex 5.3"],
+                              ["claude-sonnet-5-thinking-high", "Claude Sonnet 5 1M Thinking"]])
+        self.assertEqual([m[0] for m in crewchat.tool_models("claude", "/x/claude")], ["fable", "opus", "sonnet", "haiku"])
+
     def test_the_window_is_titled_with_the_agents_name(self):
         script = crewchat.macos_script("/tmp/x", ["/x/claude"], "start-0123456789abcdef", title="it's me")
         self.assertIn("printf '\\033]0;%s\\007' 'it'\"'\"'s me'", script)
@@ -932,7 +972,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop or reopen", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen or model", self.op(op="kick", agent=name)["error"])
 
     def stand_in(self, name, app="terminal"):
         """A real process that looks like the agent's claude (it is sleep), recorded as its session."""
