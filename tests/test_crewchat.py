@@ -808,8 +808,12 @@ class AgentCards(Base):
         self.assertEqual(self.hub.agents["page-named"]["listen"], "off")  # the setting goes with the name
         self.assertIn("reserved", self.op(op="rename", agent="page-named", new="Owner")["error"])
         self.assertIn("listening is on, off or default", self.op(op="listen", agent="page-named", mode="loud")["error"])
+        task = self.say("all", "held by the one we remove", "task")
+        session.call("hub_take", id=task)
         self.assertEqual(self.op(op="remove", agent="page-named"), {"ok": True})
         self.assertNotIn("page-named", self.names())
+        row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
+        self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
         self.assertIn("op is rename, remove or listen", self.op(op="kick", agent=name)["error"])
 

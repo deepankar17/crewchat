@@ -1014,6 +1014,11 @@ class Hub:
     def remove(self, name):
         with self.lock:
             self._local_agent(name, "remove")
+            # What it held goes back on the sheet, the way a reclaim does (a new claim key everywhere).
+            for mid, holder in list(self.taken.items()):
+                if holder == name and mid in self.sheet and self._row_status(mid) not in ("done", "removed"):
+                    self._append(SERVER_NAME, "all", "Task #%s is back on the sheet: %s was removed." % (mid, name),
+                                 "update", task=mid, status="todo", reclaimed=name)
             self._forget(name, "was removed by the owner")
             self._save()
             self._changed()
@@ -4723,8 +4728,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
                                                             "chain": chain}, timeout=30)
             except (urllib.error.URLError, OSError):
                 pass  # keep what came first
-        if "listen" in out:  # the owner set this agent's listening on the chat page: it wins over its folder's
-            wait_total = out["listen"]
+        if "listen" in out:  # the owner set this agent's listening on the chat page: off, or on at least this long
+            wait_total = max(wait_total, out["listen"]) if out["listen"] else 0
             deadline = begun + wait_total
         capped = bool(out.get("capped"))
         if out.get("link"):

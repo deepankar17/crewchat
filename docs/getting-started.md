@@ -201,7 +201,8 @@ Each agent session gets its own name, built from its tool and the folder's label
   card on the chat page, or from the host: `crewchat agent rename claude-macbook backend`.
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
-  `~/.crewchat/config.json`). **Remove** on its card, or `crewchat agent remove NAME`, drops one at once.
+  `~/.crewchat/config.json`). **Remove** on its card, or `crewchat agent remove NAME`, drops one at once and puts
+  the tasks it held back on the sheet.
 - **A newcomer starts clean.** It does not get the backlog as unread; `hub_history` shows what
   was said before.
 
