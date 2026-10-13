@@ -628,6 +628,8 @@ class Hub:
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self.started = time.time()  # nobody can be heard while the server is down (memory only)
+        self._running = {}  # agent -> its session's process running at the server's last look (memory only)
+        self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
         self._load()
 
     # Persistence ---------------------------------------------------------------------------
@@ -1101,12 +1103,18 @@ class Hub:
                 })
         return rows
 
+    def session_pids(self):
+        """The processes this project's agents recorded (refresh_processes reads just these)."""
+        with self.lock:
+            return [int(a["session"]["pid"]) for a in self.agents.values()
+                    if a.get("session") and str(a["session"].get("pid", "")).isdigit()]
+
     def check_sessions(self):
         """After the server read the process list: if an agent's session started or ended since the
         last look, the chat page hears it."""
         with self.lock:
             running = {n: process_running(a["session"], _PROCESSES[1]) for n, a in self.agents.items() if a.get("session")}
-            if running != getattr(self, "_running", {}):
+            if running != self._running:
                 self._running = running
                 self._changed()
 
@@ -1115,8 +1123,8 @@ class Hub:
         session = agent.get("session")
         if not session:
             return None
-        return {"app": session.get("app", "terminal"), "running": process_running(session, recent_process_table()),
-                "since": session.get("stopped") or session.get("since", 0), "tool": session.get("tool", "claude"),
+        return {"app": session.get("app", "terminal"), "running": process_running(session, _PROCESSES[1]),
+                "since": session.get("since", 0), "tool": session.get("tool", "claude"),
                 "reopen": session.get("tool", "claude") in REOPEN_TOOLS}
 
     def rows(self):
@@ -1244,7 +1252,7 @@ class Hub:
             raise HubError("unknown agent tool %s" % tool)
         if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
-        if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
+        if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
         key = self.new_start(name, role, task, permissions)
         try:
@@ -1944,10 +1952,10 @@ class Hub:
             }
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None):
-        table = recent_process_table() if event != "tool" else {}  # read before the lock: never ps under it
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
-        only a sign of life)."""
+        only a sign of life, or the session report it was asked for)."""
+        table = _PROCESSES[1]  # as the server last read it: never ps here
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
         with self.lock:
@@ -2027,6 +2035,10 @@ class Hub:
             raise HubError("no session recorded for %s: it has not checked in since crewchat could record it" % name)
         return session
 
+    def _connected_folder(self, folder):
+        """Is this a folder of this chat on this machine (where an agent may be started or reopened)?"""
+        return folder in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]
+
     def stop_agent(self, name):
         """The owner stops an agent's session from its card. It stays on the roster; what it held
         goes back on the sheet."""
@@ -2034,13 +2046,13 @@ class Hub:
             session = dict(self._session_of(name, "stop"))
         if not process_running(session):
             raise HubError("%s is not running" % name)
-        if not stop_process(session["pid"]):
-            raise HubError("could not stop %s" % name)
-        wait_until_stopped(session)
-        _PROCESSES[:] = [time.time(), process_table()]  # the card shows it closed at once
+        try:
+            end_session(session)
+        except HubError as e:
+            raise HubError("%s: %s" % (name, e))
         with self.lock:
-            if name in self.agents and self.agents[name].get("session"):
-                self.agents[name]["session"]["stopped"] = time.time()
+            if (self.agents.get(name) or {}).get("session", {}).get("pid") == session["pid"]:
+                self.agents[name]["session"]["since"] = time.time()  # closed since now
             self._free_tasks(name, "was stopped")
             self._event("Owner stopped %s" % name)
             self._save()
@@ -2057,9 +2069,11 @@ class Hub:
         if tool not in REOPEN_TOOLS:
             raise HubError("%s cannot reopen a conversation from the chat page yet: open it again in %s"
                            % (LAUNCH_TOOLS[tool][0], LAUNCH_TOOLS[tool][0]))
-        if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
+        if not self._connected_folder(folder):
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
-        permissions = session.get("permissions") if session.get("permissions") in LAUNCH_PERMISSIONS[tool] else "ask"
+        with self.lock:
+            permissions = (self.agents.get(name) or {}).get("permissions", "ask")
+        permissions = permissions if permissions in LAUNCH_PERMISSIONS[tool] else "ask"
         exe, base = agent_tool(tool, folder, permissions, self.home)
         return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
 
@@ -2090,36 +2104,27 @@ class Hub:
         """The owner switches an agent to another model: its session is stopped (its tasks stay
         its own) and reopened on that model, same conversation. Everything reopening needs is
         checked first, so a failure never leaves it stopped."""
-        with self.lock:
-            session = dict(self._session_of(name, "switch"))
-        tool = session.get("tool", "claude")
-        if tool not in REOPEN_TOOLS:
-            raise HubError("%s cannot switch a session's model from the chat page yet" % LAUNCH_TOOLS[tool][0])
-        exe = find_tool(tool, load_config(self.home))
-        if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, exe or "")]:
+        plan = self._reopen_plan(name, model if isinstance(model, str) and MODEL_RE.fullmatch(model) else None)
+        session, tool = plan[0], plan[0].get("tool", "claude")
+        if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, plan[2][0])]:
             raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
-        plan = self._reopen_plan(name, model)
-        if process_running(plan[0]):
-            if not stop_process(plan[0]["pid"]):
-                raise HubError("could not stop %s" % name)
-            if not wait_until_stopped(plan[0]):
-                raise HubError("%s did not stop; try again" % name)
-            _PROCESSES[:] = [time.time(), process_table()]
+        if process_running(session):
+            try:
+                end_session(session)
+            except HubError as e:
+                raise HubError("%s: %s" % (name, e))
         self.reopen_agent(name, model, plan)
 
     def _wants_session(self, name, table):
         """Should this agent's hook report its session again? After a Reopen (the same session id,
         a new process), or when the recorded process is gone, but then at most every 10 minutes:
         a session whose process cannot be found is not asked on every turn. Caller holds the lock."""
-        agent = self.agents.get(name) or {}
-        recorded = agent.get("session") or {}
-        if recorded.get("reopening"):
-            return True
-        asked = getattr(self, "_asked", {})
-        if time.time() - asked.get(name, 0) < 600 or (recorded and process_running(recorded, table)):
+        recorded = (self.agents.get(name) or {}).get("session") or {}
+        if time.time() - float(recorded.get("reopening") or 0) < REOPEN_WAIT:
+            return True  # reopened: its new process reports (asked on each hook until it does, or for 2 min)
+        if time.time() - self._asked.get(name, 0) < 600 or (recorded and process_running(recorded, table)):
             return False
-        asked[name] = time.time()
-        self._asked = asked
+        self._asked[name] = time.time()
         return bool(self.agent_folders(name))  # a process number means nothing elsewhere (_keep_session)
 
     def _keep_session(self, name, session):
@@ -2134,9 +2139,6 @@ class Hub:
         except (KeyError, TypeError, ValueError):
             return
         if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.agent_folders(name):
-            old = self.agents[name].get("session") or {}
-            kept["permissions"] = old.get("permissions", "ask") if old.get("id") == kept["id"] else (
-                self.agents[name].get("permissions", "ask"))
             self.agents[name]["session"] = kept
             self._save()
 
@@ -2660,7 +2662,7 @@ def call_tool(hub, sid, name, args, owner=False):
                                                           "the owner" if to == OWNER else to)
     new = args.get("name")
     hub.rename(me, new)
-    return "You are now %s. Everyone has been told." % new
+    return "You are now %s. Everyone has been told.%s" % (new, SESSION_NAME_NOTE % new)
 
 
 def sheet_line(row):
@@ -4098,7 +4100,7 @@ def launch_options(config, root=None, chat=""):
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t, exe) if exe else []},
+                           "models": tool_models(t, exe) if exe and t in REOPEN_TOOLS else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
@@ -4198,7 +4200,8 @@ def resume_command(exe, tool, session, permissions="ask", base=None, model=None)
     if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
     options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-    return [exe] + options + (["--model", model] if model else []) + ["--resume", session, REOPEN_PROMPT]
+    # One argument, so an id can never be taken for an option of its own.
+    return [exe] + options + (["--model", model] if model else []) + ["--resume=" + session, REOPEN_PROMPT]
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None):
@@ -5074,7 +5077,7 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session=None, again=None):
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
@@ -5082,9 +5085,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session
     session in its place may be this one reconnecting), else "ok"; text is '' when nothing arrived within
     wait_total seconds. `ack` first confirms the messages a previous hook call delivered. `chain`
     is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
-    answers "capped", and only a message from the owner ends the wait. `session`, if given, tells
-    the server which session and process the agent is (session_report), with the first call;
-    `again` makes that report when the server asks for it (after a Reopen).
+    answers "capped", and only a message from the owner ends the wait. `report` makes the
+    session report (session_report) when the server asks for one: a new session, or after a Reopen.
     """
     begun = time.time()
     deadline = begun + wait_total
@@ -5093,15 +5095,12 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
         asked = time.time()
         try:
-            body = {"key": key, "ack": ack, "wait": wait, "event": event, "chain": chain}
-            if session:
-                body["session"] = session
-            out = post_json(base + "/api/hook", token, body, timeout=MAX_WAIT + 30)
-            session = None
-            if out.get("session") == "want" and again:
-                report, again = again(), None
-                if report:  # a quick call of its own, so a long wait above is not held up
-                    post_json(base + "/api/hook", token, {"key": key, "event": "tool", "session": report}, timeout=10)
+            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
+                                                        "chain": chain}, timeout=MAX_WAIT + 30)
+            if out.get("session") == "want" and report:
+                found, report = report(), None
+                if found:  # a quick call of its own, so a long wait above is not held up
+                    post_json(base + "/api/hook", token, {"key": key, "event": "tool", "session": found}, timeout=10)
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -5149,26 +5148,31 @@ def claim_launch_key(folder, key, session):
     return True
 
 
-SESSION_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")  # a session id that may reach a command line (Reopen)
+SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
 AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a quoted path, or npm's node + cli.js)
     "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
     "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)')}
 
 
-def process_table():
-    """{pid: (parent pid, start time, command line)} of this machine's processes, or {}."""
+def process_table(pids=None):
+    """{pid: (parent pid, start time, command line)} of this machine's processes, only those in pids
+    if given (the server watches just its agents'), or {}."""
+    if pids is not None and not pids:
+        return {}
     try:
         if os.name == "nt":
+            where = ' -Filter "%s"' % " or ".join("ProcessId=%d" % int(p) for p in pids) if pids else ""
             out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
-                                  "@{n='Started';e={$_.CreationDate.ToString('o')}},CommandLine | ConvertTo-Json -Compress"],
-                                 capture_output=True, text=True, timeout=30).stdout
+                                  "Get-CimInstance Win32_Process%s | Select-Object ProcessId,ParentProcessId,"
+                                  "@{n='Started';e={$_.CreationDate.ToString('o')}},CommandLine | ConvertTo-Json -Compress"
+                                  % where], capture_output=True, text=True, timeout=30).stdout
             rows = json.loads(out or "[]")
             return {int(r["ProcessId"]): (int(r["ParentProcessId"] or 0), str(r.get("Started") or ""),
                                           str(r.get("CommandLine") or "")) for r in (rows if isinstance(rows, list) else [rows])}
         # One locale and time zone, so the hook (the agent's environment) and the server (a login
         # service) write a process's start time the same way.
-        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
+        which = ["-p", ",".join(str(int(p)) for p in pids)] if pids else ["-A"]
+        out = subprocess.run(["ps"] + which + ["-o", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
                              timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC0")).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
@@ -5180,32 +5184,30 @@ def process_table():
     return table
 
 
-_PROCESSES = [0.0, {}]  # when, process_table(): kept fresh by the server's refresh_sessions
+_PROCESSES = [0.0, {}]  # when, the agents' processes as refresh_processes last read them
 SESSIONS_EVERY = 5  # seconds between the server's looks at its agents' processes
 
 
-def recent_process_table():
-    """The process list as the server last read it. The server refreshes it every SESSIONS_EVERY
-    seconds in its own thread, so a card never waits for `ps`; only without that thread (a test, a
-    command) is it read here."""
-    if time.time() - _PROCESSES[0] > 3 * SESSIONS_EVERY:
-        _PROCESSES[:] = [time.time(), process_table()]
-    return _PROCESSES[1]
+def refresh_processes(projects):
+    """Read the processes every project's agents recorded (outside every hub's lock; none, no
+    `ps`), and tell each project's page when an agent's session started or ended."""
+    hubs = [project.hub for project in projects.all()]
+    pids = sorted({pid for hub in hubs for pid in hub.session_pids()})
+    _PROCESSES[:] = [time.time(), process_table(pids)]
+    for hub in hubs:
+        hub.check_sessions()
 
 
-def refresh_sessions(projects):
-    """Read the process list once (outside every hub's lock), and tell each project's page when an
-    agent's session started or ended."""
-    _PROCESSES[:] = [time.time(), process_table()]
-    for project in projects.all():
-        project.hub.check_sessions()
+def forget_process(pid):
+    """An agent's process that was just stopped: the cards show it closed without waiting."""
+    _PROCESSES[1] = {k: v for k, v in _PROCESSES[1].items() if k != pid}
 
 
 def session_checks(projects):
     """The server's look at its agents' processes, every SESSIONS_EVERY seconds."""
     while True:
         try:
-            refresh_sessions(projects)
+            refresh_processes(projects)
         except Exception as e:  # one bad look must not stop the next
             sys.stderr.write("%s could not check agents' sessions: %s\n" % (now_iso(), e))
         time.sleep(SESSIONS_EVERY)
@@ -5237,18 +5239,22 @@ def process_running(session, table=None):
         pid, started, tool = int(session["pid"]), str(session["started"]), session.get("tool", "claude")
     except (KeyError, TypeError, ValueError):
         return False
-    table = process_table() if table is None else table
+    table = process_table([pid]) if table is None else table
     row = table.get(pid)
     return bool(row and row[1] == started and AGENT_COMMAND.get(tool, AGENT_COMMAND["claude"]).search(row[2]))
 
 
-def wait_until_stopped(session, seconds=10):
-    """Wait (outside any lock) for an agent's process to end after stop_process. Returns whether it did."""
-    for _ in range(int(seconds * 4)):
+def end_session(session):
+    """Stop an agent's process and wait (outside any lock, up to 10 s) for it to end. HubError if it
+    does not."""
+    if not stop_process(session["pid"]):
+        raise HubError("could not stop it")
+    for _ in range(40):
         if not process_running(session):
-            return True
+            forget_process(session["pid"])
+            return
         time.sleep(0.25)
-    return False
+    raise HubError("it did not stop; try again")
 
 
 def stop_process(pid):
@@ -5312,10 +5318,10 @@ def run_hook(client, event):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
                                           "ignored": ignored, "alive": state.get("alive", 0),
-                                          "reported": state.get("reported", "")}))
+                                          }))
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
-    report = session_report(client, session, project) if state.get("reported") != session and event != "tool" else None
+    report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
 
     if event == "tool":
         # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
@@ -5329,10 +5335,7 @@ def run_hook(client, event):
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", session=report,
-                                            again=lambda: session_report(client, session, project))
-        if kind == "ok" and report:
-            state["reported"] = session
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", report=report)
         if kind != "ok":
             if ignored >= MAX_LINK_PROMPTS:
                 # Asked at several prompts and never linked: this session is not joining (or has no
@@ -5355,10 +5358,7 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
-                                                      pending, chain=chain, session=report,
-                                                      again=lambda: session_report(client, session, project))
-    if kind == "ok" and report:
-        state["reported"] = session
+                                                      pending, chain=chain, report=report)
     if kind != "ok":
         # Asking here makes the agent take one more turn, which costs a whole turn's tokens. Claude
         # Code is asked at its user's prompt instead; here only a session that was linked and must
@@ -7136,14 +7136,23 @@ $("skill-file").addEventListener("change", async () => {
   } catch (e) { alert(e.message); }
 });
 
+// What Add an agent offers on this machine (tools, folders, permissions, models): the dialog and the
+// cards' Switch model read it.
+async function launchOptions() {
+  const res = await fetch(api("/api/launch"), { cache: "no-store" });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  const opts = await res.json();
+  toolModels = {};
+  for (const t of opts.tools || []) toolModels[t.id] = t.models || [];
+  return opts;
+}
+
 async function openLaunch() {
   const dialog = $("launch"), note = $("launch-note");
   note.textContent = ""; $("l-start").disabled = false;
   dialog.showModal();
   try {
-    const res = await fetch(api("/api/launch"), { cache: "no-store" });
-    if (res.status === 401) { location.href = "/login"; return; }
-    const opts = await res.json();
+    const opts = await launchOptions();
     $("l-tool").replaceChildren(...opts.tools.map((t) => {
       const option = new Option(t.missing ? t.label + " (not installed)" : t.label, t.id);
       option.disabled = !!t.missing;
@@ -7261,14 +7270,14 @@ function agentActions(a) {
 
 // Its session: Stop while it runs, Reopen (the same conversation) when it does not, Switch model.
 let toolModels = null;  // tool -> [[id, label], ...], from /api/launch, fetched once
+let modelsAsked = false;
 async function loadModels() {
-  if (toolModels) return;
-  toolModels = {};
+  if (modelsAsked) return;  // once per page, whatever the answer
+  modelsAsked = true;
   try {
-    const res = await fetch(api("/api/launch"), { cache: "no-store" });
-    for (const t of (await res.json()).tools || []) toolModels[t.id] = t.models || [];
+    await launchOptions();
     renderAgents();
-  } catch (err) { toolModels = null; }
+  } catch (err) {}
 }
 
 function sessionLine(a) {
