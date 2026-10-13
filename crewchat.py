@@ -99,6 +99,7 @@ RECLAIM_EVERY = 60  # seconds between the server's checks for silent holders
 RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
 ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
 SERVICE_LABEL = "io.crewchat.hub"
+SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app does), name it %s."
 MAX_CHAIN_LIMIT = 50
 EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed")  # optional message fields, kept when messages travel between machines
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
@@ -968,15 +969,16 @@ class Hub:
                 self.agents[owner]["checked"] = time.time()
                 self._save()
                 self._changed()
-                return owner, "Linked. This session is %s again, in the project %s.%s" % (
-                    owner, self.roster.project, self.rules_note())
+                return owner, "Linked. This session is %s again, in the project %s.%s%s" % (
+                    owner, self.roster.project, SESSION_NAME_NOTE % owner, self.rules_note())
             if mine is None:
                 mine = row["agent"] = self._new_agent(row["place"], row["client"])
             self.links[key] = mine
             self.agents[mine]["checked"] = time.time()
             self._save()
             self._changed()
-            return mine, "Linked. You are %s, in the project %s.%s" % (mine, self.roster.project, self.rules_note())
+            return mine, "Linked. You are %s, in the project %s.%s%s" % (mine, self.roster.project,
+                                                                          SESSION_NAME_NOTE % mine, self.rules_note())
 
     def _remote_rows(self, name):
         """(device, roster row) for each other machine that lists this agent (cloud sync)."""
@@ -994,7 +996,8 @@ class Hub:
             raise HubError("no agent called %s" % name)
         return self.agents[name]
 
-    def rename(self, name, new):
+    def rename(self, name, new, tell=False):
+        """Rename an agent; with tell (the owner renamed it), the agent hears its new name."""
         check_name(new)
         with self.lock:
             self._local_agent(name, "rename")
@@ -1012,6 +1015,8 @@ class Hub:
                 if row.get("reclaimed") == name:
                     row["reclaimed"] = new
             self._event("%s is now %s" % (name, new))
+            if tell:
+                self._append(OWNER, new, "You are now %s.%s" % (new, SESSION_NAME_NOTE % new), "msg")
             self._save()
             self._changed()
 
@@ -1273,8 +1278,8 @@ class Hub:
             self.set_role(OWNER, name, spec["role"])
         if spec["task"]:
             self.assign(OWNER, name, spec["task"])
-        notes.insert(0, "You are %s, in the project %s, started from the crewchat by the owner."
-                     % (name, self.roster.project))
+        notes.insert(0, "You are %s, in the project %s, started from the crewchat by the owner.%s"
+                     % (name, self.roster.project, SESSION_NAME_NOTE % name))
         waiting = [x for x, on in (("your role's instructions", spec["role"]), ("your first task", spec["task"])) if on]
         if waiting:
             notes.append("%s %s in hub_inbox: read it now and start." % (" and ".join(waiting).capitalize(),
@@ -3452,7 +3457,7 @@ class Handler(BaseHTTPRequestHandler):
         """The owner on an agent's card: rename it, remove it, or set its listening."""
         op, name = data.get("op"), str(data.get("agent") or "")
         if op == "rename":
-            self.hub.rename(name, data.get("new"))
+            self.hub.rename(name, data.get("new"), tell=True)
         elif op == "remove":
             self.hub.remove(name)
         elif op == "listen":

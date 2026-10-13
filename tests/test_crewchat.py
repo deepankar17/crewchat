@@ -190,6 +190,17 @@ class Protocol(Base):
 class Identity(Base):
     """Agents are not configured anywhere: sessions name themselves as they arrive."""
 
+    def test_an_agent_is_asked_to_name_its_session(self):
+        session = Session(self.base, self.token)
+        key = self.hub.new_start()
+        linked = session.text("hub_link", key=key)
+        name = session.me
+        self.assertIn("If your app lets you name this session (the Claude app does), name it %s." % name, linked)
+        crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "rename", "agent": name, "new": "docs-writer"})
+        inbox = session.text("hub_inbox")
+        self.assertIn("You are now docs-writer.", inbox)
+        self.assertIn("name it docs-writer", inbox)
+
     def test_sessions_sharing_one_folder_get_their_own_names(self):
         place, token = self.join_place("studio")
         first, name1 = self.agent(token=token)
