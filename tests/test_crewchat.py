@@ -798,10 +798,15 @@ class Launching(Base):
         self.assertEqual(out, {"ok": True})
         folder, command, used, title = opened[0]
         self.assertEqual((folder, used, title), (str(self.folder), key, name))  # its own key: same name, no relink
-        self.assertEqual(command[-2:], ["--resume", "sess-0003-abc"])
+        self.assertEqual(command[-3:], ["--resume", "sess-0003-abc", crewchat.REOPEN_PROMPT])  # it gets to work
         self.assertIn("acceptEdits", command)  # the permissions it was started with
         self.assertIn("Owner reopened %s" % name, self.hub_history())
+        # Until the reopened session reports, a second click does not open a second copy.
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.reopened(agent=name)
+        self.assertIn("being reopened", json.loads(caught.exception.read())["error"])
         # An agent whose link was lost still comes back as itself: a new key tied to its name.
+        self.hub.agents[name]["session"].pop("reopening")
         self.hub.links = {k: v for k, v in self.hub.links.items() if v != name}
         _, opened = self.reopened(agent=name)
         self.assertEqual(self.hub.links[opened[0][2]], name)
@@ -843,9 +848,33 @@ class Launching(Base):
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(steps[0], "stop")
-        self.assertEqual(steps[1][-4:], ["--model", "sonnet", "--resume", "sess-0003-abc"])
+        self.assertEqual(steps[1][-5:], ["--model", "sonnet", "--resume", "sess-0003-abc", crewchat.REOPEN_PROMPT])
         self.assertEqual(self.hub.taken.get(task), name)  # still its task
         self.assertIn("Owner reopened %s on sonnet" % name, self.hub_history())
+
+    def test_switch_model_checks_it_can_reopen_before_it_stops(self):
+        name = self.closed_session()
+        self.hub.agents[name]["session"]["folder"] = "/no/longer/connected"
+        stopped = []
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
+                mock.patch.object(crewchat, "stop_process", lambda pid: stopped.append(pid) or True), \
+                mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["sonnet", "Sonnet"]]):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
+        self.assertIn("no longer connected", json.loads(caught.exception.read())["error"])
+        self.assertEqual(stopped, [])  # still running, as it was
+
+    def test_reopen_keeps_the_permissions_it_was_started_with(self):
+        crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
+                                                                     "name": "auto-one", "permissions": "auto"})
+        key = self.launched[-1][2]
+        Session(self.base, self.token).call("hub_link", key=key)  # the launched session checks in
+        self.assertEqual(self.hub.agents["auto-one"]["permissions"], "auto")
+        with self.hub.lock, mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: True):
+            self.hub._keep_session("auto-one", {"id": "sess-0012-abc", "pid": 999999, "started": "x",
+                                                "tool": "claude", "folder": str(self.folder)})
+        _, opened = self.reopened(agent="auto-one")
+        self.assertIn("auto", opened[0][1][opened[0][1].index("--permission-mode") + 1])
 
     def test_switch_model_refuses_a_model_the_tool_does_not_list(self):
         name = self.closed_session()
@@ -992,6 +1021,27 @@ class AgentCards(Base):
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
         self.assertIn("op is rename, remove, listen, stop, reopen or model", self.op(op="kick", agent=name)["error"])
+
+    def test_cards_never_wait_for_the_process_list(self):
+        _, name = self.agent()
+        self.hub.agents[name]["session"] = {"id": "sess-0011-abc", "pid": 999999, "started": "x", "app": "terminal",
+                                            "tool": "claude", "folder": "/tmp", "since": time.time()}
+        crewchat._PROCESSES[:] = [time.time(), {}]
+        with mock.patch.object(crewchat, "process_table", mock.Mock(side_effect=AssertionError("ps under the lock"))):
+            self.assertFalse(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
+        before = self.hub.version  # the server's refresher finds it running, and the page hears it
+        table = {999999: (1, "x", "/x/claude --resume sess-0011-abc")}
+        with mock.patch.object(crewchat, "process_table", lambda: table):
+            crewchat.refresh_sessions(mock.Mock(all=lambda: [mock.Mock(hub=self.hub)]))
+        self.assertGreater(self.hub.version, before)
+        self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
+
+    def test_windows_stop_is_forced(self):
+        calls = []
+        with mock.patch.object(crewchat.os, "name", "nt"), \
+                mock.patch.object(crewchat.subprocess, "run", lambda c, **kw: calls.append(c) or mock.Mock(returncode=0)):
+            crewchat.stop_process(4242)
+        self.assertEqual(calls[0], ["taskkill", "/PID", "4242", "/T", "/F"])
 
     def stand_in(self, name, app="terminal"):
         """A real process that looks like the agent's claude (it is sleep), recorded as its session."""
@@ -1428,6 +1478,9 @@ class Hooks(Base):
     def setUp(self):
         shutil.rmtree(self.state, ignore_errors=True)
         os.makedirs(self.state)
+        here = mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: True)  # its folder is this machine's
+        here.start()
+        self.addCleanup(here.stop)
 
     def test_a_tool_call_is_a_sign_of_life_at_most_once_a_minute(self):
         session, name = self.linked("busy-turn")
@@ -1450,15 +1503,48 @@ class Hooks(Base):
         self.assertEqual((kept["id"], kept["pid"], kept["started"], kept["app"], kept["tool"]),
                          ("sess-0001-abc", 4242, "x", "terminal", "claude"))
         self.assertEqual(Path(kept["folder"]).resolve(), self.folder.resolve())
-        self.hub.agents[name]["session"]["pid"] = 1  # a second hook does not report again
+        # Its recorded process is gone (4242 is not running here): the server asks once for a new report...
         self.hook("claude", "stop", {"session_id": "sess-0001-abc"},
                   env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 999, "started": "y", "app": "terminal"}'})
-        self.assertEqual(self.hub.agents[name]["session"]["pid"], 1)
+        self.assertEqual(self.hub.agents[name]["session"]["pid"], 999)
+        # ...and not on every turn after that (a process it cannot find would cost a lookup each time).
+        self.hook("claude", "stop", {"session_id": "sess-0001-abc"},
+                  env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 777, "started": "z", "app": "terminal"}'})
+        self.assertEqual(self.hub.agents[name]["session"]["pid"], 999)
         # An id that is not one is never kept: it would reach a command line on Reopen.
         bad, bad_name = self.linked("x; rm -rf /")
         self.hook("claude", "stop", {"session_id": "x; rm -rf /"},
                   env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 4243, "started": "x", "app": "terminal"}'})
         self.assertNotIn("session", self.hub.agents[bad_name])
+
+    def test_the_process_list_is_read_in_one_locale_and_time_zone(self):
+        seen = {}
+        def run(command, **kw):
+            seen.update(command=command, env=kw.get("env") or {})
+            return mock.Mock(stdout="", returncode=0)
+        with mock.patch.object(crewchat.os, "name", "posix"), mock.patch.object(crewchat.subprocess, "run", run):
+            crewchat.process_table()
+        self.assertEqual((seen["env"].get("LC_ALL"), seen["env"].get("TZ")), ("C", "UTC0"))  # hook and server agree
+        self.assertIn("-A", seen["command"])
+
+    def test_a_reopened_session_reports_its_new_process(self):
+        session, name = self.linked("sess-0009-abc")
+        env = lambda pid: {"CREWCHAT_TEST_PROCESS": '{"pid": %d, "started": "x", "app": "terminal"}' % pid}  # noqa: E731
+        self.hook("claude", "stop", {"session_id": "sess-0009-abc"}, env_extra=env(4242))
+        self.assertEqual(self.hub.agents[name]["session"]["pid"], 4242)
+        # Reopened (claude --resume keeps the id): the server asks for the report again, and gets the new process.
+        self.hub.agents[name]["session"]["reopening"] = time.time()
+        self.hook("claude", "prompt", {"session_id": "sess-0009-abc"}, env_extra=env(5555))
+        kept = self.hub.agents[name]["session"]
+        self.assertEqual(kept["pid"], 5555)
+        self.assertNotIn("reopening", kept)
+
+    def test_an_agent_from_another_machine_keeps_no_session_here(self):
+        session, name = self.linked("sess-0010-abc")
+        with mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: False):
+            self.hook("claude", "stop", {"session_id": "sess-0010-abc"},
+                      env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 4242, "started": "x", "app": "terminal"}'})
+        self.assertNotIn("session", self.hub.agents[name])
 
     def test_the_hook_finds_its_agent_among_its_ancestors(self):
         app = "/Applications/Claude.app/Contents/MacOS/Claude"
@@ -1471,6 +1557,14 @@ class Hooks(Base):
             self.assertEqual(crewchat.agent_process("claude", table),
                              {"pid": 9, "started": "Tue Oct 13 22:39:29 2026", "app": "claude-app"})
             self.assertIsNone(crewchat.agent_process("cursor", table))  # no cursor-agent above it
+            # Windows: a quoted program path, or Claude Code installed with npm (node runs its cli.js).
+            win = {10: (9, "a", "cmd /c hook"), 9: (1, "b", '"C:\\Users\\x\\.local\\bin\\claude.exe" --resume s')}
+            self.assertEqual(crewchat.agent_process("claude", win)["pid"], 9)
+            npm = {10: (9, "a", "cmd /c hook"),
+                   9: (1, "b", '"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\x\\npm\\node_modules\\'
+                               '@anthropic-ai\\claude-code\\cli.js')}
+            self.assertEqual(crewchat.agent_process("claude", npm)["pid"], 9)
+            self.assertFalse(crewchat.SESSION_RE.fullmatch("abcdefgh\n"))
             cursor = {10: (9, "a", "sh -c hook"), 9: (1, "b", "/Users/x/.local/bin/cursor-agent --trust")}
             self.assertEqual(crewchat.agent_process("cursor", cursor), {"pid": 9, "started": "b", "app": "terminal"})
 

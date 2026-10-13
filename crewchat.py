@@ -664,6 +664,8 @@ class Hub:
                 }
                 if isinstance(row.get("session"), dict):
                     self.agents[str(name)]["session"] = row["session"]
+                if row.get("permissions") in ("ask", "edits", "auto", "all"):
+                    self.agents[str(name)]["permissions"] = row["permissions"]
         for sid, row in data.get("sessions", {}).items():
             if isinstance(row, dict) and (row.get("agent") is None or row.get("agent") in self.agents):
                 self.sessions[str(sid)] = {
@@ -1097,6 +1099,15 @@ class Hub:
                 })
         return rows
 
+    def check_sessions(self):
+        """After the server read the process list: if an agent's session started or ended since the
+        last look, the chat page hears it."""
+        with self.lock:
+            running = {n: process_running(a["session"], _PROCESSES[1]) for n, a in self.agents.items() if a.get("session")}
+            if running != getattr(self, "_running", {}):
+                self._running = running
+                self._changed()
+
     def _session_state(self, agent):
         """What a card shows about a local agent's session: where it runs, and whether it still does."""
         session = agent.get("session")
@@ -1203,7 +1214,7 @@ class Hub:
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
-    def new_start(self, name="", role="", task=""):
+    def new_start(self, name="", role="", task="", permissions="ask"):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role and first task."""
         name, role, task = (str(x or "").strip() for x in (name, role, task))
@@ -1219,7 +1230,8 @@ class Hub:
             now = time.time()
             self.starts = {k: v for k, v in self.starts.items() if v["expires"] > now}
             key = "start-" + secrets.token_hex(8)
-            self.starts[key] = {"name": name, "role": role, "task": task, "expires": now + START_TTL}
+            self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
+                                "expires": now + START_TTL}
             return key
 
     def launch(self, tool, folder, name="", role="", task="", permissions="ask"):
@@ -1232,7 +1244,7 @@ class Hub:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task)
+        key = self.new_start(name, role, task, permissions)
         try:
             launch_agent(tool, folder, key, permissions, self.home)
         except (HubError, OSError) as e:
@@ -1275,6 +1287,10 @@ class Hub:
                 name = spec["name"]
             except HubError as e:
                 notes.append("You could not be named %s (%s)." % (spec["name"], e))
+        with self.lock:  # what it may do without asking: Reopen starts it the same way
+            if name in self.agents:
+                self.agents[name]["permissions"] = spec.get("permissions") or "ask"
+                self._save()
         if spec["role"]:
             self.set_role(OWNER, name, spec["role"])
         if spec["task"]:
@@ -1928,6 +1944,7 @@ class Hub:
             }
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None):
+        table = recent_process_table() if event != "tool" else {}  # read before the lock: never ps under it
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life)."""
@@ -1940,6 +1957,8 @@ class Hub:
                 return {"link": True}
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
+                if session:  # the report it was asked for (wants_session)
+                    self._keep_session(name, session)
                 return {}
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
@@ -1956,6 +1975,7 @@ class Hub:
                 self.activity[name] = ("working", now)
             if session:
                 self._keep_session(name, session)
+            want = not session and self._wants_session(name, table)
             listen = self._listen_override(name) if event == "stop" else None
             if listen == 0:  # the owner turned its listening off on the chat page: answer at once
                 wait_seconds = 0
@@ -1988,6 +2008,8 @@ class Hub:
                "owner": any(m["from"] == OWNER for m in unread)}
         if listen is not None:
             out["listen"] = listen  # the hook waits this long in all, whatever its folder says
+        if want:
+            out["session"] = "want"  # report the session again: it was reopened, or its process is gone
         return out
 
     def _free_tasks(self, name, why):
@@ -2014,7 +2036,8 @@ class Hub:
             raise HubError("%s is not running" % name)
         if not stop_process(session["pid"]):
             raise HubError("could not stop %s" % name)
-        _PROCESSES[0] = 0.0  # the cards see it gone on their next look
+        wait_until_stopped(session)
+        _PROCESSES[:] = [time.time(), process_table()]  # the card shows it closed at once
         with self.lock:
             if name in self.agents and self.agents[name].get("session"):
                 self.agents[name]["session"]["stopped"] = time.time()
@@ -2023,13 +2046,13 @@ class Hub:
             self._save()
             self._changed()
 
-    def reopen_agent(self, name, model=None):
-        """The owner reopens an agent's own conversation in a terminal window on this machine: same
-        memory, same name (its hooks get its own link key), same permissions."""
+    def _reopen_plan(self, name, model=None):
+        """What reopening an agent takes, all checked before anything is stopped: (its session,
+        its folder, the command). HubError if it cannot be reopened."""
         with self.lock:
             session = dict(self._session_of(name, "reopen"))
-        if process_running(session):
-            raise HubError("%s is still running: stop it first" % name)
+        if time.time() - float(session.get("reopening") or 0) < REOPEN_WAIT:
+            raise HubError("%s is being reopened: its window should be open on this machine" % name)
         folder, tool = session.get("folder", ""), session.get("tool", "claude")
         if tool not in REOPEN_TOOLS:
             raise HubError("%s cannot reopen a conversation from the chat page yet: open it again in %s"
@@ -2038,7 +2061,15 @@ class Hub:
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
         permissions = session.get("permissions") if session.get("permissions") in LAUNCH_PERMISSIONS[tool] else "ask"
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        command = resume_command(exe, tool, session["id"], permissions, base, model)
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
+
+    def reopen_agent(self, name, model=None, plan=None):
+        """The owner reopens an agent's own conversation in a terminal window on this machine: same
+        memory, same name (its hooks get its own link key), same permissions. It is told to carry
+        on, so its hooks report the new process and read the chat."""
+        session, folder, command = plan or self._reopen_plan(name, model)
+        if plan is None and process_running(session):
+            raise HubError("%s is still running: stop it first" % name)
         with self.lock:
             key = next((k for k, v in self.links.items() if v == name), None)
             if key is None:  # its link was lost: a new one, tied to the same name
@@ -2047,14 +2078,18 @@ class Hub:
                 self._save()
         open_terminal(folder, command, key, title=name, root=self.home)
         with self.lock:
+            if (self.agents.get(name) or {}).get("session"):
+                self.agents[name]["session"]["reopening"] = time.time()  # until its hooks report the new process
             self._event("Owner reopened %s%s%s" % (
                 name, " on %s" % model if model else "",
                 " in a Terminal window (it was in the Claude app)" if session.get("app") == "claude-app" else ""))
+            self._save()
             self._changed()
 
     def switch_model(self, name, model):
         """The owner switches an agent to another model: its session is stopped (its tasks stay
-        its own) and reopened on that model, same conversation."""
+        its own) and reopened on that model, same conversation. Everything reopening needs is
+        checked first, so a failure never leaves it stopped."""
         with self.lock:
             session = dict(self._session_of(name, "switch"))
         tool = session.get("tool", "claude")
@@ -2063,21 +2098,34 @@ class Hub:
         exe = find_tool(tool, load_config(self.home))
         if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, exe or "")]:
             raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
-        if process_running(session):
-            if not stop_process(session["pid"]):
+        plan = self._reopen_plan(name, model)
+        if process_running(plan[0]):
+            if not stop_process(plan[0]["pid"]):
                 raise HubError("could not stop %s" % name)
-            for _ in range(40):  # up to 10 s for it to end
-                if not process_running(session):
-                    break
-                time.sleep(0.25)
-            else:
+            if not wait_until_stopped(plan[0]):
                 raise HubError("%s did not stop; try again" % name)
-            _PROCESSES[0] = 0.0
-        self.reopen_agent(name, model)
+            _PROCESSES[:] = [time.time(), process_table()]
+        self.reopen_agent(name, model, plan)
+
+    def _wants_session(self, name, table):
+        """Should this agent's hook report its session again? After a Reopen (the same session id,
+        a new process), or when the recorded process is gone, but then at most every 10 minutes:
+        a session whose process cannot be found is not asked on every turn. Caller holds the lock."""
+        agent = self.agents.get(name) or {}
+        recorded = agent.get("session") or {}
+        if recorded.get("reopening"):
+            return True
+        asked = getattr(self, "_asked", {})
+        if time.time() - asked.get(name, 0) < 600 or (recorded and process_running(recorded, table)):
+            return False
+        asked[name] = time.time()
+        self._asked = asked
+        return True
 
     def _keep_session(self, name, session):
-        """Which session and process an agent is, as its hook reported it (once per session).
-        Caller holds the lock."""
+        """Which session and process an agent is, as its hook reported it (once per session, and
+        again when the server asks: after a Reopen). Only for an agent in a folder of this machine:
+        a process number means nothing elsewhere. Caller holds the lock."""
         try:
             kept = {"id": str(session["id"]), "pid": int(session["pid"]), "started": str(session["started"])[:64],
                     "app": "claude-app" if session.get("app") == "claude-app" else "terminal",
@@ -2085,12 +2133,11 @@ class Hub:
                     "folder": str(session.get("folder") or "")[:1024], "since": time.time()}
         except (KeyError, TypeError, ValueError):
             return
-        if SESSION_RE.match(kept["id"]) and kept["pid"] > 1:
+        if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.on_this_machine(name):
             old = self.agents[name].get("session") or {}
             kept["permissions"] = old.get("permissions", "ask") if old.get("id") == kept["id"] else (
                 self.agents[name].get("permissions", "ask"))
             self.agents[name]["session"] = kept
-            _PROCESSES[0] = 0.0  # a new process: the cards look again
             self._save()
 
     def _listen_override(self, name):
@@ -4088,6 +4135,9 @@ def agent_tool(tool, folder, permissions, root=None):
     return exe, base
 
 
+REOPEN_WAIT = 120  # seconds a reopened session has to report before Reopen may be clicked again
+REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_inbox, then carry on with "
+                 "your task.")
 REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
@@ -4109,7 +4159,7 @@ def tool_models(tool, exe):
         models = []
         for line in out.splitlines():
             model, sep, label = line.strip().partition(" - ")
-            if sep and MODEL_RE.match(model):
+            if sep and MODEL_RE.fullmatch(model):
                 models.append([model, label.strip()])
         _MODELS[exe] = (time.time(), models)
     return models
@@ -4117,10 +4167,10 @@ def tool_models(tool, exe):
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
-    if not SESSION_RE.match(str(session)):
+    if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
     options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-    return [exe] + options + (["--model", model] if model else []) + ["--resume", session]
+    return [exe] + options + (["--model", model] if model else []) + ["--resume", session, REOPEN_PROMPT]
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None):
@@ -4374,6 +4424,7 @@ def cmd_serve(args):
         threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -4995,7 +5046,7 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session=None):
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session=None, again=None):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
@@ -5004,7 +5055,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session
     wait_total seconds. `ack` first confirms the messages a previous hook call delivered. `chain`
     is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
     answers "capped", and only a message from the owner ends the wait. `session`, if given, tells
-    the server which session and process the agent is (session_report), with the first call.
+    the server which session and process the agent is (session_report), with the first call;
+    `again` makes that report when the server asks for it (after a Reopen).
     """
     begun = time.time()
     deadline = begun + wait_total
@@ -5018,6 +5070,10 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session
                 body["session"] = session
             out = post_json(base + "/api/hook", token, body, timeout=MAX_WAIT + 30)
             session = None
+            if out.get("session") == "want" and again:
+                report, again = again(), None
+                if report:  # a quick call of its own, so a long wait above is not held up
+                    post_json(base + "/api/hook", token, {"key": key, "event": "tool", "session": report}, timeout=10)
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -5066,8 +5122,9 @@ def claim_launch_key(folder, key, session):
 
 
 SESSION_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")  # a session id that may reach a command line (Reopen)
-AGENT_COMMAND = {"claude": re.compile(r"(^|[/\\])claude(\.exe)?(\s|$)"),
-                 "cursor": re.compile(r"(^|[/\\])(cursor-agent|agent)(\.exe)?(\s|$)")}
+AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a quoted path, or npm's node + cli.js)
+    "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
+    "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)')}
 
 
 def process_table():
@@ -5081,8 +5138,10 @@ def process_table():
             rows = json.loads(out or "[]")
             return {int(r["ProcessId"]): (int(r["ParentProcessId"] or 0), str(r.get("Started") or ""),
                                           str(r.get("CommandLine") or "")) for r in (rows if isinstance(rows, list) else [rows])}
-        out = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
-                             timeout=10).stdout
+        # One locale and time zone, so the hook (the agent's environment) and the server (a login
+        # service) write a process's start time the same way.
+        out = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
+                             timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC0")).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
     table = {}
@@ -5093,14 +5152,35 @@ def process_table():
     return table
 
 
-_PROCESSES = [0.0, {}]  # when, process_table(): the chat page's cards ask often
+_PROCESSES = [0.0, {}]  # when, process_table(): kept fresh by the server's refresh_sessions
+SESSIONS_EVERY = 5  # seconds between the server's looks at its agents' processes
 
 
-def recent_process_table(max_age=5):
-    """process_table(), at most max_age seconds old (the cards' "running" on every page poll)."""
-    if time.time() - _PROCESSES[0] > max_age:
+def recent_process_table():
+    """The process list as the server last read it. The server refreshes it every SESSIONS_EVERY
+    seconds in its own thread, so a card never waits for `ps`; only without that thread (a test, a
+    command) is it read here."""
+    if time.time() - _PROCESSES[0] > 3 * SESSIONS_EVERY:
         _PROCESSES[:] = [time.time(), process_table()]
     return _PROCESSES[1]
+
+
+def refresh_sessions(projects):
+    """Read the process list once (outside every hub's lock), and tell each project's page when an
+    agent's session started or ended."""
+    _PROCESSES[:] = [time.time(), process_table()]
+    for project in projects.all():
+        project.hub.check_sessions()
+
+
+def session_checks(projects):
+    """The server's look at its agents' processes, every SESSIONS_EVERY seconds."""
+    while True:
+        try:
+            refresh_sessions(projects)
+        except Exception as e:  # one bad look must not stop the next
+            sys.stderr.write("%s could not check agents' sessions: %s\n" % (now_iso(), e))
+        time.sleep(SESSIONS_EVERY)
 
 
 def agent_process(client, table=None):
@@ -5134,11 +5214,20 @@ def process_running(session, table=None):
     return bool(row and row[1] == started and AGENT_COMMAND.get(tool, AGENT_COMMAND["claude"]).search(row[2]))
 
 
+def wait_until_stopped(session, seconds=10):
+    """Wait (outside any lock) for an agent's process to end after stop_process. Returns whether it did."""
+    for _ in range(int(seconds * 4)):
+        if not process_running(session):
+            return True
+        time.sleep(0.25)
+    return False
+
+
 def stop_process(pid):
     """Ask a process (and on Windows its children) to end. Returns whether the signal was sent."""
     try:
         if os.name == "nt":
-            return subprocess.run(["taskkill", "/PID", str(pid), "/T"], capture_output=True, timeout=30).returncode == 0
+            return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30).returncode == 0
         os.kill(pid, signal.SIGTERM)
         return True
     except (OSError, subprocess.SubprocessError):
@@ -5147,7 +5236,7 @@ def stop_process(pid):
 
 def session_report(client, session, project):
     """What the server keeps about this agent's session, so the chat page can stop or reopen it."""
-    if not SESSION_RE.match(session):
+    if not SESSION_RE.fullmatch(session):
         return None
     found = agent_process(client)
     return dict(found, id=session, tool=client, folder=str(project)) if found else None
@@ -5198,7 +5287,7 @@ def run_hook(client, event):
                                           "reported": state.get("reported", "")}))
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
-    report = session_report(client, session, project) if state.get("reported") != session else None
+    report = session_report(client, session, project) if state.get("reported") != session and event != "tool" else None
 
     if event == "tool":
         # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
@@ -5212,7 +5301,8 @@ def run_hook(client, event):
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", session=report)
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", session=report,
+                                            again=lambda: session_report(client, session, project))
         if kind == "ok" and report:
             state["reported"] = session
         if kind != "ok":
@@ -5237,7 +5327,8 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
-                                                      pending, chain=chain, session=report)
+                                                      pending, chain=chain, session=report,
+                                                      again=lambda: session_report(client, session, project))
     if kind == "ok" and report:
         state["reported"] = session
     if kind != "ok":
