@@ -570,6 +570,9 @@ class Files(Base):
         folder = Path(tempfile.mkdtemp(dir=TMP))
         crewchat.remember(folder, self.place)  # the agent's folder is on this machine
         inside = [crewchat.token_path("Owner"), crewchat.home() / "config.json"]
+        upper = Path(str(crewchat.home()).upper()) / "config.json"
+        if upper.exists():  # a case-insensitive disk (macOS, Windows): the same folder by another name
+            inside.append(upper)
         link = folder / "notes.txt"
         try:
             link.symlink_to(crewchat.token_path("Owner"))  # a harmless-looking name for the owner's token
@@ -584,6 +587,16 @@ class Files(Base):
         copy.write_text("old token: %s\n" % crewchat.read_token("Owner"))
         for path in (config, copy):
             self.assertIn("contains a crewchat token", session.text("hub_send", to=name, text="x", files=[str(path)]))
+        shot = folder / "shots" / "2026-10-13.png"
+        shot.parent.mkdir()
+        shot.write_bytes(PNG)
+        latest = folder / "latest.png"
+        try:
+            latest.symlink_to(shot)
+        except OSError:
+            latest = shot
+        self.assertIn("with 1 file", session.text("hub_send", to="all", text="x", files=[str(latest)]))
+        self.assertEqual(self.hub.history(1)[0]["files"][0]["name"], latest.name)  # the name the agent gave
 
     def test_the_page_shows_images_and_offers_everything_else_as_a_download(self):
         png = self.upload("shot.png", PNG, "image/png")

@@ -2495,26 +2495,46 @@ def stored_tokens(roots):
     return found
 
 
+def inside_any(path, folders):
+    """Is path one of these folders or inside one? By file identity, so case and aliases do not matter."""
+    marks = []
+    for folder in folders:
+        try:
+            marks.append(os.stat(folder))
+        except OSError:
+            pass
+    for part in (path, *path.parents):
+        try:
+            here = os.stat(part)
+        except OSError:
+            continue
+        if any(os.path.samestat(here, mark) for mark in marks):
+            return True
+    return False
+
+
 def share_file(hub, path):
     """An agent shares a file from this machine (hub_send files)."""
     if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
         raise HubError("files must be absolute paths on this machine")
     # An agent can be talked into sharing crewchat's keys, which agents on linked machines could then
     # open: nothing from crewchat's own folders, and nothing that holds one of its tokens (.mcp.json).
-    # Resolved once and read from there, so a symlink cannot point elsewhere after the check.
+    # Resolved once and read from there, so a symlink cannot point elsewhere after the check. Folders
+    # are compared by identity, not by name: a path in another case (macOS, Windows) is the same folder.
+    name = Path(path).name
     path = Path(path).expanduser().resolve()
     homes = {home().resolve(), hub.roster.root.resolve()}
-    if any(path == h or h in path.parents for h in homes):
-        raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % path.name)
+    if inside_any(path, homes):
+        raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % name)
     try:
         if path.stat().st_size > MAX_UPLOAD:
-            raise HubError("%s is too big: %s at most" % (path.name, human_size(MAX_UPLOAD)))
+            raise HubError("%s is too big: %s at most" % (name, human_size(MAX_UPLOAD)))
         data = path.read_bytes()
     except OSError as e:
         raise HubError("cannot read %s (%s)" % (path, e.strerror or e))
     if any(token in data for token in stored_tokens(homes)):
-        raise HubError("%s contains a crewchat token, so it cannot be shared" % path.name)
-    return hub.add_file(path.name, data)
+        raise HubError("%s contains a crewchat token, so it cannot be shared" % name)
+    return hub.add_file(name, data)
 
 
 def open_shared_file(hub, fid):
