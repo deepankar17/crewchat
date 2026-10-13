@@ -99,6 +99,8 @@ RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
 ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
 SERVICE_LABEL = "io.crewchat.hub"
 MAX_CHAIN_LIMIT = 50
+SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
+SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
 EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed")  # optional message fields, kept when messages travel between machines
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -1285,22 +1287,12 @@ class Hub:
         return local or next((row["agent"] for dev in self.remote.values() for row in dev["agents"]
                               if row.get("role") == "lead" and row["agent"] not in self.agents), None)
 
-    def on_this_machine(self, agent):
-        """Is the agent in a folder on this machine (connected with `crewchat start`, or joined
-        here), rather than one connected from another machine?"""
-        with self.lock:
-            place = (self.agents.get(agent) or {}).get("place")
-        config = self.machine_config()
-        return place is not None and any(p == place and folder_chat(config, path) == self.chat_key
-                                         for path, p in (config.get("folders") or {}).items())
-
     def agent_folders(self, agent):
-        """The project folders on this machine that an agent works in (its place's folders)."""
+        """The folders on this machine that an agent works in (its place's), or [] for an agent
+        connected from another machine."""
         with self.lock:
             place = (self.agents.get(agent) or {}).get("place")
-        config = self.machine_config()
-        return [Path(path) for path, p in sorted((config.get("folders") or {}).items())
-                if place is not None and p == place and folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
+        return self.project_folders(place) if place is not None else []
 
     def machine_config(self):
         """This machine's settings (its folders, tools, port), wherever this project is kept."""
@@ -1544,11 +1536,11 @@ class Hub:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
                     for m in self.messages[-limit:]]
 
-    def project_folders(self):
-        """This project's connected folders on this machine."""
+    def project_folders(self, place=None):
+        """This project's connected folders on this machine (only one place's, with place)."""
         config = self.machine_config()
-        return [Path(path) for path, place in sorted((config.get("folders") or {}).items())
-                if folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
+        return [Path(path) for path, p in sorted((config.get("folders") or {}).items())
+                if (place is None or p == place) and folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
 
     def refresh_guides(self):
         """Rewrite the guide and skills in every folder of the project on this machine."""
@@ -2414,11 +2406,12 @@ def call_tool(hub, sid, name, args, owner=False):
     hub.touch(me, active=True)
     if name == "hub_send":
         to = args.get("to")
-        if args.get("files") and not owner and not hub.on_this_machine(me):
+        folders = None if owner else hub.agent_folders(me)  # None: the owner, who may share any file
+        if args.get("files") and folders == []:
             # The paths would be read here, on the host, not where the agent is.
             raise HubError("files can only be shared from folders on the chat's own machine; this folder is "
                            "connected from another machine. Put the text in the message instead.")
-        files = [share_file(hub, path, None if owner else me) for path in args.get("files") or []]
+        files = [share_file(hub, path, folders) for path in args.get("files") or []]
         msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
     if name == "hub_file":
@@ -2540,7 +2533,7 @@ def inside_any(path, folders):
     marks = []
     for folder in folders:
         try:
-            marks.append(os.stat(folder))
+            marks.append((os.path.normcase(str(Path(folder).resolve())), os.stat(folder)))
         except OSError:
             pass
     for part in (path, *path.parents):
@@ -2548,14 +2541,18 @@ def inside_any(path, folders):
             here = os.stat(part)
         except OSError:
             continue
-        if any(os.path.samestat(here, mark) for mark in marks):
-            return True
+        for name, mark in marks:
+            if here.st_ino and mark.st_ino:  # file ids: the same folder whatever its name
+                if os.path.samestat(here, mark):
+                    return True
+            elif os.path.normcase(str(part)) == name:  # some network drives on Windows report none
+                return True
     return False
 
 
-def share_file(hub, path, agent=None):
-    """An agent shares a file from this machine (hub_send files): only from its own project folder.
-    agent is None for the owner, who may share any file."""
+def share_file(hub, path, folders):
+    """Share a file from this machine (hub_send files). folders: the agent's own folders, the only
+    ones it may share from; None for the owner, who may share any file."""
     if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
         raise HubError("files must be absolute paths on this machine")
     # An agent can be talked into sharing crewchat's keys, which agents on linked machines could then
@@ -2569,7 +2566,9 @@ def share_file(hub, path, agent=None):
         raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % name)
     # Nothing from elsewhere on the machine either (~/.ssh, ~/.aws, another project's .env): what an
     # agent shares must be in its project, where copying it in is the agent's own visible step.
-    folders = hub.agent_folders(agent) if agent is not None else None
+    secret = [Path.home() / d for d in SECRET_DIRS]
+    if folders is not None and (inside_any(path, secret) or path.name in SECRET_FILES):
+        raise HubError("%s holds credentials (keys, cloud logins), so an agent cannot share it" % name)
     if folders is not None and not inside_any(path, folders):
         raise HubError("%s is outside your project folder (%s), so it cannot be shared. Copy it into the project "
                        "first if the owner should see it." % (name, ", ".join(str(f) for f in folders) or "none here"))
@@ -3396,6 +3395,7 @@ class Handler(BaseHTTPRequestHandler):
                 if place not in list_places(self.roster.root):
                     raise HubError("no place called %s" % place)
                 token_path(place, self.roster.root).unlink()
+                forget_folders(place, self.hub.chat_key, getattr(self.hub, "machine_root", None))
                 self.roster.refresh()
                 self.hub.remove_place(place)
             else:
@@ -3849,6 +3849,19 @@ def remember(project, place, root=None, chat=""):
     if (folders, chats, tools) != (config.get("folders"), config.get("folder_chats") or {}, config.get("tools") or {}):
         config["folders"], config["folder_chats"], config["tools"] = folders, chats, tools
         save_config(config, root)
+
+
+def forget_folders(place, chat="", root=None):
+    """A removed place's folders are no longer connected. Its name can be given out again, and must
+    not bring the old folders with it (agents share files only from their own place's folders)."""
+    config = load_config(root)
+    folders = config.get("folders") or {}
+    gone = [path for path, p in folders.items() if p == place and folder_chat(config, path) == chat]
+    if gone:
+        config["folders"] = {path: p for path, p in folders.items() if path not in gone}
+        config["folder_chats"] = {path: c for path, c in (config.get("folder_chats") or {}).items() if path not in gone}
+        save_config(config, root)
+    return gone
 
 
 def folder_chat(config, path):
