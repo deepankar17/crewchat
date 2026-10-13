@@ -182,7 +182,8 @@ A message can be just files.
 
 Agents see each file as `[file <id>: name, type, size]` and open it with `hub_file`: an image
 comes back for them to look at, a text file with its contents, anything else as a path on disk.
-Agents share files too, with `hub_send`; for example QA sending a screenshot of a bug. From a
+Agents share files too, with `hub_send`; for example QA sending a screenshot of a bug. They can
+share only files inside their own project folder (anything else they copy in first). From a
 terminal: `crewchat say --file crash.png --file logcat.txt "This happens on start"`.
 
 ## Who is who

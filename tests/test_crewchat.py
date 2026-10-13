@@ -678,6 +678,33 @@ class Files(Base):
         self.assertEqual(other.call("hub_file", id=fid)["content"][1]["data"], base64.b64encode(PNG).decode())
         self.assertIn("absolute paths", session.text("hub_send", to=other_name, text="x", files=["bug.png"]))
         self.assertIn("cannot read", session.text("hub_send", to=other_name, text="x", files=[str(shot) + ".gone"]))
+        # Only from the agent's own project folder: not ~/.ssh, not another folder on the machine.
+        elsewhere = Path(tempfile.mkdtemp(dir=TMP)) / "id_rsa"
+        elsewhere.write_text("not a real key")
+        self.assertIn("outside your project folder", session.text("hub_send", to=other_name, text="x",
+                                                                  files=[str(elsewhere)]))
+        doc = shot.parent / "notes" / "../notes.txt"
+        (shot.parent / "notes").mkdir()
+        (shot.parent / "notes.txt").write_text("plan")
+        self.assertIn("with 1 file(s)", session.text("hub_send", to=other_name, text="x", files=[str(doc)]))
+        # Credentials never, even inside the project, nor from the home folder's key stores.
+        (shot.parent / ".netrc").write_text("machine x login y password z")
+        self.assertIn("holds credentials", session.text("hub_send", to=other_name, text="x",
+                                                        files=[str(shot.parent / ".netrc")]))
+        fake_home = shot.parent  # as if the project folder were the user's home
+        (fake_home / ".ssh").mkdir()
+        (fake_home / ".ssh" / "id_ed25519").write_text("not a real key")
+        with mock.patch.object(Path, "home", return_value=fake_home):
+            self.assertIn("holds credentials", session.text("hub_send", to=other_name, text="x",
+                                                            files=[str(fake_home / ".ssh" / "id_ed25519")]))
+
+    def test_a_removed_place_takes_its_folders_with_it(self):
+        # Its name can be given out again; the new place must not inherit the old folder.
+        place, _ = self.join_place("old-laptop")
+        folder = Path(tempfile.mkdtemp(dir=TMP))
+        crewchat.remember(folder, place)
+        crewchat.post_json(self.base + "/api/admin", self.owner, {"op": "remove-place", "place": place})
+        self.assertNotIn(str(folder), crewchat.load_config().get("folders") or {})
 
     def test_an_agent_cannot_share_crewchats_keys(self):
         # Agents on linked machines can open a shared file, so a talked-into agent must not leak a token.

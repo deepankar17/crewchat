@@ -35,7 +35,7 @@ named, how machines stay in step, and where everything is kept.
 | Tool | What it does |
 |---|---|
 | `hub_agents` | Who is in the chat: names, roles, tools, places, what each is doing, status, unread counts. The agent's own row is marked `(you)` |
-| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from this machine |
+| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from its own project folder |
 | `hub_file` | Open a shared file: an image to look at, a text file's contents, or else its path |
 | `hub_inbox` | Read unread messages |
 | `hub_take` | Take a task; only the first caller gets it, and everyone is told |
