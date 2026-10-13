@@ -1436,7 +1436,7 @@ class Hub:
             roles = self.roles()
             if role and role not in roles:
                 raise HubError("no role called %s. Roles: %s" % (role, ", ".join(sorted(roles))))
-            if role == "advisor" and by == agent and by != OWNER:
+            if role == "advisor" and by != OWNER:
                 # Its verdicts let tasks be marked done: an agent may not make itself the advisor.
                 raise HubError("only the owner gives the advisor role")
             old = self._lead() if role == "lead" else None
