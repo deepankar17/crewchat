@@ -6483,6 +6483,7 @@ body.switching main { opacity: 0.45; pointer-events: none; transition: opacity 0
 .agent .badge.lead { color: var(--accent); }
 .agent .rolepick { margin-top: 6px; font-size: 12px; padding: 2px 6px; max-width: 100%; }
 #l-perms-note { margin: 4px 0 0; font-size: 12px; } #l-perms-note.warn { color: var(--err); }
+.agent .session { font-size: 12px; color: var(--muted); margin-top: 2px; } .agent .session.off { color: var(--warn); }
 .agent .acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
 .agent .acts button, .agent .acts select { font-size: 12px; padding: 2px 6px; }
 .sys b { font-weight: 650; }
@@ -7118,6 +7119,7 @@ function agentActions(a) {
                 "still open, it joins again the next time it uses crewchat."))
       agentOp({ op: "remove", agent: a.agent }, "Not removed", b);
   });
+  sessionControls(a, acts, agentOp);
   const listen = el("select");
   listen.setAttribute("aria-label", "Listening for " + a.agent);
   listen.title = remote || "Wait for messages after each turn (On), check once (Off), or as its folder says";
@@ -7129,6 +7131,56 @@ function agentActions(a) {
                                                    "Listening not changed", listen));
   acts.append(listen);
   return acts;
+}
+
+// Its session: Stop while it runs, Reopen (the same conversation) when it does not, Switch model.
+let toolModels = null;  // tool -> [[id, label], ...], from /api/launch, fetched once
+async function loadModels() {
+  if (toolModels) return;
+  toolModels = {};
+  try {
+    const res = await fetch(api("/api/launch"), { cache: "no-store" });
+    for (const t of (await res.json()).tools || []) toolModels[t.id] = t.models || [];
+    renderAgents();
+  } catch (err) { toolModels = null; }
+}
+
+function sessionLine(a) {
+  const s = a.session;
+  if (!s) return "";
+  if (s.running) return s.app === "claude-app" ? "Running in the Claude app" : "Running in Terminal";
+  return "Session closed " + ago(s.since, state.now);
+}
+
+function sessionControls(a, acts, agentOp) {
+  const s = a.session;
+  if (!s || a.remote) return;
+  if (s.running) {
+    actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {
+      if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
+        agentOp({ op: "stop", agent: a.agent }, "Not stopped", b);
+    });
+  } else {
+    actButton(acts, "Reopen", "Reopen " + a.agent + "'s conversation", (b) => {
+      const where = s.app === "claude-app"
+        ? "It reopens in a Terminal window. If it is still open in the Claude app, close it there first."
+        : "It reopens in a Terminal window on this machine, with its memory and name.";
+      if (confirm("Reopen " + a.agent + "? " + where)) agentOp({ op: "reopen", agent: a.agent }, "Not reopened", b);
+    });
+  }
+  loadModels();
+  const models = (toolModels || {})[s.tool] || [];
+  if (!models.length) return;
+  const pick = el("select");
+  pick.setAttribute("aria-label", "Switch " + a.agent + "'s model");
+  pick.append(new Option("Switch model…", ""), ...models.map(([id, label]) => new Option(label, id)));
+  pick.addEventListener("change", () => {
+    const model = pick.value;
+    pick.value = "";
+    if (model && confirm("Switch " + a.agent + " to " + model + "? Its session restarts on that model, same conversation."))
+      agentOp({ op: "model", agent: a.agent, model }, "Model not switched", pick);
+  });
+  acts.append(pick);
 }
 
 function setRole(agent, role, pick) {
@@ -7154,7 +7206,9 @@ function renderAgents() {
     card.append(top, where, el("div", "status", a.status || "No status set"));
     const doing = {working: "Working", listening: "Waiting for messages: answers right away",
                    idle: "Idle: sees messages when its user next types"}[a.activity];
-    if (doing && age < 900) card.append(el("div", "activity " + a.activity, doing));
+    const closed = a.session && !a.session.running;  // what its hooks last said no longer holds
+    if (doing && age < 900 && !closed) card.append(el("div", "activity " + a.activity, doing));
+    if (a.session) card.append(el("div", "session " + (a.session.running ? "on" : "off"), sessionLine(a)));
     const pick = el("select", "rolepick");
     pick.setAttribute("aria-label", "Role for " + a.agent);
     pick.append(new Option("No role", "none"), ...state.roles.map((r) => new Option("Role: " + r.title, r.name)));
