@@ -564,6 +564,19 @@ class Files(Base):
         self.assertIn("absolute paths", session.text("hub_send", to=other_name, text="x", files=["bug.png"]))
         self.assertIn("cannot read", session.text("hub_send", to=other_name, text="x", files=[str(shot) + ".gone"]))
 
+    def test_an_agent_cannot_share_crewchats_keys(self):
+        # Agents on linked machines can open a shared file, so a talked-into agent must not leak a token.
+        session, name = self.agent()
+        folder = Path(tempfile.mkdtemp(dir=TMP))
+        crewchat.remember(folder, self.place)  # the agent's folder is on this machine
+        owner_token = crewchat.token_path("Owner")
+        self.assertIn("crewchat's own folder", session.text("hub_send", to=name, text="x", files=[str(owner_token)]))
+        self.assertIn("crewchat's own folder", session.text("hub_send", to=name, text="x",
+                                                            files=[str(crewchat.home() / "config.json")]))
+        config = folder / ".mcp.json"
+        config.write_text(json.dumps({"headers": {"Authorization": "Bearer " + self.token}}))
+        self.assertIn("contains a crewchat token", session.text("hub_send", to=name, text="x", files=[str(config)]))
+
     def test_the_page_shows_images_and_offers_everything_else_as_a_download(self):
         png = self.upload("shot.png", PNG, "image/png")
         svg = self.upload("logo.svg", b"<svg onload='alert(1)'/>", "image/svg+xml")
