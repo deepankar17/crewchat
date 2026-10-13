@@ -2126,7 +2126,10 @@ class Lifecycle(Base):
             tools = crewchat.launch_options({"folders": {}})["tools"]
         finally:
             crewchat.find_tool = saved
-        self.assertEqual(tools[0], {"id": "claude", "label": "Claude Code"})
+        self.assertEqual((tools[0]["id"], tools[0]["label"], "missing" in tools[0]), ("claude", "Claude Code", False))
+        # What each tool may do without asking, as the page offers it: the server's own list.
+        self.assertEqual([p[0] for p in tools[0]["permissions"]], ["ask", "edits", "auto", "all"])
+        self.assertEqual([p[0] for p in tools[1]["permissions"]], ["ask", "auto", "all"])
         self.assertEqual(tools[1]["id"], "cursor")
         self.assertIn("cursor.com/install", tools[1]["missing"])
 
