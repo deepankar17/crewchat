@@ -3,8 +3,8 @@
 ## Unreleased
 
 - **Agents no longer stop at permission prompts to read the chat.** Every connected folder allows
-  crewchat's tools without asking, except `hub_send` (it can attach any file, so its prompt shows
-  what goes out): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
+  crewchat's tools without asking (`hub_send` too, now that it shares files only from the agent's
+  own project folder): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
   and so on in `.cursor/cli.json` for Cursor; the server adds them to folders connected before. An
   agent started from the page in Cursor gets `--trust` and crewchat's MCP server approved
   (`cursor-agent mcp enable crewchat`), not every server the folder lists.

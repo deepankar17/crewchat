@@ -4611,15 +4611,15 @@ def install_claude(project, url, token):
     return [".mcp.json", ".claude/settings.local.json"]
 
 
-# crewchat's tools an agent may use without asking: all but hub_send, which can attach any file the
-# server can read (a prompt shows which). In Claude Code's permission rules, and in Cursor's.
+# crewchat's tools an agent may use without asking: all of them (hub_send's files come only from the
+# agent's own project folder, see share_file). In Claude Code's permission rules, and in Cursor's.
 CLAUDE_ALLOW = "mcp__%s__" % SERVER_NAME
 CURSOR_ALLOW = "Mcp(%s:" % SERVER_NAME
 
 
 def crewchat_rules(prefix):
     """The allow rules for crewchat's tools, with Claude Code's or Cursor's prefix."""
-    names = [t["name"] for t in TOOLS if t["name"] != "hub_send"]
+    names = [t["name"] for t in TOOLS]
     return [prefix + n + (")" if prefix == CURSOR_ALLOW else "") for n in names]
 
 

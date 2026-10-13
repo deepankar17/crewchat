@@ -1165,11 +1165,11 @@ class Joining(Base):
         allow = settings["permissions"]["allow"]
         self.assertEqual(allow[0], "Bash(ls:*)")  # the user's own rule stays
         self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
-        self.assertNotIn("mcp__crewchat__hub_send", allow)  # ...but sending, which can attach any file, does
+        self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
         self.assertNotIn("mcp__crewchat", allow)
         cursor_allow = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
         self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
-        self.assertNotIn("Mcp(crewchat:hub_send)", cursor_allow)
+        self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
         stop = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertEqual(stop[0], "echo mine")
