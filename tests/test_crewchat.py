@@ -1147,6 +1147,43 @@ class Hooks(Base):
         shutil.rmtree(self.state, ignore_errors=True)
         os.makedirs(self.state)
 
+    def test_a_tool_call_is_a_sign_of_life_at_most_once_a_minute(self):
+        session, name = self.linked("busy-turn")
+        self.say(name, "for later")
+        self.hub.agents[name]["seen"] = 0
+        self.assertEqual(self.hook("claude", "tool", {"session_id": "busy-turn"}), "")  # never says anything
+        first = self.hub.agents[name]["seen"]
+        self.assertGreater(first, time.time() - 30)
+        self.assertEqual(self.unread(name), 1)  # nothing handed over or confirmed: that is the stop hook's
+        self.hub.agents[name]["seen"] = 0
+        self.hook("claude", "tool", {"session_id": "busy-turn"})
+        self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
+        self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
+
+    def test_upgrading_adds_new_hooks_and_keeps_the_users_own(self):
+        folder = Path(tempfile.mkdtemp(prefix="old-hooks-", dir=TMP))
+        mine = {"type": "command", "command": "echo mine"}
+        (folder / ".claude").mkdir()
+        (folder / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": "python crewchat.py hook claude stop"}]}],
+            "PostToolUse": [{"hooks": [mine]}]}}))
+        (folder / ".cursor").mkdir()
+        (folder / ".cursor" / "hooks.json").write_text(json.dumps({"version": 1, "hooks": {
+            "stop": [{"command": "python crewchat.py hook cursor stop"}]}}))
+        self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json"])
+        claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
+        self.assertEqual(sorted(claude), ["PostToolUse", "Stop", "UserPromptSubmit"])
+        tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
+        self.assertEqual((len(tool), tool[0]), (2, "echo mine"))
+        self.assertTrue(tool[1].endswith(" hook claude tool"))
+        cursor = json.loads((folder / ".cursor" / "hooks.json").read_text())["hooks"]
+        self.assertEqual(sorted(cursor), ["afterFileEdit", "afterMCPExecution", "afterShellExecution", "stop"])
+        self.assertEqual(crewchat.update_hooks(folder), [])  # up to date: nothing written
+        other = Path(tempfile.mkdtemp(prefix="not-ours-", dir=TMP))
+        (other / ".claude").mkdir()
+        (other / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [mine]}]}}))
+        self.assertEqual(crewchat.update_hooks(other), [])  # a folder crewchat did not connect
+
     def test_the_first_hook_asks_the_agent_to_link(self):
         session = Session(self.base, self.token)
         asked = self.hook("claude", "prompt", {"session_id": "L"})
@@ -2053,10 +2090,11 @@ class Lifecycle(Base):
         a, a_name = self.agent()
         b, b_name = self.agent()
         a.text("hub_take", id=tid)
-        self.assertIn("This project: tasks stay with their holder", cli("tasks", "reclaim"))
+        self.assertIn("silent for 60 min", cli("tasks", "reclaim"))  # the default
+        cli("tasks", "reclaim", "off")
         with self.later(600):
             hub.reclaim_silent()
-        self.assertEqual(hub.taken[tid], a_name)  # off unless the owner sets it
+        self.assertEqual(hub.taken[tid], a_name)  # off: however long it is silent
         for bad in ("5", "\u00b2", "soon"):  # too short to tell a crash from a long build; not a number
             with self.assertRaises(SystemExit):
                 cli("tasks", "reclaim", bad)
@@ -2078,7 +2116,7 @@ class Lifecycle(Base):
             self.assertIn("reclaimed from you while you were silent; it is back on the sheet",
                           a.text("hub_update", id=tid, status="done", note="finished"))
             taken = b.text("hub_take", id=tid)
-            self.assertIn("no sign of life (a crewchat tool call or hook) for 60 min", taken)  # told when it takes it
+            self.assertIn("no sign of life (no tool call, no hook) for 60 min", taken)  # told when it takes it
             self.assertIn("for 60 min", b.text("hub_tasks", view="all"))
             self.assertIn("%s holds it now" % b_name, a.text("hub_update", id=tid, status="in_progress", note="still on it"))
             self.assertIn("already taken by " + b_name, a.text("hub_take", id=tid))
@@ -2094,6 +2132,10 @@ class Lifecycle(Base):
         finally:
             cli("tasks", "reclaim", "off")
         self.assertEqual(hub.reclaim, 0)
+        self.assertEqual(crewchat.Hub(hub.roster).reclaim, 0)  # off stays off after a restart
+        fresh = Path(tempfile.mkdtemp(prefix="fresh-", dir=TMP))
+        crewchat.save_config({"project": "fresh"}, fresh)
+        self.assertEqual(crewchat.Hub(crewchat.Roster(fresh)).reclaim, crewchat.RECLAIM_DEFAULT)  # never set
 
     def test_reclaim_waits_for_a_listening_holder_and_follows_a_tasks_own_setting(self):
         hub = self.hub
