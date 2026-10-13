@@ -644,6 +644,7 @@ class Launching(Base):
     def setUp(self):
         self.launched = []
         self.saved = crewchat.launch_agent, crewchat.find_tool
+        self.real_launch_agent = crewchat.launch_agent
         crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None: self.launched.append(
             (tool, folder, key, permissions))
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
@@ -739,17 +740,28 @@ class Launching(Base):
 
     def test_an_older_agent_command_line_is_started_with_what_it_knows(self):
         new_cursor = "Options:\n  --approve-mcps  ...\n  --trust  ...\n  --auto-review ...\n  -f, --force ..."
-        self.assertEqual(crewchat.fit_options(new_cursor, "cursor", "auto"), (["--approve-mcps", "--trust"], []))
+        self.assertEqual(crewchat.fit_options(new_cursor, "cursor", "auto"), (["--trust"], []))
         old_cursor = "Options:\n  -f, --force  Force allow commands"
         self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "ask"), ([], []))  # it asks at its prompts instead
         self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "auto"), ([], ["--auto-review"]))
         old_claude = '--permission-mode <mode>  (choices: "acceptEdits", "bypassPermissions", "default", "plan")'
         self.assertEqual(crewchat.fit_options(old_claude, "claude", "auto"), ([], ["auto"]))
         self.assertEqual(crewchat.fit_options(old_claude, "claude", "edits"), ([], []))
-        self.assertEqual(crewchat.fit_options("", "cursor", "all"), (["--approve-mcps", "--trust"], []))  # no help: as is
+        self.assertEqual(crewchat.fit_options("", "cursor", "all"), (["--trust"], []))  # no help: as is
         with self.assertRaises(urllib.error.HTTPError):
             crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
                                                                          "permissions": ["all"]})  # not a choice
+
+    def test_a_cursor_agent_gets_crewchats_mcp_server_approved_and_no_other(self):
+        calls = []
+        fake = lambda command, **kw: calls.append((command, kw.get("cwd"))) or mock.Mock(  # noqa: E731
+            returncode=0, stdout="--trust --approve-mcps", stderr="")
+        with mock.patch.object(crewchat, "find_tool", lambda tool, config: "/x/cursor-agent"), \
+                mock.patch.object(crewchat.subprocess, "run", fake), mock.patch.object(crewchat, "run", fake), \
+                mock.patch.object(crewchat.subprocess, "Popen", lambda *a, **kw: calls.append((a[0], kw.get("cwd")))):
+            self.real_launch_agent("cursor", str(self.folder), "start-0123456789abcdef", "ask", self.hub.home)
+        self.assertIn((["/x/cursor-agent", "mcp", "enable", "crewchat"], str(self.folder)), calls)
+        self.assertFalse(any("--approve-mcps" in " ".join(map(str, c[0])) for c in calls))
 
     def test_the_launch_command_carries_no_typed_text(self):
         command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", "edits")
@@ -757,10 +769,11 @@ class Launching(Base):
         self.assertEqual(command[3], crewchat.LAUNCH_PROMPT % "start-0123456789abcdef")
         self.assertRegex(command[3], r"^[A-Za-z0-9 .,:_-]+$")  # safe in any shell, cmd.exe included
         self.assertEqual(crewchat.launch_command("/x/claude", "claude", "k", "all")[1:3], ["--permission-mode", "bypassPermissions"])
-        # Cursor's agent never stops at its MCP or folder trust prompts; "all" lets it run any command.
+        # Cursor's agent never stops at the folder's trust prompt, and is never told to approve every MCP
+        # server the folder lists (only crewchat's is approved); "all" lets it run any command.
         self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1")[1:],
-                         ["--approve-mcps", "--trust", crewchat.LAUNCH_PROMPT % "start-1"])
-        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "k", "all")[3], "--force")
+                         ["--trust", crewchat.LAUNCH_PROMPT % "start-1"])
+        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "k", "all")[2], "--force")
         script = crewchat.macos_script("/tmp/it's a folder", command, "start-0123456789abcdef")
         self.assertIn("cd '/tmp/it'\"'\"'s a folder' || exit 1", script)
         self.assertIn("export CREWCHAT_LINK_KEY=start-0123456789abcdef", script)
@@ -1121,9 +1134,14 @@ class Joining(Base):
         cursor = json.loads((folder / ".cursor" / "mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(cursor["headers"]["Authorization"], "Bearer " + token)
         settings = json.loads((folder / ".claude" / "settings.local.json").read_text())
-        self.assertEqual(settings["permissions"], {"allow": ["Bash(ls:*)", "mcp__crewchat"]})  # its tools never ask
-        self.assertEqual(json.loads((folder / ".cursor" / "cli.json").read_text()),
-                         {"permissions": {"allow": ["Mcp(crewchat:*)"]}})
+        allow = settings["permissions"]["allow"]
+        self.assertEqual(allow[0], "Bash(ls:*)")  # the user's own rule stays
+        self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
+        self.assertNotIn("mcp__crewchat__hub_send", allow)  # ...but sending, which can attach any file, does
+        self.assertNotIn("mcp__crewchat", allow)
+        cursor_allow = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
+        self.assertNotIn("Mcp(crewchat:hub_send)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
         stop = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertEqual(stop[0], "echo mine")
@@ -1315,7 +1333,7 @@ class Hooks(Base):
         self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json",
                                                         ".cursor/cli.json"])
         self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
-                         {"allow": ["mcp__crewchat"]})  # crewchat's tools never ask, after an upgrade too
+                         {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
         self.assertEqual(sorted(claude), ["PostToolUse", "Stop", "UserPromptSubmit"])
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]

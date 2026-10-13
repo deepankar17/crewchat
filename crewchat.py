@@ -3820,17 +3820,17 @@ def joined_place(project, config=None, root=None):
 
 # Agents launched from the chat page ---------------------------------------------------------
 LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent")}
-# Options every agent started from the chat page gets: Cursor's agent is never stopped by its MCP
-# servers' or the folder's trust prompts.
-LAUNCH_BASE = {"claude": [], "cursor": ["--approve-mcps", "--trust"]}
+# Options every agent started from the chat page gets: Cursor's agent is not stopped by the folder's
+# trust prompt (crewchat's MCP server alone is approved before it starts, see launch_agent).
+LAUNCH_BASE = {"claude": [], "cursor": ["--trust"]}
 # What it may do without asking, per tool: id -> (what the page says, its command-line options).
 # crewchat's own tools are always allowed, by the folder's settings (CLAUDE_ALLOW, CURSOR_ALLOW).
 LAUNCH_PERMISSIONS = {
-    "claude": {"ask": ("Use crewchat; ask before anything else", []),
+    "claude": {"ask": ("Use crewchat; ask before sending a message or anything else", []),
                "edits": ("Also edit files", ["--permission-mode", "acceptEdits"]),
                "auto": ("Also run what Claude judges safe (auto mode)", ["--permission-mode", "auto"]),
                "all": ("Do anything (no prompts at all)", ["--permission-mode", "bypassPermissions"])},
-    "cursor": {"ask": ("Use crewchat; ask before anything else", []),
+    "cursor": {"ask": ("Use crewchat; ask before sending a message or anything else", []),
                "auto": ("Also run what Cursor judges safe (auto-review)", ["--auto-review"]),
                "all": ("Run any command (--force)", ["--force"])},
 }
@@ -3950,6 +3950,11 @@ def launch_agent(tool, folder, key, permissions="ask", root=None):
         raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
             LAUNCH_TOOLS[tool][0], " ".join(missing)))
     command = launch_command(exe, tool, key, permissions, base)
+    if tool == "cursor":
+        try:  # approve crewchat's MCP server alone, not every server the folder lists (--approve-mcps)
+            subprocess.run([exe, "mcp", "enable", SERVER_NAME], cwd=str(folder), capture_output=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass  # it asks in its window instead
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
@@ -4578,23 +4583,31 @@ def install_claude(project, url, token):
     return [".mcp.json", ".claude/settings.local.json"]
 
 
-CLAUDE_ALLOW = "mcp__" + SERVER_NAME  # every crewchat tool, in Claude Code's permission rules
-CURSOR_ALLOW = "Mcp(%s:*)" % SERVER_NAME  # the same in Cursor's
+# crewchat's tools an agent may use without asking: all but hub_send, which can attach any file the
+# server can read (a prompt shows which). In Claude Code's permission rules, and in Cursor's.
+CLAUDE_ALLOW = "mcp__%s__" % SERVER_NAME
+CURSOR_ALLOW = "Mcp(%s:" % SERVER_NAME
 
 
-def allow_rule(data, rule):
-    """crewchat's rule in a settings file's permissions.allow list. Returns whether it was missing."""
+def crewchat_rules(prefix):
+    """The allow rules for crewchat's tools, with Claude Code's or Cursor's prefix."""
+    names = [t["name"] for t in TOOLS if t["name"] != "hub_send"]
+    return [prefix + n + (")" if prefix == CURSOR_ALLOW else "") for n in names]
+
+
+def allow_rule(data, prefix):
+    """crewchat's rules in a settings file's permissions.allow list. Returns whether any was missing."""
     allow = data.setdefault("permissions", {}).setdefault("allow", [])
-    if rule in allow:
-        return False
-    allow.append(rule)
-    return True
+    missing = [r for r in crewchat_rules(prefix) if r not in allow]
+    allow.extend(missing)
+    return bool(missing)
 
 
-def disallow_rule(data, rule):
-    """Take crewchat's rule out of permissions.allow, and the list (and permissions) if left empty."""
+def disallow_rule(data, prefix):
+    """Take crewchat's rules out of permissions.allow (also one the user added, such as hub_send's),
+    and the list (and permissions) if left empty."""
     permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
-    allow = [r for r in permissions.get("allow") or [] if r != rule]
+    allow = [r for r in permissions.get("allow") or [] if not str(r).startswith(prefix)]
     if allow:
         permissions["allow"] = allow
     elif permissions:

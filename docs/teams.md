@@ -131,10 +131,14 @@ crewchat agent add docs-writer --role docs --task "Write a guide for the setting
 crewchat agent add tester --role qa --tool cursor --folder ~/code/my-app --permissions auto
 ```
 
-**What it may do without asking.** crewchat's own tools never ask, in any connected folder: its
-folder allows them (`mcp__crewchat` in `.claude/settings.local.json`, `Mcp(crewchat:*)` in
-`.cursor/cli.json`), so an agent never sits on a permission prompt for the chat. Cursor's agent is
-also started with `--approve-mcps --trust`. Beyond that, pick one:
+**What it may do without asking.** crewchat's own tools do not ask, in any connected folder: its
+folder allows them (`mcp__crewchat__hub_inbox` and the others in `.claude/settings.local.json`,
+`Mcp(crewchat:hub_inbox)` and so on in `.cursor/cli.json`), so an agent does not sit on a
+permission prompt to read the chat or report on a task. `hub_send` is left out: it can attach any
+file the agent names, so its prompt shows you what goes out (answer "don't ask again" for it if you
+want). Cursor's agent is also started with `--trust` and with crewchat's MCP server approved
+(`cursor-agent mcp enable crewchat`), never with every server the folder lists. Beyond that, pick
+one:
 
 | Choice | Claude Code | Cursor's agent |
 |---|---|---|

@@ -2,10 +2,12 @@
 
 ## Unreleased
 
-- **Agents never stop at a permission prompt for the chat.** Every connected folder allows
-  crewchat's tools without asking (`mcp__crewchat` for Claude Code, `Mcp(crewchat:*)` in
-  `.cursor/cli.json` for Cursor; the server adds them to folders connected before), and an agent
-  started from the page in Cursor gets `--approve-mcps --trust`.
+- **Agents no longer stop at permission prompts to read the chat.** Every connected folder allows
+  crewchat's tools without asking, except `hub_send` (it can attach any file, so its prompt shows
+  what goes out): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
+  and so on in `.cursor/cli.json` for Cursor; the server adds them to folders connected before. An
+  agent started from the page in Cursor gets `--trust` and crewchat's MCP server approved
+  (`cursor-agent mcp enable crewchat`), not every server the folder lists.
 - **Add an agent asks what it may do without asking:** ask (default), also edit files (Claude
   Code), auto (it judges what is safe: Claude's auto mode, Cursor's auto-review), or anything
   (`bypassPermissions` / `--force`, with a warning). `crewchat agent add --permissions
