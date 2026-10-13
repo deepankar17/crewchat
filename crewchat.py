@@ -4497,7 +4497,17 @@ def update_hooks(folder):
         return change
     return [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
                                     (".cursor/hooks.json", set_cursor_hooks))
-            if edit_json(folder / rel, ours_then(setter))]
+            if not tracked_by_git(folder, rel) and edit_json(folder / rel, ours_then(setter))]
+
+
+def tracked_by_git(folder, rel):
+    """Is this file committed in the folder's repository? Then only `crewchat start` there changes
+    it, not an upgrade behind the owner's back."""
+    try:
+        return subprocess.run(["git", "-C", str(folder), "ls-files", "--error-unmatch", rel], capture_output=True,
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def edit_json(path, change):
@@ -4694,8 +4704,8 @@ def run_hook(client, event):
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
-    if event == "tool" and (not state.get("key") or time.time() - float(state.get("alive") or 0) < ALIVE_EVERY):
-        return  # after every tool call: return at once unless a minute passed (and it has linked)
+    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY:
+        return  # after every tool call: return at once unless a minute passed
     project = find_project(client)
     config = client_config(project, client) if project else None
     if config is None or hooks_off(project):
@@ -5644,8 +5654,8 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   files it touches (`areas`) and the machine it needs (`where`); `take` makes it yours. Cannot
   finish a task? Give it back with `hub_update` status `todo` and a note. A task whose holder shows
   no sign of life (no tool call, no hook) for the project's reclaim time (`hub_tasks` says it) goes
-  back on the sheet; waiting on someone's answer, mark it `blocked`. The lead hands out tasks already on the sheet with
-  `hub_assign` and only `task`.
+  back on the sheet; waiting on someone's answer, mark it `blocked`. The lead hands out tasks
+  already on the sheet with `hub_assign` and only `task`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_update`.

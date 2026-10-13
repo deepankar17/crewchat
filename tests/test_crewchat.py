@@ -1160,6 +1160,15 @@ class Hooks(Base):
         self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
         self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
 
+    def test_a_launched_cursor_agent_is_alive_before_its_first_turn_ends(self):
+        key = self.hub.new_start()
+        session = Session(self.base, self.token, "cursor")
+        session.call("hub_link", key=key)
+        name = session.me
+        self.hub.agents[name]["seen"] = 0
+        self.hook("cursor", "tool", {"conversation_id": "first-turn"}, env_extra={"CREWCHAT_LINK_KEY": key})
+        self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)  # no stop hook ran yet
+
     def test_upgrading_adds_new_hooks_and_keeps_the_users_own(self):
         folder = Path(tempfile.mkdtemp(prefix="old-hooks-", dir=TMP))
         mine = {"type": "command", "command": "echo mine"}
@@ -1183,6 +1192,11 @@ class Hooks(Base):
         (other / ".claude").mkdir()
         (other / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {"Stop": [{"hooks": [mine]}]}}))
         self.assertEqual(crewchat.update_hooks(other), [])  # a folder crewchat did not connect
+        subprocess.run(["git", "init", "-q", str(folder)], check=True)
+        (folder / ".cursor" / "hooks.json").write_text(json.dumps({"version": 1, "hooks": {
+            "stop": [{"command": "python crewchat.py hook cursor stop"}]}}))
+        subprocess.run(["git", "-C", str(folder), "add", ".cursor/hooks.json"], check=True)
+        self.assertEqual(crewchat.update_hooks(folder), [])  # committed in the repository: left for `crewchat start`
 
     def test_the_first_hook_asks_the_agent_to_link(self):
         session = Session(self.base, self.token)
