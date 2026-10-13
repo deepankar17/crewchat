@@ -660,6 +660,8 @@ class Hub:
                     "role": str(row.get("role", "")),
                     "listen": row.get("listen") if row.get("listen") in ("on", "off") else "",
                 }
+                if isinstance(row.get("session"), dict):
+                    self.agents[str(name)]["session"] = row["session"]
         for sid, row in data.get("sessions", {}).items():
             if isinstance(row, dict) and (row.get("agent") is None or row.get("agent") in self.agents):
                 self.sessions[str(sid)] = {
@@ -1913,7 +1915,7 @@ class Hub:
                 "releases": RELEASES,
             }
 
-    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False):
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None):
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life)."""
@@ -1940,6 +1942,8 @@ class Hub:
             agent["seen"] = now = time.time()
             if event == "prompt":
                 self.activity[name] = ("working", now)
+            if session:
+                self._keep_session(name, session)
             listen = self._listen_override(name) if event == "stop" else None
             if listen == 0:  # the owner turned its listening off on the chat page: answer at once
                 wait_seconds = 0
@@ -1973,6 +1977,23 @@ class Hub:
         if listen is not None:
             out["listen"] = listen  # the hook waits this long in all, whatever its folder says
         return out
+
+    def _keep_session(self, name, session):
+        """Which session and process an agent is, as its hook reported it (once per session).
+        Caller holds the lock."""
+        try:
+            kept = {"id": str(session["id"]), "pid": int(session["pid"]), "started": str(session["started"])[:64],
+                    "app": "claude-app" if session.get("app") == "claude-app" else "terminal",
+                    "tool": session.get("tool") if session.get("tool") in LAUNCH_TOOLS else "claude",
+                    "folder": str(session.get("folder") or "")[:1024], "since": time.time()}
+        except (KeyError, TypeError, ValueError):
+            return
+        if SESSION_RE.match(kept["id"]) and kept["pid"] > 1:
+            old = self.agents[name].get("session") or {}
+            kept["permissions"] = old.get("permissions", "ask") if old.get("id") == kept["id"] else (
+                self.agents[name].get("permissions", "ask"))
+            self.agents[name]["session"] = kept
+            self._save()
 
     def _listen_override(self, name):
         """Seconds an agent's stop hook waits for messages as the owner set it on the chat page, or
@@ -3574,9 +3595,10 @@ class Handler(BaseHTTPRequestHandler):
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
                 event = data.get("event") if data.get("event") in ("prompt", "tool") else "stop"
+                session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
-                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped)
+                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session)
                 out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
@@ -4818,7 +4840,7 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, session=None):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
@@ -4826,7 +4848,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
     session in its place may be this one reconnecting), else "ok"; text is '' when nothing arrived within
     wait_total seconds. `ack` first confirms the messages a previous hook call delivered. `chain`
     is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
-    answers "capped", and only a message from the owner ends the wait.
+    answers "capped", and only a message from the owner ends the wait. `session`, if given, tells
+    the server which session and process the agent is (session_report), with the first call.
     """
     begun = time.time()
     deadline = begun + wait_total
@@ -4835,8 +4858,11 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
         asked = time.time()
         try:
-            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
-                                                        "chain": chain}, timeout=MAX_WAIT + 30)
+            body = {"key": key, "ack": ack, "wait": wait, "event": event, "chain": chain}
+            if session:
+                body["session"] = session
+            out = post_json(base + "/api/hook", token, body, timeout=MAX_WAIT + 30)
+            session = None
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -4884,6 +4910,61 @@ def claim_launch_key(folder, key, session):
     return True
 
 
+SESSION_RE = re.compile(r"^[A-Za-z0-9-]{8,64}$")  # a session id that may reach a command line (Reopen)
+AGENT_COMMAND = {"claude": re.compile(r"(^|[/\\])claude(\.exe)?(\s|$)"),
+                 "cursor": re.compile(r"(^|[/\\])(cursor-agent|agent)(\.exe)?(\s|$)")}
+
+
+def process_table():
+    """{pid: (parent pid, start time, command line)} of this machine's processes, or {}."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,"
+                                  "@{n='Started';e={$_.CreationDate.ToString('o')}},CommandLine | ConvertTo-Json -Compress"],
+                                 capture_output=True, text=True, timeout=30).stdout
+            rows = json.loads(out or "[]")
+            return {int(r["ProcessId"]): (int(r["ParentProcessId"] or 0), str(r.get("Started") or ""),
+                                          str(r.get("CommandLine") or "")) for r in (rows if isinstance(rows, list) else [rows])}
+        out = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    table = {}
+    for line in out.splitlines():
+        parts = line.split(None, 7)  # pid, ppid, then lstart's five words, then the command line
+        if len(parts) >= 7 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), " ".join(parts[2:7]), parts[7] if len(parts) > 7 else "")
+    return table
+
+
+def agent_process(client, table=None):
+    """The agent's own process, as its hook finds it among its ancestors: {"pid", "started", "app"}
+    ("claude-app" under the Claude desktop app, else "terminal"), or None."""
+    if os.environ.get("CREWCHAT_TEST_PROCESS"):  # tests: hooks run as subprocesses of the test
+        return json.loads(os.environ["CREWCHAT_TEST_PROCESS"])
+    table = process_table() if table is None else table
+    pid, found, app = os.getppid(), None, "terminal"
+    for _ in range(16):
+        if pid not in table:
+            break
+        parent, started, command = table[pid]
+        if found is None and AGENT_COMMAND[client].search(command):
+            found = {"pid": pid, "started": started}
+        if "/Claude.app/" in command or "\\AnthropicClaude\\" in command:
+            app = "claude-app"
+        pid = parent
+    return dict(found, app=app) if found else None
+
+
+def session_report(client, session, project):
+    """What the server keeps about this agent's session, so the chat page can stop or reopen it."""
+    if not SESSION_RE.match(session):
+        return None
+    found = agent_process(client)
+    return dict(found, id=session, tool=client, folder=str(project)) if found else None
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -4925,7 +5006,11 @@ def run_hook(client, event):
     def save(chain, pending, asks):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
-                                          "ignored": ignored, "alive": state.get("alive", 0)}))
+                                          "ignored": ignored, "alive": state.get("alive", 0),
+                                          "reported": state.get("reported", "")}))
+
+    # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
+    report = session_report(client, session, project) if state.get("reported") != session else None
 
     if event == "tool":
         # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
@@ -4939,7 +5024,9 @@ def run_hook(client, event):
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt")
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", session=report)
+        if kind == "ok" and report:
+            state["reported"] = session
         if kind != "ok":
             if ignored >= MAX_LINK_PROMPTS:
                 # Asked at several prompts and never linked: this session is not joining (or has no
@@ -4962,7 +5049,9 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
-                                                      pending, chain=chain)
+                                                      pending, chain=chain, session=report)
+    if kind == "ok" and report:
+        state["reported"] = session
     if kind != "ok":
         # Asking here makes the agent take one more turn, which costs a whole turn's tokens. Claude
         # Code is asked at its user's prompt instead; here only a session that was linked and must

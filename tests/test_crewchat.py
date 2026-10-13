@@ -1292,6 +1292,38 @@ class Hooks(Base):
         self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
         self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
 
+    def test_a_session_is_reported_once(self):
+        session, name = self.linked("sess-0001-abc")
+        self.hook("claude", "stop", {"session_id": "sess-0001-abc"},
+                  env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 4242, "started": "x", "app": "terminal"}'})
+        kept = self.hub.agents[name]["session"]
+        self.assertEqual((kept["id"], kept["pid"], kept["started"], kept["app"], kept["tool"]),
+                         ("sess-0001-abc", 4242, "x", "terminal", "claude"))
+        self.assertEqual(Path(kept["folder"]).resolve(), self.folder.resolve())
+        self.hub.agents[name]["session"]["pid"] = 1  # a second hook does not report again
+        self.hook("claude", "stop", {"session_id": "sess-0001-abc"},
+                  env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 999, "started": "y", "app": "terminal"}'})
+        self.assertEqual(self.hub.agents[name]["session"]["pid"], 1)
+        # An id that is not one is never kept: it would reach a command line on Reopen.
+        bad, bad_name = self.linked("x; rm -rf /")
+        self.hook("claude", "stop", {"session_id": "x; rm -rf /"},
+                  env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 4243, "started": "x", "app": "terminal"}'})
+        self.assertNotIn("session", self.hub.agents[bad_name])
+
+    def test_the_hook_finds_its_agent_among_its_ancestors(self):
+        app = "/Applications/Claude.app/Contents/MacOS/Claude"
+        table = {10: (9, "Tue Oct 13 22:39:29 2026", "/bin/zsh -c crewchat hook claude stop"),
+                 9: (8, "Tue Oct 13 22:39:29 2026", "/Users/x/Library/Application Support/Claude/claude-code/2.1/"
+                                                    "claude.app/Contents/MacOS/claude --output-format stream-json"),
+                 8: (7, "Tue Oct 13 22:38:52 2026", "/Applications/Claude.app/Contents/Helpers/disclaimer --pgroup"),
+                 7: (1, "Tue Oct 13 22:38:00 2026", app)}
+        with mock.patch.object(crewchat.os, "getppid", lambda: 10), mock.patch.dict(os.environ, {"CREWCHAT_TEST_PROCESS": ""}):
+            self.assertEqual(crewchat.agent_process("claude", table),
+                             {"pid": 9, "started": "Tue Oct 13 22:39:29 2026", "app": "claude-app"})
+            self.assertIsNone(crewchat.agent_process("cursor", table))  # no cursor-agent above it
+            cursor = {10: (9, "a", "sh -c hook"), 9: (1, "b", "/Users/x/.local/bin/cursor-agent --trust")}
+            self.assertEqual(crewchat.agent_process("cursor", cursor), {"pid": 9, "started": "b", "app": "terminal"})
+
     def test_listening_set_on_the_chat_page_wins_over_the_folder(self):
         session, name = self.linked("page-listen")
         agent = lambda **body: crewchat.post_json(self.base + "/api/agent", self.owner, body)  # noqa: E731
