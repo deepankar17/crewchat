@@ -569,13 +569,21 @@ class Files(Base):
         session, name = self.agent()
         folder = Path(tempfile.mkdtemp(dir=TMP))
         crewchat.remember(folder, self.place)  # the agent's folder is on this machine
-        owner_token = crewchat.token_path("Owner")
-        self.assertIn("crewchat's own folder", session.text("hub_send", to=name, text="x", files=[str(owner_token)]))
-        self.assertIn("crewchat's own folder", session.text("hub_send", to=name, text="x",
-                                                            files=[str(crewchat.home() / "config.json")]))
+        inside = [crewchat.token_path("Owner"), crewchat.home() / "config.json"]
+        link = folder / "notes.txt"
+        try:
+            link.symlink_to(crewchat.token_path("Owner"))  # a harmless-looking name for the owner's token
+            inside.append(link)
+        except OSError:
+            pass  # Windows without the right to make symlinks
+        for path in inside:
+            self.assertIn("crewchat's own folder", session.text("hub_send", to=name, text="x", files=[str(path)]))
         config = folder / ".mcp.json"
         config.write_text(json.dumps({"headers": {"Authorization": "Bearer " + self.token}}))
-        self.assertIn("contains a crewchat token", session.text("hub_send", to=name, text="x", files=[str(config)]))
+        copy = folder / "backup.txt"
+        copy.write_text("old token: %s\n" % crewchat.read_token("Owner"))
+        for path in (config, copy):
+            self.assertIn("contains a crewchat token", session.text("hub_send", to=name, text="x", files=[str(path)]))
 
     def test_the_page_shows_images_and_offers_everything_else_as_a_download(self):
         png = self.upload("shot.png", PNG, "image/png")
