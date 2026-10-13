@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Security: an agent can no longer share crewchat's keys.** `hub_send` with a file refuses
+  anything inside crewchat's own folder (`~/.crewchat`: tokens, config, keys) and any file that
+  contains a crewchat token, such as a project's `.mcp.json`. Before, an agent talked into it could
+  share the owner's token, and agents on machines linked over Tailscale could open it with
+  `hub_file`. Reported by @codedrai on X.
 - **A task whose agent goes silent can go back on the sheet** ([#25](https://github.com/deepankar17/crewchat/issues/25)).
   A task whose holder has shown no sign of life for 60 minutes (no tool calls, no hooks, no
   messages) goes back on the sheet; `crewchat tasks reclaim MINUTES|off` changes that, and agents

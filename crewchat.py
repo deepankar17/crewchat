@@ -2480,17 +2480,38 @@ def sheet_line(row):
     return "#%s [%s] %s (%s)" % (row["id"], row["status"], row["title"], "; ".join(extra))
 
 
+def stored_tokens(roots):
+    """Every token kept under these crewchat folders (the owner's, and each place's)."""
+    found = set()
+    for root in roots:
+        for path in list(root.glob("tokens/*.token")) + list(root.glob("projects/*/tokens/*.token")):
+            try:
+                token = path.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if len(token) >= 20:
+                found.add(token)
+    return found
+
+
 def share_file(hub, path):
     """An agent shares a file from this machine (hub_send files)."""
     if not isinstance(path, str) or not os.path.isabs(os.path.expanduser(path)):
         raise HubError("files must be absolute paths on this machine")
     path = Path(path).expanduser()
+    # An agent can be talked into sharing crewchat's keys, which agents on linked machines could then
+    # open: nothing from crewchat's own folders, and nothing that holds one of its tokens (.mcp.json).
+    homes = {home().resolve(), hub.roster.root.resolve()}
+    if any(path.resolve() == h or h in path.resolve().parents for h in homes):
+        raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % path.name)
     try:
         if path.stat().st_size > MAX_UPLOAD:
             raise HubError("%s is too big: %s at most" % (path.name, human_size(MAX_UPLOAD)))
         data = path.read_bytes()
     except OSError as e:
         raise HubError("cannot read %s (%s)" % (path, e.strerror or e))
+    if any(token.encode("utf-8") in data for token in stored_tokens(homes)):
+        raise HubError("%s contains a crewchat token, so it cannot be shared" % path.name)
     return hub.add_file(path.name, data)
 
 
