@@ -737,6 +737,20 @@ class Launching(Base):
                                                                      "accept_edits": True})  # a page from before
         self.assertEqual(self.launched[-1][3], "edits")
 
+    def test_an_older_agent_command_line_is_started_with_what_it_knows(self):
+        new_cursor = "Options:\n  --approve-mcps  ...\n  --trust  ...\n  --auto-review ...\n  -f, --force ..."
+        self.assertEqual(crewchat.fit_options(new_cursor, "cursor", "auto"), (["--approve-mcps", "--trust"], []))
+        old_cursor = "Options:\n  -f, --force  Force allow commands"
+        self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "ask"), ([], []))  # it asks at its prompts instead
+        self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "auto"), ([], ["--auto-review"]))
+        old_claude = '--permission-mode <mode>  (choices: "acceptEdits", "bypassPermissions", "default", "plan")'
+        self.assertEqual(crewchat.fit_options(old_claude, "claude", "auto"), ([], ["auto"]))
+        self.assertEqual(crewchat.fit_options(old_claude, "claude", "edits"), ([], []))
+        self.assertEqual(crewchat.fit_options("", "cursor", "all"), (["--approve-mcps", "--trust"], []))  # no help: as is
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
+                                                                         "permissions": ["all"]})  # not a choice
+
     def test_the_launch_command_carries_no_typed_text(self):
         command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", "edits")
         self.assertEqual(command[:3], ["/x/claude", "--permission-mode", "acceptEdits"])

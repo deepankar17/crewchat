@@ -1214,7 +1214,7 @@ class Hub:
         without asking (LAUNCH_PERMISSIONS)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
-        if permissions not in LAUNCH_PERMISSIONS[tool]:
+        if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("that folder is not connected to this chat on this machine")
@@ -3899,10 +3899,10 @@ def launch_options(config, root=None, chat=""):
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
-def launch_command(exe, tool, key, permissions="ask"):
+def launch_command(exe, tool, key, permissions="ask", base=None):
     """The agent's command line. Only the fixed prompt, the key and fixed options reach it: no text
     typed on the chat page is ever passed to a shell."""
-    options = LAUNCH_BASE[tool] + LAUNCH_PERMISSIONS[tool][permissions][1]
+    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
     return [exe] + options + [LAUNCH_PROMPT % key]
 
 
@@ -3918,13 +3918,38 @@ def macos_script(folder, command, key):
     ]) + "\n"
 
 
+def tool_help(exe):
+    """What an agent's command line says it takes (its --help), or '' if it does not say."""
+    try:
+        out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=20)
+        return out.stdout + out.stderr
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def fit_options(help_text, tool, permissions):
+    """The launch options this copy of the tool knows: (the base options it has, the chosen
+    permission's options it lacks). An older copy is started without the base options it lacks
+    (it asks instead); a permission it cannot do is refused. With no help text, all are kept."""
+    if not help_text:
+        return LAUNCH_BASE[tool], []
+    chosen = LAUNCH_PERMISSIONS[tool][permissions][1]
+    missing = [o for o in chosen if o.startswith("--") and o not in help_text]
+    missing += [v for o, v in zip(chosen, chosen[1:]) if o == "--permission-mode" and '"%s"' % v not in help_text]
+    return [o for o in LAUNCH_BASE[tool] if o in help_text], missing
+
+
 def launch_agent(tool, folder, key, permissions="ask", root=None):
     """Open a terminal window on this machine with a new agent session in folder."""
     exe = find_tool(tool, load_config(root))
     if not exe:
         raise HubError("%s is not installed here, or crewchat cannot find it. Run `crewchat start` once in a "
                        "terminal where it works." % LAUNCH_TOOLS[tool][0])
-    command = launch_command(exe, tool, key, permissions)
+    base, missing = fit_options(tool_help(exe), tool, permissions)
+    if missing:
+        raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
+            LAUNCH_TOOLS[tool][0], " ".join(missing)))
+    command = launch_command(exe, tool, key, permissions, base)
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
@@ -7219,7 +7244,7 @@ def build_parser():
     p.add_argument("--task", help="add: its first task")
     p.add_argument("--tool", choices=sorted(LAUNCH_TOOLS), default="claude", help="add: which agent (default claude)")
     p.add_argument("--folder", help="add: a connected project folder on this machine (default: this folder)")
-    p.add_argument("--accept-edits", dest="permissions", action="store_const", const="edits",
+    p.add_argument("--accept-edits", dest="permissions", action="store_const", const="edits", default="ask",
                    help="add, Claude Code: let it edit files without asking (--permissions edits)")
     p.add_argument("--permissions", default="ask", choices=sorted({k for t in LAUNCH_PERMISSIONS.values() for k in t}),
                    help="add: what it may do without asking: ask (default), edits (Claude Code), auto, all")
