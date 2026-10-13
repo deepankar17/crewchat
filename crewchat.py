@@ -1103,7 +1103,8 @@ class Hub:
         if not session:
             return None
         return {"app": session.get("app", "terminal"), "running": process_running(session, recent_process_table()),
-                "since": session.get("stopped") or session.get("since", 0), "tool": session.get("tool", "claude")}
+                "since": session.get("stopped") or session.get("since", 0), "tool": session.get("tool", "claude"),
+                "reopen": session.get("tool", "claude") in REOPEN_TOOLS}
 
     def rows(self):
         with self.lock:
@@ -2030,6 +2031,9 @@ class Hub:
         if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
         folder, tool = session.get("folder", ""), session.get("tool", "claude")
+        if tool not in REOPEN_TOOLS:
+            raise HubError("%s cannot reopen a conversation from the chat page yet: open it again in %s"
+                           % (LAUNCH_TOOLS[tool][0], LAUNCH_TOOLS[tool][0]))
         if folder not in [f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)]:
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
         permissions = session.get("permissions") if session.get("permissions") in LAUNCH_PERMISSIONS[tool] else "ask"
@@ -2054,6 +2058,8 @@ class Hub:
         with self.lock:
             session = dict(self._session_of(name, "switch"))
         tool = session.get("tool", "claude")
+        if tool not in REOPEN_TOOLS:
+            raise HubError("%s cannot switch a session's model from the chat page yet" % LAUNCH_TOOLS[tool][0])
         exe = find_tool(tool, load_config(self.home))
         if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, exe or "")]:
             raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
@@ -4082,6 +4088,7 @@ def agent_tool(tool, folder, permissions, root=None):
     return exe, base
 
 
+REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
 MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
@@ -7160,7 +7167,7 @@ function sessionControls(a, acts, agentOp) {
       if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
         agentOp({ op: "stop", agent: a.agent }, "Not stopped", b);
     });
-  } else {
+  } else if (s.reopen) {
     actButton(acts, "Reopen", "Reopen " + a.agent + "'s conversation", (b) => {
       const where = s.app === "claude-app"
         ? "It reopens in a Terminal window. If it is still open in the Claude app, close it there first."
@@ -7168,6 +7175,7 @@ function sessionControls(a, acts, agentOp) {
       if (confirm("Reopen " + a.agent + "? " + where)) agentOp({ op: "reopen", agent: a.agent }, "Not reopened", b);
     });
   }
+  if (!s.reopen) return;  // switching a model reopens the session
   loadModels();
   const models = (toolModels || {})[s.tool] || [];
   if (!models.length) return;

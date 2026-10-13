@@ -164,9 +164,10 @@ class Page(unittest.TestCase):
             const base = state.agents[0];
             const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
             state.agents = [
-              row("running-one", {session: {app: "terminal", running: true, since: state.now - 60, tool: "claude"}}),
-              row("in-the-app", {session: {app: "claude-app", running: true, since: state.now, tool: "claude"}}),
-              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude"}}),
+              row("running-one", {session: {app: "terminal", running: true, since: state.now - 60, tool: "claude", reopen: true}}),
+              row("in-the-app", {session: {app: "claude-app", running: true, since: state.now, tool: "claude", reopen: true}}),
+              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
+              row("closed-cursor", {session: {app: "terminal", running: false, since: state.now, tool: "cursor", reopen: false}}),
               row("far-one", {remote: true, device: "laptop", session: null}),
               row("never-reported", {session: null})];
             state.names = "";
@@ -176,7 +177,7 @@ class Page(unittest.TestCase):
             const out = {
               running: buttons("running-one"), app: card("in-the-app").innerText,
               closed: buttons("closed-one"), closedText: card("closed-one").innerText,
-              far: buttons("far-one"), never: buttons("never-reported"),
+              far: buttons("far-one"), never: buttons("never-reported"), cursor: buttons("closed-cursor"),
               models: [...card("running-one").querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
             };
             state.agents = saved; toolModels = savedModels; state.names = ""; renderAgents();  // as the server says
@@ -188,7 +189,7 @@ class Page(unittest.TestCase):
         self.assertIn("Reopen", out["closed"])
         self.assertNotIn("Stop", out["closed"])
         self.assertIn("Session closed 4 min ago", out["closedText"])
-        for name in ("far", "never"):  # no session it could act on here
+        for name in ("far", "never", "cursor"):  # no session it could act on here (Cursor: not yet)
             self.assertNotIn("Stop", out[name])
             self.assertNotIn("Reopen", out[name])
         self.assertIn("Switch running-one's model", out["models"])

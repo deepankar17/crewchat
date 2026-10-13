@@ -805,6 +805,13 @@ class Launching(Base):
         _, opened = self.reopened(agent=name)
         self.assertEqual(self.hub.links[opened[0][2]], name)
 
+    def test_cursor_sessions_can_be_stopped_but_not_reopened_yet(self):
+        name = self.closed_session(tool="cursor")
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            self.reopened(agent=name)
+        self.assertIn("cannot reopen", json.loads(caught.exception.read())["error"])
+        self.assertFalse(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["reopen"])
+
     def test_reopen_is_refused_while_it_runs(self):
         name = self.closed_session()
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: True):
