@@ -31,15 +31,16 @@ class Security(unittest.TestCase):
 
     def test_owner_pages_need_a_signed_in_owner(self):
         anonymous = [("GET", "/api/poll?after=0"), ("GET", "/api/launch"), ("POST", "/api/send"),
-                     ("POST", "/api/role"), ("POST", "/api/upload")]
+                     ("POST", "/api/role"), ("POST", "/api/agent"), ("POST", "/api/upload")]
         for method, path in anonymous:
             body = {"to": "all", "text": "x"} if method == "POST" else None
             status = request(self.m.url + path, body, {"Origin": self.m.url}, method=method)[0]
             self.assertIn(status, (401, 403), path)
         # An agent's token is not the owner's.
         bearer = {"Authorization": "Bearer " + self.agent.token, "Origin": self.m.url}
-        for path in ("/api/send", "/api/role", "/api/upload", "/api/login-code", "/api/invite", "/api/admin"):
-            status = request(self.m.url + path, {"to": "all", "text": "x", "op": "remove", "name": "x"}, bearer)[0]
+        for path in ("/api/send", "/api/role", "/api/agent", "/api/upload", "/api/login-code", "/api/invite", "/api/admin"):
+            status = request(self.m.url + path, {"to": "all", "text": "x", "op": "remove", "name": "x", "agent": "x"},
+                             bearer)[0]
             self.assertIn(status, (401, 403), path)
         self.assertEqual(request(self.m.url + "/", opener=None)[0], 303)
         self.assertNotIn(b"Owner", request(self.m.url + "/files/0123456789abcdef/x")[1])

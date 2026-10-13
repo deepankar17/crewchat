@@ -657,7 +657,7 @@ class Hub:
                     "active": float(row.get("active", 0)), "cursor": int(row.get("cursor", 0)),
                     "status": str(row.get("status", "")), "checked": float(row.get("checked", 0)),
                     "role": str(row.get("role", "")),
-                    "listen": str(row.get("listen", "")) if row.get("listen") in ("on", "off") else "",
+                    "listen": row.get("listen") if row.get("listen") in ("on", "off") else "",
                 }
         for sid, row in data.get("sessions", {}).items():
             if isinstance(row, dict) and (row.get("agent") is None or row.get("agent") in self.agents):
@@ -981,14 +981,19 @@ class Hub:
     def _remote_device_of(self, name):
         return next((dev["device"] for dev, _ in self._remote_rows(name)), None)
 
+    def _local_agent(self, name, verb):
+        """An agent of this machine, or a HubError saying where it runs. Caller holds the lock."""
+        if name not in self.agents:
+            elsewhere = self._remote_device_of(name)
+            if elsewhere:
+                raise HubError("%s runs on %s; %s it there" % (name, elsewhere, verb))
+            raise HubError("no agent called %s" % name)
+        return self.agents[name]
+
     def rename(self, name, new):
         check_name(new)
         with self.lock:
-            if name not in self.agents:
-                elsewhere = self._remote_device_of(name)
-                if elsewhere:
-                    raise HubError("%s runs on %s; rename it there" % (name, elsewhere))
-                raise HubError("no agent called %s" % name)
+            self._local_agent(name, "rename")
             if new == name:
                 return
             if new.lower() in {n.lower() for n in list(self.agents) + self._remote_names() if n != name}:
@@ -1008,11 +1013,7 @@ class Hub:
 
     def remove(self, name):
         with self.lock:
-            if name not in self.agents:
-                elsewhere = self._remote_device_of(name)
-                if elsewhere:
-                    raise HubError("%s runs on %s; remove it there" % (name, elsewhere))
-                raise HubError("no agent called %s" % name)
+            self._local_agent(name, "remove")
             self._forget(name, "was removed by the owner")
             self._save()
             self._changed()
@@ -1032,7 +1033,8 @@ class Hub:
             for row in agents if isinstance(agents, list) else []:
                 if isinstance(row, dict) and NAME_RE.match(str(row.get("agent", ""))):
                     rows.append({k: row.get(k) for k in
-                                 ("agent", "client", "place", "seen", "status", "read_id", "unread", "activity", "role")})
+                                 ("agent", "client", "place", "seen", "status", "read_id", "unread", "activity", "role",
+                                  "listen")})
             old = self.remote.get(device_id)
             updated = float(updated or 0)
             self.remote[device_id] = {"device": str(device), "agents": rows, "updated": updated}
@@ -1054,7 +1056,7 @@ class Hub:
             return [
                 {"agent": n, "client": a["client"], "place": a["place"], "seen": round(a["seen"]),
                  "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n)),
-                 "activity": self._activity(n, time.time()), "role": a.get("role", "")}
+                 "activity": self._activity(n, time.time()), "role": a.get("role", ""), "listen": a.get("listen", "")}
                 for n, a in self.agents.items()
             ]
 
@@ -1080,7 +1082,7 @@ class Hub:
                     "status": str(row.get("status") or ""), "cursor": self.seq_of(row.get("read_id") or ""),
                     "unread": int(row.get("unread") or 0), "device": dev["device"], "remote": True,
                     "activity": str(row.get("activity") or "") if fresh else "",
-                    "role": str(row.get("role") or ""),
+                    "role": str(row.get("role") or ""), "listen": str(row.get("listen") or ""),
                 })
         return rows
 
@@ -1929,9 +1931,11 @@ class Hub:
             agent["seen"] = now = time.time()
             if event == "prompt":
                 self.activity[name] = ("working", now)
-            listen = self._listen_override(name)
-            if listen == 0:
-                wait_seconds = 0  # the owner turned its listening off on the chat page
+            listen = self._listen_override(name) if event == "stop" else None
+            if listen == 0:  # the owner turned its listening off on the chat page: answer at once
+                wait_seconds = 0
+            elif listen and not wait_seconds:  # turned on, and its folder says check once: wait from now
+                wait_seconds = min(MAX_WAIT, listen)
             if wait_seconds:
                 self.waiting[name] = self.waiting.get(name, 0) + 1
             self._changed()
@@ -1971,14 +1975,11 @@ class Hub:
         if mode not in ("on", "off", "default"):
             raise HubError("listening is on, off or default")
         with self.lock:
-            if name not in self.agents:
-                elsewhere = self._remote_device_of(name)
-                if elsewhere:
-                    raise HubError("%s runs on %s; change it there" % (name, elsewhere))
-                raise HubError("no agent called %s" % name)
-            self.agents[name]["listen"] = "" if mode == "default" else mode
-            self._save()
-            self._changed()
+            agent = self._local_agent(name, "change")
+            if agent.get("listen", "") != ("" if mode == "default" else mode):
+                agent["listen"] = "" if mode == "default" else mode
+                self._save()
+                self._changed()
 
     # Single-use codes ----------------------------------------------------------------------
     @staticmethod
@@ -3344,10 +3345,6 @@ class Handler(BaseHTTPRequestHandler):
                         link_projects(self.projects)
                 except crewchat_peers.PeerError as e:
                     raise HubError(str(e))
-            elif op == "rename":
-                self.hub.rename(data.get("name"), data.get("new"))
-            elif op == "remove":
-                self.hub.remove(data.get("name"))
             elif op == "shutdown":
                 # Answer first, then end the process: everything is already on disk.
                 sys.stderr.write("%s stopping, as the owner asked (crewchat stop)\n" % now_iso())
@@ -4204,10 +4201,10 @@ def cmd_agent(args):
     if args.action == "rename":
         if not args.new:
             die("usage: crewchat agent rename OLD NEW")
-        owner_call("/api/admin", {"op": "rename", "name": args.name, "new": args.new})
+        owner_call("/api/agent", {"op": "rename", "agent": args.name, "new": args.new})
         print("%s is now %s." % (args.name, args.new))
     else:
-        owner_call("/api/admin", {"op": "remove", "name": args.name})
+        owner_call("/api/agent", {"op": "remove", "agent": args.name})
         print("Removed %s. If its session is still running it will come back under a new name; "
               "to shut a folder out, use `crewchat place remove`." % args.name)
 
@@ -4726,9 +4723,8 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0):
                                                             "chain": chain}, timeout=30)
             except (urllib.error.URLError, OSError):
                 pass  # keep what came first
-        if isinstance(out.get("listen"), int) and out["listen"] != wait_total:
-            # The owner set this agent's listening on the chat page: that wins over its folder's.
-            wait_total = max(0, min(MAX_LISTEN, out["listen"]))
+        if "listen" in out:  # the owner set this agent's listening on the chat page: it wins over its folder's
+            wait_total = out["listen"]
             deadline = begun + wait_total
         capped = bool(out.get("capped"))
         if out.get("link"):
@@ -6539,10 +6535,7 @@ function renderSheet(rows) {
       pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
       acts.append(pick);
     }
-    const button = (label, title, body) => {
-      const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
-      b.addEventListener("click", () => taskOp(body)); acts.append(b);
-    };
+    const button = (label, title, body) => actButton(acts, label, title, () => taskOp(body));
     button("\u2191", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
     button("\u2193", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
     if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
@@ -6665,11 +6658,11 @@ function roleTitle(name) {
   return r ? r.title : name;
 }
 
-// The owner on an agent's card: rename, remove, listening (on, off, or its folder's default).
-async function agentOp(body, what, control) {
+// An owner action from a control: the control waits while it runs; a failure is shown.
+async function postAction(path, body, what, control) {
   if (control) control.disabled = true;
   try {
-    await postJSON("/api/agent", body);
+    await postJSON(path, body);
     $("error").textContent = "";
   } catch (err) {
     $("error").textContent = what + ": " + err.message;
@@ -6677,13 +6670,20 @@ async function agentOp(body, what, control) {
   if (control) control.disabled = false;
 }
 
+function actButton(parent, label, title, onClick) {
+  const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
+  b.addEventListener("click", () => onClick(b)); parent.append(b);
+  return b;
+}
+
+// The owner on an agent's card: rename, remove, listening (on, off, or its folder's default).
 function agentActions(a) {
   const acts = el("div", "acts");
   const remote = a.remote ? "Runs on " + a.device + ": change it there" : "";
+  const agentOp = (body, what, control) => postAction("/api/agent", body, what, control);
   const button = (label, title, run) => {
-    const b = el("button", "", label); b.type = "button"; b.title = remote || title;
-    b.setAttribute("aria-label", title); b.disabled = !!remote; b.addEventListener("click", () => run(b));
-    acts.append(b);
+    const b = actButton(acts, label, title, run);
+    if (remote) { b.title = remote; b.disabled = true; }
   };
   button("Rename", "Rename " + a.agent, (b) => {
     const name = prompt("New name for " + a.agent + " (letters, digits, - _ .):", a.agent);
@@ -6708,14 +6708,8 @@ function agentActions(a) {
   return acts;
 }
 
-async function setRole(agent, role, pick) {
-  pick.disabled = true;
-  try {
-    await postJSON("/api/role", { agent, role });
-  } catch (err) {
-    $("error").textContent = "Role not changed: " + err.message;
-  }
-  pick.disabled = false;
+function setRole(agent, role, pick) {
+  return postAction("/api/role", { agent, role }, "Role not changed", pick);
 }
 
 function renderAgents() {

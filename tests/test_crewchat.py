@@ -814,10 +814,12 @@ class AgentCards(Base):
         self.assertIn("op is rename, remove or listen", self.op(op="kick", agent=name)["error"])
 
     def test_an_agent_on_another_machine_is_changed_there(self):
-        self.hub.set_remote("dev-x", "laptop", [{"agent": "far-away", "client": "cursor", "place": "x", "seen": 1}], 1)
+        self.hub.set_remote("dev-x", "laptop", [{"agent": "far-away", "client": "cursor", "place": "x", "seen": 1,
+                                                 "listen": "on"}], 1)
         try:
             for body in ({"op": "rename", "new": "near"}, {"op": "remove"}, {"op": "listen", "mode": "on"}):
                 self.assertIn("runs on laptop", self.op(agent="far-away", **body)["error"])
+            self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == "far-away")["listen"], "on")  # shown here
         finally:
             self.hub.drop_remote("dev-x")
 
@@ -1216,6 +1218,9 @@ class Hooks(Base):
         session, name = self.linked("page-listen")
         agent = lambda **body: crewchat.post_json(self.base + "/api/agent", self.owner, body)  # noqa: E731
         agent(op="listen", agent=name, mode="on")
+        began = time.time()
+        self.hook("claude", "prompt", {"session_id": "page-listen"})
+        self.assertLess(time.time() - began, 10)  # listening is for the end of a turn: a prompt never waits
         threading.Timer(2, lambda: self.say(name, "worth the wait")).start()
         began = time.time()
         out = self.hook("claude", "stop", {"session_id": "page-listen"}, listen="0")  # the folder says check once
