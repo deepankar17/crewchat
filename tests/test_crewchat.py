@@ -897,7 +897,7 @@ class Launching(Base):
         key = self.launched[-1][2]
         Session(self.base, self.token).call("hub_link", key=key)  # the launched session checks in
         self.assertEqual(self.hub.agents["auto-one"]["permissions"], "auto")
-        with self.hub.lock, mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: True):
+        with self.hub.lock, mock.patch.object(crewchat.Hub, "agent_folders", lambda hub, agent: ["/here"]):
             self.hub._keep_session("auto-one", {"id": "sess-0012-abc", "pid": 999999, "started": "x",
                                                 "tool": "claude", "folder": str(self.folder)})
         _, opened = self.reopened(agent="auto-one")
@@ -1505,7 +1505,7 @@ class Hooks(Base):
     def setUp(self):
         shutil.rmtree(self.state, ignore_errors=True)
         os.makedirs(self.state)
-        here = mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: True)  # its folder is this machine's
+        here = mock.patch.object(crewchat.Hub, "agent_folders", lambda hub, agent: ["/here"])  # its folder is this machine's
         here.start()
         self.addCleanup(here.stop)
 
@@ -1568,7 +1568,7 @@ class Hooks(Base):
 
     def test_an_agent_from_another_machine_keeps_no_session_here(self):
         session, name = self.linked("sess-0010-abc")
-        with mock.patch.object(crewchat.Hub, "on_this_machine", lambda hub, agent: False):
+        with mock.patch.object(crewchat.Hub, "agent_folders", lambda hub, agent: []):
             self.hook("claude", "stop", {"session_id": "sess-0010-abc"},
                       env_extra={"CREWCHAT_TEST_PROCESS": '{"pid": 4242, "started": "x", "app": "terminal"}'})
         self.assertNotIn("session", self.hub.agents[name])

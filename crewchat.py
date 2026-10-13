@@ -2120,7 +2120,7 @@ class Hub:
             return False
         asked[name] = time.time()
         self._asked = asked
-        return self.on_this_machine(name)  # a process number means nothing elsewhere (_keep_session)
+        return bool(self.agent_folders(name))  # a process number means nothing elsewhere (_keep_session)
 
     def _keep_session(self, name, session):
         """Which session and process an agent is, as its hook reported it (once per session, and
@@ -2133,7 +2133,7 @@ class Hub:
                     "folder": str(session.get("folder") or "")[:1024], "since": time.time()}
         except (KeyError, TypeError, ValueError):
             return
-        if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.on_this_machine(name):
+        if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.agent_folders(name):
             old = self.agents[name].get("session") or {}
             kept["permissions"] = old.get("permissions", "ask") if old.get("id") == kept["id"] else (
                 self.agents[name].get("permissions", "ask"))
