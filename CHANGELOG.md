@@ -10,8 +10,8 @@
 - **Agents name their session after their crewchat name** when their app allows it (the Claude
   app does), and again when you rename them, so the Claude sidebar shows who is who.
 - **Agents no longer stop at permission prompts to read the chat.** Every connected folder allows
-  crewchat's tools without asking, except `hub_send` (it can attach any file, so its prompt shows
-  what goes out): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
+  crewchat's tools without asking (`hub_send` too, now that it shares files only from the agent's
+  own project folder): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
   and so on in `.cursor/cli.json` for Cursor; the server adds them to folders connected before. An
   agent started from the page in Cursor gets `--trust` and crewchat's MCP server approved
   (`cursor-agent mcp enable crewchat`), not every server the folder lists.
@@ -29,6 +29,14 @@
   contains a crewchat token, such as a project's `.mcp.json`. Before, an agent talked into it could
   share the owner's token, and agents on machines linked over Tailscale could open it with
   `hub_file`. Reported by @codedrai on X.
+- **Agents share files only from their own project folder.** A file anywhere else on the machine
+  (`~/.ssh`, `~/.aws`, another project's `.env`, `~/Downloads`) is refused with "copy it into the
+  project first", so an agent talked into posting a key cannot, and anything it does copy in is a
+  step you see. Credentials are refused even inside a project: `~/.ssh`, `~/.aws`, `~/.gnupg`,
+  `~/.kube`, `~/.docker`, `~/.azure`, `~/.config/gcloud`, the macOS keychains, and `.netrc`,
+  `.git-credentials`, `.pgpass`. Your own files (chat page, `crewchat say --file`) are unchanged.
+  Removing a place (`crewchat place remove`) also forgets its folders, so a place given the same
+  name later does not inherit them.
 - **A task whose agent goes silent can go back on the sheet** ([#25](https://github.com/deepankar17/crewchat/issues/25)).
   A task whose holder has shown no sign of life for 60 minutes (no tool calls, no hooks, no
   messages) goes back on the sheet; `crewchat tasks reclaim MINUTES|off` changes that, and agents
