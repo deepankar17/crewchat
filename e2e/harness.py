@@ -81,7 +81,10 @@ class Machine:
     count = 0
     every = []  # all machines made, so none is left running
 
-    def __init__(self, name, project="Demo"):
+    def __init__(self, name, project="Demo", agent_names=None):
+        """agent_names "place" names agents after tool and folder (claude-mac): on linked machines, a
+        name clash between them is settled by a rename, which a test should not have to wait for."""
+        self.agent_names = agent_names
         Machine.count += 1
         Machine.every.append(self)
         self.name = name
@@ -117,6 +120,8 @@ class Machine:
         folder = Path(folder or self.folder)
         out = self.cli("start", "--no-service", "--no-open", "--port", self.port, "--place", place or self.name,
                        "--project", self.project_name, "--client", client, cwd=folder)
+        if self.agent_names:
+            self.cli("setup", "--agent-names", self.agent_names)
         self.wait_up()
         return out
 
