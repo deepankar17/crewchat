@@ -8877,6 +8877,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
 #tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
+#tasks { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .task-form input { flex: 1 1 120px; min-width: 0; font-size: 13.5px; }
@@ -8913,7 +8914,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .seg button { background: transparent; color: var(--muted); padding: 5px 14px; font-size: 13px; }
 .seg button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
 .board-bar select { font-size: 13px; }
-#board { display: grid; grid-template-columns: repeat(5, minmax(200px, 1fr)); gap: 12px; align-items: start; overflow-x: auto; padding-bottom: 8px; }
+#board { display: grid; grid-template-columns: repeat(5, minmax(168px, 1fr)); gap: 12px; align-items: start; overflow-x: auto; padding-bottom: 8px; }
 .col { background: var(--soft); border-radius: var(--radius); padding: 10px; min-height: 140px; display: flex; flex-direction: column; gap: 8px;
   border: 2px solid transparent; transition: border-color 0.12s, background 0.12s; }
 .col.over { border-color: var(--accent-2); background: var(--tint); }
@@ -8927,7 +8928,8 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .tcard:hover { transform: translateY(-1px); }
 .tcard.dragging { opacity: 0.4; }
 .tcard .tid { font-size: 11.5px; color: var(--muted); font-weight: 650; }
-.tcard .ttl { margin: 2px 0 6px; font-size: 13.5px; line-height: 1.35; overflow-wrap: anywhere; }
+.tcard .ttl { margin: 2px 0 6px; font-size: 13.5px; line-height: 1.35; overflow-wrap: anywhere;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .tcard .tmeta { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 .tcard .avatar { width: 22px; height: 22px; } .tcard .avatar .initials { font-size: 9px; } .tcard .avatar .emoji { font-size: 13px; }
 .tcard .avatar .mark, .tcard .avatar .os { display: none; }

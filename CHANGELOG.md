@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A task board** (new chat page, PR 4 of 5). **Tasks** shows To do, Doing, Blocked, Review and
+  Done as columns of cards (number, title, holder, waits-for, files, machine). Drag a card to
+  reorder it, onto Done, back to To do, or onto Doing to give it to an agent; Blocked and Review are
+  the agents'. Filter by agent, role or machine; Done folds to the last 20; **List** keeps the
+  table. One column at a time on a phone. `/api/task` moves a task `before:ID` or to the `end`.
 - **Agents get first names.** A new agent is called Maya, Teo, Wren... (one nobody in the chat has)
   instead of `claude-macbook`; its tool and folder still show next to it. `crewchat setup
   --agent-names place` keeps the old names. **New agent** has a 🎲 button for a random name, and an
