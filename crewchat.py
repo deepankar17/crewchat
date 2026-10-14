@@ -99,6 +99,8 @@ RECLAIM_MINUTES = (10, 7 * 24 * 60)  # a task's holder may be silent this long b
 RECLAIM_EVERY = 60  # seconds between the server's checks for silent holders
 RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
 ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
+DOING_EVERY = 4  # ... and what it is doing, when that changed, at most this often (seconds)
+DOING_FRESH = 120  # seconds the page shows what an agent was doing
 SERVICE_LABEL = "io.crewchat.hub"
 SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app does), name it %s."
 MAX_CHAIN_LIMIT = 50
@@ -1552,7 +1554,7 @@ class Hub:
                 if isinstance(row, dict) and NAME_RE.match(str(row.get("agent", ""))):
                     rows.append({k: row.get(k) for k in
                                  ("agent", "client", "place", "seen", "status", "read_id", "unread", "activity", "role",
-                                  "listen", "picture", "colour", "os")})
+                                  "listen", "picture", "colour", "os", "doing")})
             old = self.remote.get(device_id)
             updated = float(updated or 0)
             self.remote[device_id] = {"device": str(device), "agents": rows, "updated": updated}
@@ -1583,9 +1585,14 @@ class Hub:
                 {"agent": n, "client": a["client"], "place": a["place"], "seen": round(a["seen"]),
                  "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n)),
                  "activity": self._activity(n, time.time()), "role": a.get("role", ""), "listen": a.get("listen", ""),
-                 "picture": a.get("picture", ""), "colour": a.get("colour", ""), "os": os_name()}
+                 "picture": a.get("picture", ""), "colour": a.get("colour", ""), "os": os_name(),
+                 "doing": self._doing(a, time.time())}
                 for n, a in self.agents.items()
             ]
+
+    def _doing(self, agent, now):
+        """What an agent was doing a moment ago (a tool call), or "" once it is old news."""
+        return agent.get("doing", "") if now - float(agent.get("doing_at") or 0) < DOING_FRESH else ""
 
     def _rows(self):
         now = time.time()
@@ -1595,7 +1602,7 @@ class Hub:
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
              "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
-             "os": os_name(), "permissions": a.get("permissions", "")}
+             "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now)}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1614,6 +1621,7 @@ class Hub:
                     "role": str(row.get("role") or ""), "listen": str(row.get("listen") or ""),
                     "picture": clean_picture(row.get("picture")), "colour": clean_colour(row.get("colour")),
                     "os": clean_os(row.get("os")),
+                    "doing": " ".join(str(row.get("doing") or "").split())[:80] if fresh else "",
                 })
         return rows
 
@@ -2681,7 +2689,7 @@ class Hub:
                 "releases": RELEASES,
             }
 
-    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None):
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing=""):
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life, or the session report it was asked for)."""
@@ -2695,6 +2703,12 @@ class Hub:
                 return {"link": True}
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
+                doing = " ".join(str(doing or "").split())[:80]
+                if doing and doing != agent.get("doing"):  # what it does now, for the chat page
+                    agent["doing"] = doing
+                    self._changed()
+                if doing:
+                    agent["doing_at"] = time.time()
                 if session:  # the report it was asked for (wants_session)
                     self._keep_session(name, session)
                 return {}
@@ -4670,7 +4684,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
-                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session)
+                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session, data.get("doing"))
                 out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
@@ -6254,6 +6268,38 @@ def session_report(client, session, project):
     return dict(found, id=session, tool=client, folder=str(project)) if found else None
 
 
+def tool_summary(client, data):
+    """What an agent's tool call was, in a few safe words for the chat page: a file's name, a command's
+    program (and its subcommand), never their arguments or what was read or written."""
+    name = str(data.get("tool_name") or "")
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    if client == "cursor":  # afterFileEdit sends a file, afterShellExecution a command
+        if data.get("file_path"):
+            name, args = "Edit", {"file_path": data["file_path"]}
+        elif data.get("command"):
+            name, args = "Bash", {"command": data["command"]}
+    base = lambda path: Path(str(path or "")).name[:60]  # noqa: E731
+    if not name or "crewchat" in name:
+        return ""  # the chat's own tools: what they do shows in the chat already
+    verbs = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Write": "Writing", "NotebookEdit": "Editing"}
+    if name in verbs:
+        return (verbs[name] + " " + base(args.get("file_path") or args.get("notebook_path"))).strip()
+    if name == "Bash":
+        for part in re.split(r"&&|\|\||;|\|", str(args.get("command") or "")):
+            words = [w for w in part.split() if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
+            if words and words[0] not in ("cd", "sudo", "env", "export", "set", "time"):
+                prog = base(words[0])
+                sub = words[1] if len(words) > 1 and re.fullmatch(r"[a-z][a-z-]{1,20}", words[1]) else ""
+                return ("Running " + prog + (" " + sub if sub else ""))[:60] if re.fullmatch(r"[\w.+-]{1,40}", prog) else ""
+        return ""
+    simple = {"Grep": "Searching the code", "Glob": "Searching the code", "WebFetch": "Reading the web",
+              "WebSearch": "Searching the web", "Task": "Working with a helper", "Agent": "Working with a helper",
+              "TodoWrite": "Planning"}
+    if name in simple:
+        return simple[name]
+    return "Using " + name if re.fullmatch(r"[\w.-]{1,40}", name) else ""
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -6267,8 +6313,10 @@ def run_hook(client, event):
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
-    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY:
-        return  # after every tool call: return at once unless a minute passed
+    doing = tool_summary(client, data) if event == "tool" else ""
+    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY and (
+            not doing or doing == state.get("doing") or time.time() - float(state.get("doing_at") or 0) < DOING_EVERY):
+        return  # after every tool call: return at once unless a minute passed, or it does something new
     project = find_project(client)
     config = client_config(project, client) if project else None
     if config is None or hooks_off(project):
@@ -6296,7 +6344,7 @@ def run_hook(client, event):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
                                           "ignored": ignored, "alive": state.get("alive", 0),
-                                          }))
+                                          "doing": state.get("doing", ""), "doing_at": state.get("doing_at", 0)}))
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
@@ -6305,8 +6353,10 @@ def run_hook(client, event):
         # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
         # above), so a long turn without a crewchat tool does not look silent. Never waits or delivers.
         state["alive"] = time.time()
+        if doing:
+            state["doing"], state["doing_at"] = doing, time.time()
         save(chain, pending, asks)
-        post_json(base + "/api/hook", token, {"key": key, "event": "tool"}, timeout=5)
+        post_json(base + "/api/hook", token, {"key": key, "event": "tool", "doing": doing}, timeout=5)
         return
 
     if event == "prompt":
@@ -8884,6 +8934,23 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #bell .menu-list { left: auto; right: 0; min-width: 260px; }
 #bell.off #bell-icon { filter: grayscale(1); opacity: 0.55; }
 
+/* Live: who is working, and on what. */
+.dot.working { background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(31, 138, 82, 0.45); } 60% { box-shadow: 0 0 0 5px rgba(31, 138, 82, 0); } }
+.agent .holds .doing { color: var(--ok-strong); font-weight: 600; }
+@media (prefers-color-scheme: dark) { .agent .holds .doing { color: var(--ok); } }
+#working { margin: 0; padding: 2px max(18px, calc((100% - 860px) / 2)); font-size: 12.5px; color: var(--muted); flex: none; }
+#working .dots::after { content: "…"; display: inline-block; animation: blink 1.2s steps(3) infinite; width: 1.2em; overflow: hidden; vertical-align: bottom; }
+@keyframes blink { 0% { width: 0.3em; } 100% { width: 1.2em; } }
+.msg, .sys { animation: rise 0.18s ease-out; }
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .dot.working, .msg, .sys, #working .dots::after { animation: none; } }
+.welcome { max-width: 520px; margin: 10vh auto 0; text-align: center; color: var(--muted); }
+.welcome img { width: 96px; height: 96px; }
+.welcome h2 { color: var(--ink); font-size: 20px; margin: 8px 0 4px; }
+.welcome .acts { justify-content: center; margin-top: 14px; gap: 8px; }
+.welcome .acts button { padding: 8px 16px; font-size: 14px; }
+
 /* Avatars (the class names PR 1 gave them). */
 .avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
   width: 34px; height: 34px; border-radius: 50%; background: var(--av); }
@@ -9228,6 +9295,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
     <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
   </section>
+  <p id="working" aria-live="off" hidden></p>
   <form id="form">
     <div id="pending" aria-label="Files to send"></div>
     <div class="pillbox">
@@ -9487,6 +9555,7 @@ function showView(view) {
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
   if (view === "commands") loadCommands();
+  $("working").hidden = view !== "chat" || $("working").hidden;
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
@@ -10125,7 +10194,8 @@ function renderAgents(force) {
     card.dataset.agent = a.agent;
     const who = el("span", "who");
     who.append(el("span", "name " + colour(a.agent), a.agent));
-    const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
+    const working = a.activity === "working" && age < 90 && !(a.session && !a.session.running);
+    const dot = el("span", "dot" + (working ? " working" : age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.title = doing(a) + " · " + ago(a.seen, state.now);
     const right = el("span", "inline");
     if (a.unread) right.append(el("span", "count", String(a.unread)), el("span", "sr", " unread"));
@@ -10133,7 +10203,8 @@ function renderAgents(force) {
     const task = heldTask(a.agent);
     const holds = el("span", "holds");
     if (a.role) holds.append(el("span", "badge " + a.role, roleTitle(a.role)), " ");
-    holds.append(task ? "#" + task.id + " " + task.title : a.status || doing(a));
+    if (working && a.doing) holds.append(el("span", "doing", a.doing));
+    else holds.append(task ? "#" + task.id + " " + task.title : a.status || doing(a));
     card.append(avatar(a), who, right, holds);
     card.addEventListener("click", () => openPanel("agent", a.agent));
     box.append(card);
@@ -10352,7 +10423,7 @@ function panelAgent(name) {
 
   const now = [];
   now.push(field("Status", a.status || "No status set"));
-  now.push(field("Doing", doing(a) + " · " + ago(a.seen, state.now)));
+  now.push(field("Doing", (a.doing && a.activity === "working" ? a.doing : doing(a)) + " · " + ago(a.seen, state.now)));
   if (a.session) now.push(field("Session", sessionLine(a)));
   const task = heldTask(a.agent);
   if (task) {
@@ -10812,6 +10883,21 @@ function applySearch() {
 }
 $("search").addEventListener("input", applySearch);
 
+// An empty chat: what to do first.
+function welcome() {
+  const box = el("div", "welcome");
+  box.id = "empty";
+  const img = el("img"); img.alt = ""; img.src = "/pictures/bot.webp";
+  const acts = el("div", "acts");
+  actButton(acts, "New agent", "Start a new agent", () => openLaunch());
+  actButton(acts, "Post a task", "Write a task for the crew", () => { setTask(true); text.focus(); });
+  actButton(acts, "Roles", "See the project's roles", () => openPanel("roles"));
+  box.append(img, el("h2", "", "Your crew's chat starts here"),
+             el("p", "", state.agents.length ? "Say hello, or post a task: the crew settles who takes it."
+                                            : "Add an agent, or open Claude Code or Cursor in a connected folder: it joins by itself."), acts);
+  return box;
+}
+
 function addMessages(list, first) {
   if (!list.length) return;
   const log = $("log");
@@ -10926,6 +11012,18 @@ function notify(needs) {
   }
 }
 
+// Who is working right now, under the thread: "Maya is editing Login.kt…".
+function renderWorking() {
+  const busy = state.agents.filter((a) => a.activity === "working" && state.now - a.seen < 90 && !(a.session && !a.session.running));
+  const line = $("working");
+  line.hidden = !busy.length || $("log").hidden;
+  if (!busy.length) return;
+  const one = busy[0];
+  const what = busy.length === 1 && one.doing ? " is " + one.doing.charAt(0).toLowerCase() + one.doing.slice(1)
+    : busy.length === 1 ? " is working" : busy.length === 2 ? " and " + busy[1].agent + " are working" : " and " + (busy.length - 1) + " others are working";
+  line.replaceChildren(el("b", "", one.agent), what, el("span", "dots"));
+}
+
 // The space's header: the project, and how many agents, machines and open tasks it has.
 function renderHeader() {
   $("space-avatar").textContent = letter(state.project);
@@ -10984,12 +11082,13 @@ async function loop() {
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
       renderAgents();
+      renderWorking();
       addMessages(data.messages, first);
       // Roles changed (here or in another tab): what the roles panels show is read again.
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
         loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
-      if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the crew below.";
+      if (first && $("empty")) $("empty").replaceWith(welcome());
       refreshDynamic();
       // Scroll last: the cards and read receipts above change the list's height.
       if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;

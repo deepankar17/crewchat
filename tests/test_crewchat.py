@@ -989,6 +989,41 @@ class Roles(Base):
         self.assertIn("Manager", cli("roles"))
 
 
+class Activity(Base):
+    """What an agent is doing, from its tool calls, in a few safe words."""
+
+    def test_a_tool_call_in_a_few_safe_words(self):
+        say = crewchat.tool_summary
+        self.assertEqual(say("claude", {"tool_name": "Edit", "tool_input": {"file_path": "/x/app/Login.kt"}}), "Editing Login.kt")
+        self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": "/secret/dir/.env"}}), "Reading .env")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
+                         "Running npm test")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "cd app && ./gradlew assemble"}}),
+                         "Running gradlew assemble")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}}), "Running curl")
+        self.assertEqual(say("claude", {"tool_name": "Grep", "tool_input": {"pattern": "password"}}), "Searching the code")
+        self.assertEqual(say("claude", {"tool_name": "mcp__crewchat__hub_send"}), "")
+        self.assertEqual(say("cursor", {"file_path": "/a/b/Theme.kt"}), "Editing Theme.kt")
+        self.assertEqual(say("cursor", {"command": "pytest -q"}), "Running pytest")
+        self.assertEqual(say("claude", {"tool_name": "<img src=x>"}), "")
+        for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
+            for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
+                        say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}})):
+                self.assertNotIn(leaked, out)
+
+    def test_the_page_shows_it_while_fresh(self):
+        session, name = self.agent()
+        key = "k" * 16
+        session.text("hub_link", key=key)
+        hook = lambda **body: crewchat.post_json(self.base + "/api/hook", self.token, dict({"key": key}, **body))  # noqa: E731
+        hook(event="tool", doing="Editing Login.kt")
+        row = lambda: next(r for r in self.hub.rows() if r["agent"] == name)  # noqa: E731
+        self.assertEqual(row()["doing"], "Editing Login.kt")
+        with self.hub.lock:
+            self.hub.agents[name]["doing_at"] -= crewchat.DOING_FRESH + 1
+        self.assertEqual(row()["doing"], "")  # old news
+
+
 class NeedsYou(Base):
     """What waits on the owner: blocked tasks, reviews, tasks given back, unread messages."""
 
