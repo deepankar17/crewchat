@@ -598,6 +598,8 @@ class NewPage(Signed):
         c.click("#view-tasks")
         self.assertFalse(c.js("$('tasks').hidden"))
         self.assertTrue(c.js("$('form').hidden"))
+        c.js("$('as-list').click()")
+        self.addCleanup(c.js, "$('as-board').click()")
         c.type_into("#t-title", "Write the welcome screen")
         c.js("$('task-form').requestSubmit()")
         c.until("$('sheet').innerText.includes('Write the welcome screen')", what="the new task")
@@ -629,6 +631,8 @@ class NewPage(Signed):
             return ['todo', 'doing', 'blocked', 'review', 'done'].map(col => JSON.stringify(dropAction(r, col, ''))); })()"""
                      % json.dumps(ids[0]))
         self.assertIn('"where":"end"', rules[0])  # a move within its own column
+        self.assertEqual(c.js("JSON.stringify(dropAction(state.sheet.find(x => x.id === %s), 'todo', %s))"
+                              % (json.dumps(ids[0]), json.dumps(ids[0]))), "null")  # its own place: nothing
         self.assertIn('"give"', rules[1])  # Doing asks who takes it
         self.assertEqual(rules[2:4], ["null", "null"])  # Blocked and Review are the agents' to set
         self.assertIn('"status":"done"', rules[4])
@@ -638,13 +642,16 @@ class NewPage(Signed):
         # Doing asks for an agent, then gives it the task.
         c.js("askGive(state.sheet.find(x => x.id === %s))" % json.dumps(ids[0]))
         self.assertFalse(c.js("$('give').hidden"))
-        c.js("$('give-to').value = %s; $('give-to').dispatchEvent(new Event('change'))" % json.dumps(self.agent.name))
+        self.assertIn("Give #%s to" % ids[0], c.js("$('give-label').textContent"))
+        c.js("$('give-to').value = %s; $('give-ok').click()" % json.dumps(self.agent.name))
         c.until("!!document.querySelector('#board .col[data-col=doing] .tcard[data-task=\"%s\"]')" % ids[0],
                 what="the task given to the agent")
+        # Done and Doing tasks can't be given from the board: only one to do.
+        self.assertEqual(c.js("JSON.stringify(dropAction(state.sheet.find(x => x.id === %s), 'doing', ''))" % json.dumps(ids[1])), "null")
         # A filter by agent, and the list view.
         c.js("$('f-agent').value = %s; $('f-agent').dispatchEvent(new Event('change'))" % json.dumps(self.agent.name))
-        self.assertTrue(c.js("[...document.querySelectorAll('#board .tcard')].every(b => b.innerText.includes(%s))"
-                             % json.dumps(self.agent.name)))
+        shown = c.js("[...document.querySelectorAll('#board .tcard')].map(b => b.innerText)")
+        self.assertTrue(shown and all(self.agent.name in t for t in shown), shown)
         c.js("$('f-agent').value = ''; $('f-agent').dispatchEvent(new Event('change'))")
         c.js("$('as-list').click()")
         self.assertTrue(c.js("$('board').hidden && !$('sheet').hidden"))
@@ -652,6 +659,25 @@ class NewPage(Signed):
         # A card opens its task in the panel.
         c.js("document.querySelector('#board .tcard').click()")
         c.until("$('panel-title').textContent.startsWith('Task #')", what="the task panel")
+        self.assertEqual(c.errors, [])
+
+    def test_dragging_a_card_with_the_mouse(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        c.js("$('as-board').click()")
+        ids = [c.js("postJSON('/api/task', {op: 'add', title: %s}).then(r => r.id)" % json.dumps("Drag %d" % i)) for i in range(3)]
+        card = "document.querySelector('#board .tcard[data-task=\"%s\"]')"
+        c.until("!!" + card % ids[2], what="the cards")
+        # Drag the last of the three to just above the first: the page reads where the pointer is.
+        c.js("""(() => { const from = %s, onto = %s, col = onto.closest('.col'), dt = new DataTransfer();
+            const box = onto.getBoundingClientRect(), y = box.top + 2;
+            from.dispatchEvent(new DragEvent('dragstart', {dataTransfer: dt, bubbles: true}));
+            col.dispatchEvent(new DragEvent('dragover', {dataTransfer: dt, bubbles: true, cancelable: true, clientY: y}));
+            onto.dispatchEvent(new DragEvent('drop', {dataTransfer: dt, bubbles: true, cancelable: true, clientY: y}));
+            from.dispatchEvent(new DragEvent('dragend', {dataTransfer: dt, bubbles: true})); })()""" % (card % ids[2], card % ids[0]))
+        order = "state.sheet.map(r => r.id).filter(id => %s.includes(id))" % json.dumps(ids)
+        c.until("JSON.stringify(%s) === %s" % (order, json.dumps(json.dumps([ids[2], ids[0], ids[1]]).replace(" ", ""))),
+                what="the card moved above the first")
         self.assertEqual(c.errors, [])
 
     def test_new_agent_in_four_steps(self):
