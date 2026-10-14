@@ -2168,6 +2168,8 @@ class Hub:
                 "agents": self._rows(),
                 "roles": [{"name": k, "title": v[0]} for k, v in self.roles().items()],
                 "statuses": STATUSES,
+                "tools": TOOLS_INFO,
+                "presets": PICTURE_PRESETS,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
                 "update": getattr(self, "newer", ""),
@@ -6904,6 +6906,21 @@ h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywher
 .agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
 .agent .top { display: flex; align-items: center; gap: 8px; }
 .agent .name { font-weight: 600; overflow-wrap: anywhere; }
+.avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 28px; height: 28px; border-radius: 50%; background: var(--av); box-shadow: 0 0 0 1px var(--off); }
+.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+.avatar .initials { color: var(--av-ink); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
+.avatar .emoji { font-size: 16px; line-height: 1; }
+.avatar .mark, .avatar .os { position: absolute; bottom: -4px; height: 13px; min-width: 13px; padding: 0 2px;
+  border-radius: 7px; font-size: 7.5px; line-height: 13px; text-align: center; box-shadow: 0 0 0 1.5px var(--panel); }
+.avatar .mark { right: -5px; background: var(--mk); color: #fff; font-weight: 700; }
+.avatar .os { left: -5px; background: var(--panel); }
+.msg .meta .avatar { width: 20px; height: 20px; align-self: center; }
+.msg .meta .avatar .initials { font-size: 8.5px; } .msg .meta .avatar .emoji { font-size: 12px; }
+.msg .meta .avatar .mark, .msg .meta .avatar .os { display: none; }
+.picmenu > summary { cursor: pointer; font-size: 12px; color: var(--accent); list-style: none; display: inline; }
+.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
+.picmenu .picks button { min-width: 30px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
 .dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
 .agent .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
@@ -7603,6 +7620,7 @@ function agentActions(a) {
       agentOp({ op: "remove", agent: a.agent }, "Not removed", b);
   });
   sessionControls(a, acts, agentOp);
+  if (!remote) acts.append(pictureMenu(a, agentOp));
   const listen = el("select");
   listen.setAttribute("aria-label", "Listening for " + a.agent);
   listen.title = remote || "Wait for messages after each turn (On), check once (Off), or as its folder says";
@@ -7674,6 +7692,7 @@ function setRole(agent, role, pick) {
 function renderAgents() {
   const box = $("agents");
   if (box.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;  // menu open
+  if (box.querySelector(".picmenu[open]")) return;  // choosing a picture
   box.replaceChildren();
   if (!state.agents.length) box.append(el("p", "none", "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use Add an agent above."));
   for (const a of state.agents) {
@@ -7682,7 +7701,7 @@ function renderAgents() {
     const top = el("div", "top");
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.setAttribute("aria-hidden", "true");
-    top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
+    top.append(avatar(a), dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
     // The role goes under the name: names are long and the card is narrow.
     const where = el("div", "where");
     if (a.role) where.append(el("span", "badge " + a.role, roleTitle(a.role)), document.createTextNode(" "));
@@ -7711,6 +7730,92 @@ function renderAgents() {
     // Names colour by roster position, so repaint what is already on screen.
     for (const n of $("log").querySelectorAll("[data-who]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
   }
+  const looks = state.agents.map((a) => [a.agent, a.client, a.picture, a.colour, a.os, a.device].join(" ")).join("\n");
+  if (looks !== state.looks) {  // a new picture or colour: repaint the ones on messages too
+    state.looks = looks;
+    for (const n of $("log").querySelectorAll(".avatar[data-who]")) n.replaceWith(avatar(agentRow(n.dataset.who)));
+  }
+}
+
+// An agent's picture: its uploaded image, a preset, or its initials, on its colour (the tool's own by
+// default), with its tool's lettermark, and its machine's OS when the chat spans several machines.
+const OS_BADGES = { mac: ["\u{1F34E}", "macOS"], windows: ["\u{1FA9F}", "Windows"], linux: ["\u{1F427}", "Linux"] };
+
+function agentRow(name) {
+  return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
+}
+
+function inkOn(hex) {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 ? "#111" : "#fff";
+}
+
+function initials(name) {
+  const parts = name.split(/[-_.]+/).filter(Boolean);
+  return parts.slice(0, 2).map((p) => p[0]).join("").toUpperCase() || "?";
+}
+
+function avatar(a) {
+  const tool = (state.tools || {})[a.client] || (state.tools || {}).agent || { colour: "#6b7280", mark: "", label: "" };
+  const fill = a.colour || tool.colour;
+  const box = el("span", "avatar");
+  box.dataset.who = a.agent;
+  box.style.setProperty("--av", fill);
+  box.style.setProperty("--av-ink", inkOn(fill));
+  const letters = () => el("span", "initials", initials(a.agent));
+  const [kind, id] = (a.picture || "").split(":");
+  if (kind === "file") {
+    const img = el("img");
+    img.alt = ""; img.src = "/files/" + id;
+    img.addEventListener("error", () => img.replaceWith(letters()));
+    box.append(img);
+  } else if (kind === "preset" && (state.presets || {})[id]) {
+    box.append(el("span", "emoji", state.presets[id]));
+  } else {
+    box.append(letters());
+  }
+  if (tool.mark) {
+    const mark = el("span", "mark", tool.mark);
+    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
+    box.append(mark);
+  }
+  const os = OS_BADGES[a.os];
+  if (os && new Set(state.agents.map((r) => r.device)).size > 1) {
+    const badge = el("span", "os", os[0]); badge.title = os[1];
+    box.append(badge);
+  }
+  box.title = a.agent + (tool.label ? " · " + tool.label : "");
+  return box;
+}
+
+// The card's Picture menu: a preset, initials, an image of your own, and a colour.
+function pictureMenu(a, agentOp) {
+  const menu = el("details", "picmenu");
+  menu.append(el("summary", "", "Picture"));
+  const picks = el("div", "picks");
+  const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
+    .then(() => { menu.open = false; });
+  for (const [id, emoji] of Object.entries(state.presets || {}))
+    actButton(picks, emoji, "Picture: " + id, (b) => set({ picture: "preset:" + id }, b));
+  actButton(picks, "Initials", "Picture: initials", (b) => set({ picture: "" }, b));
+  const file = el("input");
+  file.type = "file"; file.accept = "image/png,image/jpeg,image/webp"; file.hidden = true;
+  file.addEventListener("change", async () => {
+    const f = file.files[0]; file.value = "";
+    if (!f) return;
+    try { await set({ picture: "file:" + await uploadFile(f) }); }
+    catch (err) { $("error").textContent = "Picture not changed: " + err.message; }
+  });
+  actButton(picks, "Upload\u2026", "Upload a picture (PNG, JPEG or WebP, 512 KB at most)", () => file.click());
+  const tint = el("input");
+  tint.type = "color"; tint.value = a.colour || ((state.tools || {})[a.client] || {}).colour || "#6b7280";
+  tint.setAttribute("aria-label", "Colour for " + a.agent);
+  tint.addEventListener("change", () => set({ colour: tint.value }, tint));
+  actButton(picks, "Tool colour", "Back to the tool's own colour", (b) => set({ colour: "" }, b));
+  picks.append(file, tint);
+  menu.append(picks);
+  return menu;
 }
 
 function named(tag, cls, name) {
@@ -7774,6 +7879,7 @@ function buildMessage(m) {
   const box = el("div", "msg" + (own ? " own" : "") + (m.kind === "task" ? " task" : "") + (m.kind === "update" ? " update" : ""));
   box.dataset.id = m.id;
   const meta = el("div", "meta");
+  if (!own) meta.append(avatar(agentRow(m.from)));
   meta.append(own ? el("span", "who", "You") : named("span", "who", m.from));
   if (m.to !== "all") meta.append(el("span", "to", "to " + (m.to === "Owner" ? "you" : m.to)));
   meta.append(el("span", "", new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })));
@@ -7868,6 +7974,7 @@ async function loop() {
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
+      state.tools = data.tools || {}; state.presets = data.presets || {};
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       showUpdate(data.update || "", data.releases || "");
       if (data.project && data.project + " · crewchat" !== state.title) {
