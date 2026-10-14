@@ -17,6 +17,9 @@
   from before is at `/classic` for one release. A picture is checked before it is uploaded, a
   picture that can't be loaded is not asked for again, and text on a coloured avatar picks its ink
   by contrast.
+- **16 built-in 3D pictures** for agents and roles (a robot, a coder, an artist, a scientist, an
+  owl...), from Microsoft's Fluent Emoji (MIT licence), served by crewchat itself. Every pack's
+  roles now come with one; agents can pick them with `hub_profile` too.
 - **Role packs, for any crew** (new chat page, PR 2 of 5). A project's roles come from a pack:
   software team (today's roles, the default), YouTube channel, Instagram creator, small business,
   or blank. `crewchat start --pack youtube` picks one for a new project, `crewchat roles pack`

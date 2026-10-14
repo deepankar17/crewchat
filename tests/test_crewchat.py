@@ -538,7 +538,7 @@ class Teams(Base):
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
         poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
         qa = next(r for r in poll["roles"] if r["name"] == "qa")
-        self.assertEqual((qa["title"], qa["picture"], qa["source"]), ("QA", "preset:flask", "pack"))
+        self.assertEqual((qa["title"], qa["picture"], qa["source"]), ("QA", "art:scientist", "pack"))
         self.assertNotIn("description", qa)  # instructions come from /api/roles, not every poll
 
     def test_there_is_one_lead(self):
@@ -663,7 +663,8 @@ class RolePacks(unittest.TestCase):
             self.assertLessEqual({"lead", "advisor"}, set(pack["roles"]), pid)
             for name, role in pack["roles"].items():
                 self.assertEqual(crewchat.clean_role(role)["description"], role["description"], (pid, name))
-                self.assertIn(role["picture"][len("preset:"):], crewchat.PICTURE_PRESETS, (pid, name))
+                self.assertEqual(crewchat.clean_picture(role["picture"]), role["picture"], (pid, name))
+                self.assertTrue(role["picture"].startswith("art:"), (pid, name))  # the 3D pictures
         lead = self.packs["youtube"]["roles"]["lead"]
         self.assertEqual(lead["label"], "Producer")
         self.assertIn("hub_assign", lead["description"])
@@ -783,10 +784,7 @@ class Roles(Base):
         self.hub.roster.refresh(force=True)
 
     def op(self, token=None, **body):
-        try:
-            return crewchat.post_json(self.base + "/api/roles", token or self.owner, body)
-        except urllib.error.HTTPError as e:
-            return dict(json.loads(e.read()), status=e.code)
+        return self.op_at("/api/roles", token, **body)
 
     def poll(self):
         return self.hub.poll(-1, -1, 0)
@@ -1564,6 +1562,21 @@ class Profiles(Base):
         self.assertIn("no picture preset", self.op(op="profile", agent=name, picture="preset:nope")["error"])
         self.assertIn("#rrggbb", self.op(op="profile", agent=name, colour="red")["error"])
         self.assertIn("#rrggbb", self.op(op="profile", agent=name, colour="#12345g")["error"])
+
+    def test_the_built_in_3d_pictures(self):
+        status, body, headers = self.raw("/pictures/robot.webp")  # not secret: no sign-in needed
+        self.assertEqual((status, headers["Content-Type"], body[:4], body[8:12]), (200, "image/webp", b"RIFF", b"WEBP"))
+        self.assertIn("immutable", headers["Cache-Control"])
+        for bad in ("/pictures/nope.webp", "/pictures/robot.png", "/pictures/../files/x"):
+            self.assertEqual(self.raw(bad)[0], 404, bad)
+        session, name = self.agent()
+        self.assertEqual(self.op(op="profile", agent=name, picture="art:owl"), {"ok": True})
+        self.assertEqual(self.row(name)["picture"], "art:owl")
+        self.assertIn("no picture called nope", self.op(op="profile", agent=name, picture="art:nope")["error"])
+        self.assertIn("picture art:fox", session.text("hub_profile", picture="fox"))
+        self.assertEqual(crewchat.clean_picture("art:../x"), "")
+        self.assertEqual(set(crewchat.ART_DATA), set(crewchat.ART_PICTURES))
+        self.assertEqual(self.hub.poll(-1, -1, 0)["art"]["robot"], "Robot")
 
     def test_uploaded_picture_limits(self):
         _, name = self.agent()

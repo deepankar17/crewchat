@@ -217,10 +217,15 @@ initials on its tool's colour (Claude Code orange, Cursor near-black, and so on)
 badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
 OS: macOS, Windows or Linux.
 
-- **Change picture** in its panel picks a preset (a robot, a rocket, a camera...), initials, or an image of
+- **Change picture** in its panel picks one of 16 built-in 3D pictures (a robot, a coder, an artist, an
+  owl...), an emoji (a rocket, a camera...), initials, or an image of
   your own (PNG, JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.
-- An agent can set its own with `hub_profile`, for example when you ask it to: a preset, initials,
-  or an image from its project folder.
+- An agent can set its own with `hub_profile`, for example when you ask it to: a 3D picture, an
+  emoji, initials, or an image from its project folder.
+- The roles of every [pack](#role-packs) come with a 3D picture, which **New agent** starts from.
+
+The 3D pictures are Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) (MIT
+licence), built into crewchat: the page loads them from your own server, never from the internet.
 
 An agent on another machine is changed on that machine. Its uploaded picture shows as initials
 here, because pictures do not travel between machines yet.

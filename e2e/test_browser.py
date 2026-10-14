@@ -114,6 +114,11 @@ class Signed(unittest.TestCase):
     def log_text(self):
         return self.chrome.js("document.getElementById('log').innerText")
 
+    def shown_though_hidden(self):
+        """Elements marked hidden that the page's styles show anyway."""
+        return self.chrome.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
+                              ".map(e => e.id || e.className)")
+
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
 class Page(Signed):
@@ -381,8 +386,7 @@ class Page(Signed):
         c.js("const t = document.getElementById('l-tool'); t.value = [...t.options].find(o => o.value !== 'claude').value;"
              "t.dispatchEvent(new Event('change'))")
         self.assertNotIn("edits", c.js("[...document.getElementById('l-perms').options].map(o => o.value)"))
-        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
-                              ".map(e => e.id || e.className)"), [])
+        self.assertEqual(self.shown_though_hidden(), [])
         c.click("#l-cancel")
         # Opened again, the list starts on its first tool: the box shows exactly when that is Claude Code.
         c.js("document.getElementById('l-tool').replaceChildren()")  # so that the wait below sees the new list
@@ -439,8 +443,7 @@ class NewPage(Signed):
         self.assertIn("1 agent", c.js("$('space-meta').textContent"))
         self.assertTrue(c.js("$('classic-link').href").endswith("/classic"))
         self.assertTrue(c.js("$('panel').hidden"))
-        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
-                              ".map(e => e.id || e.className)"), [])
+        self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])
 
     def test_mention_writes_to_one_agent_and_post_as_task(self):
@@ -489,8 +492,8 @@ class NewPage(Signed):
         c = self.chrome
         c.until("state.agents.length > 0", what="the agents")
         out = c.js("""(() => {
-            const saved = state.agents, savedModels = toolModels;
-            toolModels = {claude: [["opus", "Opus (latest)"]]};
+            const saved = state.agents, savedModels = state.models;
+            state.models = {claude: [["opus", "Opus (latest)"]]};
             const base = state.agents[0];
             const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
             state.agents = [
@@ -502,7 +505,7 @@ class NewPage(Signed):
                       text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
                       picture: !!b.querySelector(".picmenu")}; };
             const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one")};
-            closePanel(); state.agents = saved; toolModels = savedModels; renderAgents();
+            closePanel(); state.agents = saved; state.models = savedModels; renderAgents(true);
             return out;
         })()""")
         self.assertIn("Stop", out["running"]["buttons"])
@@ -562,7 +565,7 @@ class NewPage(Signed):
         self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, True])
         c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
         self.assertEqual(c.js(step), 1)  # a template skips to the workspace
-        self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", "preset:flask"])
+        self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", "art:scientist"])
         c.click("#l-next")
         c.click("#l-next")
         self.assertEqual(c.js(step), 3)
@@ -570,8 +573,7 @@ class NewPage(Signed):
         self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Briefing")
         c.click("#l-back")
         self.assertEqual(c.js(step), 2)
-        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
-                              ".map(e => e.id || e.className)"), [])
+        self.assertEqual(self.shown_though_hidden(), [])
         c.click("#l-cancel")
         self.assertEqual(c.errors, [])
 

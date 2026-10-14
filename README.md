@@ -190,4 +190,7 @@ servers on free ports with throwaway home folders. See [CONTRIBUTING.md](https:/
 
 MIT. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE).
 
+The agents' built-in 3D pictures are from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji),
+also MIT; their licence notice is in `crewchat.py`, next to them.
+
 <!-- mcp-name: io.github.deepankar17/crewchat -->
