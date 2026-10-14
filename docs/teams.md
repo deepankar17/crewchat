@@ -219,18 +219,53 @@ OS: macOS, Windows or Linux.
 An agent on another machine is changed on that machine. Its uploaded picture shows as initials
 here, because pictures do not travel between machines yet.
 
+## Role packs
+
+A project's roles come from a **pack**, chosen when the project is made. Every pack but Blank has
+a lead (whatever the pack calls it, it hands out the work) and an advisor.
+
+| Pack | Roles |
+|---|---|
+| `software` (the default) | Lead, Developer, QA, Reviewer, Docs, Advisor |
+| `youtube` | Producer (lead), Researcher, Scriptwriter, Thumbnail and title designer, Editor's assistant, SEO and community, Advisor |
+| `instagram` | Content planner (lead), Caption writer, Visual designer, Community manager, Analytics, Advisor |
+| `business` | Manager (lead), Customer support, Marketing, Bookkeeping assistant, Operations, Advisor |
+| `blank` | None: add your own |
+
+Roles in the YouTube, Instagram and business packs are told never to publish, post, send, buy or
+answer anyone outside the chat for you: they prepare it as a file and you decide. A pack also sets
+the project's crew, software or general, which the chat page uses to choose its words (folders
+and commits, or agents, tasks and files); it reaches every linked machine.
+
+```bash
+crewchat start --pack youtube        # a new project, with the YouTube channel's roles
+crewchat roles packs                 # every pack, yours too
+crewchat roles pack business         # start this project's roles over from a pack
+crewchat roles save-pack studio --label "My studio"   # keep this project's roles as a pack
+```
+
+Starting over from a pack drops the roles you added or changed in that project; agents keep the
+role they have. Saved packs are kept in `~/.crewchat/config.json` and offered to every project on
+the machine.
+
 ## Your own roles
 
 ```bash
 crewchat roles                                           # list them
-crewchat roles add designer --title Designer --prompt "You design screens. ..."
+crewchat roles add designer --label Designer --prompt "You design screens. ..."
 crewchat roles add security --file security-reviewer.md  # instructions from a file
-crewchat roles add qa --file our-qa-process.md           # replace a built-in role
+crewchat roles add qa --file our-qa-process.md           # change one of the pack's roles
+crewchat roles add designer --picture palette --colour "#2f5fd6" --tool cursor
 crewchat roles remove designer
+crewchat roles export --file roles.json                  # all of them, to keep or share
+crewchat roles import roles.json                         # into another project (--chat NAME)
 ```
 
-They are stored in `~/.crewchat/config.json` on the host and appear in the chat page's role menus.
-An agent that already had a role keeps its instructions until you give it the role again.
+A role has a label (the name in the chat), its instructions, and a picture, colour and tool that
+a new agent with that role starts with. Roles are stored in the project's `config.json` on the
+host and appear in the chat page's role menus. Removing a role takes it from the agents that have
+it, and tells them. An agent that already had a role keeps its old instructions until you give it
+the role again. The owner can do all of this from the chat page as well (`/api/roles`).
 
 Tips for a role's instructions:
 

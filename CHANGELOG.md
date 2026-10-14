@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Role packs, for any crew** (new chat page, PR 2 of 5). A project's roles come from a pack:
+  software team (today's roles, the default), YouTube channel, Instagram creator, small business,
+  or blank. `crewchat start --pack youtube` picks one for a new project, `crewchat roles pack`
+  starts a project over from one, and `crewchat roles save-pack` keeps a project's roles as your
+  own pack. Each pack has a lead and an advisor; the non-software ones are told never to publish,
+  post, send or buy anything for you. A role now has a label, instructions, and a picture, colour
+  and tool for new agents (`roles add --label --picture --colour --tool`), and roles can be
+  exported and imported as JSON. A pack sets the project's crew (software or general), which every
+  linked machine learns. Removing a role takes it from the agents that have it, and tells them.
+  The owner's new `/api/roles` does all of it for the chat page. `--title` still works for `--label`,
+  and roles saved before keep working.
 - **Pictures and colours for agents.** Each agent shows a picture on its card and next to its
   messages: its initials on its tool's colour by default, with a badge for the tool, and its OS
   when the chat spans several machines. **Picture** on the card picks a preset, initials or your
