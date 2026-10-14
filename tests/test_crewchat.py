@@ -1245,6 +1245,19 @@ class AgentCards(Base):
         self.assertIn(name, self.names())
 
 
+class Profiles(Base):
+    """An agent's picture and colour, its tool's brand and its machine's OS."""
+
+    def test_every_known_client_has_a_brand_row(self):
+        for client in crewchat.KNOWN_CLIENTS + ("antigravity", "grok"):
+            row = crewchat.tool_info(client)
+            self.assertRegex(row["colour"], r"^#[0-9a-f]{6}$", client)
+            self.assertTrue(1 <= len(row["mark"]) <= 2, client)
+        self.assertEqual(crewchat.tool_info("claude")["colour"], "#d97757")
+        self.assertEqual(crewchat.tool_info("something-new"), crewchat.TOOLS_INFO["agent"])
+        self.assertIn(crewchat.os_name(), ("mac", "windows", "linux", "other"))
+
+
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
         status, _, headers = self.raw("/")

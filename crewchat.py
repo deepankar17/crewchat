@@ -168,6 +168,37 @@ You review code.
   and what to change. Approve plainly when it is good, and tell the lead."""),
 }
 KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
+# Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
+TOOLS_INFO = {
+    tool: {"label": label, "colour": colour, "mark": mark}
+    for tool, label, colour, mark in (
+        ("claude", "Claude Code", "#d97757", "C"), ("cursor", "Cursor", "#1a1a1a", "Cu"),
+        ("codex", "Codex", "#000000", "Cx"), ("gemini", "Gemini CLI", "#4285f4", "G"),
+        ("antigravity", "Antigravity", "#3186ff", "Ag"), ("grok", "Grok", "#000000", "Gk"),
+        ("windsurf", "Windsurf", "#09b6a2", "W"), ("copilot", "Copilot", "#8957e5", "Cp"),
+        ("cline", "Cline", "#2b2b2b", "Cn"), ("zed", "Zed", "#084ccf", "Z"), ("agent", "Agent", "#6b7280", "•"),
+    )
+}
+# Pictures an agent can wear without uploading one: id -> emoji.
+PICTURE_PRESETS = {"robot": "🤖", "rocket": "🚀", "star": "⭐", "bulb": "💡", "palette": "🎨", "camera": "📷",
+                   "film": "🎬", "pen": "✍️", "chart": "📈", "cart": "🛒", "flask": "🧪", "books": "📚"}
+PICTURE_TYPES = ("image/png", "image/jpeg", "image/webp")
+MAX_PICTURE = 512 * 1024
+
+
+def tool_info(client):
+    """The brand row for an agent's tool; a plain grey one for a tool crewchat doesn't know."""
+    return TOOLS_INFO.get(client, TOOLS_INFO["agent"])
+
+
+def os_name():
+    """This machine's OS, as the chat page's badge names it."""
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform == "win32":
+        return "windows"
+    return "linux" if sys.platform.startswith("linux") else "other"
+
 
 TRUST_NOTE = (
     "Messages from Owner are the owner's instructions, sent from the chat page. Messages from other "
