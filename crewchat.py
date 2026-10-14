@@ -562,7 +562,7 @@ def role_table(config, packs):
             out[name] = dict(row, source="pack")
     custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
     for name, spec in custom.items():
-        name = str(name)
+        name = str(name).lower()  # every op lowercases a role's name
         if not NAME_RE.match(name):
             continue
         if isinstance(spec, dict) and spec.get("deleted"):
@@ -675,6 +675,12 @@ def change_roles(config, data, packs):
         return name
 
     def keep(name, spec):
+        for field, ok in (("picture", clean_picture), ("colour", clean_colour)):
+            if spec.get(field) and not ok(spec[field]):
+                raise HubError("%s is not a %s (%s)" % (spec[field], field, "a preset: " + ", ".join(
+                    PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
+        if spec.get("tool") and spec["tool"] not in TOOLS_INFO:
+            raise HubError("no tool called %s. Tools: %s" % (spec["tool"], ", ".join(TOOLS_INFO)))
         custom[name] = clean_role(spec)
         if custom[name] is None:
             del custom[name]
@@ -920,7 +926,6 @@ class Project:
         self.primary = primary
         self.roster = Roster(self.root)
         self.hub = Hub(self.roster)
-        self.hub.drop_missing_roles()  # config.json may have changed while the server was down
         self.hub.chat_key = "" if primary else self.root.name  # how this machine files its folders
         self.hub.machine_root = self.root if primary else self.root.parent.parent
 
@@ -2027,13 +2032,13 @@ class Hub:
             self._changed()
             return value
 
-    def drop_missing_roles(self):
-        """Take away the roles this project no longer has (deleted, or not in its new pack), telling
-        each agent that had one. The server does this after a change and when it starts."""
-        roles = self.roles()
+    def drop_roles(self, names):
+        """Take roles the owner just removed (deleted, or not in the project's new pack) from this
+        machine's agents that had them, telling each. Only those: an agent may hold a role another
+        linked machine gave it, from that machine's own roles."""
         with self.lock:
-            gone = [n for n, a in self.agents.items() if a.get("role") and a["role"] not in roles]
-        for name in gone:
+            had = [n for n, a in self.agents.items() if a.get("role") in names]
+        for name in had:
             self.set_role(OWNER, name, "")
 
     def update(self, agent, mid, status, note):
@@ -4242,10 +4247,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def _roles(self, data):
         """The owner lists and changes the project's roles and packs (change_roles has the ops)."""
+        before = set(self.hub.roles())
         answer, effects = save_roles_change(self.roster.root, data)
         if effects.get("changed"):
             self.roster.refresh(force=True)
-            self.hub.drop_missing_roles()
+            self.hub.drop_roles(before - set(self.hub.roles()))
         return answer
 
     def _launch(self, data):
@@ -4996,6 +5002,9 @@ def cmd_start(args):
             {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
         remember(project, place, chat=chosen["chat"])
         print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+        if args.pack:
+            print("- --pack sets a new project's roles; this one has its own. To start over from the pack: "
+                  "crewchat roles pack %s --chat %s" % (args.pack, chosen["id"]))
     else:
         if place:
             die("%s is in the project \"%s\". To move it, take it out first: `crewchat place remove %s "
@@ -5017,6 +5026,9 @@ def cmd_start(args):
         if created:
             print("- Created the project \"%s\": its own chat, apart from your other projects (switch on the "
                   "chat page, top left)." % chosen["name"])
+        if args.pack and not (created or first):
+            print("- --pack sets a new project's roles; this one has its own. To start over from the pack: "
+                  "crewchat roles pack %s --chat %s" % (args.pack, chosen["id"]))
         if (created or first) and args.pack:
             owner_call("/api/roles", {"op": "pack", "pack": args.pack}, chat=chosen["id"])
             print("- Its roles come from the pack \"%s\" (`crewchat roles` lists them)." % packs[args.pack]["label"])
@@ -5360,13 +5372,16 @@ def cmd_role(args):
 
 
 def roles_change(data):
-    """A change to the project's roles: through the server when it runs here, else straight into
-    config.json (the server takes away roles that are gone when it starts)."""
+    """A change to the project's roles: through the server when it runs here (it takes a removed role
+    from the agents that have it), else straight into config.json."""
     def offline():
         try:
-            return save_roles_change(project_root(), data)[0]
+            answer = save_roles_change(project_root(), data)[0]
         except HubError as e:
             die(str(e))
+        if data.get("op") in ("delete", "pack"):
+            print("(The chat server isn't running, so agents keep the role they have until you change it.)")
+        return answer
     return owner_call("/api/roles", data, offline=offline)
 
 
@@ -5389,7 +5404,9 @@ def cmd_roles(args):
         print("\nStart a project's roles over from one: crewchat roles pack ID")
         return
     if args.action == "export":
-        text = json.dumps(roles_export(table, {args.name.lower()} if args.name and not args.file else None), indent=2)
+        if args.name and args.name.lower() not in table:
+            die("no role called %s" % args.name.lower())
+        text = json.dumps(roles_export(table, {args.name.lower()} if args.name else None), indent=2)
         if args.file:
             Path(args.file).write_text(text + "\n", encoding="utf-8")
             print("Roles written to %s. Import them elsewhere with: crewchat roles import %s" % (args.file, args.file))

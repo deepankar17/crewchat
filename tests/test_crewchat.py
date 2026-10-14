@@ -683,7 +683,9 @@ class RolePacks(unittest.TestCase):
             self.change(config, "create", name="empty", description="  ")
         with self.assertRaisesRegex(crewchat.HubError, "letters, digits"):
             self.change(config, "create", name="../x", description="x")
-        edited = self.change(config, "edit", name="designer", label="Screen designer", tool="no-such-tool")["role"]
+        with self.assertRaisesRegex(crewchat.HubError, "no tool called no-such-tool"):
+            self.change(config, "edit", name="designer", tool="no-such-tool")
+        edited = self.change(config, "edit", name="designer", label="Screen designer", tool="")["role"]
         self.assertEqual((edited["label"], edited["description"], edited["tool"]), ("Screen designer", "You design.", ""))
         copy = self.change(config, "duplicate", name="designer")["role"]
         self.assertEqual((copy["name"], copy["label"]), ("designer-copy", "Screen designer (copy)"))
@@ -750,6 +752,11 @@ class RolePacks(unittest.TestCase):
             table = crewchat.role_table({"pack": "my-studio"}, packs)
             self.assertEqual(table["captions"]["label"], "Copywriter")
         self.assertEqual(crewchat.role_packs(os.path.join(TMP, "nowhere")), crewchat.ROLE_PACKS)
+
+    def test_a_role_written_with_capitals_can_still_be_changed(self):
+        config = {"roles": {"Designer": {"title": "Designer", "prompt": "You design."}}}
+        self.assertIn("designer", crewchat.role_table(config, self.packs))
+        self.assertEqual(self.change(config, "edit", name="Designer", label="Screens")["role"]["label"], "Screens")
 
     def test_roles_from_elsewhere_are_reduced_to_what_the_page_can_draw(self):
         row = crewchat.clean_role({"label": "  Two\n words " + "x" * 80, "description": "d" * 9000,
@@ -827,18 +834,23 @@ class Roles(Base):
         self.op(op="pack", pack="software")
         self.assertEqual(self.poll()["crew"], "software")
 
-    def test_a_role_removed_while_the_server_was_down_is_taken_away_when_it_starts(self):
-        self.op(op="create", name="designer", description="You design.")
+    def test_a_role_another_machine_gave_is_kept_when_this_one_changes_its_roles(self):
         session, name = self.agent()
-        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "designer"})
-        session.text("hub_inbox")
-        config = crewchat.load_config(self.root)
-        del config["roles"]["designer"]  # as `crewchat roles remove` does with no server
-        crewchat.save_config(config, self.root)
-        self.hub.roster.refresh(force=True)
-        self.hub.drop_missing_roles()  # what a starting server does
-        self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")
-        self.assertIn("You no longer have a role", session.text("hub_inbox"))
+        with self.hub.lock:
+            self.hub.agents[name]["role"] = "researcher"  # from a linked machine on the YouTube pack
+        self.op(op="delete", name="docs")
+        self.op(op="pack", pack="business")
+        self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "researcher")
+        self.assertNotIn("You no longer have a role", session.text("hub_inbox"))
+        with self.hub.lock:
+            self.hub.agents[name]["role"] = ""
+
+    def test_the_owner_is_told_about_a_bad_picture_colour_or_tool(self):
+        for field, value, why in (("picture", "preset:nope", "a preset"), ("colour", "red", "#rrggbb"),
+                                  ("tool", "cursr", "no tool called cursr")):
+            self.assertIn(why, self.op(op="create", name="x", description="x", **{field: value})["error"])
+            self.assertIn(why, self.op(op="edit", name="qa", **{field: value})["error"])
+        self.assertNotIn("x", [r["name"] for r in self.op(op="list")["roles"]])
 
     def test_save_a_pack_and_start_another_project_from_it(self):
         self.op(op="edit", name="qa", label="Tester")
@@ -855,7 +867,10 @@ class Roles(Base):
         cli("roles", "add", "designer", "--label", "Screen designer")  # a change keeps the instructions
         self.assertIn("Screen designer\n\nYou design.", cli("roles", "show", "designer"))
         path = os.path.join(TMP, "roles.json")
+        cli("roles", "export", "designer", "--file", path)
+        self.assertEqual(list(json.loads(Path(path).read_text())["roles"]), ["designer"])
         cli("roles", "export", "--file", path)
+        self.assertIn("qa", json.loads(Path(path).read_text())["roles"])
         cli("roles", "remove", "designer")
         self.assertIn("Imported", cli("roles", "import", path))
         self.assertIn("designer", cli("roles"))
