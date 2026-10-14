@@ -235,7 +235,8 @@ a lead (whatever the pack calls it, it hands out the work) and an advisor.
 Roles in the YouTube, Instagram and business packs are told never to publish, post, send, buy or
 answer anyone outside the chat for you: they prepare it as a file and you decide. A pack also sets
 the project's crew, software or general, which the chat page uses to choose its words (folders
-and commits, or agents, tasks and files); it reaches every linked machine.
+and commits, or agents, tasks and files). Roles and packs belong to each machine: a project
+shared with another machine uses that machine's own.
 
 ```bash
 crewchat start --pack youtube        # a new project, with the YouTube channel's roles
@@ -244,8 +245,8 @@ crewchat roles pack business         # start this project's roles over from a pa
 crewchat roles save-pack studio --label "My studio"   # keep this project's roles as a pack
 ```
 
-Starting over from a pack drops the roles you added or changed in that project; agents keep the
-role they have. Saved packs are kept in `~/.crewchat/config.json` and offered to every project on
+Starting over from a pack drops the roles you added or changed in that project, and takes away
+any role the new pack doesn't have from the agents that had it. Saved packs are kept in `~/.crewchat/config.json` and offered to every project on
 the machine.
 
 ## Your own roles

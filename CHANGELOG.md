@@ -9,8 +9,9 @@
   own pack. Each pack has a lead and an advisor; the non-software ones are told never to publish,
   post, send or buy anything for you. A role now has a label, instructions, and a picture, colour
   and tool for new agents (`roles add --label --picture --colour --tool`), and roles can be
-  exported and imported as JSON. A pack sets the project's crew (software or general), which every
-  linked machine learns. Removing a role takes it from the agents that have it, and tells them.
+  exported and imported as JSON. A pack sets the project's crew (software or general), the words the
+  chat page uses. Removing a role, or starting over from a pack without it, takes it from the
+  agents that have it, and tells them.
   The owner's new `/api/roles` does all of it for the chat page. `--title` still works for `--label`,
   and roles saved before keep working.
 - **Pictures and colours for agents.** Each agent shows a picture on its card and next to its
