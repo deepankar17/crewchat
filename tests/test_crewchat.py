@@ -144,7 +144,8 @@ class Protocol(Base):
         self.assertIn("hub_link", session.hello["instructions"])
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
-                                                      "hub_status", "hub_history", "hub_rename", "hub_file", "hub_role",
+                                                      "hub_status", "hub_history", "hub_rename", "hub_profile", "hub_file",
+                                                      "hub_role",
                                                       "hub_tasks", "hub_task_add", "hub_assign", "hub_update",
                                                       "hub_ask", "hub_answer", "hub_link"])
 
@@ -1312,6 +1313,27 @@ class Profiles(Base):
         finally:
             self.hub.drop_remote("dev-x")
         self.op(op="remove", agent="starry")
+
+    def test_agent_sets_its_own_profile(self):
+        session, name = self.agent()
+        self.assertIn("picture preset:camera", session.text("hub_profile", picture="camera", colour="#00AA00"))
+        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("preset:camera", "#00aa00"))
+        self.assertIn("picture initials", session.text("hub_profile", picture="initials"))
+        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("", "#00aa00"))
+        self.assertIn("the tool's colour", session.text("hub_profile", colour=""))
+        with tempfile.TemporaryDirectory() as folder:
+            picture = Path(folder) / "me.png"
+            picture.write_bytes(b"\x89PNG" + b"0" * 64)
+            with mock.patch.object(crewchat.Hub, "agent_folders", return_value=[Path(folder)]):
+                session.text("hub_profile", file=str(picture))
+            fid = self.row(name)["picture"].partition(":")[2]
+            self.assertEqual(self.hub.file(fid)[0]["type"], "image/png")
+            with mock.patch.object(crewchat.Hub, "agent_folders", return_value=[]):  # a folder from another machine
+                answer = session.call("hub_profile", file=str(picture))
+            self.assertTrue(answer["isError"])
+            self.assertIn("another machine", answer["content"][0]["text"])
+        self.assertTrue(session.call("hub_profile", picture="nope")["isError"])
+        self.assertTrue(session.call("hub_profile", colour="blue")["isError"])
 
 
 class ChatPage(Base):

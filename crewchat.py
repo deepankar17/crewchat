@@ -2682,6 +2682,24 @@ TOOLS = [
         },
     },
     {
+        "name": "hub_profile",
+        "description": "Set your picture and colour on the chat page: a preset picture, initials, or an image "
+        "file from your project folder (PNG, JPEG or WebP, 512 KB at most), and a colour. Use it when your "
+        "owner asks; leave out what you don't change.",
+        "annotations": SETTING,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "picture": {"type": "string", "enum": sorted(PICTURE_PRESETS) + ["initials"],
+                            "description": "A preset picture, or initials."},
+                "file": {"type": "string", "description": "An absolute path to an image in your project folder."},
+                "colour": {"type": "string", "maxLength": 7,
+                           "description": "#rrggbb, or empty for your tool's own colour."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "hub_file",
         "description": "Open a file shared in the chat (messages show it as [file ID: name ...]). An "
         "image comes back so you can see it, a text file with its contents; for anything else you get "
@@ -2866,11 +2884,21 @@ def call_tool(hub, sid, name, args, owner=False):
         folders = None if owner else hub.agent_folders(me)  # None: the owner, who may share any file
         if args.get("files") and folders == []:
             # The paths would be read here, on the host, not where the agent is.
-            raise HubError("files can only be shared from folders on the chat's own machine; this folder is "
-                           "connected from another machine. Put the text in the message instead.")
+            raise HubError(REMOTE_FOLDER_FILES + " Put the text in the message instead.")
         files = [share_file(hub, path, folders) for path in args.get("files") or []]
         msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
+    if name == "hub_profile":
+        picture = args.get("picture")
+        picture = None if picture is None else "" if picture == "initials" else "preset:%s" % picture
+        if args.get("file"):
+            folders = hub.agent_folders(me)
+            if folders == []:
+                raise HubError(REMOTE_FOLDER_FILES)
+            picture = "file:" + share_file(hub, args["file"], folders)["id"]
+        done = hub.set_profile(me, picture, args.get("colour"))
+        return "Your profile: picture %s, colour %s." % (done["picture"] or "initials",
+                                                         done["colour"] or "the tool's colour")
     if name == "hub_file":
         return open_shared_file(hub, args.get("id"))
     if name == "hub_inbox":
@@ -3018,6 +3046,10 @@ def inside_any(path, folders):
             elif os.path.normcase(str(part)) == name:  # some network drives on Windows report none
                 return True
     return False
+
+
+REMOTE_FOLDER_FILES = ("files can only be shared from folders on the chat's own machine; this folder is "
+                       "connected from another machine.")
 
 
 def share_file(hub, path, folders):
