@@ -9513,8 +9513,9 @@ $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
   if (!title) return;
-  if (await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value }))
-    for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+  const fields = ["t-title", "t-depends", "t-areas", "t-where"], sent = fields.map((id) => $(id).value);
+  if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
+    fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
