@@ -692,8 +692,8 @@ def change_roles(config, data, packs):
     def keep(name, spec):
         for field, ok in (("picture", clean_picture), ("colour", clean_colour)):
             if spec.get(field) and not ok(spec[field]):
-                raise HubError("%s is not a %s (%s)" % (spec[field], field, "a preset: " + ", ".join(
-                    PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
+                raise HubError("%s is not a %s (%s)" % (spec[field], field, "art:" + ", art:".join(ART_PICTURES) +
+                               ", or preset:" + ", preset:".join(PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
         if spec.get("tool") and str(spec["tool"]) not in TOOLS_INFO:
             raise HubError("no tool called %s. Tools: %s" % (spec["tool"], ", ".join(TOOLS_INFO)))
         custom[name] = clean_role(spec)
@@ -4132,7 +4132,7 @@ class Handler(BaseHTTPRequestHandler):
             pid = name[:-len(".webp")] if name.endswith(".webp") else ""
             if pid in ART_PICTURES:
                 self._reply(200, base64.b64decode(ART_DATA[pid]), ctype="image/webp",
-                            extra={"Cache-Control": "public, max-age=604800, immutable"})
+                            extra={"Cache-Control": "public, max-age=86400"})
             else:
                 self._reply(404, b"")
         elif url.path.startswith("/files/"):
@@ -4295,8 +4295,8 @@ class Handler(BaseHTTPRequestHandler):
         if not name or len(name) > MAX_PROJECT_NAME:
             raise HubError("a project's name is 1 to %d characters" % MAX_PROJECT_NAME)
         pack = str(data.get("pack") or DEFAULT_PACK)
-        find_pack(pack, role_packs())
         base = self.projects.base
+        find_pack(pack, role_packs(base))
         if find_chat(name, base):
             raise HubError("there is a project called %s already" % name)
         chosen = create_project(name, base, pack)
@@ -8627,7 +8627,7 @@ CHAT_PAGE = r"""<!doctype html>
   --bg: #eef3ff; --panel: #ffffff; --soft: #f6f8ff; --ink: #0b1f55; --text: #1b2440; --muted: #5d6a8f;
   --line: #dfe7ff; --accent: #2f5fd6; --accent-2: #5b8cff; --deep: #2148ad; --on-accent: #ffffff; --tint: #dfe7ff;
   --task: #fff6dd; --task-line: #e9cf86; --task-ink: #6b4e00;
-  --ok: #1f8a52; --warn: #b37400; --off: #a3acc4; --err: #c4321f;
+  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f;
   --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
   --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
   --radius: 18px; --shadow: 0 1px 2px rgba(11, 31, 85, 0.06), 0 6px 20px rgba(11, 31, 85, 0.07);
@@ -8637,7 +8637,7 @@ CHAT_PAGE = r"""<!doctype html>
     --bg: #0a1330; --panel: #111c40; --soft: #16234d; --ink: #e8eeff; --text: #dfe6ff; --muted: #9daad3;
     --line: #24346a; --accent: #5b8cff; --accent-2: #8fb0ff; --deep: #2f5fd6; --on-accent: #0b1f55; --tint: #1c2b5c;
     --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
-    --ok: #63c58c; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
+    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
     --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
     --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
@@ -8666,6 +8666,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .meta { font-size: 12.5px; color: var(--muted); }
 .phone-only { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* Top bar: one Chrome-style tab per project. */
 #topbar { grid-area: top; display: flex; align-items: flex-end; gap: 6px; padding: 8px 12px 0; min-width: 0; }
@@ -8675,7 +8676,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .tab { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 14px 14px 0 0; max-width: 220px;
   color: var(--muted); text-decoration: none; white-space: nowrap; flex: none; }
 .tab:hover { background: var(--tint); color: var(--ink); }
-.tab[aria-selected="true"] { background: var(--panel); color: var(--ink); font-weight: 650; }
+.tab[aria-current="page"] { background: var(--panel); color: var(--ink); font-weight: 650; }
 .tab .pname { overflow: hidden; text-overflow: ellipsis; }
 .tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
 .tab .unread:empty { width: 8px; }
@@ -8694,7 +8695,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .menu-list button, .menu-list a { background: none; color: var(--text); text-align: left; border-radius: 10px; padding: 8px 12px;
   font-weight: 500; text-decoration: none; font-size: 14px; }
 .menu-list button:hover, .menu-list a:hover { background: var(--tint); }
-.menu-list button[aria-checked="true"]::after { content: " \2713"; color: var(--accent); }
+.menu-list button[aria-pressed="true"]::after { content: " \2713"; color: var(--accent); }
 .menu-list hr { border: 0; border-top: 1px solid var(--line); margin: 4px 6px; width: auto; }
 #projects { font-weight: 650; }
 #switching { margin: 0 0 6px auto; align-self: center; font-size: 13px; }
@@ -8734,7 +8735,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .emoji { font-size: 18px; line-height: 1; }
 .avatar .mark, .avatar .os { position: absolute; bottom: -3px; height: 14px; min-width: 14px; padding: 0 3px; border-radius: 7px;
   font-size: 8px; line-height: 14px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
-.avatar .mark { right: -4px; background: var(--mk); color: #fff; font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
+.avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
 .picmenu > summary { cursor: pointer; list-style: none; display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; }
@@ -8788,7 +8789,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg.own .mention { background: var(--panel); }
 @media (prefers-color-scheme: dark) { .mention { color: var(--accent-2); } }
 .pill { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 0 9px; background: var(--tint); color: var(--ink); }
-.pill.done { background: var(--ok); color: var(--panel); } .pill.blocked { background: var(--err); color: var(--panel); }
+.pill.done { background: var(--ok-strong); color: #fff; } .pill.blocked { background: var(--err); color: var(--panel); }
 .sys { text-align: center; font-size: 12.5px; color: var(--muted); margin: 4px auto 12px; max-width: 640px; }
 .sys b { font-weight: 650; }
 .sys details { display: inline; } .sys summary { display: inline; cursor: pointer; text-decoration: underline dotted; }
@@ -8833,11 +8834,11 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
 #sheet td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
 #sheet td.meta { font-size: 12px; color: var(--muted); }
-#sheet tr.done td { opacity: 0.55; }
+#sheet tr.done td { color: var(--muted); }
 #sheet tr .open-task { background: none; color: var(--text); padding: 0; border-radius: 0; font-weight: 500; text-align: left; }
 .st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 9px; background: var(--tint); white-space: nowrap; }
 .st.doing, .st.review { background: var(--accent); color: var(--on-accent); }
-.st.done { background: var(--ok); color: var(--panel); } .st.blocked { background: var(--err); color: var(--panel); }
+.st.done { background: var(--ok-strong); color: #fff; } .st.blocked { background: var(--err); color: var(--panel); }
 .acts { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 #sheet .acts { justify-content: flex-end; }
 .acts button, .acts select { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--text); border: 1px solid var(--line); }
@@ -8941,13 +8942,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <body>
 <header id="topbar">
   <a class="brand wide-only" href="/" title="crewchat">__LOGO__</a>
-  <nav id="tabs" role="tablist" aria-label="Projects"></nav>
+  <nav id="tabs" aria-label="Projects"></nav>
   <details id="tab-add" class="menu">
     <summary title="Switch to a project, or make one" aria-label="Switch to a project, or make one">+</summary>
-    <div class="menu-list" role="menu">
+    <div class="menu-list">
       <div id="tab-menu"></div>
       <hr>
-      <button type="button" id="new-project" role="menuitem">New project…</button>
+      <button type="button" id="new-project">New project…</button>
     </div>
   </details>
   <select id="projects" class="phone-only" aria-label="Project"></select>
@@ -8969,17 +8970,17 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <div id="scrim"></div>
 <main id="space">
   <header id="space-head">
-    <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board">☰</button>
+    <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board" aria-expanded="false" aria-controls="rail">☰</button>
     <span id="space-avatar" class="pav" aria-hidden="true">c</span>
     <div class="titles"><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
     <input id="search" type="search" placeholder="Search" aria-label="Search this chat" autocomplete="off">
     <details id="space-menu" class="menu">
       <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
-      <div class="menu-list" role="menu">
-        <button type="button" role="menuitem" data-panel="project">Rules, skills and machines</button>
-        <button type="button" role="menuitem" data-panel="roles">Roles</button>
+      <div class="menu-list">
+        <button type="button" data-panel="project">Rules, skills and machines</button>
+        <button type="button" data-panel="roles">Roles</button>
         <hr>
-        <a role="menuitem" id="classic-link" href="/classic">The classic page</a>
+        <a id="classic-link" href="/classic">The classic page</a>
       </div>
     </details>
   </header>
@@ -8987,7 +8988,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
-  <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
+  <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2></div>
     <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
@@ -9000,6 +9001,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <input type="text" id="t-where" placeholder="machine" aria-label="Machine">
       <button id="t-add">Add</button>
     </form>
+    <p id="tasks-note" class="meta" role="alert"></p>
     <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
   <section id="commands" hidden aria-label="Commands">
@@ -9016,10 +9018,10 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <div class="pillbox">
       <details id="plus" class="menu up">
         <summary title="Attach a file, post as a task, new agent" aria-label="More">+</summary>
-        <div class="menu-list" role="menu">
-          <button type="button" id="attach" role="menuitem">Attach a file</button>
-          <button type="button" id="as-task" role="menuitemcheckbox" aria-checked="false">Post as task</button>
-          <button type="button" id="plus-agent" role="menuitem">New agent</button>
+        <div class="menu-list">
+          <button type="button" id="attach">Attach a file</button>
+          <button type="button" id="as-task" aria-pressed="false">Post as task</button>
+          <button type="button" id="plus-agent">New agent</button>
         </div>
       </details>
       <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
@@ -9032,7 +9034,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 </main>
 <aside id="panel" hidden aria-labelledby="panel-title">
   <header class="panel-head">
-    <h2 id="panel-title"></h2>
+    <h2 id="panel-title" tabindex="-1"></h2>
     <button type="button" class="icon" id="panel-close" aria-label="Close the panel" title="Close (Esc)">✕</button>
   </header>
   <div id="panel-body"></div>
@@ -9191,14 +9193,11 @@ function renderProjects(list, current) {
   const tab = (p) => {
     const a = el("a", "tab");
     a.href = chatUrl("/", p.id);
-    a.setAttribute("role", "tab");
-    a.setAttribute("aria-selected", String(p.id === current));
+    if (p.id === current) a.setAttribute("aria-current", "page");
     a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
     a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
     if (p.fresh) {
-      const dot = el("span", "unread");
-      dot.setAttribute("aria-label", "new messages");
-      a.append(dot);
+      a.append(el("span", "unread"), el("span", "sr", " (new messages)"));
     }
     a.addEventListener("click", (e) => {
       e.preventDefault();
@@ -9209,7 +9208,7 @@ function renderProjects(list, current) {
   $("tabs").replaceChildren(...list.map(tab));
   $("tab-menu").replaceChildren(...list.filter((p) => p.id !== current).map((p) => {
     const b = el("button", "", p.name);
-    b.type = "button"; b.setAttribute("role", "menuitem");
+    b.type = "button";
     b.addEventListener("click", () => switchTo(p.id, p.name));
     return b;
   }));
@@ -9277,8 +9276,13 @@ $("view-commands").addEventListener("click", () => showView($("commands").hidden
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
 // A phone: the rail is a drawer.
-$("rail-open").addEventListener("click", () => document.body.classList.add("rail-open"));
-$("scrim").addEventListener("click", () => document.body.classList.remove("rail-open"));
+function setDrawer(open) {
+  document.body.classList.toggle("rail-open", open);
+  $("rail-open").setAttribute("aria-expanded", String(open));
+  if (open) $("view-tasks").focus();
+}
+$("rail-open").addEventListener("click", () => setDrawer(true));
+$("scrim").addEventListener("click", () => setDrawer(false));
 
 // Menus (details elements) close when something else is clicked, or on Escape.
 document.addEventListener("click", (e) => {
@@ -9400,6 +9404,11 @@ $("cmd-filter").addEventListener("input", filterCommands);
 function taskOp(body) {
   return postAction("/api/task", body, "Task not changed");
 }
+// Where an action's error is shown: the panel, the task board, or under the message box.
+function showError(text) {
+  if (state.panel && $("panel-body").querySelector(".panel-note")) return panelNote(text);
+  ($("tasks").hidden ? $("error") : $("tasks-note")).textContent = text;
+}
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
 function taskActions(r, parent) {
   if (r.status === "todo" || r.status === "waiting") {
@@ -9458,8 +9467,8 @@ $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
   if (!title) return;
-  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
-  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+  if (await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value }))
+    for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
@@ -9547,6 +9556,7 @@ function applyRole(name) {
 }
 async function openLaunch(role) {
   const dialog = $("launch"), note = $("launch-note");
+  clearTimeout(state.launchClose);
   $("plus").open = false;
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
@@ -9626,7 +9636,7 @@ async function startAgent(event) {
       picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
       instructions: $("l-instructions").value.trim() });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
-    setTimeout(() => $("launch").close(), 4000);
+    state.launchClose = setTimeout(() => $("launch").close(), 4000);
   } catch (err) {
     note.textContent = "Not started: " + err.message;
     $("l-start").disabled = false;
@@ -9659,10 +9669,10 @@ async function postAction(path, body, what, control) {
   if (control) control.disabled = true;
   try {
     const out = await postJSON(path, body);
-    $("error").textContent = "";
+    $("error").textContent = ""; $("tasks-note").textContent = "";
     return out;
   } catch (err) {
-    (state.panel ? panelNote : (m) => { $("error").textContent = m; })(what + ": " + err.message);
+    showError(what + ": " + err.message);
     return null;
   } finally {
     if (control) control.disabled = false;
@@ -9733,26 +9743,36 @@ function doing(a) {
 }
 
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
+// The agent open in the panel is marked in the rail, without drawing the rail again.
+function markOpen() {
+  const p = state.panel;
+  for (const card of $("agents").querySelectorAll(".agent")) {
+    const on = !!p && p.kind === "agent" && p.id === card.dataset.agent;
+    card.classList.toggle("on", on);
+    if (on) card.setAttribute("aria-current", "true"); else card.removeAttribute("aria-current");
+  }
+}
+
 function renderAgents(force) {
   const box = $("agents");
-  const key = JSON.stringify([state.agents, state.held, state.roles, state.panel, Math.floor(state.now / 60)]);
-  if (!force && key === state.railKey) return;
+  const key = JSON.stringify([state.agents, state.held, state.roles, Math.floor(state.now / 60)]);
+  if (!force && key === state.railKey) return markOpen();
   state.railKey = key;
+  const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.agent : "";
   box.replaceChildren();
   if (!state.agents.length) box.append(el("p", "none", word("none")));
   for (const a of state.agents) {
     const age = a.seen ? state.now - a.seen : Infinity;
-    const card = el("button", "agent" + (state.panel && state.panel.kind === "agent" && state.panel.id === a.agent ? " on" : ""));
+    const card = el("button", "agent");
     card.type = "button";
     card.dataset.agent = a.agent;
-    card.setAttribute("aria-label", a.agent + (a.role ? ", " + roleTitle(a.role) : "") + ": open");
     const who = el("span", "who");
     who.append(el("span", "name " + colour(a.agent), a.agent));
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.title = doing(a) + " · " + ago(a.seen, state.now);
     const right = el("span", "inline");
-    if (a.unread) right.append(el("span", "count", String(a.unread)));
-    right.append(dot);
+    if (a.unread) right.append(el("span", "count", String(a.unread)), el("span", "sr", " unread"));
+    right.append(dot, el("span", "sr", dot.title));
     const task = heldTask(a.agent);
     const holds = el("span", "holds");
     if (a.role) holds.append(el("span", "badge " + a.role, roleTitle(a.role)), " ");
@@ -9761,6 +9781,8 @@ function renderAgents(force) {
     card.addEventListener("click", () => openPanel("agent", a.agent));
     box.append(card);
   }
+  markOpen();
+  if (focused) box.querySelector('[data-agent="' + CSS.escape(focused) + '"]')?.focus();
   const names = state.agents.map((a) => a.agent).join("\n");
   if (names !== state.names) {
     state.names = names;
@@ -9828,7 +9850,7 @@ function avatar(a, cls) {
   }
   if (tool.mark && a.client) {
     const mark = el("span", "mark", tool.mark);
-    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
+    mark.style.setProperty("--mk", tool.colour); mark.style.setProperty("--mk-ink", inkOn(tool.colour)); mark.title = tool.label;
     box.append(mark);
   }
   const os = OS_BADGES[a.os];
@@ -9891,30 +9913,41 @@ function pictureMenu(a, agentOp) {
 // The side panel: an agent, a task, a role, the roles, or the project. Esc or ✕ closes it; it is
 // drawn again as the chat changes, unless the owner is choosing or typing in it.
 function openPanel(kind, id) {
+  const from = document.activeElement;
+  if (!state.panel) state.panelFrom = from && from !== document.body ? from : null;  // focus goes back there
   state.panel = { kind, id };
   document.body.classList.remove("rail-open");
-  if ((kind === "roles" || kind === "role") && !state.roleInfo) loadRoles().then(() => renderPanel(true)).catch(() => {});
+  if ((kind === "roles" || kind === "role") && !state.roleInfo) loadRolesInto();
   renderPanel(true);
-  renderAgents(true);
+  markOpen();
+  $("panel-title").focus();
 }
 function closePanel() {
   state.panel = null;
   $("panel").hidden = true;
   document.body.classList.remove("panel-open");
-  renderAgents(true);
+  markOpen();
+  const back = state.panelFrom && state.panelFrom.isConnected ? state.panelFrom
+    : state.panelFrom && state.panelFrom.dataset && $("agents").querySelector('[data-agent="' + CSS.escape(state.panelFrom.dataset.agent || "") + '"]');
+  state.panelFrom = null;
+  if (back) back.focus();
+}
+// The roles panels' data: loaded, or the error and a way to try again.
+function loadRolesInto() {
+  state.rolesError = "";
+  return loadRoles().then(() => renderPanel(true)).catch((e) => { state.rolesError = e.message; renderPanel(true); });
 }
 $("panel-close").addEventListener("click", closePanel);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
   const menu = document.querySelector("details.menu[open]");
-  if (menu) { menu.open = false; return; }
+  if (menu) { menu.open = false; menu.querySelector("summary").focus(); return; }
   if (state.panel) closePanel();
   else document.body.classList.remove("rail-open");
 });
+// Not drawn again while the owner is in it: choosing, typing, or on one of its buttons.
 function panelBusy() {
-  const body = $("panel-body"), active = document.activeElement;
-  return body.querySelector(".picmenu[open], form.editing") ||
-    (body.contains(active) && ["SELECT", "INPUT", "TEXTAREA"].includes(active.tagName));
+  return $("panel-body").querySelector(".picmenu[open], form.editing") || $("panel-body").contains(document.activeElement);
 }
 function renderPanel(force) {
   const p = state.panel;
@@ -10035,7 +10068,8 @@ function nameField(a, agentOp) {
     const ok = await agentOp({ op: "rename", agent: a.agent, new: name }, "Not renamed", input);
     busy = false;
     const p = state.panel;
-    if (ok && p && p.kind === "agent" && p.id === a.agent) openPanel("agent", name);
+    if (ok) a.agent = name;  // the row as the next poll will have it
+    if (ok && p && p.kind === "agent" && p.id !== name) openPanel("agent", name);
     else if (!ok) input.value = a.agent;
   };
   input.addEventListener("keydown", (e) => {
@@ -10089,7 +10123,7 @@ function roleAvatar(r) {
 }
 function panelRoles() {
   const info = state.roleInfo;
-  if (!info) return ["Roles", card("", el("p", "meta", "Loading…"))];
+  if (!info) return ["Roles", rolesLoading()];
   const pack = info.packs.find((p) => p.id === info.pack);
   const list = el("ul", "rolelist");
   for (const r of info.roles) {
@@ -10136,6 +10170,12 @@ function panelRoles() {
   });
   return ["Roles", card("Pack", el("p", "", pack ? pack.label : info.pack), packPick, save), card("This project's roles", list), card("", acts)];
 }
+function rolesLoading() {
+  if (!state.rolesError) return card("", el("p", "meta", "Loading…"));
+  const retry = el("div", "acts");
+  actButton(retry, "Try again", "Load the roles again", loadRolesInto);
+  return card("", el("p", "meta", "Could not load the roles: " + state.rolesError), retry);
+}
 function download(name, data) {
   const a = el("a");
   a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2) + "\n"], { type: "application/json" }));
@@ -10145,9 +10185,9 @@ function download(name, data) {
 }
 function panelRole(name) {
   const info = state.roleInfo;
-  if (!info) return ["Role", card("", el("p", "meta", "Loading…"))];
+  if (!info) return ["Role", rolesLoading()];
   const r = info.roles.find((x) => x.name === name);
-  if (state.panel.editing) return roleForm(r);
+  if (state.panel.editing && (r || !name)) return roleForm(r);
   if (!r) return [name, card("", el("p", "meta", "There is no role called " + name + " now."))];
   const tool = own(state.tools, r.tool);
   const head = el("div", "ident");
@@ -10433,6 +10473,13 @@ async function loop() {
       const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
                               { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
+      if (res.status === 404 && CHAT) {  // its project is gone: say so, and offer the others
+        $("empty")?.remove();
+        const gone = el("p", "empty", "This project is not on this machine any more. ");
+        const link = el("a", "", "Open your first project"); link.href = "/";
+        gone.append(link); $("log").replaceChildren(gone);
+        return;
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       state.failures = 0;
@@ -10467,7 +10514,7 @@ async function loop() {
       addMessages(data.messages, first);
       // Roles changed (here or in another tab): what the roles panels show is read again.
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
-        loadRoles().then(() => renderPanel(true)).catch(() => {});
+        loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
       if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the crew below.";
       refreshDynamic();
@@ -10535,7 +10582,7 @@ async function uploadFile(file) {
 
 function setTask(on) {
   state.asTask = on;
-  $("as-task").setAttribute("aria-checked", String(on));
+  $("as-task").setAttribute("aria-pressed", String(on));
   $("task-chip").hidden = !on;
   text.placeholder = on ? "Describe the task. The crew settles who takes it…" : "Message the crew (@name writes to one)";
 }

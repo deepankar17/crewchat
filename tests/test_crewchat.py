@@ -734,6 +734,13 @@ class RolePacks(unittest.TestCase):
                 self.change(config, "import", roles=bad)
             self.assertFalse(config.get("roles"))
 
+    def test_a_pack_saved_from_its_label_alone(self):
+        config = {"pack": "software"}
+        self.assertEqual(self.change(config, "save_pack", label="Night shift")["pack"]["id"], "night-shift")
+        self.assertEqual(self.change(config, "save_pack", label="2024 crew")["pack"]["id"], "pack")
+        with self.assertRaisesRegex(crewchat.HubError, "built-in"):
+            self.change(config, "save_pack", label="YouTube")
+
     def test_saved_packs(self):
         config = {"pack": "instagram"}
         self.change(config, "edit", name="captions", label="Copywriter")
@@ -1566,7 +1573,7 @@ class Profiles(Base):
     def test_the_built_in_3d_pictures(self):
         status, body, headers = self.raw("/pictures/robot.webp")  # not secret: no sign-in needed
         self.assertEqual((status, headers["Content-Type"], body[:4], body[8:12]), (200, "image/webp", b"RIFF", b"WEBP"))
-        self.assertIn("immutable", headers["Cache-Control"])
+        self.assertIn("max-age", headers["Cache-Control"])
         for bad in ("/pictures/nope.webp", "/pictures/robot.png", "/pictures/../files/x"):
             self.assertEqual(self.raw(bad)[0], 404, bad)
         session, name = self.agent()
