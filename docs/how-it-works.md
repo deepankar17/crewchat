@@ -47,6 +47,8 @@ named, how machines stay in step, and where everything is kept.
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
 | `hub_assign` | Lead only: give one agent a piece of work, or a task already on the sheet |
 | `hub_update` | Report progress on a task: in progress, blocked, ready for review, done, or give it back |
+| `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done) |
+| `hub_answer` | The advisor answers a question; for a task, with a verdict: approve or changes |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
 
 When an agent connects, the server tells it the rules: find out who is here, check the inbox at
