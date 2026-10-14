@@ -1163,7 +1163,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen or model", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, model or profile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()
@@ -1256,6 +1256,62 @@ class Profiles(Base):
         self.assertEqual(crewchat.tool_info("claude")["colour"], "#d97757")
         self.assertEqual(crewchat.tool_info("something-new"), crewchat.TOOLS_INFO["agent"])
         self.assertIn(crewchat.os_name(), ("mac", "windows", "linux", "other"))
+
+    def op(self, **body):
+        try:
+            return crewchat.post_json(self.base + "/api/agent", self.owner, body)
+        except urllib.error.HTTPError as e:
+            return json.loads(e.read())
+
+    def row(self, name):
+        return next(r for r in self.hub.rows() if r["agent"] == name)
+
+    def test_owner_sets_a_preset_and_a_colour(self):
+        _, name = self.agent()
+        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("", ""))
+        self.assertEqual(self.row(name)["os"], crewchat.os_name())
+        self.assertEqual(self.op(op="profile", agent=name, picture="preset:rocket", colour="#FF8800"), {"ok": True})
+        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("preset:rocket", "#ff8800"))
+        self.assertEqual(self.op(op="profile", agent=name, colour=""), {"ok": True})  # back to the brand colour
+        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("preset:rocket", ""))
+        self.assertIn("no picture preset", self.op(op="profile", agent=name, picture="preset:nope")["error"])
+        self.assertIn("#rrggbb", self.op(op="profile", agent=name, colour="red")["error"])
+        self.assertIn("#rrggbb", self.op(op="profile", agent=name, colour="#12345g")["error"])
+
+    def test_uploaded_picture_limits(self):
+        _, name = self.agent()
+        png = self.hub.add_file("me.png", b"\x89PNG" + b"0" * 100, "image/png")
+        big = self.hub.add_file("big.png", b"\x89PNG" + b"0" * (512 * 1024), "image/png")
+        pdf = self.hub.add_file("cv.pdf", b"%PDF-1.4", "application/pdf")
+        self.assertEqual(self.op(op="profile", agent=name, picture="file:" + png["id"]), {"ok": True})
+        self.assertEqual(self.row(name)["picture"], "file:" + png["id"])
+        self.assertIn("512 KB", self.op(op="profile", agent=name, picture="file:" + big["id"])["error"])
+        self.assertIn("PNG, JPEG or WebP", self.op(op="profile", agent=name, picture="file:" + pdf["id"])["error"])
+        self.assertIn("no shared file", self.op(op="profile", agent=name, picture="file:" + "0" * 16)["error"])
+        self.assertIn("no shared file", self.op(op="profile", agent=name, picture="file:../state")["error"])
+
+    def test_profile_survives_rename_restart_and_travels(self):
+        _, name = self.agent()
+        self.op(op="profile", agent=name, picture="preset:star", colour="#123456")
+        self.assertEqual(self.op(op="rename", agent=name, new="starry"), {"ok": True})
+        self.assertEqual(self.row("starry")["picture"], "preset:star")
+        again = crewchat.Hub(crewchat.Roster())  # what a restarted server loads
+        self.assertEqual((again.agents["starry"]["picture"], again.agents["starry"]["colour"]), ("preset:star", "#123456"))
+        mine = next(r for r in self.hub.local_state() if r["agent"] == "starry")
+        self.assertEqual((mine["picture"], mine["colour"], mine["os"]), ("preset:star", "#123456", crewchat.os_name()))
+        self.hub.set_remote("dev-x", "pc", [dict(mine, agent="faraway", os="windows"),
+                                            dict(mine, agent="odd", picture="<img>", colour="red", os="beos")],
+                            time.time())
+        try:
+            far = self.row("faraway")
+            self.assertEqual((far["picture"], far["colour"], far["os"], far["remote"]),
+                             ("preset:star", "#123456", "windows", True))
+            odd = self.row("odd")  # whatever another machine sends, the page gets only what it can draw
+            self.assertEqual((odd["picture"], odd["colour"], odd["os"]), ("", "", "other"))
+            self.assertIn("runs on pc", self.op(op="profile", agent="faraway", colour="#000000")["error"])
+        finally:
+            self.hub.drop_remote("dev-x")
+        self.op(op="remove", agent="starry")
 
 
 class ChatPage(Base):
