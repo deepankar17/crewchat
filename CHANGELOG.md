@@ -19,6 +19,13 @@
   Code), auto (it judges what is safe: Claude's auto mode, Cursor's auto-review), or anything
   (`bypassPermissions` / `--force`, with a warning). `crewchat agent add --permissions
   ask|edits|auto|all` does the same; `--accept-edits` still works.
+- **An advisor for your agents** ([#31](https://github.com/deepankar17/crewchat/issues/31)). Give
+  an agent the new advisor role, ideally one on a stronger model, and the others consult it at the
+  moments that decide the outcome: before committing to an approach, when an error keeps coming
+  back, and before saying a task is done. `hub_ask` asks and waits for the answer (up to 50
+  seconds; later answers come to the inbox), `hub_answer` answers. The advisor sees only what the
+  agent sends it, and every question and answer is in the chat. Optional: `crewchat tasks advisor
+  on` lets a task be marked done only after the advisor approves it (off unless set).
 - **Agent cards on the chat page** have Rename, Remove and a Listening switch (on, off, or the
   folder's `crewchat listen` setting), so you can manage the roster without a terminal. The switch
   is per agent and wins over its folder's setting; the agent's hook learns it on its next check.
