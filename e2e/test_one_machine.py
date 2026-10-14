@@ -96,7 +96,7 @@ class OneMachine(unittest.TestCase):
         self.assertIn("followup_message", out)
         self.assertNotIn("decision", out)
         c.call("hub_link", key=re.search(r'key "([^"]+)"', out["followup_message"]).group(1))
-        self.assertTrue(c.whoami().startswith("cursor-"))
+        self.assertRegex(c.whoami(), r"^[A-Z][a-z]+$")  # a first name of its own
 
     def test_rename_from_the_agent_and_from_the_terminal(self):
         a = self.linked()

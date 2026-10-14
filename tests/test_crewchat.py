@@ -203,7 +203,35 @@ class Identity(Base):
         self.assertIn("name it docs-writer", inbox)
         self.assertIn("name it its-own-name", session.text("hub_rename", name="its-own-name"))  # renaming itself too
 
+    def place_names(self):
+        """Name new agents after their tool and folder, as before 0.14, for this test."""
+        config = crewchat.load_config()
+        config["agent_names"] = "place"
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+
+        def back():
+            config.pop("agent_names", None)
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+        self.addCleanup(back)
+
+    def test_new_agents_get_first_names_of_their_own(self):
+        place, token = self.join_place("names")
+        names = [self.agent(client, token=token)[1] for client in ("claude-code", "claude-code", "Cursor")]
+        self.assertEqual(len(set(n.lower() for n in names)), 3)
+        for name in names:
+            self.assertIn(name, crewchat.AGENT_NAMES)
+        with self.hub.lock:  # every first name taken: tool and folder, as before
+            taken = {n: {} for n in crewchat.AGENT_NAMES}
+            saved, self.hub.agents = self.hub.agents, dict(self.hub.agents, **taken)
+            try:
+                self.assertEqual(self.hub._agent_name("names", "claude"), "claude-names")
+            finally:
+                self.hub.agents = saved
+
     def test_sessions_sharing_one_folder_get_their_own_names(self):
+        self.place_names()
         place, token = self.join_place("studio")
         first, name1 = self.agent(token=token)
         second, name2 = self.agent(token=token)
@@ -260,9 +288,10 @@ class Identity(Base):
         place, token = self.join_place("plain")
         call = lambda name, **a: crewchat.rpc(  # noqa: E731
             self.mcp, token, "tools/call", {"name": name, "arguments": a})["result"]["content"][0]["text"]
-        self.assertIn("agent-plain (you)", call("hub_agents"))
-        self.assertIn("agent-plain (you)", call("hub_agents"))
-        self.assertEqual(self.names().count("agent-plain"), 1)
+        me = lambda: next(l for l in call("hub_agents").splitlines() if " (you)" in l).split(" (you)")[0]  # noqa: E731
+        first = me()
+        self.assertEqual(me(), first)  # the same agent again, not a new one
+        self.assertEqual(self.names().count(first), 1)
 
     def test_owner_can_rename_and_remove(self):
         session, name = self.agent()
@@ -1903,9 +1932,9 @@ class Joining(Base):
         self.assertTrue(hooks["hooks"]["stop"][0]["command"].endswith(" hook cursor stop"))
         self.assertIn(".mcp.json", (folder / ".git" / "info" / "exclude").read_text())
         self.assertNotIn("do not commit", out)
-        # Two sessions opened in that folder are two agents.
+        # Two sessions opened in that folder are two agents, each with a first name of its own.
         one, two = Session(self.base, token), Session(self.base, token, "cursor")
-        self.assertEqual((one.me, two.me), ("claude-work-laptop", "cursor-work-laptop"))
+        self.assertEqual({one.me in crewchat.AGENT_NAMES, two.me in crewchat.AGENT_NAMES, one.me != two.me}, {True})
         # Joining again replaces our hooks instead of stacking them, and gets its own place.
         cli(*self.invite("--place", "Work Laptop"), "--project", str(folder))
         settings = json.loads((folder / ".claude" / "settings.local.json").read_text())
@@ -2365,7 +2394,7 @@ class Hooks(Base):
         key = re.search(r'key "([^"]+)"', first["followup_message"]).group(1)
         session.call("hub_link", key=key)
         name = session.me
-        self.assertTrue(name.startswith("cursor-"))
+        self.assertIn("cursor on", session.text("hub_agents"))
         self.say(name, "for cursor")
         out = json.loads(self.hook("cursor", "stop", {"status": "completed", "loop_count": 1, "conversation_id": "c"}))
         self.assertIn("for cursor", out["followup_message"])

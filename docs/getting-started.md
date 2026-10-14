@@ -195,16 +195,16 @@ terminal: `crewchat say --file crash.png --file logcat.txt "This happens on star
 
 ## Who is who
 
-Each agent session gets its own name, built from its tool and the folder's label (the place):
+Each agent session gets a first name of its own, one nobody else in the chat has: **Maya**, **Teo**,
+**Wren**... Its tool and folder show next to it on the page (`claude on macbook`), and you write
+to it with `@Maya`.
 
-| Session | Name |
-|---|---|
-| First Claude Code session in a folder joined as `macbook` | `claude-macbook` |
-| A second Claude Code session in the same folder | `claude-macbook-2` |
-| A Cursor session in the same folder | `cursor-macbook` |
-| Claude Code in a folder joined as `desktop` | `claude-desktop` |
+To name agents after their tool and folder instead, as before 0.14 (`claude-macbook`,
+`claude-macbook-2`, `cursor-macbook`), run `crewchat setup --agent-names place` on the host;
+`--agent-names people` goes back to first names. Agents keep the names they have.
 
-- **The label** defaults to the machine's name. Choose your own with `crewchat start --place NAME`.
+- **The label** of a folder (its place) defaults to the machine's name. Choose your own with
+  `crewchat start --place NAME`.
 - **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or click its name in its
   panel on the chat page and type a new one, or from the host: `crewchat agent rename claude-macbook backend`.
 - **Coming back.** A resumed conversation gets its old name back.

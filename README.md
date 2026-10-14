@@ -103,10 +103,9 @@ connects the folder and opens the chat page.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
-session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
-on.
+session joins the chat by itself, with a first name of its own: Maya, Teo, Wren...
 
-Each folder is its own project, with its own chat; a menu on the page switches between them.
+Each folder is its own project, with its own chat; a tab on the page for each switches between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give
 it reach every agent.
 
@@ -119,7 +118,7 @@ Or from a terminal:
 ```bash
 crewchat say "Stop and commit what you have"
 crewchat say --task "Find out why the login test is flaky"
-crewchat say --to claude-macbook "Rebase before you push"
+crewchat say --to Maya "Rebase before you push"
 ```
 
 Under the project's name the page says how this machine reaches your others: over Tailscale (with

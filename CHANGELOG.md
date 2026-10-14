@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Agents get first names.** A new agent is called Maya, Teo, Wren... (one nobody in the chat has)
+  instead of `claude-macbook`; its tool and folder still show next to it. `crewchat setup
+  --agent-names place` keeps the old names. **New agent** has a 🎲 button for a random name, and an
+  agent's name is a field in its panel to change it.
 - **A new chat page** (new chat page, PR 3 of 5). A tab for each project along the top (with
   **+** to switch or make a project, choosing the role pack its crew starts from), the crew on the
   left, the project's space in the middle, and a side panel on the right. Click an agent to open

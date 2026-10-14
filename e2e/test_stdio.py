@@ -94,7 +94,7 @@ class Stdio(unittest.TestCase):
             tools = relay.answer(relay.request("tools/list"))["result"]["tools"]
             self.assertIn("hub_send", [t["name"] for t in tools])
             me = next(l for l in relay.call("hub_agents").splitlines() if "(you)" in l).split(" (you)")[0]
-            self.assertTrue(me.startswith("claude-desk"), me)
+            self.assertRegex(me, r"^[A-Z][a-z]+$")  # a first name of its own
             relay.call("hub_send", to="Owner", text="hello from the desktop")
             self.m.owner.wait_for("hello from the desktop", **{"from": me})
             self.m.owner.send(me, "hello desktop")

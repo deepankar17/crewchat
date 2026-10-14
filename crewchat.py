@@ -274,6 +274,15 @@ or clash before it does."""),
     "blank": {"label": "Blank", "crew": "general", "roles": {}},
 }
 KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
+# First names a new agent is given, unless the machine names agents after their tool and folder
+# (config "agent_names": "place"). Short, easy to type after @, and from many places.
+AGENT_NAMES = (
+    "Ada", "Amara", "Anya", "Arlo", "Asha", "Bea", "Bodhi", "Cleo", "Dara", "Elio", "Emre", "Esme", "Ezra",
+    "Faye", "Finn", "Gia", "Hana", "Hugo", "Ines", "Iris", "Ivo", "Jade", "Joon", "Juno", "Kai", "Kemi", "Kira",
+    "Lars", "Leo", "Lina", "Luca", "Maya", "Mika", "Milo", "Nadia", "Nia", "Nico", "Noor", "Odin", "Omar",
+    "Otto", "Pia", "Quinn", "Ravi", "Remy", "Rhea", "Rosa", "Sami", "Sana", "Selin", "Tara", "Teo", "Uma",
+    "Vera", "Wren", "Yara", "Yuki", "Zara", "Zeke", "Zoe",
+)
 # Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
 TOOLS_INFO = {
     tool: {"label": label, "colour": colour, "mark": mark}
@@ -1331,9 +1340,19 @@ class Hub:
             number += 1
         return "%s-%d" % (base, number)
 
+    def _agent_name(self, place, client):
+        """A new agent's name: a first name nobody here has, or with "agent_names": "place" (and when
+        every first name is taken) its tool and folder, as claude-macbook. Caller holds the lock."""
+        if self.machine_config().get("agent_names", "people") != "place":
+            taken = {n.lower() for n in list(self.agents) + self._remote_names()}
+            free = [n for n in AGENT_NAMES if n.lower() not in taken]
+            if free:
+                return secrets.choice(free)
+        return self._free_name("%s-%s" % (client, place))
+
     def _new_agent(self, place, client):
         now = time.time()
-        name = self._free_name("%s-%s" % (client, place))
+        name = self._agent_name(place, client)
         self.agents[name] = {
             "place": place, "client": client, "created": now, "seen": now, "active": now,
             "cursor": self.next_seq - 1,  # a newcomer does not inherit the backlog as unread
@@ -2563,6 +2582,7 @@ class Hub:
                 "art": ART_PICTURES,
                 "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
+                "names": AGENT_NAMES,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
                 "update": getattr(self, "newer", ""),
@@ -3570,9 +3590,10 @@ COMMANDS = [
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
-        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N]",
-         "Change settings: the chat's name, the local port, the address other machines use, and how many turns in "
-         "a row an agent may take on other agents' messages before only you can wake it (default 10).", None),
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place]",
+         "Change settings: the chat's name, the local port, the address other machines use, how many turns in "
+         "a row an agent may take on other agents' messages before only you can wake it (default 10), and how new "
+         "agents are named: a first name (people) or their tool and folder (place).", None),
     ]),
     ("The server", [
         ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
@@ -4658,7 +4679,7 @@ def free_port(start):
     return start
 
 
-def setup_host(project=None, port=None, url=None, max_chain=None):
+def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
     config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
@@ -4670,6 +4691,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None):
     })
     if max_chain:
         config["max_chain"] = int(max_chain)  # Roster.max_chain keeps it within bounds
+    if agent_names:
+        config["agent_names"] = agent_names
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -4680,7 +4703,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None):
 
 
 def cmd_setup(args):
-    config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None))
+    config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None),
+                        getattr(args, "agent_names", None))
     print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
@@ -5118,9 +5142,11 @@ def cmd_start(args):
     print()
     kinds = {"all": ("claude", "cursor"), "claude": ("claude",), "cursor": ("cursor",)}[args.client]
     where = "this folder" if project == Path.cwd().resolve() else str(project)
-    print("Now open %s in %s. Each new session joins the chat by itself, named %s-%s, %s-%s-2, ..."
+    named = ("%s-%s, %s-%s-2, ..." % (kinds[0], place, kinds[0], place)
+             if config.get("agent_names") == "place" else "with a first name of its own (Maya, Teo, ...)")
+    print("Now open %s in %s. Each new session joins the chat by itself, %s"
           % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where,
-             kinds[0], place, kinds[0], place))
+             ("named " + named) if config.get("agent_names") == "place" else named))
     print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
     print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
     if not (config.get("peers") or config.get("cloud")):
@@ -8910,6 +8936,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 .inline { display: flex; gap: 10px; align-items: center; }
 .swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; background: var(--sw, var(--off)); }
 #l-perms-note.warn { color: var(--err); }
+#l-dice { padding: 6px 12px; font-size: 16px; flex: none; }
 #launch-note, #rules-note, #project-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
 #rules-input { min-height: 180px; }
 
@@ -9059,7 +9086,9 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <div>
       <fieldset class="step">
         <label for="l-template">From a template</label><select id="l-template"></select>
-        <label for="l-name">Name (optional)</label><input type="text" id="l-name" maxlength="32" placeholder="for example docs-writer" autocomplete="off">
+        <label for="l-name">Name (optional)</label>
+        <div class="inline"><input type="text" id="l-name" maxlength="32" placeholder="a first name of its own if empty" autocomplete="off">
+          <button type="button" class="secondary" id="l-dice" title="A random name nobody here has" aria-label="A random name">🎲</button></div>
         <label for="l-role">Role</label><select id="l-role"></select>
         <label for="l-picture">Picture</label><select id="l-picture"></select>
         <label for="l-colour">Colour</label>
@@ -9644,6 +9673,12 @@ $("l-template").addEventListener("change", () => {
   $("l-role").value = role; applyRole(role); showStep(1);
 });
 $("l-role").addEventListener("change", () => applyRole($("l-role").value));
+// A random first name nobody in the chat has yet (the server gives one anyway when the field is empty).
+$("l-dice").addEventListener("click", () => {
+  const taken = new Set(state.agents.map((a) => a.agent.toLowerCase()));
+  const free = (state.agentNames || []).filter((n) => !taken.has(n.toLowerCase()) && n !== $("l-name").value);
+  if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
+});
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
@@ -10442,7 +10477,7 @@ async function loop() {
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       state.tools = data.tools || {}; state.presets = data.presets || {}; state.art = data.art || {};
-      state.models = data.models || {}; state.pictures = data.pictures;
+      state.models = data.models || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
       state.held = {};
@@ -10639,6 +10674,8 @@ def build_parser():
     p.add_argument("--url", help="address other machines use, e.g. https://host.tailnet.ts.net")
     p.add_argument("--max-chain", type=int, help="turns in a row an agent may take on chat messages alone "
                    "before only you can wake it (default %d, at most %d)" % (MAX_CHAIN, MAX_CHAIN_LIMIT))
+    p.add_argument("--agent-names", choices=["people", "place"], help="how new agents are named: a first "
+                   "name such as Maya (people, the default), or after their tool and folder, such as claude-macbook (place)")
     p.set_defaults(fn=cmd_setup)
 
     p = sub.add_parser("serve", help="run the chat server in this terminal")
