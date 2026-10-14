@@ -249,6 +249,46 @@ class Page(unittest.TestCase):
         self.assertNotIn("Picture", out["remoteAction"])  # change it on its own machine
         self.assertEqual(c.errors, [])
 
+    def test_message_avatars_survive_roster_changes(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        out = c.js("""(() => {
+            const saved = state.agents;
+            const base = state.agents[0];
+            const node = buildMessage({id: "av-2", seq: 2, kind: "msg", from: base.agent, to: "all", text: "kept", ts: state.now});
+            $("log").append(node);
+            state.agents = saved.concat([Object.assign({}, base, {agent: "newcomer", session: null})]);  // someone joins
+            renderAgents();
+            const kept = node.querySelector('[data-who].avatar, .meta > span:first-child').className;
+            state.agents = saved.concat([Object.assign({}, base, {agent: "odd", client: "constructor", session: null}),
+                                         Object.assign({}, base, {agent: "odder", client: "__proto__", colour: "zz",
+                                                                  session: null})]);
+            let threw = "";
+            try { renderAgents(); } catch (e) { threw = String(e); }
+            const odd = [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes("odd"));
+            const oddColour = odd ? odd.querySelector('.avatar').style.getPropertyValue("--av") : "";
+            node.remove(); state.agents = saved; state.names = ""; renderAgents();
+            return {kept, threw, oddColour};
+        })()""")
+        self.assertIn("avatar", out["kept"])  # still drawn as an avatar after the names changed
+        self.assertEqual(out["threw"], "")  # a tool called "constructor" is just an unknown tool
+        self.assertEqual(out["oddColour"], "#6b7280")
+        self.assertEqual(c.errors, [])
+
+    def test_closing_the_picture_menu_shows_what_changed(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        c.js("""(() => { window.savedAgents = state.agents;
+                 state.agents = [Object.assign({}, state.agents[0], {agent: "menu-one", remote: false, session: null})];
+                 renderAgents(); })()""")
+        c.js("document.querySelector('#agents .picmenu').open = true")
+        c.js("""(() => { state.agents = [Object.assign({}, state.agents[0], {status: "changed while open"})];
+                 renderAgents(); })()""")
+        self.assertNotIn("changed while open", c.js("$('agents').innerText"))  # frozen while choosing
+        c.js("document.querySelector('#agents .picmenu').open = false")
+        c.until("$('agents').innerText.includes('changed while open')", what="the cards to catch up")
+        c.js("state.agents = window.savedAgents; renderAgents()")
+
     def test_one_machine_shows_no_os_badge(self):
         c = self.chrome
         c.until("state.agents.length > 0 && state.tools", what="the agents")

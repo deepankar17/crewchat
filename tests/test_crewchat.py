@@ -1333,6 +1333,19 @@ class Profiles(Base):
             self.assertTrue(answer["isError"])
             self.assertIn("another machine", answer["content"][0]["text"])
         self.assertTrue(session.call("hub_profile", picture="nope")["isError"])
+
+    def test_agent_picture_is_checked_before_it_is_kept(self):
+        session, _ = self.agent()
+        before = set(os.listdir(self.hub.home / "files")) if (self.hub.home / "files").exists() else set()
+        with tempfile.TemporaryDirectory() as folder:
+            big, text = Path(folder) / "big.png", Path(folder) / "notes.txt"
+            big.write_bytes(b"\x89PNG" + b"0" * (512 * 1024))
+            text.write_text("not a picture")
+            with mock.patch.object(crewchat.Hub, "agent_folders", return_value=[Path(folder)]):
+                self.assertIn("512 KB", session.call("hub_profile", file=str(big))["content"][0]["text"])
+                self.assertIn("PNG, JPEG or WebP", session.call("hub_profile", file=str(text))["content"][0]["text"])
+        after = set(os.listdir(self.hub.home / "files")) if (self.hub.home / "files").exists() else set()
+        self.assertEqual(after, before)  # nothing kept for a refused picture
         self.assertTrue(session.call("hub_profile", colour="blue")["isError"])
 
 

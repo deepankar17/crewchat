@@ -222,6 +222,18 @@ def clean_os(value):
     return value if value in ("mac", "windows", "linux") else "other"
 
 
+def check_picture_file(path):
+    """An image file an agent offers as its picture, checked before it is kept."""
+    if file_type(Path(str(path)).name) not in PICTURE_TYPES:
+        raise HubError("a picture is PNG, JPEG or WebP")
+    try:
+        too_big = os.path.getsize(os.path.expanduser(str(path))) > MAX_PICTURE
+    except OSError:
+        too_big = False  # share_file says what is wrong with it
+    if too_big:
+        raise HubError("a picture is 512 KB at most")
+
+
 def check_picture(hub, value):
     """A picture the owner or the agent chose, checked; returns it as stored."""
     value = str(value or "")
@@ -2897,6 +2909,7 @@ def call_tool(hub, sid, name, args, owner=False):
             folders = hub.agent_folders(me)
             if folders == []:
                 raise HubError(REMOTE_FOLDER_FILES)
+            check_picture_file(args["file"])
             picture = "file:" + share_file(hub, args["file"], folders)["id"]
         done = hub.set_profile(me, picture, args.get("colour"))
         return "Your profile: picture %s, colour %s." % (done["picture"] or "initials",
@@ -7729,7 +7742,7 @@ function renderAgents() {
     select.replaceChildren(new Option("Everyone", "all"), ...state.agents.map((a) => new Option(a.agent, a.agent)));
     select.value = [...select.options].some((o) => o.value === keep) ? keep : "all";
     // Names colour by roster position, so repaint what is already on screen.
-    for (const n of $("log").querySelectorAll("[data-who]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
+    for (const n of $("log").querySelectorAll("[data-cls]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
   }
   const looks = state.agents.map((a) => [a.agent, a.client, a.picture, a.colour, a.os, a.device].join(" ")).join("\n");
   if (looks !== state.looks) {  // a new picture or colour: repaint the ones on messages too
@@ -7746,7 +7759,12 @@ function agentRow(name) {
   return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
 }
 
+function own(table, key) {
+  return table && Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
 function inkOn(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex)) return "#fff";
   const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
     .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
   return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 ? "#111" : "#fff";
@@ -7758,7 +7776,7 @@ function initials(name) {
 }
 
 function avatar(a) {
-  const tool = (state.tools || {})[a.client] || (state.tools || {}).agent || { colour: "#6b7280", mark: "", label: "" };
+  const tool = own(state.tools, a.client) || own(state.tools, "agent") || { colour: "#6b7280", mark: "", label: "" };
   const fill = a.colour || tool.colour;
   const box = el("span", "avatar");
   box.dataset.who = a.agent;
@@ -7771,7 +7789,7 @@ function avatar(a) {
     img.alt = ""; img.src = "/files/" + id;
     img.addEventListener("error", () => img.replaceWith(letters()));
     box.append(img);
-  } else if (kind === "preset" && (state.presets || {})[id]) {
+  } else if (kind === "preset" && own(state.presets, id)) {
     box.append(el("span", "emoji", state.presets[id]));
   } else {
     box.append(letters());
@@ -7794,6 +7812,7 @@ function avatar(a) {
 function pictureMenu(a, agentOp) {
   const menu = el("details", "picmenu");
   menu.append(el("summary", "", "Picture"));
+  menu.addEventListener("toggle", () => { if (!menu.open) renderAgents(); });  // cards wait while it is open
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
     .then(() => { menu.open = false; });
@@ -7810,7 +7829,7 @@ function pictureMenu(a, agentOp) {
   });
   actButton(picks, "Upload\u2026", "Upload a picture (PNG, JPEG or WebP, 512 KB at most)", () => file.click());
   const tint = el("input");
-  tint.type = "color"; tint.value = a.colour || ((state.tools || {})[a.client] || {}).colour || "#6b7280";
+  tint.type = "color"; tint.value = a.colour || (own(state.tools, a.client) || {}).colour || "#6b7280";
   tint.setAttribute("aria-label", "Colour for " + a.agent);
   tint.addEventListener("change", () => set({ colour: tint.value }, tint));
   actButton(picks, "Tool colour", "Back to the tool's own colour", (b) => set({ colour: "" }, b));
