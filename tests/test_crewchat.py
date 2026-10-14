@@ -230,6 +230,47 @@ class Identity(Base):
             finally:
                 self.hub.agents = saved
 
+    def test_a_first_name_that_still_holds_tasks_is_not_given_again(self):
+        with self.hub.lock:
+            saved = dict(self.hub.taken)
+            self.hub.taken.update({"t%d" % i: n for i, n in enumerate(crewchat.AGENT_NAMES)})  # forgotten holders
+            try:
+                self.assertNotIn(self.hub._agent_name("x", "claude"), crewchat.AGENT_NAMES)
+            finally:
+                self.hub.taken = saved
+
+    def test_a_name_clash_with_another_machine_is_settled_by_one_side(self):
+        session, name = self.agent()
+        sync = mock.Mock(device_id="m-zzz", shared=True)
+        with mock.patch.object(self.hub, "sync", sync):
+            self.hub.set_remote("m-aaa", "other", [{"agent": name.lower(), "client": "claude", "place": "x"}], 1)
+        try:
+            self.assertNotIn(name, self.hub.agents)  # the larger id gives way: this machine renamed its agent
+            self.assertIn("You are now %s." % session.me, session.text("hub_inbox"))
+        finally:
+            self.hub.drop_remote("m-aaa")
+        other, other_name = self.agent()
+        with mock.patch.object(self.hub, "sync", mock.Mock(device_id="m-aaa", shared=True)):
+            self.hub.set_remote("m-zzz", "other", [{"agent": other_name, "client": "claude", "place": "x"}], 1)
+        try:
+            self.assertIn(other_name, self.hub.agents)  # the smaller id keeps its name: the other machine gives way
+        finally:
+            self.hub.drop_remote("m-zzz")
+
+    def test_names_are_matched_in_any_case(self):
+        session, name = self.agent()
+        crewchat.post_json(self.base + "/api/send", self.owner, {"to": name.lower(), "text": "lower case"})
+        self.assertIn("lower case", session.text("hub_inbox"))
+
+    def test_the_setting_and_the_page_know_the_names(self):
+        try:
+            cli("setup", "--agent-names", "place")
+            self.assertEqual(crewchat.load_config()["agent_names"], "place")
+        finally:
+            cli("setup", "--agent-names", "people")
+        self.assertEqual(crewchat.load_config()["agent_names"], "people")
+        self.assertEqual(self.hub.poll(-1, -1, 0)["names"], crewchat.AGENT_NAMES)
+
     def test_sessions_sharing_one_folder_get_their_own_names(self):
         self.place_names()
         place, token = self.join_place("studio")

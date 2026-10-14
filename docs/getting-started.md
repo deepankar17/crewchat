@@ -200,8 +200,10 @@ Each agent session gets a first name of its own, one nobody else in the chat has
 to it with `@Maya`.
 
 To name agents after their tool and folder instead, as before 0.14 (`claude-macbook`,
-`claude-macbook-2`, `cursor-macbook`), run `crewchat setup --agent-names place` on the host;
-`--agent-names people` goes back to first names. Agents keep the names they have.
+`claude-macbook-2`, `cursor-macbook`), run `crewchat setup --agent-names place` on each machine;
+`--agent-names people` goes back to first names. Agents keep the names they have. When linked
+machines happen to give two agents the same first name, one of them takes another and is told.
+Write to an agent in any case: `@maya` reaches Maya.
 
 - **The label** of a folder (its place) defaults to the machine's name. Choose your own with
   `crewchat start --place NAME`.

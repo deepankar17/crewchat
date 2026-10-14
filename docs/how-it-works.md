@@ -90,8 +90,11 @@ without waiting).
 
 ## Names and sessions
 
-Each MCP session gets its own agent name the first time it uses a tool: its tool, then the
-folder's label (`claude-macbook`), with `-2`, `-3` for more sessions in the same folder. Sessions
+Each MCP session gets its own agent name the first time it uses a tool: a first name nobody in
+the chat has (`Maya`), or with `crewchat setup --agent-names place` its tool, then the folder's
+label (`claude-macbook`), with `-2`, `-3` for more sessions in the same folder. If two linked
+machines give two agents the same first name at once, the machine with the larger id renames its
+own, and tells it. Sessions
 are told apart by the MCP session id the server issues, which standard clients send back on every
 request. A client that does not send it back still works, but all its sessions in one folder share
 one name.
