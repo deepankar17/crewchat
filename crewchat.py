@@ -167,6 +167,111 @@ You review code.
 - Send your findings to the developer with hub_send, most important first, each with the file
   and what to change. Approve plainly when it is good, and tell the lead."""),
 }
+
+# Role packs: the roles a project starts with, chosen when it is made. Whatever a pack calls them,
+# "lead" is the role that hands out the work and "advisor" the one the others consult. A crew is
+# "software" (the page talks of folders and commits) or "general" (agents, tasks, files).
+CREWS = ("software", "general")
+DEFAULT_PACK = "software"
+MAX_ROLE_LABEL = 40
+MAX_ROLE_TEXT = 4000  # 50 of them still fit one request (MAX_BODY)
+
+GENERAL_LEAD = """
+Your job is to plan and hand out the work, not to do most of it yourself.
+- When the owner posts a task, take it with hub_take. Break it into pieces one agent can finish,
+  and give each piece to the best-placed agent with hub_assign (pass the owner's task id as
+  `task`). Say what "done" looks like.
+- Match work to roles (hub_agents shows them), and keep two agents off the same file at once.
+- Agents report to you with hub_update. Answer blocked agents quickly; reassign if needed.
+- When an agent reports a piece done, check it, then give that agent its next piece with
+  hub_assign right away. Nobody should sit idle while there is work. If nothing is left, tell Owner.
+- When everything is done, check the result and report to Owner with hub_send: what was done,
+  what is left, anything the owner must decide.
+- Tell Owner early if something is unclear or risky. Do not invent requirements."""
+
+GENERAL_MEMBER = """
+- Work on what is assigned to you (hub_assign from the lead, or a task from Owner). If the chat
+  has no lead, bid for open tasks as usual.
+- When you get a task, first send hub_update on it with in_progress and one line on your plan.
+  Then report blocked (with what you need) if you are stuck, review when it is ready, done when
+  accepted. Ask the lead or Owner when something is unclear rather than guessing."""
+
+NEVER_ON_OWNERS_BEHALF = """
+- Never publish, post, send, buy or reply to anyone outside this chat on the owner's behalf:
+  prepare it as a file, share it with hub_send, and let Owner decide."""
+
+
+def _pack(label, crew, roles):
+    return {"label": label, "crew": crew, "roles": {
+        name: {"label": title, "description": text.strip(), "picture": "preset:" + picture if picture else ""}
+        for name, (title, picture, text) in roles.items()}}
+
+
+def _general(pack_label, roles):
+    """A pack for a crew that isn't writing software: every role gets the general rules."""
+    out = {}
+    for name, (title, picture, text) in roles.items():
+        rules = GENERAL_LEAD if name == "lead" else GENERAL_MEMBER
+        out[name] = (title, picture, text.strip() + "\n" + rules.strip("\n") + NEVER_ON_OWNERS_BEHALF)
+    out["advisor"] = ("Advisor", "bulb", ROLES["advisor"][1])
+    return _pack(pack_label, "general", out)
+
+
+ROLE_PACKS = {
+    "software": _pack("Software team", "software", {
+        name: (ROLES[name][0], picture, ROLES[name][1]) for name, picture in (
+            ("lead", "star"), ("developer", "robot"), ("qa", "flask"), ("reviewer", "bulb"),
+            ("docs", "books"), ("advisor", "bulb"))}),
+    "youtube": _general("YouTube channel", {
+        "lead": ("Producer", "film", "You are the producer of a YouTube channel, and lead its crew."),
+        "researcher": ("Researcher", "books", """\
+You research the channel's videos: facts, sources, what viewers ask about and what other channels
+have already covered. Give every fact its source, and say plainly what you could not check."""),
+        "scriptwriter": ("Scriptwriter", "pen", """\
+You write the channel's scripts: a hook in the first seconds, a clear structure, the channel's
+voice. Write in a file, mark where visuals or B-roll go, and keep to the length asked for."""),
+        "designer": ("Thumbnail and title designer", "palette", """\
+You propose titles and thumbnails: several options for each video, short and honest about what
+the video delivers (no clickbait the video doesn't pay off), with the reason for each."""),
+        "editor": ("Editor's assistant", "camera", """\
+You help the editor: shot lists, cut notes with timestamps, captions and chapter markers, and
+lists of the footage, music and graphics a video still needs."""),
+        "seo": ("SEO and community", "chart", """\
+You write descriptions, tags and chapters, and draft replies to comments for Owner to check.
+Report which videos and topics do well, with the numbers you were given."""),
+    }),
+    "instagram": _general("Instagram creator", {
+        "lead": ("Content planner", "star", "You plan an Instagram creator's content, and lead the crew."),
+        "captions": ("Caption writer", "pen", """\
+You write captions in the creator's voice: a strong first line, a call to action, and hashtags
+that fit. Offer two or three options per post."""),
+        "visual": ("Visual designer", "palette", """\
+You design posts, carousels and Reel covers: layouts, text on images and a consistent look.
+Share drafts as files, and say which sizes they are for."""),
+        "community": ("Community manager", "rocket", """\
+You draft replies to comments and messages for Owner to check, and note questions people ask
+often: they are ideas for posts."""),
+        "analytics": ("Analytics", "chart", """\
+You read the numbers Owner gives you (reach, saves, follows) and say what works, what doesn't,
+and what to try next. Never guess figures you were not given."""),
+    }),
+    "business": _general("Small business", {
+        "lead": ("Manager", "star", "You manage a small business's crew."),
+        "support": ("Customer support", "robot", """\
+You draft answers to customers' questions and complaints for Owner to send: friendly, short,
+correct about the business's policies. Ask when you don't know a policy."""),
+        "marketing": ("Marketing", "rocket", """\
+You plan and draft marketing: posts, emails, offers and the calendar for them, each with who it
+is for and what it should achieve."""),
+        "bookkeeping": ("Bookkeeping assistant", "chart", """\
+You keep records tidy: sort receipts and invoices, prepare summaries and flag what looks wrong.
+You are not an accountant: say so when something needs one."""),
+        "operations": ("Operations", "cart", """\
+You keep the business running: stock, suppliers, schedules and checklists. Spot what will run out
+or clash before it does."""),
+    }),
+    "blank": {"label": "Blank", "crew": "general", "roles": {}},
+}
 KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
 # Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
 TOOLS_INFO = {
@@ -396,15 +501,232 @@ def load_config(root=None):
     return data
 
 
-def all_roles(config):
-    """Built-in roles, plus the owner's own from config.json ("roles": {name: {title, prompt}}),
-    as {name: (title, prompt)}. An owner's role with a built-in name replaces it."""
-    out = dict(ROLES)
+def clean_label(value):
+    return " ".join(str(value or "").split())[:MAX_ROLE_LABEL]
+
+
+def clean_role(spec):
+    """A role as crewchat keeps it, {label, description, picture, colour, tool}, from config.json, a
+    pack or an import (title and prompt are read too, as before 0.14). None if it has no instructions."""
+    if not isinstance(spec, dict):
+        return None
+    description = str(spec.get("description") or spec.get("prompt") or "").strip()
+    if not description:
+        return None
+    tool = str(spec.get("tool") or "")
+    return {"label": clean_label(spec.get("label") or spec.get("title")),
+            "description": description[:MAX_ROLE_TEXT], "picture": clean_picture(spec.get("picture")),
+            "colour": clean_colour(spec.get("colour")), "tool": tool if tool in TOOLS_INFO else ""}
+
+
+def clean_pack(spec):
+    """An owner's saved pack, {label, crew, roles}, or None if it is not one."""
+    if not isinstance(spec, dict) or not isinstance(spec.get("roles"), dict):
+        return None
+    roles = {str(n).lower(): clean_role(r) for n, r in spec["roles"].items() if NAME_RE.match(str(n))}
+    return {"label": clean_label(spec.get("label")) or "My pack",
+            "crew": spec.get("crew") if spec.get("crew") in CREWS else "general",
+            "roles": {n: r for n, r in roles.items() if r}}
+
+
+def role_packs(base=None):
+    """The packs a project can start from, by id: the built-in ones, then the owner's saved ones
+    (the machine's config.json, "packs")."""
+    out = dict(ROLE_PACKS)
+    path = (Path(base) if base else home()) / "config.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8")).get("packs")
+    except (OSError, ValueError, AttributeError):
+        saved = None
+    for pid, spec in (saved.items() if isinstance(saved, dict) else ()):
+        pack = clean_pack(spec)
+        if pack and NAME_RE.match(str(pid)) and pid not in ROLE_PACKS:
+            out[str(pid)] = dict(pack, saved=True)
+    return out
+
+
+def project_pack(config, packs):
+    """The id of the pack a project's roles start from ("software" before 0.14, or if it is gone)."""
+    pack = str(config.get("pack") or DEFAULT_PACK)
+    return pack if pack in packs else DEFAULT_PACK
+
+
+def role_table(config, packs):
+    """A project's roles, {name: {label, description, picture, colour, tool, source}}: its pack's,
+    then the owner's own from config.json ("roles": {name: role}). An owner's role with a pack
+    role's name replaces it, and {"deleted": true} takes one of the pack's away."""
+    out = {}
+    for name, spec in packs[project_pack(config, packs)]["roles"].items():
+        row = clean_role(spec)
+        if row:
+            out[name] = dict(row, source="pack")
     custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
     for name, spec in custom.items():
-        if isinstance(spec, dict) and NAME_RE.match(str(name)) and spec.get("prompt"):
-            out[str(name)] = (str(spec.get("title") or name), str(spec["prompt"]))
+        name = str(name).lower()  # every op lowercases a role's name
+        if not NAME_RE.match(name):
+            continue
+        if isinstance(spec, dict) and spec.get("deleted"):
+            out.pop(name, None)
+            continue
+        row = clean_role(spec)
+        if row:
+            out[name] = dict(row, source="yours")
+    for name, row in out.items():
+        row["label"] = row["label"] or name.replace("-", " ").replace("_", " ").capitalize()
     return out
+
+
+def role_texts(table):
+    """Roles as {name: (label, description)}: what an agent is told when it gets one."""
+    return {name: (row["label"], row["description"]) for name, row in table.items()}
+
+
+ROLE_FIELDS = ("label", "description", "picture", "colour", "tool")
+MAX_IMPORT_ROLES = 50
+ROLES_LOCK = threading.Lock()  # one change to a config.json's roles at a time
+
+
+def role_name(value):
+    return check_name(str(value or "").strip().lower())
+
+
+def find_pack(pid, packs):
+    if pid not in packs:
+        raise HubError("no pack called %s. Packs: %s" % (pid, ", ".join(packs)))
+    return packs[pid]
+
+
+def roles_export(table, names=None):
+    """Roles as a file the owner can keep or import into another project."""
+    return {"crewchat": "roles", "version": 1, "roles": {
+        name: {k: row[k] for k in ROLE_FIELDS} for name, row in table.items() if names is None or name in names}}
+
+
+def roles_listing(config, packs, table):
+    """What the page needs to show and edit a project's roles."""
+    return {"pack": project_pack(config, packs), "roles": [dict(row, name=name) for name, row in table.items()],
+            "packs": [{"id": pid, "label": p["label"], "crew": p["crew"], "roles": list(p["roles"]),
+                       "saved": bool(p.get("saved"))} for pid, p in packs.items()]}
+
+
+def save_roles_change(root, data):
+    """change_roles on a project's config.json, saved (a new pack in the machine's config.json)."""
+    with ROLES_LOCK:
+        config = load_config(root)
+        answer, effects = change_roles(config, data, role_packs())
+        if "saved_pack" in effects:
+            mine = load_config()
+            if not isinstance(mine.get("packs"), dict):
+                mine["packs"] = {}
+            mine["packs"][effects["saved_pack"][0]] = effects["saved_pack"][1]
+            save_config(mine)
+        elif effects.get("changed"):
+            save_config(config, root)
+    return answer, effects
+
+
+def _import_rows(spec):
+    """The roles in an import, all checked before any is kept."""
+    if isinstance(spec, dict) and isinstance(spec.get("roles"), (dict, list)):
+        spec = spec["roles"]  # a whole exported file
+    if isinstance(spec, list):
+        if not all(isinstance(r, dict) for r in spec):
+            raise HubError("roles to import are a list of roles, each with a name")
+        spec = {r.get("name"): r for r in spec}
+    if not isinstance(spec, dict) or not spec:
+        raise HubError("nothing to import: give roles as exported by crewchat")
+    if len(spec) > MAX_IMPORT_ROLES:
+        raise HubError("import at most %d roles at once" % MAX_IMPORT_ROLES)
+    rows = {}
+    for raw, role in spec.items():
+        name = role_name(raw)
+        rows[name] = clean_role(role)
+        if rows[name] is None:
+            raise HubError("the role %s has no description" % name)
+    return rows
+
+
+def change_roles(config, data, packs):
+    """One change the owner makes to a project's roles (data["op"]), applied to config in place; the
+    caller saves it. Returns (answer, effects): effects["changed"] when config changed, and
+    effects["saved_pack"], (id, pack), for the machine's packs."""
+    op = str(data.get("op") or "list")
+    table = role_table(config, packs)
+    if op == "list":
+        return roles_listing(config, packs, table), {}
+    if op == "export":
+        names = data.get("names")
+        return roles_export(table, set(map(str, names)) if isinstance(names, list) else None), {}
+    if op == "save_pack":  # this project's roles, as a pack other projects can start from
+        pid = role_name(data.get("id"))
+        if pid in ROLE_PACKS:
+            raise HubError("%s is a built-in pack; choose another name" % pid)
+        crew = data.get("crew") if data.get("crew") in CREWS else packs[project_pack(config, packs)]["crew"]
+        pack = clean_pack({"label": data.get("label") or pid, "crew": crew, "roles": roles_export(table)["roles"]})
+        return {"pack": dict(pack, id=pid)}, {"saved_pack": (pid, pack)}
+    if not isinstance(config.get("roles"), dict):
+        config["roles"] = {}
+    custom = config["roles"]
+
+    def existing():
+        name = role_name(data.get("name"))
+        if name not in table:
+            raise HubError("no role called %s" % name)
+        return name
+
+    def keep(name, spec):
+        for field, ok in (("picture", clean_picture), ("colour", clean_colour)):
+            if spec.get(field) and not ok(spec[field]):
+                raise HubError("%s is not a %s (%s)" % (spec[field], field, "a preset: " + ", ".join(
+                    PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
+        if spec.get("tool") and str(spec["tool"]) not in TOOLS_INFO:
+            raise HubError("no tool called %s. Tools: %s" % (spec["tool"], ", ".join(TOOLS_INFO)))
+        custom[name] = clean_role(spec)
+        if custom[name] is None:
+            del custom[name]
+            raise HubError("a role needs a description: what the agent is told to do")
+        return {"role": dict(custom[name], name=name)}
+
+    if op == "create":
+        name = role_name(data.get("name"))
+        if name in table:
+            raise HubError("there is a role called %s already" % name)
+        answer = keep(name, {k: data.get(k) for k in ROLE_FIELDS})
+    elif op == "edit":
+        name = existing()
+        answer = keep(name, dict(table[name], **{k: data[k] for k in ROLE_FIELDS if k in data}))
+    elif op == "duplicate":
+        name = existing()
+        if data.get("new"):
+            new = role_name(data["new"])
+        else:
+            new, number = name + "-copy", 2
+            while new in table:
+                new, number = "%s-copy-%d" % (name, number), number + 1
+            new = role_name(new[:32])
+        if new in table:
+            raise HubError("there is a role called %s already" % new)
+        answer = keep(new, dict(table[name], label=table[name]["label"] + " (copy)"))
+    elif op == "delete":
+        name = existing()
+        if name in packs[project_pack(config, packs)]["roles"]:
+            custom[name] = {"deleted": True}  # one of the pack's: kept away
+        else:
+            custom.pop(name, None)
+        answer = {"deleted": name}
+    elif op == "import":
+        rows = _import_rows(data.get("roles"))
+        custom.update(rows)
+        answer = {"imported": sorted(rows)}
+    elif op == "pack":
+        pid = str(data.get("pack") or "")
+        find_pack(pid, packs)
+        config["pack"] = pid
+        config["roles"] = {}  # a project starts over from its new pack
+        answer = roles_listing(config, packs, role_table(config, packs))
+    else:
+        raise HubError("op is list, create, edit, duplicate, delete, import, export, pack or save_pack")
+    return answer, {"changed": True}
 
 
 def save_config(config, root=None):
@@ -456,20 +778,31 @@ class Roster:
 
     def _mtimes(self):
         out = []
-        for path in (self.root / "config.json", self.root / "tokens"):
+        paths = [self.root / "config.json", self.root / "tokens"]
+        if self.root != home():
+            paths.append(home() / "config.json")  # the machine's saved packs
+        for path in paths:
             try:
                 out.append(path.stat().st_mtime_ns)
             except OSError:
                 out.append(0)
         return tuple(out)
 
-    def refresh(self):
+    def refresh(self, force=False):
+        """Read the settings and tokens again if they changed on disk (or force: a change was just
+        written, maybe within the clock's last tick)."""
         stamp = self._mtimes()
-        if stamp == self._stamp:
+        if stamp == self._stamp and not force:
             return
         config = load_config(self.root)
         self.config = config
-        self.roles = all_roles(config)
+        packs = role_packs()
+        self.pack = project_pack(config, packs)
+        self.crew = packs[self.pack]["crew"]
+        self.role_rows = role_table(config, packs)
+        self.roles = role_texts(self.role_rows)
+        self.page_roles = [{"name": n, "title": r["label"], "picture": r["picture"], "colour": r["colour"],
+                            "tool": r["tool"], "source": r["source"]} for n, r in self.role_rows.items()]
         self.project = str(config["project"])
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
@@ -1699,6 +2032,15 @@ class Hub:
             self._changed()
             return value
 
+    def drop_roles(self, names):
+        """Take roles the owner just removed (deleted, or not in the project's new pack) from this
+        machine's agents that had them, telling each. Only those: an agent may hold a role another
+        linked machine gave it, from that machine's own roles."""
+        with self.lock:
+            had = [n for n, a in self.agents.items() if a.get("role") in names]
+        for name in had:
+            self.set_role(OWNER, name, "")
+
     def update(self, agent, mid, status, note):
         """Progress on a task, sent to whoever coordinates it: the lead, or else whoever posted it."""
         mid = self._id(mid)
@@ -2178,7 +2520,9 @@ class Hub:
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
                 "agents": self._rows(),
-                "roles": [{"name": k, "title": v[0]} for k, v in self.roles().items()],
+                "roles": self.roster.page_roles,  # their instructions come from /api/roles
+                "pack": self.roster.pack,
+                "crew": self.roster.crew,
                 "statuses": STATUSES,
                 "tools": TOOLS_INFO,
                 "presets": PICTURE_PRESETS,
@@ -3184,10 +3528,10 @@ COMMANDS = [
         ("start [FOLDER] [--place NAME] [--client all|claude|cursor] [--chat PROJECT]",
          "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to "
          "run again. --place labels the folder in agent names; --chat puts it in that project (made if there is none).", None),
-        ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open]",
+        ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open] [--pack ID]",
          "The first time: the chat's name and local port. --no-service runs the server until you log out instead of "
          "at every login; --keep-awake (macOS) keeps the machine from sleeping while crewchat runs; --no-open does "
-         "not open this page.", None),
+         "not open this page; --pack gives a new project the roles of a pack (crewchat roles packs).", None),
         ("connect [tailscale|cloud]", "Link this machine with your others. Without an argument it explains both ways and asks.", None),
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
@@ -3225,9 +3569,15 @@ COMMANDS = [
         ("role AGENT ROLE", "Give an agent a role (none takes it away); the menu on an agent's card does the same.", None),
         ("roles [list]", "List the roles.", {"argv": ["roles"], "chat": True}),
         ("roles show NAME", "A role's instructions.", None),
-        ("roles add NAME --prompt TEXT [--title TITLE]", "Add your own role, or replace a built-in one.", None),
+        ("roles add NAME --prompt TEXT [--label LABEL]", "Add your own role, or change one (--picture, --colour, --tool too).", None),
         ("roles add NAME --file FILE", "The same, reading the instructions from a file.", None),
-        ("roles remove NAME", "Remove one of your roles.", None),
+        ("roles add NAME [--picture PRESET] [--colour #RRGGBB] [--tool TOOL]", "What a new agent with the role starts with.", None),
+        ("roles remove NAME", "Remove a role; agents that have it are told.", None),
+        ("roles packs", "List the role packs: software team, YouTube channel, Instagram creator, small business, blank, and yours.", {"argv": ["roles", "packs"], "chat": True}),
+        ("roles pack ID", "Start the project's roles over from a pack.", None),
+        ("roles save-pack ID [--label LABEL]", "Keep the project's roles as a pack for other projects.", None),
+        ("roles export [NAME] [--file FILE]", "Write roles as JSON, to share or keep.", None),
+        ("roles import FILE", "Add the roles in a file written by roles export.", None),
     ]),
     ("Projects, rules, skills and the task sheet", [
         ("projects", "This machine's projects and their folders.", {"argv": ["projects"]}),
@@ -3356,7 +3706,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -3895,6 +4245,15 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _roles(self, data):
+        """The owner lists and changes the project's roles and packs (change_roles has the ops)."""
+        before = set(self.hub.roles())
+        answer, effects = save_roles_change(self.roster.root, data)
+        if effects.get("changed"):
+            self.roster.refresh(force=True)
+            self.hub.drop_roles(before - set(self.hub.roles()))
+        return answer
+
     def _launch(self, data):
         """Add an agent: a new agent session on this machine."""
         permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
@@ -4091,10 +4450,11 @@ class Handler(BaseHTTPRequestHandler):
             except HubError as e:
                 self._json(400, {"error": str(e)})
             return
-        if path in ("/api/send", "/api/role", "/api/agent", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
+        if path in ("/api/send", "/api/role", "/api/roles", "/api/agent", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
             if not self._owner_request():
                 return
-            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/agent": self._agent_op,
+            action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
+                      "/api/agent": self._agent_op,
                       "/api/launch": self._launch,
                       "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}[path]
             try:
@@ -4193,7 +4553,9 @@ def owner_token():
 CURRENT_CHAT = None  # the project owner commands act on: --chat, or the one of the folder they run in
 
 
-def owner_call(path, body, chat=None):
+def owner_call(path, body, chat=None, offline=None):
+    """POST to the chat server here as the owner. With offline, a server that isn't running calls
+    offline() for the answer instead of stopping."""
     chat = chat or CURRENT_CHAT
     try:
         return post_json(local_url() + path, owner_token(), body, headers={"X-Crewchat-Chat": chat} if chat else None)
@@ -4203,6 +4565,8 @@ def owner_call(path, body, chat=None):
         except ValueError:
             die("the server answered HTTP %d" % e.code)
     except (urllib.error.URLError, OSError) as e:
+        if offline:
+            return offline()
         die("the chat server is not running here (%s). Start it with `crewchat serve` or "
             "`crewchat service install`." % getattr(e, "reason", e))
 
@@ -4615,6 +4979,12 @@ def cmd_start(args):
     project = Path(args.folder or ".").resolve()
     if not project.is_dir():
         die("%s is not a folder" % project)
+    packs = role_packs()
+    if args.pack:
+        try:
+            find_pack(args.pack, packs)
+        except HubError as e:
+            die(str(e))
     print(banner())
     print()
     first = not (home() / "config.json").exists()
@@ -4632,6 +5002,9 @@ def cmd_start(args):
             {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
         remember(project, place, chat=chosen["chat"])
         print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
+        if args.pack:
+            print("- --pack sets a new project's roles; this one has its own. To start over from the pack: "
+                  "crewchat roles pack %s --chat %s" % (args.pack, chosen["id"]))
     else:
         if place:
             die("%s is in the project \"%s\". To move it, take it out first: `crewchat place remove %s "
@@ -4653,6 +5026,12 @@ def cmd_start(args):
         if created:
             print("- Created the project \"%s\": its own chat, apart from your other projects (switch on the "
                   "chat page, top left)." % chosen["name"])
+        if args.pack and not (created or first):
+            print("- --pack sets a new project's roles; this one has its own. To start over from the pack: "
+                  "crewchat roles pack %s --chat %s" % (args.pack, chosen["id"]))
+        if (created or first) and args.pack:
+            owner_call("/api/roles", {"op": "pack", "pack": args.pack}, chat=chosen["id"])
+            print("- Its roles come from the pack \"%s\" (`crewchat roles` lists them)." % packs[args.pack]["label"])
         if others:
             print("- Added %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
             print("  `crewchat places` lists its folders; `crewchat place remove %s` takes this one out." % place)
@@ -4992,41 +5371,95 @@ def cmd_role(args):
         print("%s is now %s, and has been sent the role's instructions." % (args.agent, args.role))
 
 
+def roles_change(data):
+    """A change to the project's roles: through the server when it runs here (it takes a removed role
+    from the agents that have it), else straight into config.json."""
+    def offline():
+        try:
+            answer = save_roles_change(project_root(), data)[0]
+        except HubError as e:
+            die(str(e))
+        if data.get("op") in ("delete", "pack"):
+            print("(The chat server isn't running, so agents keep the role they have until you change it.)")
+        return answer
+    return owner_call("/api/roles", data, offline=offline)
+
+
 def cmd_roles(args):
     root = project_root()
     config = load_config(root)
-    custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
-    roles = all_roles(config)
+    packs = role_packs()
+    table = role_table(config, packs)
     if args.action == "list":
-        for name, (title, _) in sorted(roles.items()):
-            print("  %-12s %s%s" % (name, title, " (yours)" if name in custom else ""))
+        pid = project_pack(config, packs)
+        print("Pack: %s (%s)\n" % (pid, packs[pid]["label"]))
+        for name, row in table.items():
+            print("  %-12s %s%s" % (name, row["label"], " (yours)" if row["source"] == "yours" else ""))
         print("\nGive an agent a role: crewchat role AGENT ROLE (or use the menu on its card in the chat page).")
         return
+    if args.action == "packs":
+        for pid, pack in packs.items():
+            print("  %-12s %s: %s%s" % (pid, pack["label"], ", ".join(pack["roles"]) or "no roles",
+                                       " (yours)" if pack.get("saved") else ""))
+        print("\nStart a project's roles over from one: crewchat roles pack ID")
+        return
+    if args.action == "export":
+        if args.name and args.name.lower() not in table:
+            die("no role called %s" % args.name.lower())
+        text = json.dumps(roles_export(table, {args.name.lower()} if args.name else None), indent=2)
+        if args.file:
+            Path(args.file).write_text(text + "\n", encoding="utf-8")
+            print("Roles written to %s. Import them elsewhere with: crewchat roles import %s" % (args.file, args.file))
+        else:
+            print(text)
+        return
+    if args.action == "import":
+        path = args.file or args.name
+        if not path:
+            die("usage: crewchat roles import FILE")
+        try:
+            spec = json.loads(Path(path).read_text(encoding="utf-8"))
+        except OSError as e:
+            die("cannot read %s (%s)" % (path, e.strerror or e))
+        except ValueError:
+            die("%s is not JSON exported by crewchat" % path)
+        names = roles_change({"op": "import", "roles": spec})["imported"]
+        print("Imported %d role%s: %s." % (len(names), "" if len(names) == 1 else "s", ", ".join(names)))
+        return
     if not args.name:
-        die("usage: crewchat roles %s NAME" % args.action)
+        die("usage: crewchat roles %s %s" % (args.action, "ID" if "pack" in args.action else "NAME"))
     name = args.name.lower()
-    if args.action == "show":
-        if name not in roles:
+    if args.action == "pack":
+        roles_change({"op": "pack", "pack": name})
+        print("This project's roles start over from the pack %s. Agents whose role it doesn't have lose it." % name)
+    elif args.action == "save-pack":
+        roles_change({"op": "save_pack", "id": name, "label": args.label or args.title})
+        print("Saved this project's roles as the pack %s. Use it in another project with: "
+              "crewchat roles pack %s --chat PROJECT" % (name, name))
+    elif args.action == "show":
+        if name not in table:
             die("no role called %s" % name)
-        print("%s\n\n%s" % roles[name])
+        print("%s\n\n%s" % (table[name]["label"], table[name]["description"]))
     elif args.action == "add":
-        if not NAME_RE.match(name):
-            die("a role name is letters, digits, - _ . (32 at most)")
         prompt = Path(args.file).read_text(encoding="utf-8") if args.file else args.prompt
-        if not prompt or not prompt.strip():
+        if name not in table and (not prompt or not prompt.strip()):
             die("give the role's instructions with --prompt \"...\" or --file FILE")
-        custom[name] = {"title": args.title or name.replace("-", " ").capitalize(), "prompt": prompt.strip()}
-        config["roles"] = custom
-        save_config(config, root)
-        print("Role %s saved%s. Give it to an agent with: crewchat role AGENT %s" % (
-            name, " (it replaces the built-in one)" if name in ROLES else "", name))
+        fields = {"label": args.label or args.title, "description": prompt, "picture": args.picture,
+                  "colour": args.colour, "tool": args.tool}
+        if args.picture and not args.picture.startswith(("preset:", "file:")):
+            fields["picture"] = "preset:" + args.picture
+        fields = {k: v for k, v in fields.items() if v is not None and (k != "description" or v.strip())}
+        if name in table:
+            roles_change(dict(fields, op="edit", name=name))
+            print("Role %s changed. Agents that have it are told the new instructions when they next get it." % name)
+        else:
+            roles_change(dict(fields, op="create", name=name))
+            print("Role %s saved. Give it to an agent with: crewchat role AGENT %s" % (name, name))
     else:
-        if name not in custom:
-            die("no custom role called %s%s" % (name, " (built-in roles cannot be removed)" if name in ROLES else ""))
-        del custom[name]
-        config["roles"] = custom
-        save_config(config, root)
-        print("Role %s removed. Agents that had it keep it until you change their role." % name)
+        if name not in table:
+            die("no role called %s" % name)
+        roles_change({"op": "delete", "name": name})
+        print("Role %s removed. Agents that had it no longer have a role." % name)
 
 
 def upload(path):
@@ -8142,6 +8575,8 @@ def build_parser():
     p.add_argument("--no-service", action="store_true", help="run the server until log out, not at every login")
     p.add_argument("--keep-awake", action="store_true", help="macOS: keep the machine from sleeping while it runs")
     p.add_argument("--no-open", action="store_true", help="do not open the chat page")
+    p.add_argument("--pack", help="a new project's roles: software (default), youtube, instagram, business, blank, "
+                                  "or one you saved (`crewchat roles packs`)")
     p.set_defaults(fn=cmd_start)
 
     p = sub.add_parser("setup", help="set up the chat on this machine (the host)")
@@ -8220,12 +8655,18 @@ def build_parser():
     p.add_argument("role", help="a role's name, or none")
     p.set_defaults(fn=cmd_role)
 
-    p = sub.add_parser("roles", help="list, show, add or remove roles and their instructions")
-    p.add_argument("action", nargs="?", default="list", choices=["list", "show", "add", "remove"])
-    p.add_argument("name", nargs="?")
-    p.add_argument("--title", help="add: the name shown in the chat (default: from NAME)")
+    p = sub.add_parser("roles", help="list, show, add or remove roles; packs, import and export")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "show", "add", "remove", "packs", "pack", "save-pack", "import", "export"])
+    p.add_argument("name", nargs="?", help="a role's name; a pack's id for pack and save-pack; a file for import")
+    p.add_argument("--label", help="add: the name shown in the chat (default: from NAME); save-pack: the pack's name")
+    p.add_argument("--title", help=argparse.SUPPRESS)  # --label, before 0.14
     p.add_argument("--prompt", help="add: the role's instructions")
-    p.add_argument("--file", help="add: read the role's instructions from this file")
+    p.add_argument("--file", help="add: read the role's instructions from this file; import/export: the file")
+    p.add_argument("--picture", help="add: a preset (%s)" % ", ".join(PICTURE_PRESETS))
+    p.add_argument("--colour", help="add: a colour, #rrggbb (default: the agent's tool's)")
+    p.add_argument("--tool", help="add: the tool a new agent with this role uses (%s)" % ", ".join(
+        t for t in TOOLS_INFO if t != "agent"))
     p.set_defaults(fn=cmd_roles)
 
     p = sub.add_parser("stop", help="stop crewchat on this machine (the server; agents keep working)")

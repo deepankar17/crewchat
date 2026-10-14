@@ -33,6 +33,7 @@ the current one) and open the chat page. Safe to run again.
 | `--no-service` | Run the server until you log out, instead of at every login |
 | `--keep-awake` | macOS: keep the machine from sleeping while crewchat runs |
 | `--no-open` | Do not open the chat page |
+| `--pack ID` | A new project's roles: `software` (default), `youtube`, `instagram`, `business`, `blank`, or a pack you saved |
 
 ### `crewchat connect [tailscale|cloud]`
 
@@ -93,9 +94,14 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat role AGENT ROLE` | Give an agent a role; `none` takes it away |
 | `crewchat roles` | List the roles |
 | `crewchat roles show NAME` | A role's instructions |
-| `crewchat roles add NAME --prompt TEXT [--title TITLE]` | Add your own role, or replace a built-in one |
+| `crewchat roles add NAME --prompt TEXT [--label LABEL]` | Add your own role, or change one (`--picture`, `--colour`, `--tool` too) |
 | `crewchat roles add NAME --file FILE` | The same, reading the instructions from a file |
-| `crewchat roles remove NAME` | Remove one of your roles |
+| `crewchat roles remove NAME` | Remove a role; agents that have it are told |
+| `crewchat roles packs` | List the role packs: software team, YouTube channel, Instagram creator, small business, blank, and yours |
+| `crewchat roles pack ID` | Start the project's roles over from a pack |
+| `crewchat roles save-pack ID [--label LABEL]` | Keep the project's roles as a pack for other projects |
+| `crewchat roles export [NAME] [--file FILE]` | Write roles as JSON, to share or keep |
+| `crewchat roles import FILE` | Add the roles in a file written by `roles export` |
 
 ## Projects, rules, skills and the task sheet
 
@@ -190,7 +196,9 @@ Other settings in `~/.crewchat/config.json`:
 |---|---|
 | `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
 | `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24) |
-| `roles` | Your own roles (`crewchat roles add` writes them) |
+| `roles` | The project's own roles (`crewchat roles add` writes them) |
+| `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
+| `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |
 
 `CREWCHAT_HOME` moves `~/.crewchat` elsewhere.
 
