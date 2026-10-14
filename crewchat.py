@@ -2410,7 +2410,7 @@ class Hub:
             self._changed()
 
     def move_row(self, mid, where):
-        """Up, down or top: a new order between its neighbours."""
+        """Up, down, top, end, or before:ID (a drop on the board): a new order between its neighbours."""
         mid = self._id(mid)
         with self.lock:
             rows = [k for k, _ in sorted(((k, v) for k, v in self.sheet.items() if not v.get("removed")),
@@ -2426,8 +2426,17 @@ class Hub:
             elif where == "down":
                 new = ((order(rows[i + 1]) + order(rows[i + 2])) / 2 if i + 2 < len(rows)
                        else (order(rows[-1]) + 1 if i + 1 < len(rows) else None))
+            elif where == "end":
+                new = order(rows[-1]) + 1 if rows[-1] != mid else None
+            elif str(where).startswith("before:"):  # dropped on another task, on the board
+                target = self._id(str(where)[len("before:"):])
+                if target not in rows:
+                    raise HubError("#%s is not on the task sheet" % target)
+                j = rows.index(target)
+                prev = rows[j - 1] if j else None
+                new = None if mid in (target, prev) else (order(prev) + order(target)) / 2 if prev else order(target) - 1
             else:
-                raise HubError("move a task up, down or to the top")
+                raise HubError("move a task up, down, to the top, to the end, or before:ID")
         if new is not None:
             self.plan_change(mid, order=repr(new))
 
@@ -8881,6 +8890,36 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
   font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
 .cmd pre.bad { border-color: var(--err); }
 
+/* The task board: a column per state, cards that drag. */
+.board-bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+.seg { display: inline-flex; background: var(--soft); border: 1px solid var(--line); border-radius: 99px; padding: 3px; }
+.seg button { background: transparent; color: var(--muted); padding: 5px 14px; font-size: 13px; }
+.seg button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
+.board-bar select { font-size: 13px; }
+#board { display: grid; grid-template-columns: repeat(5, minmax(200px, 1fr)); gap: 12px; align-items: start; overflow-x: auto; padding-bottom: 8px; }
+.col { background: var(--soft); border-radius: var(--radius); padding: 10px; min-height: 140px; display: flex; flex-direction: column; gap: 8px;
+  border: 2px solid transparent; transition: border-color 0.12s, background 0.12s; }
+.col.over { border-color: var(--accent-2); background: var(--tint); }
+.col.nodrop.dragging-on { opacity: 0.55; }
+.col-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--ink); padding: 2px 4px; }
+.col-head .n { margin-left: auto; font-size: 12px; font-weight: 650; color: var(--muted); background: var(--panel); border-radius: 99px; padding: 0 8px; }
+.col-head .swatch { width: 10px; height: 10px; }
+.col .hint { font-size: 12px; color: var(--muted); text-align: center; padding: 14px 6px; border: 1.5px dashed var(--line); border-radius: 14px; }
+.tcard { display: block; width: 100%; text-align: left; background: var(--panel); color: var(--text); border-radius: 14px; padding: 10px 12px;
+  font-weight: 400; box-shadow: var(--shadow); border-left: 4px solid var(--edge, var(--line)); cursor: grab; transition: transform 0.12s; }
+.tcard:hover { transform: translateY(-1px); }
+.tcard.dragging { opacity: 0.4; }
+.tcard .tid { font-size: 11.5px; color: var(--muted); font-weight: 650; }
+.tcard .ttl { margin: 2px 0 6px; font-size: 13.5px; line-height: 1.35; overflow-wrap: anywhere; }
+.tcard .tmeta { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.tcard .avatar { width: 22px; height: 22px; } .tcard .avatar .initials { font-size: 9px; } .tcard .avatar .emoji { font-size: 13px; }
+.tcard .avatar .mark, .tcard .avatar .os { display: none; }
+.tchip { font-size: 11px; background: var(--soft); border-radius: 99px; padding: 1px 8px; color: var(--muted); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.tcard .who { font-size: 12px; color: var(--muted); margin-right: auto; }
+.more { background: transparent; color: var(--accent); font-size: 12.5px; padding: 4px; }
+.give { display: flex; gap: 8px; align-items: center; background: var(--panel); box-shadow: var(--shadow); border-radius: 16px; padding: 10px 12px; margin: 10px 0; }
+.give label { font-size: 13px; font-weight: 650; }
+
 /* The side panel: an agent, a role, a task, or the project. */
 #panel { grid-area: panel; overflow-y: auto; padding: 12px 14px 20px; min-width: 0; }
 .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
@@ -8961,6 +9000,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   body.rail-open #scrim { display: block; position: fixed; inset: 0; z-index: 30; background: rgba(11, 31, 85, 0.35); }
   #panel { position: fixed; z-index: 50; inset: 0; background: var(--bg); }
   .msg { max-width: 96%; }
+  #board { grid-template-columns: repeat(5, 86%); scroll-snap-type: x mandatory; }
+  .col { scroll-snap-align: start; }
 }
 @media (prefers-reduced-motion: reduce) { #rail { transition: none; } }
 </style>
@@ -9016,10 +9057,19 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
   <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
-    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2></div>
+    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
+      <span id="board-count" class="meta"></span></div>
     <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
       what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
       the lead hands tasks out.</p>
+    <div class="board-bar">
+      <div class="seg" role="group" aria-label="Show tasks as">
+        <button type="button" id="as-board" aria-pressed="true">Board</button><button type="button" id="as-list" aria-pressed="false">List</button>
+      </div>
+      <select id="f-agent" aria-label="Only the tasks of an agent"></select>
+      <select id="f-role" aria-label="Only the tasks of a role"></select>
+      <select id="f-machine" aria-label="Only the tasks of a machine"></select>
+    </div>
     <form id="task-form" class="task-form">
       <input type="text" id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
       <input type="text" id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
@@ -9027,7 +9077,10 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <input type="text" id="t-where" placeholder="machine" aria-label="Machine">
       <button id="t-add">Add</button>
     </form>
-    <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
+    <div id="board" aria-label="Task board"></div>
+    <div id="give" class="give" hidden><label for="give-to">Give it to</label><select id="give-to"></select>
+      <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
+    <table id="sheet" hidden><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
   <section id="commands" hidden aria-label="Commands">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Commands</h2></div>
@@ -9456,9 +9509,11 @@ function taskMeta(r) {
   meta.push("from " + (r.from === "Owner" ? "you" : r.from));
   return meta.join(" · ");
 }
-function renderSheet(rows) {
-  const open = rows.filter((r) => r.status !== "done").length;
+function renderSheet(all) {
+  const open = all.filter((r) => r.status !== "done").length;
   $("tasks-count").textContent = open ? "(" + open + ")" : "";
+  renderBoard(all);
+  const rows = boardFilters(all);
   const body = $("sheet").tBodies[0];
   if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
   if (!rows.length) {
@@ -9483,6 +9538,134 @@ function renderSheet(rows) {
     return tr;
   }));
 }
+// The board: To do, Doing, Blocked, Review, Done. A card opens the task; dragging one moves it, as the
+// owner may: reorder in a column, Done, back to To do, or Doing (to an agent, asked for). Blocked and
+// Review are for agents to set.
+const COLUMNS = [["todo", "To do", "var(--off)"], ["doing", "Doing", "var(--accent)"], ["blocked", "Blocked", "var(--err)"],
+                 ["review", "Review", "var(--warn)"], ["done", "Done", "var(--ok)"]];
+const column = (r) => (r.status === "waiting" ? "todo" : r.status);
+const DONE_SHOWN = 20;
+let boardDrag = null;
+function boardFilters(rows) {
+  const keep = (id, all, options) => {
+    const pick = $(id), now = pick.value;
+    const key = JSON.stringify(options);
+    if (pick.dataset.key !== key) {
+      pick.dataset.key = key;
+      pick.replaceChildren(new Option(all, ""), ...options.map(([v, t]) => new Option(t, v)));
+      pick.value = options.some(([v]) => v === now) ? now : "";
+    }
+    return pick.value;
+  };
+  const agentOf = (name) => state.agents.find((a) => a.agent === name);
+  const agents = [...new Set(rows.map((r) => r.holder).filter(Boolean))].sort();
+  const roles = [...new Set(agents.map((n) => (agentOf(n) || {}).role).filter(Boolean))];
+  const machines = [...new Set(rows.map((r) => r.where || (agentOf(r.holder) || {}).device).filter(Boolean))].sort();
+  const agent = keep("f-agent", "Every agent", agents.map((n) => [n, n]));
+  const role = keep("f-role", "Every role", roles.map((r) => [r, roleTitle(r)]));
+  const machine = keep("f-machine", "Every machine", machines.map((m) => [m, m]));
+  $("f-machine").hidden = machines.length < 2;
+  return rows.filter((r) => (!agent || r.holder === agent) && (!role || (agentOf(r.holder) || {}).role === role) &&
+    (!machine || (r.where || (agentOf(r.holder) || {}).device) === machine));
+}
+function taskCard(r) {
+  const b = el("button", "tcard");
+  b.type = "button"; b.draggable = true; b.dataset.task = r.id;
+  b.style.setProperty("--edge", (COLUMNS.find((c) => c[0] === column(r)) || [])[2] || "");
+  b.append(el("div", "tid", "#" + r.id + (r.status === "waiting" ? " · waiting" : "")), el("div", "ttl", r.title));
+  const meta = el("div", "tmeta");
+  if (r.holder) { meta.append(avatar(agentRow(r.holder))); meta.append(el("span", "who", r.holder)); }
+  for (const d of r.depends) meta.append(el("span", "tchip", "waits for #" + d));
+  for (const f of r.areas) meta.append(el("span", "tchip", f));
+  if (r.where) meta.append(el("span", "tchip", "on " + r.where));
+  if (meta.childNodes.length) b.append(meta);
+  b.addEventListener("click", () => openPanel("task", r.id));
+  b.addEventListener("dragstart", (e) => {
+    boardDrag = r; b.classList.add("dragging"); e.dataTransfer.effectAllowed = "move";
+    e.dataTransfer.setData("text/plain", r.id);
+    for (const c of document.querySelectorAll(".col.nodrop")) c.classList.add("dragging-on");
+  });
+  b.addEventListener("dragend", () => {
+    boardDrag = null; b.classList.remove("dragging");
+    for (const c of document.querySelectorAll(".col")) c.classList.remove("over", "dragging-on");
+  });
+  return b;
+}
+// What dropping r on a column (before a card, or at its end) does; null when nothing.
+function dropAction(r, col, before) {
+  const from = column(r);
+  if (col === "blocked" || col === "review") return null;
+  if (col === from) return { op: "move", task: r.id, where: before ? "before:" + before : "end" };
+  if (col === "done") return { op: "status", task: r.id, status: "done" };
+  if (col === "todo") return { op: "status", task: r.id, status: "todo" };
+  if (col === "doing") return { give: r };
+  return null;
+}
+function askGive(r) {
+  $("give-to").replaceChildren(new Option("An agent…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+  $("give").hidden = false; $("give").dataset.task = r.id;
+  $("give-to").focus();
+}
+$("give-to").addEventListener("change", async () => {
+  const agent = $("give-to").value;
+  if (!agent) return;
+  $("give").hidden = true;
+  await taskOp({ op: "assign", task: $("give").dataset.task, agent });
+});
+$("give-cancel").addEventListener("click", () => { $("give").hidden = true; });
+function renderBoard(rows) {
+  const board = $("board");
+  if (boardDrag || board.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  const shown = boardFilters(rows);
+  const key = JSON.stringify([shown, state.showAllDone, state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
+  if (key === state.boardKey) return;
+  state.boardKey = key;
+  const focused = document.activeElement && board.contains(document.activeElement) ? document.activeElement.dataset.task : "";
+  $("board-count").textContent = shown.length === rows.length ? "" : shown.length + " of " + rows.length + " shown";
+  board.replaceChildren(...COLUMNS.map(([id, label, tint]) => {
+    const col = el("section", "col" + (id === "blocked" || id === "review" ? " nodrop" : ""));
+    col.dataset.col = id;
+    col.setAttribute("aria-label", label);
+    let mine = shown.filter((r) => column(r) === id);
+    const head = el("div", "col-head");
+    const sw = el("span", "swatch"); sw.style.setProperty("--sw", tint);
+    head.append(sw, label, el("span", "n", String(mine.length)));
+    col.append(head);
+    if (id === "done" && mine.length > DONE_SHOWN && !state.showAllDone) {
+      const hidden = mine.length - DONE_SHOWN;
+      mine = mine.slice(-DONE_SHOWN);
+      const more = el("button", "more", "Show " + hidden + " older");
+      more.type = "button"; more.addEventListener("click", () => { state.showAllDone = true; renderBoard(state.sheet); });
+      col.append(more);
+    }
+    col.append(...mine.map(taskCard));
+    if (!mine.length) col.append(el("p", "hint", id === "blocked" || id === "review" ? "Agents put tasks here" : "Nothing here"));
+    col.addEventListener("dragover", (e) => {
+      if (!boardDrag || !dropAction(boardDrag, id)) return;
+      e.preventDefault(); col.classList.add("over");
+    });
+    col.addEventListener("dragleave", (e) => { if (!col.contains(e.relatedTarget)) col.classList.remove("over"); });
+    col.addEventListener("drop", (e) => {
+      e.preventDefault(); col.classList.remove("over");
+      const r = boardDrag, card = e.target.closest && e.target.closest(".tcard");
+      const act = r && dropAction(r, id, card && card.dataset.task !== r.id ? card.dataset.task : "");
+      if (!act) return;
+      if (act.give) askGive(act.give); else taskOp(act);
+    });
+    return col;
+  }));
+  if (focused) board.querySelector('[data-task="' + CSS.escape(focused) + '"]')?.focus();
+}
+function showBoard(on) {
+  $("board").hidden = !on; $("sheet").hidden = on;
+  $("as-board").setAttribute("aria-pressed", String(on)); $("as-list").setAttribute("aria-pressed", String(!on));
+  try { localStorage.setItem("crewchat-tasks-as", on ? "board" : "list"); } catch (e) {}
+}
+$("as-board").addEventListener("click", () => showBoard(true));
+$("as-list").addEventListener("click", () => showBoard(false));
+for (const id of ["f-agent", "f-role", "f-machine"]) $(id).addEventListener("change", () => { state.boardKey = ""; renderSheet(state.sheet); });
+try { if (localStorage.getItem("crewchat-tasks-as") === "list") showBoard(false); } catch (e) {}
+
 $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();

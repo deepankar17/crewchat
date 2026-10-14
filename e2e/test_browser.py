@@ -573,6 +573,51 @@ class NewPage(Signed):
         self.assertFalse(c.js("$('log').hidden"))
         self.assertEqual(c.errors, [])
 
+    def test_the_task_board(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        c.js("$('as-board').click()")
+        c.type_into("#t-title", "Board task one")
+        c.js("$('task-form').requestSubmit()")
+        c.until("!!document.querySelector('#board .col[data-col=todo] .tcard')", what="a card in To do")
+        c.type_into("#t-title", "Board task two")
+        c.js("$('task-form').requestSubmit()")
+        c.until("[...document.querySelectorAll('#board .tcard')].some(b => b.innerText.includes('Board task two'))",
+                what="the second card")
+        self.assertEqual(c.js("[...document.querySelectorAll('#board .col')].map(c => c.dataset.col)"),
+                         ["todo", "doing", "blocked", "review", "done"])
+        ids = c.js("[...document.querySelectorAll('#board .tcard')].filter(b => b.innerText.includes('Board task'))"
+                   ".map(b => b.dataset.task)")
+        # The drop rules, as the page applies them.
+        rules = c.js("""(() => { const r = state.sheet.find(x => x.id === %s);
+            return ['todo', 'doing', 'blocked', 'review', 'done'].map(col => JSON.stringify(dropAction(r, col, ''))); })()"""
+                     % json.dumps(ids[0]))
+        self.assertIn('"where":"end"', rules[0])  # a move within its own column
+        self.assertIn('"give"', rules[1])  # Doing asks who takes it
+        self.assertEqual(rules[2:4], ["null", "null"])  # Blocked and Review are the agents' to set
+        self.assertIn('"status":"done"', rules[4])
+        # A drop on Done marks it done; a drop before another card reorders.
+        c.js("taskOp(dropAction(state.sheet.find(x => x.id === %s), 'done', ''))" % json.dumps(ids[1]))
+        c.until("!!document.querySelector('#board .col[data-col=done] .tcard[data-task=\"%s\"]')" % ids[1], what="done")
+        # Doing asks for an agent, then gives it the task.
+        c.js("askGive(state.sheet.find(x => x.id === %s))" % json.dumps(ids[0]))
+        self.assertFalse(c.js("$('give').hidden"))
+        c.js("$('give-to').value = %s; $('give-to').dispatchEvent(new Event('change'))" % json.dumps(self.agent.name))
+        c.until("!!document.querySelector('#board .col[data-col=doing] .tcard[data-task=\"%s\"]')" % ids[0],
+                what="the task given to the agent")
+        # A filter by agent, and the list view.
+        c.js("$('f-agent').value = %s; $('f-agent').dispatchEvent(new Event('change'))" % json.dumps(self.agent.name))
+        self.assertTrue(c.js("[...document.querySelectorAll('#board .tcard')].every(b => b.innerText.includes(%s))"
+                             % json.dumps(self.agent.name)))
+        c.js("$('f-agent').value = ''; $('f-agent').dispatchEvent(new Event('change'))")
+        c.js("$('as-list').click()")
+        self.assertTrue(c.js("$('board').hidden && !$('sheet').hidden"))
+        c.js("$('as-board').click()")
+        # A card opens its task in the panel.
+        c.js("document.querySelector('#board .tcard').click()")
+        c.until("$('panel-title').textContent.startsWith('Task #')", what="the task panel")
+        self.assertEqual(c.errors, [])
+
     def test_new_agent_in_four_steps(self):
         c = self.chrome
         c.click("#add-agent")
