@@ -45,6 +45,7 @@ chat shows who set each role.
 | **Developer** | Work on what it is given. Report progress. When something is ready, tell QA what changed and how to test it, and fix what QA or the reviewer finds |
 | **QA** | Test what developers say is ready: run the tests, try it as a user would, look for edge cases. Send each bug to the developer with steps to reproduce. Mark the task done when it passes. It does not fix the code itself unless asked |
 | **Reviewer** | Review changes that are ready: bugs, unclear code, security problems, missing tests. Send findings to the developer, most important first, and approve plainly when it is good |
+| **Advisor** | Answer the other agents' questions (`hub_ask`) at decision points: before they commit to an approach, when an error keeps coming back, and before they say a task is done. For a check before done, approve or ask for changes. It does not take tasks or change files itself unless asked |
 | **Docs** | Keep the README, guides and changelog in step with what developers finish. Read the code before describing it |
 
 `crewchat roles show developer` prints a role's full instructions.
@@ -79,6 +80,29 @@ Step by step:
 ![A lead, a developer and QA. 1: You post a task, and the lead gets it. 2: The lead takes it. 3: and assigns a piece to the developer. 4: The developer reports progress. 5: and tells QA it's ready to test. 6: QA finds a bug, and tells the developer directly. 7: The developer fixes it. 8: QA marks it done. 9: The lead reports back to you.](images/diagram-team.gif)
 
 Only the lead can assign work with `hub_assign`. Any agent can still message any other.
+
+## The advisor
+
+Give one agent the advisor role, ideally one running a stronger model (for example a Claude Code
+session on Opus or Fable), and the others consult it at the moments that decide the outcome:
+before committing to an approach, when an error keeps coming back, and before saying a task is
+done. An agent asks with `hub_ask` and waits for the answer; the advisor answers with
+`hub_answer`. Both are messages in the chat, so you see every question and answer.
+
+The advisor sees only what the asking agent sends it (the goal, what it tried, the error or the
+change), not that agent's session. With several advisors, a question goes to the one with the
+fewest waiting.
+
+Only you give the advisor role (an agent cannot take it itself), and only the advisor a question
+was sent to answers it, once. An advisor on another linked machine is asked too.
+
+**Check before done (optional).** `crewchat tasks advisor on` lets a task be marked done only
+after the advisor approves it: the agent holding the task asks with `hub_ask` and the task's
+number, and the advisor answers with a verdict, approve or changes. Only the answer to the newest
+check counts, and an approval lapses when the task changes hands, is given back, or work on it
+starts again (`in_progress`). The sheet shows `advisor: approved` or `changes needed` on the task.
+You can always mark a task done yourself. `crewchat tasks advisor off` turns it off again; it is
+off unless you set it.
 
 ## The task sheet and the lead
 
