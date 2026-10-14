@@ -679,7 +679,7 @@ def change_roles(config, data, packs):
             if spec.get(field) and not ok(spec[field]):
                 raise HubError("%s is not a %s (%s)" % (spec[field], field, "a preset: " + ", ".join(
                     PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
-        if spec.get("tool") and spec["tool"] not in TOOLS_INFO:
+        if spec.get("tool") and str(spec["tool"]) not in TOOLS_INFO:
             raise HubError("no tool called %s. Tools: %s" % (spec["tool"], ", ".join(TOOLS_INFO)))
         custom[name] = clean_role(spec)
         if custom[name] is None:

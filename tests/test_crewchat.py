@@ -845,6 +845,17 @@ class Roles(Base):
         with self.hub.lock:
             self.hub.agents[name]["role"] = ""
 
+    def test_the_command_line_without_a_server(self):
+        with mock.patch.object(crewchat, "local_url", lambda config=None: "http://127.0.0.1:9"):  # nothing listens
+            out = cli("roles", "add", "offline-role", "--prompt", "You work offline.")
+            self.assertIn("Role offline-role saved", out)
+            self.assertIn("agents keep the role", cli("roles", "remove", "offline-role"))
+        self.assertNotIn("offline-role", crewchat.role_table(crewchat.load_config(self.root), crewchat.role_packs()))
+
+    def test_a_request_of_the_wrong_shape_is_an_error_not_a_crash(self):
+        self.assertIn("no tool called", self.op(op="create", name="x", description="x", tool=["cursor"])["error"])
+        self.assertIn("names start with a letter", self.op(op="create", name=["x"], description="x")["error"])
+
     def test_the_owner_is_told_about_a_bad_picture_colour_or_tool(self):
         for field, value, why in (("picture", "preset:nope", "a preset"), ("colour", "red", "#rrggbb"),
                                   ("tool", "cursr", "no tool called cursr")):
