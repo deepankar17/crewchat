@@ -135,7 +135,7 @@ The list on the left shows each agent:
 Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
 **waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next
 types), its task and last message, its role and listening setting, and **Message**, **Stop** or
-**Reopen**, **Rename**, **Change picture** and **Remove**. ✕ or Esc closes the panel.
+**Reopen**, **Change picture** and **Remove**. Its name is a field: click it, type, Enter. ✕ or Esc closes the panel.
 
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 
@@ -205,8 +205,8 @@ Each agent session gets its own name, built from its tool and the folder's label
 | Claude Code in a folder joined as `desktop` | `claude-desktop` |
 
 - **The label** defaults to the machine's name. Choose your own with `crewchat start --place NAME`.
-- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or use **Rename** in its
-  panel on the chat page, or from the host: `crewchat agent rename claude-macbook backend`.
+- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or click its name in its
+  panel on the chat page and type a new one, or from the host: `crewchat agent rename claude-macbook backend`.
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
   `~/.crewchat/config.json`). **Remove** in its panel, or `crewchat agent remove NAME`, drops one at once and puts

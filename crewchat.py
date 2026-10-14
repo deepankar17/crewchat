@@ -8864,6 +8864,14 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .card p { margin: 4px 0; font-size: 13.5px; overflow-wrap: anywhere; }
 .ident { display: flex; gap: 12px; align-items: center; }
 .ident .nm { font-size: 17px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.ident .names { min-width: 0; flex: 1; }
+.namefield { display: flex; align-items: center; gap: 4px; }
+.namefield input.nm { font: inherit; font-size: 17px; font-weight: 700; color: var(--ink); background: transparent;
+  border: 1px solid transparent; border-radius: 10px; padding: 1px 6px; margin-left: -7px; width: 100%; min-width: 0; }
+.namefield input.nm:hover { border-color: var(--line); }
+.namefield input.nm:focus { background: var(--soft); border-color: var(--accent-2); outline: none; }
+.namefield .pencil { color: var(--muted); font-size: 13px; }
+.namefield input.nm:focus + .pencil { visibility: hidden; }
 .field { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 10px; align-items: center; font-size: 13.5px; margin: 6px 0; }
 .field > span:first-child { color: var(--muted); font-size: 12.5px; }
 .field select, .field input, .field textarea { width: 100%; }
@@ -9946,8 +9954,8 @@ function panelAgent(name) {
   const agentOp = (body, what, control) => postAction("/api/agent", body, what, control);
   const tool = own(state.tools, a.client) || {};
   const head = el("div", "ident");
-  const names = el("div");
-  names.append(el("div", "nm", a.agent));
+  const names = el("div", "names");
+  names.append(remote ? el("div", "nm", a.agent) : nameField(a, agentOp));
   if (a.role) names.append(el("span", "badge " + a.role, roleTitle(a.role)));
   names.append(el("div", "meta", [tool.label || a.client, a.place + (a.remote ? " on " + a.device : "")].join(" · ")));
   head.append(avatar(a, "big"), names);
@@ -9995,14 +10003,6 @@ function panelAgent(name) {
     if (cls) b.classList.add(cls);
     if (remote) { b.title = remote; b.disabled = true; }
   };
-  button("Rename", "Rename " + a.agent, (b) => {
-    const name = prompt("New name for " + a.agent + " (letters, digits, - _ .):", a.agent);
-    if (name && name.trim() && name.trim() !== a.agent)
-      agentOp({ op: "rename", agent: a.agent, new: name.trim() }, "Not renamed", b).then((ok) => {
-        const p = state.panel;
-        if (ok && p && p.kind === "agent" && p.id === a.agent) openPanel("agent", name.trim());
-      });
-  });
   if (!remote) acts.append(pictureMenu(a, agentOp));
   button("Remove", "Remove " + a.agent + " from the chat", (b) => {
     if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
@@ -10012,6 +10012,39 @@ function panelAgent(name) {
   const cards = [card("", head), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
   if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
   return [a.agent, ...cards];
+}
+
+// The agent's name, editable where it stands (as in a bot builder): Enter or leaving the field saves,
+// Escape puts it back.
+function nameField(a, agentOp) {
+  const box = el("label", "namefield");
+  const input = el("input", "nm");
+  input.type = "text"; input.value = a.agent; input.maxLength = 32; input.spellcheck = false;
+  input.setAttribute("aria-label", "Name for " + a.agent);
+  input.title = "Click to rename: letters, digits, - _ .";
+  let busy = false;
+  const save = async () => {
+    const name = input.value.trim();
+    if (busy) return;
+    if (!name || name === a.agent) { input.value = a.agent; return; }
+    if (!/^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(name)) {
+      panelNote("Not renamed: a name starts with a letter and uses letters, digits, - _ . (32 at most)");
+      input.value = a.agent; return;
+    }
+    busy = true;
+    const ok = await agentOp({ op: "rename", agent: a.agent, new: name }, "Not renamed", input);
+    busy = false;
+    const p = state.panel;
+    if (ok && p && p.kind === "agent" && p.id === a.agent) openPanel("agent", name);
+    else if (!ok) input.value = a.agent;
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); save(); }
+    if (e.key === "Escape") { e.stopPropagation(); input.value = a.agent; input.blur(); }
+  });
+  input.addEventListener("blur", save);
+  box.append(input, el("span", "pencil", "✎"));
+  return box;
 }
 
 function panelTask(id) {

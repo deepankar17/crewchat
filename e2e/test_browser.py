@@ -474,7 +474,8 @@ class NewPage(Signed):
         self.assertTrue(c.js("document.body.classList.contains('panel-open')"))
         self.assertTrue(c.js(self.card() + ".classList.contains('on')"))
         texts = c.js("$('panel-body').innerText")
-        for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Rename", "Remove", "Change picture"):
+        self.assertEqual(c.js("document.querySelector('#panel input[aria-label^=\"Name for\"]').value"), self.agent.name)
+        for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Remove", "Change picture"):
             self.assertIn(word, texts.upper() if word.isupper() else texts)
         sel = "#panel select[aria-label='Role for %s']" % self.agent.name
         c.js("(() => { const s = document.querySelector(%s); s.value = 'reviewer'; s.dispatchEvent(new Event('change')); })()"
@@ -486,6 +487,22 @@ class NewPage(Signed):
         c.js("$('text').value = ''")
         c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
         c.until("$('panel').hidden && !document.body.classList.contains('panel-open')", what="Esc to close the panel")
+        self.assertEqual(c.errors, [])
+
+    def test_rename_in_the_panel(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.js(self.card() + ".click()")
+        field = "document.querySelector('#panel .namefield input')"
+        c.until("!!" + field, what="the name field")
+        c.js("(() => { const f = %s; f.value = 'bad name!'; f.dispatchEvent(new FocusEvent('blur')); })()" % field)
+        self.assertIn("Not renamed", c.js("$('panel-body').innerText"))
+        self.assertEqual(c.js(field + ".value"), self.agent.name)
+        c.js("(() => { const f = %s; f.value = 'Nova'; f.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'})); })()" % field)
+        eventually(lambda: "Nova" in [r["agent"] for r in self.m.owner.poll()["agents"]], what="the rename")
+        c.until("$('panel-title').textContent === 'Nova'", what="the panel to follow the new name")
+        c.js("(() => { const f = %s; f.value = %s; f.dispatchEvent(new FocusEvent('blur')); })()" % (field, json.dumps(self.agent.name)))
+        eventually(lambda: self.agent.name in [r["agent"] for r in self.m.owner.poll()["agents"]], what="the name back")
         self.assertEqual(c.errors, [])
 
     def test_session_controls_in_the_panel(self):
@@ -503,7 +520,7 @@ class NewPage(Signed):
             const look = (n) => { openPanel("agent", n); const b = $("panel-body");
               return {buttons: [...b.querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent),
                       text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
-                      picture: !!b.querySelector(".picmenu")}; };
+                      picture: !!b.querySelector(".picmenu"), nameField: !!b.querySelector(".namefield")}; };
             const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one")};
             closePanel(); state.agents = saved; state.models = savedModels; renderAgents(true);
             return out;
@@ -512,7 +529,8 @@ class NewPage(Signed):
         self.assertIn("Switch running-one's model", out["running"]["selects"])
         self.assertIn("Reopen", out["closed"]["buttons"])
         self.assertIn("Session closed 4 min ago", out["closed"]["text"])
-        self.assertNotIn("Rename", out["far"]["buttons"])  # it runs on another machine: changed there
+        self.assertNotIn("Remove", out["far"]["buttons"])  # it runs on another machine: changed there
+        self.assertFalse(out["far"]["nameField"])
         self.assertFalse(out["far"]["picture"])
         self.assertIn("Runs on laptop", out["far"]["text"])
         self.assertEqual(c.errors, [])

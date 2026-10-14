@@ -6,7 +6,8 @@
   **+** to switch or make a project, choosing the role pack its crew starts from), the crew on the
   left, the project's space in the middle, and a side panel on the right. Click an agent to open
   it in the panel: what it is doing, its task and last message, its role, listening and
-  permissions, and Message, Stop or Reopen, Switch model, Rename, Change picture and Remove; a
+  permissions, and Message, Stop or Reopen, Switch model, Change picture and Remove (its name is a field
+  you click to rename); a
   task opens with its history, and **⋯ > Roles** lists the project's roles to read, edit,
   duplicate, export, delete or import, start over from a pack or save as one. The message box is a
   pill with **+** (attach a file, post as task, new agent); `@name` at the start writes to one
