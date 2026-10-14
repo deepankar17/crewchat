@@ -3123,6 +3123,24 @@ class Lifecycle(Base):
         a.text("hub_inbox")
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "move", "task": crash, "where": "top"})
         self.assertEqual(hub.sheet_rows()[0]["id"], crash)
+        # The board drops a task before another one, or at the end.
+        order = lambda: [r["id"] for r in hub.sheet_rows()]  # noqa: E731
+        move = lambda where: crewchat.post_json(self.base + "/api/task", self.owner,  # noqa: E731
+                                                {"op": "move", "task": crash, "where": where})
+        move("before:" + sign)
+        self.assertEqual(order()[order().index(crash) + 1], sign)
+        move("end")
+        self.assertEqual(order()[-1], crash)
+        move("before:" + order()[0])
+        self.assertEqual(order()[0], crash)
+        with self.assertRaises(urllib.error.HTTPError):
+            move("before:nope")
+        before = order()
+        move("before:" + crash)  # its own place
+        move("before:" + order()[order().index(crash) + 1])  # just above the next one: where it is
+        self.assertEqual(order(), before)
+        move("end"); move("end")  # already last
+        self.assertEqual(order()[-1], crash)
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": sign})
         self.assertNotIn(sign, [r["id"] for r in hub.sheet_rows()])
         self.assertEqual(a.text("hub_inbox"), "No new messages.")

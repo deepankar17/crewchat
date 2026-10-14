@@ -262,6 +262,10 @@ def scene_team(b):
     b.js("openPanel('roles')")
     time.sleep(0.8)
     b.shoot("roles-panel", "#panel", pad=0)
+    b.js("closePanel(); showView('tasks'); $('as-board').click()")
+    time.sleep(0.5)
+    b.shoot("task-board")
+    b.js("showView('chat')")
     chat.stop()
 
 

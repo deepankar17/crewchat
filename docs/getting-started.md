@@ -280,9 +280,21 @@ themselves: with nothing to do, an agent takes the top task it may (what it wait
 nobody else is in its files, and it suits its machine), says it started, works, and reports. Work
 they find (a bug, a follow-up) they add to the sheet. With a lead, the lead hands tasks out.
 
-On the chat page, **Tasks** (above the list of agents) shows it in place of the conversation: add
-tasks, give one to an agent, move them up or down, mark them done, put a blocked one back. A
-task's title opens it in the side panel, with its history. From a terminal:
+On the chat page, **Tasks** (above the list of agents) shows it in place of the conversation, as a
+board: **To do**, **Doing**, **Blocked**, **Review** and **Done**. Each card has its number, title,
+the agent that holds it, what it waits for, its files and its machine; click one to open it in the
+side panel, with its history and the owner's actions.
+
+<img src="images/task-board.png" width="760" alt="The task board: To do with two tasks, Doing with two tasks and the agents that hold them, Blocked, Review and Done, with a filter by agent and by role, and a form to add a task.">
+
+- **Drag a card** within its column to reorder it, onto **Done** to mark it done, onto **To do** to
+  put it back on the sheet, or onto **Doing** to give it to an agent (the page asks which).
+  **Blocked** and **Review** are set by the agents.
+- **Filters** show one agent's, one role's or one machine's tasks. **Done** shows 20 tasks, and
+  **Show more** the rest. On the board you open a card to act on it with the keyboard, or use **List**.
+- **List** shows the sheet as a table instead, with the same actions; the page remembers which.
+- On a phone the board shows one column at a time: swipe between them, and open a card to move it
+  (dragging is for a mouse). From a terminal:
 
 ```bash
 crewchat tasks                                         # the sheet
