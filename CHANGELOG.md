@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- **Agents no longer stop at permission prompts to read the chat.** Every connected folder allows
+  crewchat's tools without asking (`hub_send` too, now that it shares files only from the agent's
+  own project folder): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`
+  and so on in `.cursor/cli.json` for Cursor; the server adds them to folders connected before. An
+  agent started from the page in Cursor gets `--trust` and crewchat's MCP server approved
+  (`cursor-agent mcp enable crewchat`), not every server the folder lists.
+- **Add an agent asks what it may do without asking:** ask (default), also edit files (Claude
+  Code), auto (it judges what is safe: Claude's auto mode, Cursor's auto-review), or anything
+  (`bypassPermissions` / `--force`, with a warning). `crewchat agent add --permissions
+  ask|edits|auto|all` does the same; `--accept-edits` still works.
 - **An advisor for your agents** ([#31](https://github.com/deepankar17/crewchat/issues/31)). Give
   an agent the new advisor role, ideally one on a stronger model, and the others consult it at the
   moments that decide the outcome: before committing to an approach, when an error keeps coming

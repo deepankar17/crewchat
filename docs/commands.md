@@ -83,7 +83,8 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `--task TEXT` | Its first task |
 | `--tool claude\|cursor` | Claude Code (default) or Cursor's agent |
 | `--folder FOLDER` | A connected project folder on this machine (default: the current one) |
-| `--accept-edits` | Claude Code: let it edit files without asking |
+| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (Claude Code), auto (it judges what is safe), or anything ([details](teams.md#add-an-agent-from-the-chat-page)) |
+| `--accept-edits` | The same as `--permissions edits` |
 
 ## Teams
 

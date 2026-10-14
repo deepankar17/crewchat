@@ -299,7 +299,7 @@ def scene_add_agent(b):
     chat.hub.set_role(O, list(chat.hub.agents)[0], "lead")
     chat.quiet()
     old = crewchat.launch_options
-    crewchat.launch_options = lambda config, root=None: {
+    crewchat.launch_options = lambda config, *where: {
         "tools": [{"id": "claude", "label": "Claude Code"}, {"id": "cursor", "label": "Cursor"}],
         "folders": [{"path": "/Users/you/code/notes-app", "name": "notes-app", "place": "macbook"}]}
     try:

@@ -786,8 +786,9 @@ class Launching(Base):
     def setUp(self):
         self.launched = []
         self.saved = crewchat.launch_agent, crewchat.find_tool
-        crewchat.launch_agent = lambda tool, folder, key, edits=False, root=None: self.launched.append(
-            (tool, folder, key, edits))
+        self.real_launch_agent = crewchat.launch_agent
+        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None: self.launched.append(
+            (tool, folder, key, permissions))
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
@@ -814,8 +815,8 @@ class Launching(Base):
 
     def test_a_launched_agent_gets_its_name_role_and_task(self):
         self.assertEqual(self.launch(name="docs-writer", role="docs", task="Write the settings guide"), {"ok": True})
-        tool, folder, key, edits = self.launched[-1]
-        self.assertEqual((tool, folder, edits), ("claude", str(self.folder), False))
+        tool, folder, key, permissions = self.launched[-1]
+        self.assertEqual((tool, folder, permissions), ("claude", str(self.folder), "ask"))
         self.assertTrue(key.startswith("start-"))
         self.assertIn("Owner started a new Claude Code agent in %s as docs-writer" % self.folder.name,
                       [m["text"] for m in self.hub.history(5)])
@@ -861,15 +862,61 @@ class Launching(Base):
     def test_the_command_line_can_add_one(self):
         out = cli("agent", "add", "tester", "--folder", str(self.folder), "--role", "qa", "--accept-edits")
         self.assertIn("Opened a new Claude Code session in %s" % self.folder, out)
-        self.assertEqual(self.launched[-1][3], True)
+        self.assertEqual(self.launched[-1][3], "edits")  # --accept-edits, as before
+        cli("agent", "add", "--tool", "cursor", "--folder", str(self.folder), "--permissions", "auto")
+        self.assertEqual(self.launched[-1][3], "auto")
+
+    def test_permissions_are_checked_per_tool(self):
+        for tool, permissions, ok in (("claude", "edits", True), ("cursor", "edits", False), ("cursor", "all", True),
+                                      ("claude", "root", False)):
+            body = {"tool": tool, "folder": str(self.folder), "permissions": permissions}
+            if ok:
+                crewchat.post_json(self.base + "/api/launch", self.owner, body)
+                self.assertEqual(self.launched[-1][3], permissions)
+            else:
+                with self.assertRaises(urllib.error.HTTPError):
+                    crewchat.post_json(self.base + "/api/launch", self.owner, body)
+        crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
+                                                                     "accept_edits": True})  # a page from before
+        self.assertEqual(self.launched[-1][3], "edits")
+
+    def test_an_older_agent_command_line_is_started_with_what_it_knows(self):
+        new_cursor = "Options:\n  --approve-mcps  ...\n  --trust  ...\n  --auto-review ...\n  -f, --force ..."
+        self.assertEqual(crewchat.fit_options(new_cursor, "cursor", "auto"), (["--trust"], []))
+        old_cursor = "Options:\n  -f, --force  Force allow commands"
+        self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "ask"), ([], []))  # it asks at its prompts instead
+        self.assertEqual(crewchat.fit_options(old_cursor, "cursor", "auto"), ([], ["--auto-review"]))
+        old_claude = '--permission-mode <mode>  (choices: "acceptEdits", "bypassPermissions", "default", "plan")'
+        self.assertEqual(crewchat.fit_options(old_claude, "claude", "auto"), ([], ["auto"]))
+        self.assertEqual(crewchat.fit_options(old_claude, "claude", "edits"), ([], []))
+        self.assertEqual(crewchat.fit_options("", "cursor", "all"), (["--trust"], []))  # no help: as is
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
+                                                                         "permissions": ["all"]})  # not a choice
+
+    def test_a_cursor_agent_gets_crewchats_mcp_server_approved_and_no_other(self):
+        calls = []
+        fake = lambda command, **kw: calls.append((command, kw.get("cwd"))) or mock.Mock(  # noqa: E731
+            returncode=0, stdout="--trust --approve-mcps", stderr="")
+        with mock.patch.object(crewchat, "find_tool", lambda tool, config: "/x/cursor-agent"), \
+                mock.patch.object(crewchat.subprocess, "run", fake), mock.patch.object(crewchat, "run", fake), \
+                mock.patch.object(crewchat.subprocess, "Popen", lambda *a, **kw: calls.append((a[0], kw.get("cwd")))), \
+                mock.patch.object(crewchat.shutil, "which", lambda name: "/usr/bin/" + name):  # Linux: a terminal
+            self.real_launch_agent("cursor", str(self.folder), "start-0123456789abcdef", "ask", self.hub.home)
+        self.assertIn((["/x/cursor-agent", "mcp", "enable", "crewchat"], str(self.folder)), calls)
+        self.assertFalse(any("--approve-mcps" in " ".join(map(str, c[0])) for c in calls))
 
     def test_the_launch_command_carries_no_typed_text(self):
-        command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", accept_edits=True)
+        command = crewchat.launch_command("/x/claude", "claude", "start-0123456789abcdef", "edits")
         self.assertEqual(command[:3], ["/x/claude", "--permission-mode", "acceptEdits"])
         self.assertEqual(command[3], crewchat.LAUNCH_PROMPT % "start-0123456789abcdef")
         self.assertRegex(command[3], r"^[A-Za-z0-9 .,:_-]+$")  # safe in any shell, cmd.exe included
-        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1", True)[1:2],
-                         [crewchat.LAUNCH_PROMPT % "start-1"])
+        self.assertEqual(crewchat.launch_command("/x/claude", "claude", "k", "all")[1:3], ["--permission-mode", "bypassPermissions"])
+        # Cursor's agent never stops at the folder's trust prompt, and is never told to approve every MCP
+        # server the folder lists (only crewchat's is approved); "all" lets it run any command.
+        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "start-1")[1:],
+                         ["--trust", crewchat.LAUNCH_PROMPT % "start-1"])
+        self.assertEqual(crewchat.launch_command("/x/cursor-agent", "cursor", "k", "all")[2], "--force")
         script = crewchat.macos_script("/tmp/it's a folder", command, "start-0123456789abcdef")
         self.assertIn("cd '/tmp/it'\"'\"'s a folder' || exit 1", script)
         self.assertIn("export CREWCHAT_LINK_KEY=start-0123456789abcdef", script)
@@ -1230,7 +1277,14 @@ class Joining(Base):
         cursor = json.loads((folder / ".cursor" / "mcp.json").read_text())["mcpServers"]["crewchat"]
         self.assertEqual(cursor["headers"]["Authorization"], "Bearer " + token)
         settings = json.loads((folder / ".claude" / "settings.local.json").read_text())
-        self.assertEqual(settings["permissions"], {"allow": ["Bash(ls:*)"]})
+        allow = settings["permissions"]["allow"]
+        self.assertEqual(allow[0], "Bash(ls:*)")  # the user's own rule stays
+        self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
+        self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
+        self.assertNotIn("mcp__crewchat", allow)
+        cursor_allow = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
+        self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
         stop = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertEqual(stop[0], "echo mine")
@@ -1419,7 +1473,10 @@ class Hooks(Base):
         (folder / ".cursor").mkdir()
         (folder / ".cursor" / "hooks.json").write_text(json.dumps({"version": 1, "hooks": {
             "stop": [{"command": "python crewchat.py hook cursor stop"}]}}))
-        self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json"])
+        self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json",
+                                                        ".cursor/cli.json"])
+        self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
+                         {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
         self.assertEqual(sorted(claude), ["PostToolUse", "Stop", "UserPromptSubmit"])
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
@@ -2140,9 +2197,10 @@ class Lifecycle(Base):
         crewchat.install_cursor(mine, self.base, self.token)
         (mine / ".crewchat-listen").write_text("0\n")
         self.assertEqual(set(crewchat.disconnect_folder(mine)), {
-            ".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json", ".crewchat-listen"})
+            ".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json", ".cursor/cli.json",
+            ".crewchat-listen"})
         for rel in (".mcp.json", ".claude/settings.local.json", ".cursor/mcp.json", ".cursor/hooks.json",
-                    ".crewchat-listen"):
+                    ".cursor/cli.json", ".crewchat-listen"):
             self.assertFalse((mine / rel).exists(), rel)
         # A folder with the owner's own servers and hooks keeps them.
         shared = Path(tempfile.mkdtemp(dir=TMP))
@@ -2243,7 +2301,10 @@ class Lifecycle(Base):
             tools = crewchat.launch_options({"folders": {}})["tools"]
         finally:
             crewchat.find_tool = saved
-        self.assertEqual(tools[0], {"id": "claude", "label": "Claude Code"})
+        self.assertEqual((tools[0]["id"], tools[0]["label"], "missing" in tools[0]), ("claude", "Claude Code", False))
+        # What each tool may do without asking, as the page offers it: the server's own list.
+        self.assertEqual([p[0] for p in tools[0]["permissions"]], ["ask", "edits", "auto", "all"])
+        self.assertEqual([p[0] for p in tools[1]["permissions"]], ["ask", "auto", "all"])
         self.assertEqual(tools[1]["id"], "cursor")
         self.assertIn("cursor.com/install", tools[1]["missing"])
 
