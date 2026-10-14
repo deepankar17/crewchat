@@ -537,7 +537,9 @@ class Teams(Base):
                                 {"Content-Type": "application/json", "Origin": self.base}, opener)
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
         poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
-        self.assertIn({"name": "qa", "title": "QA"}, poll["roles"])
+        qa = next(r for r in poll["roles"] if r["name"] == "qa")
+        self.assertEqual((qa["title"], qa["label"], qa["picture"], qa["source"]), ("QA", "QA", "preset:flask", "pack"))
+        self.assertNotIn("description", qa)  # instructions come from /api/roles, not every poll
 
     def test_there_is_one_lead(self):
         (one, n1), (two, n2) = self.agent(), self.agent()

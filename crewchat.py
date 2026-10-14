@@ -2516,7 +2516,9 @@ class Hub:
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
                 "agents": self._rows(),
-                "roles": [dict(row, name=k, title=row["label"]) for k, row in self.roster.role_rows.items()],
+                "roles": [{"name": k, "title": row["label"], "label": row["label"], "picture": row["picture"],
+                           "colour": row["colour"], "tool": row["tool"], "source": row["source"]}
+                          for k, row in self.roster.role_rows.items()],  # instructions: /api/roles
                 "pack": self.roster.pack,
                 "crew": self.crew or self.roster.packs[self.roster.pack]["crew"],
                 "statuses": STATUSES,
@@ -3524,10 +3526,10 @@ COMMANDS = [
         ("start [FOLDER] [--place NAME] [--client all|claude|cursor] [--chat PROJECT]",
          "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to "
          "run again. --place labels the folder in agent names; --chat puts it in that project (made if there is none).", None),
-        ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open]",
+        ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open] [--pack ID]",
          "The first time: the chat's name and local port. --no-service runs the server until you log out instead of "
          "at every login; --keep-awake (macOS) keeps the machine from sleeping while crewchat runs; --no-open does "
-         "not open this page.", None),
+         "not open this page; --pack gives a new project the roles of a pack (crewchat roles packs).", None),
         ("connect [tailscale|cloud]", "Link this machine with your others. Without an argument it explains both ways and asks.", None),
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
@@ -3567,6 +3569,7 @@ COMMANDS = [
         ("roles show NAME", "A role's instructions.", None),
         ("roles add NAME --prompt TEXT [--label LABEL]", "Add your own role, or change one (--picture, --colour, --tool too).", None),
         ("roles add NAME --file FILE", "The same, reading the instructions from a file.", None),
+        ("roles add NAME [--picture PRESET] [--colour #RRGGBB] [--tool TOOL]", "What a new agent with the role starts with.", None),
         ("roles remove NAME", "Remove a role; agents that have it are told.", None),
         ("roles packs", "List the role packs: software team, YouTube channel, Instagram creator, small business, blank, and yours.", {"argv": ["roles", "packs"], "chat": True}),
         ("roles pack ID", "Start the project's roles over from a pack.", None),
