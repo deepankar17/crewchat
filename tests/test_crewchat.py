@@ -3194,6 +3194,12 @@ class Lifecycle(Base):
         self.assertEqual(order()[0], crash)
         with self.assertRaises(urllib.error.HTTPError):
             move("before:nope")
+        before = order()
+        move("before:" + crash)  # its own place
+        move("before:" + order()[order().index(crash) + 1])  # just above the next one: where it is
+        self.assertEqual(order(), before)
+        move("end"); move("end")  # already last
+        self.assertEqual(order()[-1], crash)
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": sign})
         self.assertNotIn(sign, [r["id"] for r in hub.sheet_rows()])
         self.assertEqual(a.text("hub_inbox"), "No new messages.")

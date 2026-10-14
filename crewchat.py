@@ -8983,7 +8983,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
 #tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
-#tasks { padding: 16px 20px; }
+#tasks.board-on { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .task-form input { flex: 1 1 120px; min-width: 0; font-size: 13.5px; }
@@ -9024,7 +9024,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .col { background: var(--soft); border-radius: var(--radius); padding: 10px; min-height: 140px; display: flex; flex-direction: column; gap: 8px;
   border: 2px solid transparent; transition: border-color 0.12s, background 0.12s; }
 .col.over { border-color: var(--accent-2); background: var(--tint); }
-.col.nodrop.dragging-on { opacity: 0.55; }
+#board.dragging .col.nodrop { opacity: 0.55; }
 .col-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--ink); padding: 2px 4px; }
 .col-head .n { margin-left: auto; font-size: 12px; font-weight: 650; color: var(--muted); background: var(--panel); border-radius: 99px; padding: 0 8px; }
 .col-head .swatch { width: 10px; height: 10px; }
@@ -9215,7 +9215,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     </form>
     <p id="tasks-note" class="meta" role="alert"></p>
     <div id="board" aria-label="Task board"></div>
-    <div id="give" class="give" hidden><label for="give-to">Give it to</label><select id="give-to"></select>
+    <div id="give" class="give" hidden role="group" aria-labelledby="give-label"><label for="give-to" id="give-label">Give it to</label>
+      <select id="give-to"></select><button type="button" id="give-ok">Give</button>
       <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
     <table id="sheet" hidden><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
@@ -9487,6 +9488,7 @@ function showView(view) {
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
   if (view === "commands") loadCommands();
+  $("give").hidden = true;
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
@@ -9658,14 +9660,15 @@ function taskMeta(r) {
 function renderSheet(all) {
   const open = all.filter((r) => r.status !== "done").length;
   $("tasks-count").textContent = open ? "(" + open + ")" : "";
-  renderBoard(all);
   const rows = boardFilters(all);
+  renderBoard(rows, all);
+  if ($("sheet").hidden) return;
   const body = $("sheet").tBodies[0];
   if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
   if (!rows.length) {
     const row = body.insertRow(); body.replaceChildren(row);
     const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
-    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
+    cell.textContent = all.length ? "No task matches the filters." : "No tasks yet. Add one above, or post a message as a task.";
     return;
   }
   body.replaceChildren(...rows.map((r) => {
@@ -9703,7 +9706,8 @@ function boardFilters(rows) {
     }
     return pick.value;
   };
-  const agentOf = (name) => state.agents.find((a) => a.agent === name);
+  const byName = new Map(state.agents.map((a) => [a.agent, a]));
+  const agentOf = (name) => byName.get(name);
   const agents = [...new Set(rows.map((r) => r.holder).filter(Boolean))].sort();
   const roles = [...new Set(agents.map((n) => (agentOf(n) || {}).role).filter(Boolean))];
   const machines = [...new Set(rows.map((r) => r.where || (agentOf(r.holder) || {}).device).filter(Boolean))].sort();
@@ -9711,8 +9715,10 @@ function boardFilters(rows) {
   const role = keep("f-role", "Every role", roles.map((r) => [r, roleTitle(r)]));
   const machine = keep("f-machine", "Every machine", machines.map((m) => [m, m]));
   $("f-machine").hidden = machines.length < 2;
+  const placeOf = (r) => r.where || (agentOf(r.holder) || {}).device;
+  if ($("f-machine").hidden) $("f-machine").value = "";  // a filter nobody can see does not filter
   return rows.filter((r) => (!agent || r.holder === agent) && (!role || (agentOf(r.holder) || {}).role === role) &&
-    (!machine || (r.where || (agentOf(r.holder) || {}).device) === machine));
+    (!$("f-machine").value || placeOf(r) === machine));
 }
 function taskCard(r) {
   const b = el("button", "tcard");
@@ -9729,45 +9735,68 @@ function taskCard(r) {
   b.addEventListener("dragstart", (e) => {
     boardDrag = r; b.classList.add("dragging"); e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", r.id);
-    for (const c of document.querySelectorAll(".col.nodrop")) c.classList.add("dragging-on");
+    $("board").classList.add("dragging");
   });
   b.addEventListener("dragend", () => {
-    boardDrag = null; b.classList.remove("dragging");
-    for (const c of document.querySelectorAll(".col")) c.classList.remove("over", "dragging-on");
+    boardDrag = null;
+    $("board").classList.remove("dragging");
+    state.boardKey = "";  // what changed during the drag shows now
+    renderSheet(state.sheet);
   });
   return b;
 }
 // What dropping r on a column (before a card, or at its end) does; null when nothing.
+// What dropping r does: before the card `before` in a column (or at its end, with before ""), as the
+// owner may. null: nothing (its own place; Blocked and Review are the agents'; only a task to do can be
+// given to an agent).
 function dropAction(r, col, before) {
   const from = column(r);
-  if (col === "blocked" || col === "review") return null;
+  if (col === "blocked" || col === "review" || before === r.id) return null;
   if (col === from) return { op: "move", task: r.id, where: before ? "before:" + before : "end" };
   if (col === "done") return { op: "status", task: r.id, status: "done" };
   if (col === "todo") return { op: "status", task: r.id, status: "todo" };
-  if (col === "doing") return { give: r };
+  if (col === "doing") return from === "todo" ? { give: r } : null;
   return null;
 }
+// The card a drop lands before: the first whose middle is below the pointer ("" for the column's end).
+function dropBefore(col, y, dragged) {
+  for (const card of col.querySelectorAll(".tcard")) {
+    const box = card.getBoundingClientRect();
+    if (y < box.top + box.height / 2) return card.dataset.task === dragged ? dragged : card.dataset.task;
+  }
+  return "";
+}
+// Give a task to an agent: the board asks which, with a Give button.
 function askGive(r) {
-  $("give-to").replaceChildren(new Option("An agent…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+  const agents = state.agents.map((a) => new Option(a.agent, a.agent));
+  $("give-to").replaceChildren(...(agents.length ? agents : [new Option("No agent here yet", "")]));
+  $("give-label").textContent = "Give #" + r.id + " to";
+  $("give-ok").disabled = !agents.length;
   $("give").hidden = false; $("give").dataset.task = r.id;
   $("give-to").focus();
 }
-$("give-to").addEventListener("change", async () => {
-  const agent = $("give-to").value;
-  if (!agent) return;
+function closeGive() {
+  const id = $("give").dataset.task;
   $("give").hidden = true;
-  await taskOp({ op: "assign", task: $("give").dataset.task, agent });
+  $("board").querySelector('[data-task="' + CSS.escape(id || "") + '"]')?.focus();
+}
+$("give-ok").addEventListener("click", async () => {
+  const agent = $("give-to").value, task = $("give").dataset.task;
+  if (!agent) return;
+  closeGive();
+  await taskOp({ op: "assign", task, agent });
 });
-$("give-cancel").addEventListener("click", () => { $("give").hidden = true; });
-function renderBoard(rows) {
+$("give-cancel").addEventListener("click", closeGive);
+$("give").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closeGive(); } });
+function renderBoard(shown, all) {
   const board = $("board");
-  if (boardDrag || board.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
-  const shown = boardFilters(rows);
-  const key = JSON.stringify([shown, state.showAllDone, state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
+  if (boardDrag || board.hidden) return;
+  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.where]), state.showAllDone,
+                              state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
   if (key === state.boardKey) return;
   state.boardKey = key;
   const focused = document.activeElement && board.contains(document.activeElement) ? document.activeElement.dataset.task : "";
-  $("board-count").textContent = shown.length === rows.length ? "" : shown.length + " of " + rows.length + " shown";
+  $("board-count").textContent = shown.length === all.length ? "" : shown.length + " of " + all.length + " shown";
   board.replaceChildren(...COLUMNS.map(([id, label, tint]) => {
     const col = el("section", "col" + (id === "blocked" || id === "review" ? " nodrop" : ""));
     col.dataset.col = id;
@@ -9780,7 +9809,7 @@ function renderBoard(rows) {
     if (id === "done" && mine.length > DONE_SHOWN && !state.showAllDone) {
       const hidden = mine.length - DONE_SHOWN;
       mine = mine.slice(-DONE_SHOWN);
-      const more = el("button", "more", "Show " + hidden + " older");
+      const more = el("button", "more", "Show " + hidden + " more");
       more.type = "button"; more.addEventListener("click", () => { state.showAllDone = true; renderBoard(state.sheet); });
       col.append(more);
     }
@@ -9793,8 +9822,8 @@ function renderBoard(rows) {
     col.addEventListener("dragleave", (e) => { if (!col.contains(e.relatedTarget)) col.classList.remove("over"); });
     col.addEventListener("drop", (e) => {
       e.preventDefault(); col.classList.remove("over");
-      const r = boardDrag, card = e.target.closest && e.target.closest(".tcard");
-      const act = r && dropAction(r, id, card && card.dataset.task !== r.id ? card.dataset.task : "");
+      const r = boardDrag;
+      const act = r && dropAction(r, id, dropBefore(col, e.clientY, r.id));
       if (!act) return;
       if (act.give) askGive(act.give); else taskOp(act);
     });
@@ -9803,14 +9832,19 @@ function renderBoard(rows) {
   if (focused) board.querySelector('[data-task="' + CSS.escape(focused) + '"]')?.focus();
 }
 function showBoard(on) {
-  $("board").hidden = !on; $("sheet").hidden = on;
+  $("board").hidden = !on; $("sheet").hidden = on; $("give").hidden = true;
+  $("tasks").classList.toggle("board-on", on);
+  state.boardKey = "";
+  renderSheet(state.sheet);
   $("as-board").setAttribute("aria-pressed", String(on)); $("as-list").setAttribute("aria-pressed", String(!on));
   try { localStorage.setItem("crewchat-tasks-as", on ? "board" : "list"); } catch (e) {}
 }
 $("as-board").addEventListener("click", () => showBoard(true));
 $("as-list").addEventListener("click", () => showBoard(false));
-for (const id of ["f-agent", "f-role", "f-machine"]) $(id).addEventListener("change", () => { state.boardKey = ""; renderSheet(state.sheet); });
-try { if (localStorage.getItem("crewchat-tasks-as") === "list") showBoard(false); } catch (e) {}
+for (const id of ["f-agent", "f-role", "f-machine"]) $(id).addEventListener("change", () => renderSheet(state.sheet));
+let asList = false;
+try { asList = localStorage.getItem("crewchat-tasks-as") === "list"; } catch (e) {}
+showBoard(!asList);
 
 $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
