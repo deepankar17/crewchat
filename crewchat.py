@@ -6912,7 +6912,8 @@ h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywher
 .avatar .initials { color: var(--av-ink); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
 .avatar .emoji { font-size: 16px; line-height: 1; }
 .avatar .mark, .avatar .os { position: absolute; bottom: -4px; height: 13px; min-width: 13px; padding: 0 2px;
-  border-radius: 7px; font-size: 7.5px; line-height: 13px; text-align: center; box-shadow: 0 0 0 1.5px var(--panel); }
+  border-radius: 7px; font-size: 7.5px; line-height: 13px; text-align: center;
+  box-shadow: 0 0 0 1.5px var(--panel), 0 0 0 2.5px var(--off); }
 .avatar .mark { right: -5px; background: var(--mk); color: #fff; font-weight: 700; }
 .avatar .os { left: -5px; background: var(--panel); }
 .msg .meta .avatar { width: 20px; height: 20px; align-self: center; }
