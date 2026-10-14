@@ -437,9 +437,9 @@ class NewPage(Signed):
         c = self.chrome
         c.until("!!%s" % self.card(), what="the agent in the rail")
         self.assertEqual(c.js("$('project').textContent"), "Demo")
-        tabs = c.js("[...document.querySelectorAll('#tabs .tab')].map(t => [t.innerText, t.getAttribute('aria-selected')])")
-        self.assertIn(["D\nDemo", "true"], tabs)  # (and one for each other project, all unselected)
-        self.assertEqual([t for t in tabs if t[1] == "true"], [["D\nDemo", "true"]])
+        tabs = c.js("[...document.querySelectorAll('#tabs .tab')].map(t => [t.innerText, t.getAttribute('aria-current')])")
+        self.assertIn(["D\nDemo", "page"], tabs)  # (and one for each other project, not current)
+        self.assertEqual([t for t in tabs if t[1] == "page"], [["D\nDemo", "page"]])
         self.assertIn("1 agent", c.js("$('space-meta').textContent"))
         self.assertTrue(c.js("$('classic-link').href").endswith("/classic"))
         self.assertTrue(c.js("$('panel').hidden"))
@@ -456,6 +456,10 @@ class NewPage(Signed):
         self.assertEqual(msg["to"], self.agent.name)
         self.assertIn("hello from the new page", eventually(self.agent.stop_hook, what="the agent to get it"))
         c.until("!!document.querySelector('#log .msg.own .mention')", what="the mention as a chip")
+        name = json.dumps(self.agent.name)
+        self.assertEqual(c.js("[recipient('@' + %s + ': hi'), recipient('@' + %s + '. hi'), recipient('@' + %s + 'x hi'),"
+                              " recipient('hi @' + %s)]" % (name, name, name, name)),
+                         [self.agent.name, self.agent.name, "all", "all"])
         c.click("#as-task")
         self.assertFalse(c.js("$('task-chip').hidden"))
         c.type_into("#text", "a task from the new page")
@@ -487,6 +491,38 @@ class NewPage(Signed):
         c.js("$('text').value = ''")
         c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
         c.until("$('panel').hidden && !document.body.classList.contains('panel-open')", what="Esc to close the panel")
+
+    def test_keyboard_focus_goes_into_the_panel_and_back(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.js(self.card() + ".focus(); " + self.card() + ".click()")
+        c.until("document.activeElement === $('panel-title')", what="focus in the panel")
+        c.js("renderAgents(true); renderPanel(true)")  # the chat moved on meanwhile
+        self.assertTrue(c.js(self.card() + ".classList.contains('on') && %s.getAttribute('aria-current') === 'true'" % self.card()))
+        c.js("$('panel-close').click()")
+        c.until("document.activeElement === %s" % self.card(), what="focus back on the agent")
+        self.assertEqual(c.errors, [])
+
+    def test_errors_on_the_task_board_are_shown_there_and_keep_the_task(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        c.type_into("#t-title", "Waits for a task that isn't there")
+        c.type_into("#t-depends", "#9999")
+        c.js("$('task-form').requestSubmit()")
+        c.until("$('tasks-note').textContent.includes('Task not changed')", what="the error on the board")
+        self.assertEqual(c.js("$('t-title').value"), "Waits for a task that isn't there")  # kept to fix and retry
+        c.js("for (const id of ['t-title', 't-depends']) $(id).value = ''")
+        self.assertEqual(c.errors, [])
+
+    def test_a_project_that_is_gone(self):
+        c = self.chrome
+        try:
+            c.open(self.m.url + "/?chat=no-such-project")
+            c.until("$('log').innerText.includes('not on this machine any more')", what="the page to say so")
+            self.assertFalse(c.js("$('banner').classList.contains('show')"))  # not "can't reach the server"
+        finally:
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
         self.assertEqual(c.errors, [])
 
     def test_rename_in_the_panel(self):

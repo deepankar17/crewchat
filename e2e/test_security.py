@@ -178,7 +178,7 @@ class RemoteFolder(unittest.TestCase):
         cls.host.stop()
 
     def test_the_remote_folder_talks_to_the_host(self):
-        self.assertTrue(self.remote.name.endswith("-laptop"), self.remote.name)
+        self.assertEqual(self.host.owner.row(self.remote.name)["place"], "laptop")
         self.remote.stop_hook()
         self.host.owner.send(self.remote.name, "hello laptop")
         self.assertIn("hello laptop", self.remote.stop_hook())

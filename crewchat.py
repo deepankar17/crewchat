@@ -298,7 +298,7 @@ TOOLS_INFO = {
 PICTURE_PRESETS = {"robot": "🤖", "rocket": "🚀", "star": "⭐", "bulb": "💡", "palette": "🎨", "camera": "📷",
                    "film": "🎬", "pen": "✍️", "chart": "📈", "cart": "🛒", "flask": "🧪", "books": "📚"}
 # 3D pictures built into crewchat (from Microsoft's Fluent Emoji, MIT licence: see ART_DATA): id -> label.
-ART_PICTURES = {"robot": "Robot", "coder": "Coder", "technologist": "Technologist", "scientist": "Scientist", "artist": "Artist", "office": "Office worker", "teacher": "Teacher", "detective": "Detective", "mechanic": "Mechanic", "student": "Student", "cook": "Cook", "astronaut": "Astronaut", "mage": "Mage", "alien": "Alien", "owl": "Owl", "fox": "Fox"}
+ART_PICTURES = {"bot": "Robot", "coder": "Coder", "technologist": "Technologist", "scientist": "Scientist", "artist": "Artist", "office": "Office worker", "teacher": "Teacher", "detective": "Detective", "mechanic": "Mechanic", "student": "Student", "cook": "Cook", "astronaut": "Astronaut", "mage": "Mage", "alien": "Alien", "owl": "Owl", "fox": "Fox"}
 PICTURE_TYPES = ("image/png", "image/jpeg", "image/webp")
 MAX_PICTURE = 512 * 1024
 
@@ -685,6 +685,8 @@ def change_roles(config, data, packs):
         pid = role_name(data.get("id") or slug(str(data.get("label") or ""), 32, "pack"))
         if pid in ROLE_PACKS:
             raise HubError("%s is a built-in pack; choose another name" % pid)
+        if packs.get(pid, {}).get("saved") and not data.get("replace"):
+            raise HubError("there is a pack called %s already; replace it, or choose another name" % pid)
         crew = data.get("crew") if data.get("crew") in CREWS else packs[project_pack(config, packs)]["crew"]
         pack = clean_pack({"label": data.get("label") or pid, "crew": crew, "roles": roles_export(table)["roles"]})
         return {"pack": dict(pack, id=pid)}, {"saved_pack": (pid, pack)}
@@ -701,8 +703,8 @@ def change_roles(config, data, packs):
     def keep(name, spec):
         for field, ok in (("picture", clean_picture), ("colour", clean_colour)):
             if spec.get(field) and not ok(spec[field]):
-                raise HubError("%s is not a %s (%s)" % (spec[field], field, "a preset: " + ", ".join(
-                    PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
+                raise HubError("%s is not a %s (%s)" % (spec[field], field, "art:" + ", art:".join(ART_PICTURES) +
+                               ", or preset:" + ", preset:".join(PICTURE_PRESETS) if field == "picture" else "#rrggbb"))
         if spec.get("tool") and str(spec["tool"]) not in TOOLS_INFO:
             raise HubError("no tool called %s. Tools: %s" % (spec["tool"], ", ".join(TOOLS_INFO)))
         custom[name] = clean_role(spec)
@@ -1718,7 +1720,7 @@ class Hub:
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
-    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions=""):
+    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model=""):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
@@ -1739,7 +1741,7 @@ class Hub:
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
                                 "picture": picture, "colour": colour,
-                                "instructions": instructions, "expires": now + START_TTL}
+                                "instructions": instructions, "model": model, "expires": now + START_TTL}
             return key
 
     def launch(self, tool, folder, name="", role="", task="", permissions="ask", model="", picture="",
@@ -1755,7 +1757,7 @@ class Hub:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task, permissions, picture, colour, instructions)
+        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model)
         try:
             launch_agent(tool, folder, key, permissions, self.home, model)
         except (HubError, OSError) as e:
@@ -1801,6 +1803,8 @@ class Hub:
         with self.lock:  # what it may do without asking: Reopen starts it the same way
             if name in self.agents:
                 self.agents[name]["permissions"] = spec.get("permissions") or "ask"
+                if spec.get("model"):
+                    self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
                 self._save()
         if spec.get("picture") or spec.get("colour"):
             try:
@@ -2717,7 +2721,10 @@ class Hub:
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
         with self.lock:
             permissions = (self.agents.get(name) or {}).get("permissions", "ask")
+            model = model or (self.agents.get(name) or {}).get("model") or None
         permissions = permissions if permissions in LAUNCH_PERMISSIONS[tool] else "ask"
+        if model and model not in [m for m, _ in tool_models(tool)]:
+            model = None
         exe, base = agent_tool(tool, folder, permissions, self.home)
         return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
 
@@ -2758,6 +2765,10 @@ class Hub:
         if process_running(session):
             end_session(name, session)
         self._open_again(name, model, session, folder, command)
+        with self.lock:
+            if name in self.agents:
+                self.agents[name]["model"] = model  # a later Reopen keeps it
+                self._save()
 
     def _wants_session(self, name, table):
         """Should this agent's hook report its session again? After a Reopen (the same session id,
@@ -3101,7 +3112,7 @@ TOOLS = [
     },
     {
         "name": "hub_profile",
-        "description": "Set your picture and colour on the chat page: a 3D picture (robot, coder, artist...), "
+        "description": "Set your picture and colour on the chat page: a 3D picture (bot, coder, artist...), "
         "an emoji preset, initials, or an image file from your project folder (PNG, JPEG or WebP, 512 KB at "
         "most), and a colour. Use it when your owner asks; leave out what you don't change.",
         "annotations": SETTING,
@@ -4162,7 +4173,7 @@ class Handler(BaseHTTPRequestHandler):
             pid = name[:-len(".webp")] if name.endswith(".webp") else ""
             if pid in ART_PICTURES:
                 self._reply(200, base64.b64decode(ART_DATA[pid]), ctype="image/webp",
-                            extra={"Cache-Control": "public, max-age=604800, immutable"})
+                            extra={"Cache-Control": "public, max-age=86400"})
             else:
                 self._reply(404, b"")
         elif url.path.startswith("/files/"):
@@ -4325,11 +4336,14 @@ class Handler(BaseHTTPRequestHandler):
         if not name or len(name) > MAX_PROJECT_NAME:
             raise HubError("a project's name is 1 to %d characters" % MAX_PROJECT_NAME)
         pack = str(data.get("pack") or DEFAULT_PACK)
-        find_pack(pack, role_packs())
         base = self.projects.base
+        find_pack(pack, role_packs(base))
         if find_chat(name, base):
             raise HubError("there is a project called %s already" % name)
-        chosen = create_project(name, base, pack)
+        try:
+            chosen = create_project(name, base, pack)
+        except OSError as e:
+            raise HubError("the project was not made (%s)" % (e.strerror or e))
         self.projects.refresh()
         return {"id": chosen["id"], "name": chosen["name"]}
 
@@ -4340,6 +4354,8 @@ class Handler(BaseHTTPRequestHandler):
         if effects.get("changed"):
             self.roster.refresh(force=True)
             self.hub.drop_roles(before - set(self.hub.roles()))
+            with self.hub.lock:
+                self.hub._changed()  # every page shows the new roles
         return answer
 
     def _launch(self, data):
@@ -8662,7 +8678,7 @@ CHAT_PAGE = r"""<!doctype html>
   --bg: #eef3ff; --panel: #ffffff; --soft: #f6f8ff; --ink: #0b1f55; --text: #1b2440; --muted: #5d6a8f;
   --line: #dfe7ff; --accent: #2f5fd6; --accent-2: #5b8cff; --deep: #2148ad; --on-accent: #ffffff; --tint: #dfe7ff;
   --task: #fff6dd; --task-line: #e9cf86; --task-ink: #6b4e00;
-  --ok: #1f8a52; --warn: #b37400; --off: #a3acc4; --err: #c4321f;
+  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f;
   --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
   --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
   --radius: 18px; --shadow: 0 1px 2px rgba(11, 31, 85, 0.06), 0 6px 20px rgba(11, 31, 85, 0.07);
@@ -8672,7 +8688,7 @@ CHAT_PAGE = r"""<!doctype html>
     --bg: #0a1330; --panel: #111c40; --soft: #16234d; --ink: #e8eeff; --text: #dfe6ff; --muted: #9daad3;
     --line: #24346a; --accent: #5b8cff; --accent-2: #8fb0ff; --deep: #2f5fd6; --on-accent: #0b1f55; --tint: #1c2b5c;
     --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
-    --ok: #63c58c; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
+    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
     --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
     --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
@@ -8701,6 +8717,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .meta { font-size: 12.5px; color: var(--muted); }
 .phone-only { display: none !important; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
 /* Top bar: one Chrome-style tab per project. */
 #topbar { grid-area: top; display: flex; align-items: flex-end; gap: 6px; padding: 8px 12px 0; min-width: 0; }
@@ -8710,7 +8727,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .tab { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 14px 14px 0 0; max-width: 220px;
   color: var(--muted); text-decoration: none; white-space: nowrap; flex: none; }
 .tab:hover { background: var(--tint); color: var(--ink); }
-.tab[aria-selected="true"] { background: var(--panel); color: var(--ink); font-weight: 650; }
+.tab[aria-current="page"] { background: var(--panel); color: var(--ink); font-weight: 650; }
 .tab .pname { overflow: hidden; text-overflow: ellipsis; }
 .tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
 .tab .unread:empty { width: 8px; }
@@ -8729,7 +8746,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .menu-list button, .menu-list a { background: none; color: var(--text); text-align: left; border-radius: 10px; padding: 8px 12px;
   font-weight: 500; text-decoration: none; font-size: 14px; }
 .menu-list button:hover, .menu-list a:hover { background: var(--tint); }
-.menu-list button[aria-checked="true"]::after { content: " \2713"; color: var(--accent); }
+.menu-list button[aria-pressed="true"]::after { content: " \2713"; color: var(--accent); }
 .menu-list hr { border: 0; border-top: 1px solid var(--line); margin: 4px 6px; width: auto; }
 #projects { font-weight: 650; }
 #switching { margin: 0 0 6px auto; align-self: center; font-size: 13px; }
@@ -8769,7 +8786,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .emoji { font-size: 18px; line-height: 1; }
 .avatar .mark, .avatar .os { position: absolute; bottom: -3px; height: 14px; min-width: 14px; padding: 0 3px; border-radius: 7px;
   font-size: 8px; line-height: 14px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
-.avatar .mark { right: -4px; background: var(--mk); color: #fff; font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
+.avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
 .picmenu > summary { cursor: pointer; list-style: none; display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; }
@@ -8823,7 +8840,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg.own .mention { background: var(--panel); }
 @media (prefers-color-scheme: dark) { .mention { color: var(--accent-2); } }
 .pill { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 0 9px; background: var(--tint); color: var(--ink); }
-.pill.done { background: var(--ok); color: var(--panel); } .pill.blocked { background: var(--err); color: var(--panel); }
+.pill.done { background: var(--ok-strong); color: #fff; } .pill.blocked { background: var(--err); color: var(--panel); }
 .sys { text-align: center; font-size: 12.5px; color: var(--muted); margin: 4px auto 12px; max-width: 640px; }
 .sys b { font-weight: 650; }
 .sys details { display: inline; } .sys summary { display: inline; cursor: pointer; text-decoration: underline dotted; }
@@ -8868,11 +8885,11 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
 #sheet td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
 #sheet td.meta { font-size: 12px; color: var(--muted); }
-#sheet tr.done td { opacity: 0.55; }
+#sheet tr.done td { color: var(--muted); }
 #sheet tr .open-task { background: none; color: var(--text); padding: 0; border-radius: 0; font-weight: 500; text-align: left; }
 .st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 9px; background: var(--tint); white-space: nowrap; }
 .st.doing, .st.review { background: var(--accent); color: var(--on-accent); }
-.st.done { background: var(--ok); color: var(--panel); } .st.blocked { background: var(--err); color: var(--panel); }
+.st.done { background: var(--ok-strong); color: #fff; } .st.blocked { background: var(--err); color: var(--panel); }
 .acts { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
 #sheet .acts { justify-content: flex-end; }
 .acts button, .acts select { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--text); border: 1px solid var(--line); }
@@ -9009,13 +9026,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <body>
 <header id="topbar">
   <a class="brand wide-only" href="/" title="crewchat">__LOGO__</a>
-  <nav id="tabs" role="tablist" aria-label="Projects"></nav>
+  <nav id="tabs" aria-label="Projects"></nav>
   <details id="tab-add" class="menu">
     <summary title="Switch to a project, or make one" aria-label="Switch to a project, or make one">+</summary>
-    <div class="menu-list" role="menu">
+    <div class="menu-list">
       <div id="tab-menu"></div>
       <hr>
-      <button type="button" id="new-project" role="menuitem">New project…</button>
+      <button type="button" id="new-project">New project…</button>
     </div>
   </details>
   <select id="projects" class="phone-only" aria-label="Project"></select>
@@ -9037,17 +9054,17 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <div id="scrim"></div>
 <main id="space">
   <header id="space-head">
-    <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board">☰</button>
+    <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board" aria-expanded="false" aria-controls="rail">☰</button>
     <span id="space-avatar" class="pav" aria-hidden="true">c</span>
     <div class="titles"><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
     <input id="search" type="search" placeholder="Search" aria-label="Search this chat" autocomplete="off">
     <details id="space-menu" class="menu">
       <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
-      <div class="menu-list" role="menu">
-        <button type="button" role="menuitem" data-panel="project">Rules, skills and machines</button>
-        <button type="button" role="menuitem" data-panel="roles">Roles</button>
+      <div class="menu-list">
+        <button type="button" data-panel="project">Rules, skills and machines</button>
+        <button type="button" data-panel="roles">Roles</button>
         <hr>
-        <a role="menuitem" id="classic-link" href="/classic">The classic page</a>
+        <a id="classic-link" href="/classic">The classic page</a>
       </div>
     </details>
   </header>
@@ -9055,7 +9072,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
-  <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
+  <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
       <span id="board-count" class="meta"></span></div>
@@ -9077,6 +9094,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <input type="text" id="t-where" placeholder="machine" aria-label="Machine">
       <button id="t-add">Add</button>
     </form>
+    <p id="tasks-note" class="meta" role="alert"></p>
     <div id="board" aria-label="Task board"></div>
     <div id="give" class="give" hidden><label for="give-to">Give it to</label><select id="give-to"></select>
       <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
@@ -9096,10 +9114,10 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <div class="pillbox">
       <details id="plus" class="menu up">
         <summary title="Attach a file, post as a task, new agent" aria-label="More">+</summary>
-        <div class="menu-list" role="menu">
-          <button type="button" id="attach" role="menuitem">Attach a file</button>
-          <button type="button" id="as-task" role="menuitemcheckbox" aria-checked="false">Post as task</button>
-          <button type="button" id="plus-agent" role="menuitem">New agent</button>
+        <div class="menu-list">
+          <button type="button" id="attach">Attach a file</button>
+          <button type="button" id="as-task" aria-pressed="false">Post as task</button>
+          <button type="button" id="plus-agent">New agent</button>
         </div>
       </details>
       <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
@@ -9112,7 +9130,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 </main>
 <aside id="panel" hidden aria-labelledby="panel-title">
   <header class="panel-head">
-    <h2 id="panel-title"></h2>
+    <h2 id="panel-title" tabindex="-1"></h2>
     <button type="button" class="icon" id="panel-close" aria-label="Close the panel" title="Close (Esc)">✕</button>
   </header>
   <div id="panel-body"></div>
@@ -9252,6 +9270,7 @@ window.addEventListener("pageshow", (e) => {
   document.body.classList.remove("switching");
   $("switching").hidden = true;
   $("projects").disabled = false;
+  $("projects").value = CHAT || ((state.projects || [])[0] || {}).id || "";
 });
 function seen(id, last) {
   try {
@@ -9273,14 +9292,11 @@ function renderProjects(list, current) {
   const tab = (p) => {
     const a = el("a", "tab");
     a.href = chatUrl("/", p.id);
-    a.setAttribute("role", "tab");
-    a.setAttribute("aria-selected", String(p.id === current));
+    if (p.id === current) a.setAttribute("aria-current", "page");
     a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
     a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
     if (p.fresh) {
-      const dot = el("span", "unread");
-      dot.setAttribute("aria-label", "new messages");
-      a.append(dot);
+      a.append(el("span", "unread"), el("span", "sr", " (new messages)"));
     }
     a.addEventListener("click", (e) => {
       e.preventDefault();
@@ -9291,7 +9307,7 @@ function renderProjects(list, current) {
   $("tabs").replaceChildren(...list.map(tab));
   $("tab-menu").replaceChildren(...list.filter((p) => p.id !== current).map((p) => {
     const b = el("button", "", p.name);
-    b.type = "button"; b.setAttribute("role", "menuitem");
+    b.type = "button";
     b.addEventListener("click", () => switchTo(p.id, p.name));
     return b;
   }));
@@ -9359,8 +9375,13 @@ $("view-commands").addEventListener("click", () => showView($("commands").hidden
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
 // A phone: the rail is a drawer.
-$("rail-open").addEventListener("click", () => document.body.classList.add("rail-open"));
-$("scrim").addEventListener("click", () => document.body.classList.remove("rail-open"));
+function setDrawer(open) {
+  document.body.classList.toggle("rail-open", open);
+  $("rail-open").setAttribute("aria-expanded", String(open));
+  if (open) $("view-tasks").focus();
+}
+$("rail-open").addEventListener("click", () => setDrawer(true));
+$("scrim").addEventListener("click", () => setDrawer(false));
 
 // Menus (details elements) close when something else is clicked, or on Escape.
 document.addEventListener("click", (e) => {
@@ -9481,6 +9502,11 @@ $("cmd-filter").addEventListener("input", filterCommands);
 // The task sheet: every task of the project, in order, with who holds it. A task opens in the panel.
 function taskOp(body) {
   return postAction("/api/task", body, "Task not changed");
+}
+// Where an action's error is shown: the panel, the task board, or under the message box.
+function showError(text) {
+  if (state.panel && $("panel-body").querySelector(".panel-note")) return panelNote(text);
+  ($("tasks").hidden ? $("error") : $("tasks-note")).textContent = text;
 }
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
 function taskActions(r, parent) {
@@ -9670,8 +9696,8 @@ $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
   if (!title) return;
-  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
-  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+  if (await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value }))
+    for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
@@ -9759,6 +9785,7 @@ function applyRole(name) {
 }
 async function openLaunch(role) {
   const dialog = $("launch"), note = $("launch-note");
+  clearTimeout(state.launchClose);
   $("plus").open = false;
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
@@ -9783,7 +9810,7 @@ async function openLaunch(role) {
     }));
     const firstReady = opts.tools.find((t) => !t.missing);
     if (firstReady) $("l-tool").value = firstReady.id;
-    showTool();
+    if ($("l-role").value) applyRole($("l-role").value); else showTool();  // a role picked meanwhile
     const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
     const ready = opts.tools.filter((t) => !t.missing);
     $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
@@ -9838,7 +9865,7 @@ async function startAgent(event) {
       picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
       instructions: $("l-instructions").value.trim() });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
-    setTimeout(() => $("launch").close(), 4000);
+    state.launchClose = setTimeout(() => $("launch").close(), 4000);
   } catch (err) {
     note.textContent = "Not started: " + err.message;
     $("l-start").disabled = false;
@@ -9877,10 +9904,10 @@ async function postAction(path, body, what, control) {
   if (control) control.disabled = true;
   try {
     const out = await postJSON(path, body);
-    $("error").textContent = "";
+    $("error").textContent = ""; $("tasks-note").textContent = "";
     return out;
   } catch (err) {
-    (state.panel ? panelNote : (m) => { $("error").textContent = m; })(what + ": " + err.message);
+    showError(what + ": " + err.message);
     return null;
   } finally {
     if (control) control.disabled = false;
@@ -9951,26 +9978,36 @@ function doing(a) {
 }
 
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
+// The agent open in the panel is marked in the rail, without drawing the rail again.
+function markOpen() {
+  const p = state.panel;
+  for (const card of $("agents").querySelectorAll(".agent")) {
+    const on = !!p && p.kind === "agent" && p.id === card.dataset.agent;
+    card.classList.toggle("on", on);
+    if (on) card.setAttribute("aria-current", "true"); else card.removeAttribute("aria-current");
+  }
+}
+
 function renderAgents(force) {
   const box = $("agents");
-  const key = JSON.stringify([state.agents, state.held, state.roles, state.panel, Math.floor(state.now / 60)]);
-  if (!force && key === state.railKey) return;
+  const key = JSON.stringify([state.agents, state.held, state.roles, Math.floor(state.now / 60)]);
+  if (!force && key === state.railKey) return markOpen();
   state.railKey = key;
+  const focused = document.activeElement && box.contains(document.activeElement) ? document.activeElement.dataset.agent : "";
   box.replaceChildren();
   if (!state.agents.length) box.append(el("p", "none", word("none")));
   for (const a of state.agents) {
     const age = a.seen ? state.now - a.seen : Infinity;
-    const card = el("button", "agent" + (state.panel && state.panel.kind === "agent" && state.panel.id === a.agent ? " on" : ""));
+    const card = el("button", "agent");
     card.type = "button";
     card.dataset.agent = a.agent;
-    card.setAttribute("aria-label", a.agent + (a.role ? ", " + roleTitle(a.role) : "") + ": open");
     const who = el("span", "who");
     who.append(el("span", "name " + colour(a.agent), a.agent));
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.title = doing(a) + " · " + ago(a.seen, state.now);
     const right = el("span", "inline");
-    if (a.unread) right.append(el("span", "count", String(a.unread)));
-    right.append(dot);
+    if (a.unread) right.append(el("span", "count", String(a.unread)), el("span", "sr", " unread"));
+    right.append(dot, el("span", "sr", dot.title));
     const task = heldTask(a.agent);
     const holds = el("span", "holds");
     if (a.role) holds.append(el("span", "badge " + a.role, roleTitle(a.role)), " ");
@@ -9979,6 +10016,8 @@ function renderAgents(force) {
     card.addEventListener("click", () => openPanel("agent", a.agent));
     box.append(card);
   }
+  markOpen();
+  if (focused) box.querySelector('[data-agent="' + CSS.escape(focused) + '"]')?.focus();
   const names = state.agents.map((a) => a.agent).join("\n");
   if (names !== state.names) {
     state.names = names;
@@ -10046,7 +10085,7 @@ function avatar(a, cls) {
   }
   if (tool.mark && a.client) {
     const mark = el("span", "mark", tool.mark);
-    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
+    mark.style.setProperty("--mk", tool.colour); mark.style.setProperty("--mk-ink", inkOn(tool.colour)); mark.title = tool.label;
     box.append(mark);
   }
   const os = OS_BADGES[a.os];
@@ -10109,30 +10148,41 @@ function pictureMenu(a, agentOp) {
 // The side panel: an agent, a task, a role, the roles, or the project. Esc or ✕ closes it; it is
 // drawn again as the chat changes, unless the owner is choosing or typing in it.
 function openPanel(kind, id) {
+  const from = document.activeElement;
+  if (!state.panel) state.panelFrom = from && from !== document.body ? from : null;  // focus goes back there
   state.panel = { kind, id };
   document.body.classList.remove("rail-open");
-  if ((kind === "roles" || kind === "role") && !state.roleInfo) loadRoles().then(() => renderPanel(true)).catch(() => {});
+  if ((kind === "roles" || kind === "role") && !state.roleInfo) loadRolesInto();
   renderPanel(true);
-  renderAgents(true);
+  markOpen();
+  $("panel-title").focus();
 }
 function closePanel() {
   state.panel = null;
   $("panel").hidden = true;
   document.body.classList.remove("panel-open");
-  renderAgents(true);
+  markOpen();
+  const back = state.panelFrom && state.panelFrom.isConnected ? state.panelFrom
+    : state.panelFrom && state.panelFrom.dataset && $("agents").querySelector('[data-agent="' + CSS.escape(state.panelFrom.dataset.agent || "") + '"]');
+  state.panelFrom = null;
+  if (back) back.focus();
+}
+// The roles panels' data: loaded, or the error and a way to try again.
+function loadRolesInto() {
+  state.rolesError = "";
+  return loadRoles().then(() => renderPanel(true)).catch((e) => { state.rolesError = e.message; renderPanel(true); });
 }
 $("panel-close").addEventListener("click", closePanel);
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
   const menu = document.querySelector("details.menu[open]");
-  if (menu) { menu.open = false; return; }
+  if (menu) { menu.open = false; menu.querySelector("summary").focus(); return; }
   if (state.panel) closePanel();
   else document.body.classList.remove("rail-open");
 });
+// Not drawn again while the owner is in it: choosing, typing, or on one of its buttons.
 function panelBusy() {
-  const body = $("panel-body"), active = document.activeElement;
-  return body.querySelector(".picmenu[open], form.editing") ||
-    (body.contains(active) && ["SELECT", "INPUT", "TEXTAREA"].includes(active.tagName));
+  return $("panel-body").querySelector(".picmenu[open], form.editing") || $("panel-body").contains(document.activeElement);
 }
 function renderPanel(force) {
   const p = state.panel;
@@ -10211,7 +10261,7 @@ function panelAgent(name) {
   const acts = el("div", "acts");
   actButton(acts, "Message", "Write to " + a.agent, () => {
     const m = leadingMention(text.value);
-    text.value = "@" + a.agent + " " + (m ? text.value.slice(m[0].length).trimStart() : text.value);
+    text.value = "@" + a.agent + " " + (m ? text.value.slice(m[0].length).replace(/^[,:]?\s*/, "") : text.value);
     fit(); text.focus();
     if (matchMedia("(max-width: 760px)").matches) closePanel();
   });
@@ -10240,10 +10290,10 @@ function nameField(a, agentOp) {
   input.type = "text"; input.value = a.agent; input.maxLength = 32; input.spellcheck = false;
   input.setAttribute("aria-label", "Name for " + a.agent);
   input.title = "Click to rename: letters, digits, - _ .";
-  let busy = false;
+  let busy = false, done = false;
   const save = async () => {
     const name = input.value.trim();
-    if (busy) return;
+    if (busy || done) return;
     if (!name || name === a.agent) { input.value = a.agent; return; }
     if (!/^[A-Za-z][A-Za-z0-9_.-]{0,31}$/.test(name)) {
       panelNote("Not renamed: a name starts with a letter and uses letters, digits, - _ . (32 at most)");
@@ -10252,8 +10302,10 @@ function nameField(a, agentOp) {
     busy = true;
     const ok = await agentOp({ op: "rename", agent: a.agent, new: name }, "Not renamed", input);
     busy = false;
+    done = !!ok;
     const p = state.panel;
-    if (ok && p && p.kind === "agent" && p.id === a.agent) openPanel("agent", name);
+    if (ok) a.agent = name;  // the row as the next poll will have it
+    if (ok && p && p.kind === "agent" && p.id !== name) openPanel("agent", name);
     else if (!ok) input.value = a.agent;
   };
   input.addEventListener("keydown", (e) => {
@@ -10307,7 +10359,7 @@ function roleAvatar(r) {
 }
 function panelRoles() {
   const info = state.roleInfo;
-  if (!info) return ["Roles", card("", el("p", "meta", "Loading…"))];
+  if (!info) return ["Roles", rolesLoading()];
   const pack = info.packs.find((p) => p.id === info.pack);
   const list = el("ul", "rolelist");
   for (const r of info.roles) {
@@ -10349,10 +10401,23 @@ function panelRoles() {
   actButton(save, "Save as a pack…", "Keep these roles as a pack other projects can start from", async (b) => {
     const label = prompt("A name for the pack:", "");
     if (!label) return;
-    const out = await rolesOp({ op: "save_pack", label }, "Not saved", b);
+    let out = null;
+    try {
+      out = await postJSON("/api/roles", { op: "save_pack", label });
+    } catch (e) {
+      if (!/already/.test(e.message) || !confirm(e.message.replace(/;.*/, "") + ". Replace it?")) return panelNote("Not saved: " + e.message);
+      out = await postAction("/api/roles", { op: "save_pack", label, replace: true }, "Not saved", b);
+    }
+    if (out) await loadRoles().catch(() => {});
     if (out) { renderPanel(true); panelNote("Saved as the pack " + out.pack.label + "."); }
   });
   return ["Roles", card("Pack", el("p", "", pack ? pack.label : info.pack), packPick, save), card("This project's roles", list), card("", acts)];
+}
+function rolesLoading() {
+  if (!state.rolesError) return card("", el("p", "meta", "Loading…"));
+  const retry = el("div", "acts");
+  actButton(retry, "Try again", "Load the roles again", loadRolesInto);
+  return card("", el("p", "meta", "Could not load the roles: " + state.rolesError), retry);
 }
 function download(name, data) {
   const a = el("a");
@@ -10363,9 +10428,9 @@ function download(name, data) {
 }
 function panelRole(name) {
   const info = state.roleInfo;
-  if (!info) return ["Role", card("", el("p", "meta", "Loading…"))];
+  if (!info) return ["Role", rolesLoading()];
   const r = info.roles.find((x) => x.name === name);
-  if (state.panel.editing) return roleForm(r);
+  if (state.panel.editing && (r || !name)) return roleForm(r);
   if (!r) return [name, card("", el("p", "meta", "There is no role called " + name + " now."))];
   const tool = own(state.tools, r.tool);
   const head = el("div", "ident");
@@ -10412,7 +10477,8 @@ function roleForm(r) {
   const picture = el("select");
   picture.setAttribute("aria-label", "Picture");
   picture.append(...pictureOptions());
-  picture.value = r && [...picture.options].some((o) => o.value === r.picture) ? r.picture : "";
+  if (r && r.picture && ![...picture.options].some((o) => o.value === r.picture)) picture.append(new Option("Its own picture", r.picture));
+  picture.value = r ? r.picture : "";
   form.append(field("Picture", picture));
   const tint = el("input"); tint.type = "color"; tint.value = (r && r.colour) || toolColour((r && r.tool) || "agent");
   const ownColour = el("input"); ownColour.type = "checkbox"; ownColour.checked = !(r && r.colour);
@@ -10496,10 +10562,10 @@ function withMentions(text) {
   const out = document.createDocumentFragment();
   let at = 0;
   for (const m of text.matchAll(MENTION)) {
-    const known = m[1] === "Owner" || isAgent(m[1]);
-    if (!known) continue;
-    out.append(text.slice(at, m.index), el("span", "mention", m[1] === "Owner" ? "@you" : m[0]));
-    at = m.index + m[0].length;
+    const name = m[1] === "Owner" ? "Owner" : agentIn(m[1]);
+    if (!name) continue;
+    out.append(text.slice(at, m.index), el("span", "mention", name === "Owner" ? "@you" : "@" + name));
+    at = m.index + 1 + name.length;
   }
   out.append(text.slice(at));
   return out;
@@ -10651,6 +10717,13 @@ async function loop() {
       const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
                               { cache: "no-store" });
       if (res.status === 401) { location.href = "/login"; return; }
+      if (res.status === 404 && CHAT) {  // its project is gone: say so, and offer the others
+        $("empty")?.remove();
+        const gone = el("p", "empty", "This project is not on this machine any more. ");
+        const link = el("a", "", "Open your first project"); link.href = "/";
+        gone.append(link); $("log").replaceChildren(gone);
+        return;
+      }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
       state.failures = 0;
@@ -10685,7 +10758,7 @@ async function loop() {
       addMessages(data.messages, first);
       // Roles changed (here or in another tab): what the roles panels show is read again.
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
-        loadRoles().then(() => renderPanel(true)).catch(() => {});
+        loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
       if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the crew below.";
       refreshDynamic();
@@ -10753,7 +10826,7 @@ async function uploadFile(file) {
 
 function setTask(on) {
   state.asTask = on;
-  $("as-task").setAttribute("aria-checked", String(on));
+  $("as-task").setAttribute("aria-pressed", String(on));
   $("task-chip").hidden = !on;
   text.placeholder = on ? "Describe the task. The crew settles who takes it…" : "Message the crew (@name writes to one)";
 }
@@ -10773,12 +10846,21 @@ $("form").addEventListener("drop", (e) => {
 });
 
 text.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!$("send").disabled) $("form").requestSubmit(); }
 });
 // Who a message goes to: the agent its first word mentions, else everyone.
+// "@Maya", "@Maya," or "@Maya:" at the start: the agent's name, without punctuation that follows it.
+function agentIn(word) {
+  for (let name = word; name; name = name.slice(0, -1)) {
+    if (isAgent(name)) return name;
+    if (!/[.\-_]$/.test(name)) return "";
+  }
+  return "";
+}
 function leadingMention(value) {
   const m = [...value.matchAll(MENTION)][0];
-  return m && m.index === 0 && /^(\s|$)/.test(value.slice(m[0].length)) && isAgent(m[1]) ? m : null;
+  const name = m && m.index === 0 ? agentIn(m[1]) : "";
+  return name && !/^[\w]/.test(value.slice(1 + name.length)) ? [ "@" + name, name ] : null;
 }
 function recipient(value) {
   const m = leadingMention(value);
@@ -11079,7 +11161,7 @@ def build_parser():
 #   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 #   SOFTWARE.
 ART_DATA = {
-    "robot": "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",
+    "bot": "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",
     "coder": "UklGRkYLAABXRUJQVlA4WAoAAAAQAAAAfwAAfwAAQUxQSPkDAAABCkrY/hmSpH9EZHevbdu2eRzP3NbGzTzNac2Tbd7so2179zZGd09lZCwaVTH/XOP3+0dETAD+pumrwFLofuVYCq2wTRxlVFcKZFS61jBgl4tuuu2K0/ZYTgAst+dpV9xG20UQWsKw/l2d9Ov47aOX8NFvkX5tZX0JrVBhv8/JjpnVHLWYmZHYT6oWKJgwnx2O2KA2KwBHNM6fIJV6BVMGWbPLhYOGSjdXZOogI7sOlqlSOcUCcOQQI3sIliMFppU5qWaSkT0FWSpxppIHJryUGrDHAG2CwOvjBIc/mxiZIchnDxc4ZRzKdYlNZJZoyGuLgyrOyx2pLsy2FN4O7zQJODp1GmYM49ESFHGo3o51yro0Vjno4bFjTE1eYNxBvB4BM1LDzMEZYnoUHJ9ibuDxUjQ5ZmkwTQKmsskNnCJBk30bIi8Q+2jiZP3F+dn64jTp/zzFvMDP+1WBPJbqvAoNThFUuJSdvIyXokCVIxjzAosuTrbtsMkJtG3F6dL/WW6lXxd43J86ORkhHqpWPD3VORXCV7oETEpNTuAkMVU8NvsqN9tMvCruqVQz60KDJgH7p8jMwf3F9KgwM3VyMxZUegTcsjTcgqDJDU1+uF6TCmekOrfCM1Dp4bHFUGzyQiwmXg8QV6QlTU5Ykq4QD0Udl30ssc6nkLashyZwMnDZgpRxsQE40dUJNrtwSWpyAJdcsJnAibYuSDUvFwtiTvR1ftXZucxa1TvRSJb7IZfvlxOlBj5LMQewDGgV3srlLdMJwAupzqHwBSjtcV8u98HrVOHi1MnBCClaHcmYA3ikVh6bDqamd2DZVLxOcPJiU/eu4AVxoqCDHyNG7XNHp9g78GjX57qalwvSZf9yir0Ci5cum8vICZZZY6NNbOORNyK54QZlPZa1pg02vUKZuub6665H0kYmaWZYbUDgsnGy1nVfLFg8OKKNcRHJuTH1HHMXYlEXMf+za9YQl4nDKq8llV9ZxSGPCuel4dh0Owd0Ow7zHCl5OHkm1knhgifFZeGkeidFjcC3g7g8+j7Qyvqy+VCrkk3/R1p91P9/yfrK7zsflv1Iq4+XM987I4D3tHpfAG+9IYA1Djr+h9RoBP54/EFrCOB7QGDyQ7OS6vbgZMB3LWD3FxLJqBdIspiELhmOWchYN6DiQIlcaBK6YjiZ7LAFjYSELngc2olIrQjYoeLH5bDSJ6lmSxZ+vBIwnoCzU83WLDxLbBxO+j9tYnugsX5xYws4NDVsUdAkjK3CRazbpNBQjc3jljgcW3Q4moSxOXkitezj4sZz3duvvj76G2++RXv3PWXf4ZtvvD76q3adjNtXHGMws6KvmXGMheP7Dehatht/2QUAVlA4ICYHAAAQJwCdASqAAIAAPmEmkEUkIiGWzHZEQAYEoA0jJK376lUzrbI1XXfkL9Se2+8w/68esB6MfQA/YD1c/UH/cD2AP1Q9NT9nPg0/tn/B/dD4Bf5P/W//hnPH+F/ED9OYM+VoWySZx5APpL2Cv1h6wH7Y+yJ+wCdvwXAmRe65UEXNy8uIdwz27sVKikSQ+sICrGJ5zxJvo7OlqW9fYUCEgKtOxsV74HEZJAmSKTflmuqdO4Aj2ML00KIW0OHFhTR9j7Eq2tiIYCk/HotmYP3SGFZFMJNdLHiWXKzDL7QD/SJ23QuOvhnCtuPi65uYDGIz4HokB59hZ3JF7P65B9UkwOhkEUjOS4uqqT3xjyzLSJ6Vaz7uWftIRaxuJflIXPah/BYJLuL+bamJiscnXY977+Ghv/gxb1Iw9QBa8Jh+kRTWw3gA/v206T3w6eRmtaE4LMGubzB+k2KB0fMIkztcGpAfcwjGuBRofSmgCrba4GjIvfbuStYLyni7OfRsa5KI+ll0zvXKvfCN9yrwbF3dOOeort4/JwuN80MUyNKVbkXmgG8UyUpmtNcl43WmuoJmLc1NL4NphuBrIajbkHX6BaaPic4HmaOi4rnpsF17iXLm8gwT50q6TBAzNB0+z2u33bnrnVM9PJysZqoxPoFsIv/dh3OreVC/XQMy56SuyiMbQ6VfCVe2nkHsPX67NC/J3SuaC+XaP1vHyNtsVWni9FejXTp20cIHXKfVg1iCz64RTfabo74Uf2da13Fw75ik3EFW0KgWDMt4tAFKv8DFBloNc10L+Qo+DA6/8HfS8XzZorJmGkYal+8MPahao07clg1aRfK/OqasbrEnMrTP5Wro8Rwh5gznIg5zHd1l8svU7BS46bODK8ddA5y2vC0Dcen+6zOJ50rTL3xAmGMidjfX2Lr3kKsqrQ04ySdbRVRu4Ae0n4Idt8EvDY6noqjNJRNy/lEp57PpUcBRbBeP0bdwzcNc6wCXoHXNqScCZz145efeZFkQwbNbg9KzmKwP2zW5vP3TvXWKkoVm6tnIIue8IqF1zafIhu3RitvzVJEvxc9z/piRee5gR+kK6NLPSZ86Ju3ByXFCU/Q5vs4LAdV7J/1ephI2wZElFRA1dRWR1s3RonMe27xFVqRZPn6FEsBWFemLnV0g83FpnxJjWwS3bsG7KQ4MsFuB2l07FV1H0JSMZ9HkdwbzJGuZtPl2/7WlC8SFM6cUaO3Hs6/o72+0TJKxAbqDpJqYnDCVY2RLtZjwVQPqRyeSMDJl+S/ypzvPACGqgmf1/0gD89iN/mNsfQLt2+P6y30ClwPqPECEBhkD7nAr+Ld/VNyP5khsM8I5Pt3Hkfh18K4bvujnDtVeyxWZrHSvrzxBV5JniE7aXNqYbdup+Ip9F/+YYfaFHr7wV6Uxz6q17V0CUsGPT3Qlf8HXj3oM49bm8nVJziZweb2/NRnFnRQa/aiJZtFgNAdMkXm3TfmBcHa31+qCoyg2TTjhVt63+maqqtMB8B5OEeQaAbcTxpicSf1FFoHC7k/BOEkz7Y0xFJH+IuZS45/qar8l2n1+oLkWSmme54c0j2Z2Az1qeh7H9LbacT2sTHk++kbxPH7isG4zmxPbow1SEu/ABSgPnV/vd614CdlSYthWM0NS2kGdAAySidU1Nq+v7mGA8qAjubvN3SAr/j//yOJHRaBTxlddh6HixMwa0/cQX7Wuvc4jMH/t5maUQ8FtyVNvaWxwOKhomIP2mrBtMvwGlNZ7UCMw7EX5qD43kEkBE4bfTqyHpQ/qTow5jfe9VOkA+H6DmbrdKesQQGh2gZEIbuCHItCBBhA1BEAx85dBka0CUjKE94wdGjghYG+5k1HgKoZtZUIwYHYQ9OoogkwXHZn+eHo6iFfI7bNWeFIyEEaztH9PEv69B0KdgA3+sP9oOnb+5GFspSD5fcgzuPlERMHQ7E94Lq4Z0pSkNK0czM7FNvSb9YL/fJgZyNcTT6tPOQvmp0fr65bu3sjfglwy3Xlz5eMf9eVeuVaGoPIOMChg7L577hMYJHsc4cW5WtP1F4yClCgbR9n8F28ke3Rad5i6sSMHFqnT8LcKsQdT6oe/15/P/2Ez1rtx9s1XO62wPdS9/SANmW4SYz9925pIbVqSOW3lCR/2E3c7JqfvptDXinM9U4Y9zMtAYNElS5wqhfSIk2/kzLSBuHtM1T1eCVdyI21B6iFfr+lB/3KD3wb9vtbFRvXbcWkHxoFcBjt3PR/GrELVZH4ixF6Bwkv2QfIQ+TmoVU6z71+1JcwDo2UV5NR7y+zwAQY9wDoKnl1I+Sv8Nb3B9WoNWbwP/tg/Us8aB+1glZLdp2/IyszmI7YplHSomS5sQOA88e/Wn9zLMSxH4KkDfVV9WRKcQORmZ/+yrwDeu1LM5wquOfB1KuZ/4Gjob9t63m9DHSpMiBAAAAA=",
     "technologist": "UklGRtoKAABXRUJQVlA4WAoAAAAQAAAAfwAAfwAAQUxQSO4DAAABoEZrmyFJer+IHNszbaxt27Zt27Zt27v/bKPHtm1PszrwLnqrujOi1rsnIiYA/+QUnSgRlWjJT0ojS63ykAY673PTqx99/PrN+3YGdL4Rhcr7Z/M3Z91TBiV5RQEXLSW9MdYa48lF5wM6j2i0fZU0nr/pDfl6RySSF0QnGh0/pPHM2htWlQM6URI30QoA1vqehjlbzjqhDQAkEjENoPuO572yipbNaMlJT5y+ngZ0rEQBB769hCQdm9U7kpmhl/eGqCgJsMf3JGmNZ3M7Y0nOPgfQEVJo/RDprPdsWe8M+UE/qOgIun5KZ5lKbzi2HCoyotp9QcPUGo7pKRIXhSfYyBQ38h2oqGjsQuPTRMt9oWOi8Ckt0+W/hEREYfUMfbo8G9eEikeC02iZcstTkcTkIZq0GT4UE8G7tGmzfB8SDYEaRJc2x2EaEo92M+nT5rmgY0z6VIeQqYyHwjY+AM/9kcQiwUW0TL3hHdCxEHwdguOoBJHU2Mp6Bui4B3QcFD6gDcHyE6goaOxJxyCd3wU6BqL704Zh+bmoCGjsTs9AvdsKOgbPeROK4T0RELSaQB+K5Y8KEppCUV04nks6xWBjG1J9WQy28iFl1oYKbxMbUkNlDIrrQlrRHRKaoPWUcBxH6PCg8DJNKIZPQyP4BMfTheJ4BJLwFNZupA/Ds6ESEoM1MgFVxCDBwXQM1PMgJOFpPEkTiuHj0MEJWk+kD8VzbAIJrzITUl0RVGgaOzEkt3kM9mC4nm7LGGzt6cNpXCM8QUFtSPM7QMLTw2hDsf4jCILXeIAmGF6GJAbbeB+I93XlUMGIiGpa629ow7B8BYlkmS7RyHrLjPcheC6vQNZKpUiA1j1KyspKmyzv+QpdCI53di8uLCwoKCgoLCzo0Q5QqRF0v3dCdV19k3V19bXVDHRlbbbVM19ZF5ISkU4/MsoL14FKR4KLmHE+62B8jg18B0pSIfjQWUbY+4UdkQqBGkwXJdaXpiUZFauG1aFSMjpWmTXT0mpMtNb602TsP37G/OEb+/+elLSJVsPaSrecJAKMilVNP0BpaRHRAIp2nkEfp9pj1+8AQLWAAoqv+a6aETfTX9obUM2m0f72pYz/tztASfNobDiINM77iHlnPO11EGkOhU0X0HjG33o+Ai25KZTPp2Fe9Ia3QeUkqtXnNMyT3vrdoXPROJmGedNyXFuRHKTNaO/yBx2Phc5OYx965lHrv4Lkcr83+cSzugAqK8i3rtHlU+sOhM5G0HY+8+0FSLLr8MmAqv79+1f9uv+QYcOGjxg5OrIjhw8f0r+q6f5V3w85ETobAJK10lon8dVaSbZK8HtT8m5uf98FVlA4IMYGAAAwJACdASqAAIAAPmEqkUWkIqoVCm6IoAYEsYBm3IJCJvu26fi5etDpkW8g/4HzQMxy/DPw8Vb0rceXegD0Of9rzJfV/sE/zD+qf8r1t+ob/YdJxE3B8l5FGh36pryBAbO3VIPwrGESQDKi7cu29PYb/twjqzGAF0C58mzjVoyVhrp65DyqyfP1YBX9mcOwuGxRxEqIsRDCP4jYJ5RNnj/0b1lS4wDrbE2QB7040TYPmjVhwILY2K4Vhvscad9i/FFoZA3dcjkNmn+pUARQwJv63pE5kVUrtdp7TIODwHrmj4WOB0djDKQ4+c8HnV060Ugv6B7gF55YSyDHXSfztbecce0+yPbUcaX7oA4mRKsTKFIc4w2LT21xLr6d0qQU27CGLBGJUIuyfwQAAP79bkg1JusVh1kFzu7TD1eMefrAnNBk1KeIXx/cXkKlTQGvZtZNmnLJtjrNN/POC26KpSCHAorCqh9yJ/GFB83Ww1Bv0jX9lLiq2tcozNMrdrRNqI/IbRgdiSye0wc/8AxVd93pTfpxw01iZJ7OoMHizEh5dCQptBp6e1ZAx/mnSNwrx3hwxTw6kdbxr0/imnecMf/HsvAESaRTFf8uLBxQIpiMfTyOQbcV6KETKjHhZk+K+JBScUJnQXKaRaCWzEwm2kpN0mbnPXOKz/Dz/xJNL40mH3h+74FkHiuxQu0Cz86p6TLGdiDJuZV1q/b7+SpFeIESVUu55xhwPkG1qe6iZApGXJXkx59yxhl181srimNd5JV7M82nokqTPb4SHuW0JwdTrIVdBiDk3ktRNVf52ZmXGwSjHwsbpg3YKKPLU8hA4NDs9C7kaRVAD6YF/wp7jl6g4gyrfeHboyg3E5nprOgb1fV/48PPVWDBZRqqrzCPK3P3TLEjxAbB1fNxRcXHnYJ0RFDXBGsiZxdPJ6yOcOG6K8+iTaPwXTV0uVeBlMYHw3SfOiRCY/wtFKWg55vPe5GneTlSHiVykXf5B4aeGe4efd4qdXT13Dzbf2L+JPLh7cTMdF1CxCrQSpCRygl/P7uwNll4wRdzlq2StfSbx9iQgYSIQqiPuetCvKyp/Nu+bTS1QF6kAhwHFbT9g53KjiIV1zvVFowEj7chsE7W49WddzX5h23D/w1vlpwLmyeOzJks/QCVm6ZDDsoSNc0SQ6UyCPkc5YEesfn/sikac2SgT2f0jv+K9SkNmELDbP8g6zz3xPCx4XksAicC8SwaF1uvXRyuD24NGi0Hj4fK8sBm28QBN+Cq9sLvYABJr/rkh4Cg4SY5Pc7z9HRmo3R+QvUIQ0sHff5/qdh3FM2PMYnefgdTbnn+08OpjHCJL+GiFUp0mHEIJDnneklb7NAXgpm1Fcog9EH4cLc8qIc4gT15SBwujciAVcUDB6mFx0UiC71futzESa8zfrId3UTMa5WiyEhe8eyNewA+nBr7EcIBXRx/8Fj6tZUjljZ78nVtKqrcM+5PpNqHvrmHCWxVcp0+viHU5ZmY2FM5TenOrCc2FCNbEDSqnpvcIAMo4KA2RNOvNh5a/FD1DLRLbb707UE3SC3H6IHl0W0WPjnhQEjSZRFzvOz5Ms2CHkh1rq4tPZEeKP/wQO/np+1/T+89e6geSsNVr6Vv4id4qXdlspbF1euxdK4TQ7Oic40pcKawu3zzrwuyR9Ez50n69gD/5nq3Gqh3ejbQ0+ZVs5PHK1DUKGRy9H/2VdTrsUHgkyRBVuLv8AE0Ejey554WYfudt60i/RX3zD6f/FN9w7VnIH2jbAkIzQMVMBqr9Ngoe2kPfWOf8gbcgJkrtsIMuJhFjzEsLms8gYy1d4Vh9GGtZMIYVlxGHwsAwQvSaTCZvS+LTy9Do6kiZObXY+V/pDBID30kM4cRoKDycvnZLkXKIKHQZ8/5jPg5yoz/+M82Gfrjk+CRmAGU4qBQYfOPC/60M/JlC6BHhKZZwA6/unKUCSeTAXKP/VXbOs1JR8HZyiAkkC18sMxh6au0IsrXj7aNPpHEovVWGLHQzLCjIRJR5HSSeseVpFENGF/b3eBq7wDyYuQ2+fgY0eeh/vt35iTncTT9h6c4XB4Whm+3m0R/Byv4LdArwQ5utoZaA3eCnkc2piH/L0KgVRryY/WSTbl6ugNH1rH4Js28RB3OIJ0xlvuOvhGyD1moeViKLHXhm93IzeqKyur7LVJKuKqu8Yj5lER2n2pgAYLokAzRA4hRppXkOhoVWT3zKJEdCX05tP+Dzb0AR909t29hmo6Ndf4rOXW76l4UJ11stRb//pebbOe3DGtlm/jeTW04RmctbLRRCOzsNOvQAAA=",
     "scientist": "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",

@@ -763,6 +763,20 @@ class RolePacks(unittest.TestCase):
                 self.change(config, "import", roles=bad)
             self.assertFalse(config.get("roles"))
 
+    def test_a_pack_saved_from_its_label_alone(self):
+        config = {"pack": "software"}
+        self.assertEqual(self.change(config, "save_pack", label="Night shift")["pack"]["id"], "night-shift")
+        self.assertEqual(self.change(config, "save_pack", label="2024 crew")["pack"]["id"], "pack")
+        with self.assertRaisesRegex(crewchat.HubError, "built-in"):
+            self.change(config, "save_pack", label="YouTube")
+
+    def test_a_saved_pack_is_replaced_only_when_asked(self):
+        config = {"pack": "software"}
+        packs = dict(self.packs, crew=dict(crewchat.clean_pack({"label": "Crew", "roles": {}}), saved=True))
+        with self.assertRaisesRegex(crewchat.HubError, "already"):
+            crewchat.change_roles(config, {"op": "save_pack", "label": "Crew!"}, packs)
+        self.assertEqual(crewchat.change_roles(config, {"op": "save_pack", "label": "Crew!", "replace": True}, packs)[0]["pack"]["id"], "crew")
+
     def test_saved_packs(self):
         config = {"pack": "instagram"}
         self.change(config, "edit", name="captions", label="Copywriter")
@@ -884,7 +898,7 @@ class Roles(Base):
         self.assertIn("names start with a letter", self.op(op="create", name=["x"], description="x")["error"])
 
     def test_the_owner_is_told_about_a_bad_picture_colour_or_tool(self):
-        for field, value, why in (("picture", "preset:nope", "a preset"), ("colour", "red", "#rrggbb"),
+        for field, value, why in (("picture", "preset:nope", "is not a picture"), ("colour", "red", "#rrggbb"),
                                   ("tool", "cursr", "no tool called cursr")):
             self.assertIn(why, self.op(op="create", name="x", description="x", **{field: value})["error"])
             self.assertIn(why, self.op(op="edit", name="qa", **{field: value})["error"])
@@ -1174,6 +1188,7 @@ class Launching(Base):
         self.assertIn("the owner's instructions", note)
         row = next(r for r in self.hub.rows() if r["agent"] == "picture-tester")
         self.assertEqual((row["picture"], row["colour"], row["permissions"]), ("preset:flask", "#aabbcc", "ask"))
+        self.assertEqual(self.hub.agents["picture-tester"]["model"], "sonnet")  # Reopen starts it on the same model
         inbox = session.text("hub_inbox")
         self.assertIn("Ask before touching api/.", inbox)
         self.assertLess(inbox.index("Ask before touching api/."), inbox.index("Test the login"))  # before the task
@@ -1593,10 +1608,10 @@ class Profiles(Base):
         self.assertIn("#rrggbb", self.op(op="profile", agent=name, colour="#12345g")["error"])
 
     def test_the_built_in_3d_pictures(self):
-        status, body, headers = self.raw("/pictures/robot.webp")  # not secret: no sign-in needed
+        status, body, headers = self.raw("/pictures/bot.webp")  # not secret: no sign-in needed
         self.assertEqual((status, headers["Content-Type"], body[:4], body[8:12]), (200, "image/webp", b"RIFF", b"WEBP"))
-        self.assertIn("immutable", headers["Cache-Control"])
-        for bad in ("/pictures/nope.webp", "/pictures/robot.png", "/pictures/../files/x"):
+        self.assertIn("max-age", headers["Cache-Control"])
+        for bad in ("/pictures/nope.webp", "/pictures/bot.png", "/pictures/../files/x"):
             self.assertEqual(self.raw(bad)[0], 404, bad)
         session, name = self.agent()
         self.assertEqual(self.op(op="profile", agent=name, picture="art:owl"), {"ok": True})
@@ -1605,7 +1620,8 @@ class Profiles(Base):
         self.assertIn("picture art:fox", session.text("hub_profile", picture="fox"))
         self.assertEqual(crewchat.clean_picture("art:../x"), "")
         self.assertEqual(set(crewchat.ART_DATA), set(crewchat.ART_PICTURES))
-        self.assertEqual(self.hub.poll(-1, -1, 0)["art"]["robot"], "Robot")
+        self.assertEqual(self.hub.poll(-1, -1, 0)["art"]["bot"], "Robot")
+        self.assertIn("picture preset:robot", session.text("hub_profile", picture="robot"))  # the emoji, still
 
     def test_uploaded_picture_limits(self):
         _, name = self.agent()
