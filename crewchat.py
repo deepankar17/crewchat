@@ -9002,6 +9002,14 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg .to { border: 1px solid var(--line); border-radius: 99px; padding: 0 8px; font-size: 11.5px; }
 .msg .body { background: var(--soft); border-radius: 4px 18px 18px 18px; padding: 9px 14px; white-space: pre-wrap; overflow-wrap: anywhere; justify-self: start; }
 .msg.own { margin-left: auto; grid-template-columns: minmax(0, 1fr); }
+.msg { position: relative; }
+.msg.cont { margin-top: -10px; }
+.msg.cont > .avatar { visibility: hidden; height: 0; }
+.msg.cont > .meta { display: none; }
+.msg .reply { position: absolute; right: -6px; top: -4px; font-size: 12px; padding: 2px 10px; background: var(--panel); color: var(--accent);
+  border: 1px solid var(--line); opacity: 0; transition: opacity 0.12s; }
+.msg:hover .reply, .msg .reply:focus-visible { opacity: 1; }
+@media (hover: none) { .msg .reply { display: none; } }
 .msg.own .meta { justify-content: flex-end; }
 .msg.own .body { background: var(--tint); color: var(--ink); border-radius: 18px 4px 18px 18px; justify-self: end; }
 .msg.task .body { background: var(--task); color: var(--text); border: 1px solid var(--task-line); border-radius: 16px; justify-self: stretch; }
@@ -9030,6 +9038,15 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #form { flex: none; padding: 10px max(18px, calc((100% - 860px) / 2)) max(14px, env(safe-area-inset-bottom)); }
 .pillbox { display: flex; gap: 6px; align-items: flex-end; background: var(--soft); border: 1px solid var(--line); border-radius: 26px; padding: 5px; }
 .pillbox:focus-within { border-color: var(--accent-2); }
+.pillbox { position: relative; }
+.mentions { position: absolute; left: 44px; bottom: calc(100% + 6px); min-width: 220px; background: var(--panel); border-radius: 14px;
+  box-shadow: var(--shadow); border: 1px solid var(--line); padding: 4px; z-index: 30; display: flex; flex-direction: column; }
+.mentions button { display: flex; align-items: center; gap: 8px; background: none; color: var(--text); text-align: left;
+  border-radius: 10px; padding: 5px 8px; font-weight: 500; font-size: 13.5px; }
+.mentions button[aria-selected="true"], .mentions button:hover { background: var(--tint); }
+.mentions .avatar { width: 24px; height: 24px; } .mentions .avatar .initials { font-size: 9.5px; }
+.mentions .avatar .mark, .mentions .avatar .os { display: none; }
+.mentions .r { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 #plus > summary { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
   font-size: 22px; color: var(--accent); }
 #plus > summary:hover { background: var(--tint); }
@@ -9309,6 +9326,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       </details>
       <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
       <input type="file" id="files" multiple hidden>
+      <div id="mentions" class="mentions" role="listbox" aria-label="Agents" hidden></div>
       <textarea id="text" rows="1" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
       <button id="send" disabled>Send</button>
     </div>
@@ -10843,6 +10861,12 @@ function buildMessage(m) {
   if (m.files && m.files.length) body.append(fileLinks(m.files));
   box.append(meta, body);
   if (mine) box.append(el("div", "receipt"));
+  else {
+    const reply = el("button", "reply", "Reply");
+    reply.type = "button"; reply.title = "Write to " + m.from;
+    reply.addEventListener("click", () => { text.value = "@" + m.from + " " + text.value.replace(/^@\S+\s*/, ""); fit(); text.focus(); });
+    box.append(reply);
+  }
   return box;
 }
 
@@ -10898,6 +10922,13 @@ function welcome() {
   return box;
 }
 
+// A message right after another from the same sender (within 5 minutes, same day, plain) joins it:
+// no second name and picture.
+function groupWith(m, prev) {
+  return prev && prev.from === m.from && m.from !== "Owner" && m.kind === "msg" && prev.kind === "msg" &&
+    m.to === prev.to && m.ts - prev.ts < 300;
+}
+
 function addMessages(list, first) {
   if (!list.length) return;
   const log = $("log");
@@ -10907,6 +10938,8 @@ function addMessages(list, first) {
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
     if (day !== state.lastDay) { const d = el("p", "day", day); d.hidden = !!searchWant(); log.append(d); state.lastDay = day; }
     const node = buildMessage(m);
+    if (groupWith(m, state.lastShown) && state.lastShownDay === day) node.classList.add("cont");
+    state.lastShown = m.kind === "plan" ? state.lastShown : m; state.lastShownDay = day;
     node.hidden = !matches(node, searchWant());
     log.append(node);
     if (node.classList.contains("msg") && (m.from === "Owner" || m.kind === "task")) state.nodes.set(m.id, [m, node]);
@@ -11175,7 +11208,48 @@ $("form").addEventListener("drop", (e) => {
   addFiles(e.dataTransfer.files);
 });
 
+// "@" in the message box: the agents whose name starts with what follows, to pick with the arrows
+// and Enter or Tab, or a click.
+const mention = { at: -1, items: [], on: 0 };
+function mentionQuery() {
+  const upto = text.value.slice(0, text.selectionStart);
+  const m = upto.match(/(?:^|\s)@([\w.-]{0,32})$/);
+  return m ? { at: upto.length - m[1].length - 1, q: m[1].toLowerCase() } : null;
+}
+function showMentions() {
+  const found = mentionQuery(), box = $("mentions");
+  mention.items = found ? state.agents.filter((a) => a.agent.toLowerCase().startsWith(found.q)).slice(0, 6) : [];
+  box.hidden = !mention.items.length;
+  if (box.hidden) return;
+  mention.at = found.at; mention.on = Math.min(mention.on, mention.items.length - 1);
+  box.replaceChildren(...mention.items.map((a, i) => {
+    const b = el("button");
+    b.type = "button"; b.setAttribute("role", "option"); b.setAttribute("aria-selected", String(i === mention.on));
+    b.append(avatar(a), el("span", "", a.agent), el("span", "r", a.role ? roleTitle(a.role) : ""));
+    b.addEventListener("mousedown", (e) => { e.preventDefault(); pickMention(i); });
+    return b;
+  }));
+}
+function pickMention(i) {
+  const a = mention.items[i], end = text.selectionStart;
+  if (!a) return;
+  text.value = text.value.slice(0, mention.at) + "@" + a.agent + " " + text.value.slice(end);
+  const caret = mention.at + a.agent.length + 2;
+  text.setSelectionRange(caret, caret);
+  $("mentions").hidden = true; mention.on = 0; fit();
+}
+text.addEventListener("input", showMentions);
+text.addEventListener("blur", () => { $("mentions").hidden = true; });
 text.addEventListener("keydown", (e) => {
+  if (!$("mentions").hidden && mention.items.length) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      mention.on = (mention.on + (e.key === "ArrowDown" ? 1 : -1) + mention.items.length) % mention.items.length;
+      return showMentions();
+    }
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); return pickMention(mention.on); }
+    if (e.key === "Escape") { e.stopPropagation(); $("mentions").hidden = true; return; }
+  }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!$("send").disabled) $("form").requestSubmit(); }
 });
 // Who a message goes to: the agent its first word mentions, else everyone.

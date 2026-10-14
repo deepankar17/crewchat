@@ -687,6 +687,29 @@ class NewPage(Signed):
         c.js("localStorage.removeItem('crewchat-notify-first'); showBell()")
         self.assertEqual(c.errors, [])
 
+    def test_mention_suggestions_reply_and_grouping(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        first = self.agent.name[:2]
+        c.js("const t = $('text'); t.focus(); t.value = 'hi @%s'; t.setSelectionRange(t.value.length, t.value.length);"
+             "t.dispatchEvent(new Event('input'))" % first)
+        c.until("!$('mentions').hidden", what="the suggestions")
+        self.assertIn(self.agent.name, c.js("$('mentions').innerText"))
+        c.js("$('text').dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'}))")
+        self.assertEqual(c.js("$('text').value"), "hi @%s " % self.agent.name)
+        self.assertTrue(c.js("$('mentions').hidden"))
+        c.js("$('text').value = ''")
+        # Two messages in a row from one agent: the second joins the first; Reply writes to it.
+        self.agent.call("hub_send", to="Owner", text="first of two")
+        self.agent.call("hub_send", to="Owner", text="second of two")
+        c.until("$('log').innerText.includes('second of two')", what="the messages")
+        last = "[...document.querySelectorAll('#log .msg')].pop()"
+        self.assertTrue(c.js(last + ".classList.contains('cont')"))
+        c.js(last + ".querySelector('.reply').click()")
+        self.assertEqual(c.js("$('text').value"), "@%s " % self.agent.name)
+        c.js("$('text').value = ''")
+        self.assertEqual(c.errors, [])
+
     def test_new_agent_in_four_steps(self):
         c = self.chrome
         c.click("#add-agent")

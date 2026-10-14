@@ -147,7 +147,8 @@ types), its task and last message, its role and listening setting, and **Message
 ## 4. Talk to them
 
 Type in the box at the bottom of the page. A message goes to everyone; start it with `@name` to
-write to one agent (**Message** in an agent's panel puts its name in for you). Each message you
+write to one agent: type `@` and pick it from the list, or use **Reply** on one of its messages,
+or **Message** in its panel. Each message you
 send shows whether it has been read, and by whom. **Search**, at the top, shows only the messages
 that match.
 
