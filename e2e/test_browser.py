@@ -195,6 +195,106 @@ class Page(unittest.TestCase):
         self.assertIn("Switch running-one's model", out["models"])
         self.assertEqual(c.errors, [])
 
+    def test_avatars_follow_the_profile(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        c.js("""(() => {
+            window.savedAgents = state.agents;
+            const base = state.agents[0];
+            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false, session: null}, extra);
+            state.agents = [
+              row("rocket-cursor", {client: "cursor", picture: "preset:rocket", colour: ""}),
+              row("lost-picture", {client: "claude", picture: "file:" + "0".repeat(16), colour: "#000000",
+                                   remote: true, device: "pc", os: "windows"})];
+            state.names = "";
+            renderAgents();
+            buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi", ts: state.now})
+              .setAttribute("id", "avatar-probe");
+        })()""")
+        c.until("""(() => { const a = [...document.querySelectorAll('#agents .agent')]
+                     .find(e => e.innerText.includes('lost-picture')); return a && !a.querySelector('.avatar img'); })()""",
+                what="the missing picture to fall back to initials")
+        c.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-color-scheme", "value": "dark"}])
+        self.addCleanup(c.call, "Emulation.setEmulatedMedia", features=[])
+        self.assertTrue(c.js("matchMedia('(prefers-color-scheme: dark)').matches"))
+        out = c.js("""(() => {
+            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
+            const av = (n) => card(n).querySelector('.avatar');
+            const probe = buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi",
+                                        ts: state.now});
+            const out = {
+              rocket: av("rocket-cursor").innerText, rocketColour: av("rocket-cursor").style.getPropertyValue("--av"),
+              mark: av("rocket-cursor").querySelector('.mark').textContent,
+              lost: av("lost-picture").querySelector('.initials').textContent,
+              lostInk: getComputedStyle(av("lost-picture").querySelector('.initials')).color,
+              ring: getComputedStyle(av("lost-picture")).boxShadow,
+              os: !!av("lost-picture").querySelector('.os'), osTitle: av("lost-picture").querySelector('.os').title,
+              inMessage: !!probe.querySelector('.avatar'),
+              pictureAction: [...card("rocket-cursor").querySelectorAll('summary')].map(s => s.textContent),
+              remoteAction: [...card("lost-picture").querySelectorAll('summary')].map(s => s.textContent),
+            };
+            state.agents = window.savedAgents; state.names = ""; renderAgents();  // as the server says
+            return out;
+        })()""")
+        self.assertIn("\U0001F680", out["rocket"])
+        self.assertEqual(out["rocketColour"], "#1a1a1a")  # Cursor's own colour
+        self.assertEqual(out["mark"], "Cu")
+        self.assertEqual(out["lost"], "LP")  # its picture is on another machine: initials, not a broken image
+        self.assertEqual(out["lostInk"], "rgb(255, 255, 255)")  # white on black
+        self.assertNotEqual(out["ring"], "none")
+        self.assertTrue(out["os"])  # two machines: each agent says which OS it runs on
+        self.assertEqual(out["osTitle"], "Windows")
+        self.assertTrue(out["inMessage"])
+        self.assertIn("Picture", out["pictureAction"])
+        self.assertNotIn("Picture", out["remoteAction"])  # change it on its own machine
+        self.assertEqual(c.errors, [])
+
+    def test_message_avatars_survive_roster_changes(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        out = c.js("""(() => {
+            const saved = state.agents;
+            const base = state.agents[0];
+            const node = buildMessage({id: "av-2", seq: 2, kind: "msg", from: base.agent, to: "all", text: "kept", ts: state.now});
+            $("log").append(node);
+            state.agents = saved.concat([Object.assign({}, base, {agent: "newcomer", session: null})]);  // someone joins
+            renderAgents();
+            const kept = node.querySelector('[data-who].avatar, .meta > span:first-child').className;
+            state.agents = saved.concat([Object.assign({}, base, {agent: "odd", client: "constructor", session: null}),
+                                         Object.assign({}, base, {agent: "odder", client: "__proto__", colour: "zz",
+                                                                  session: null})]);
+            let threw = "";
+            try { renderAgents(); } catch (e) { threw = String(e); }
+            const odd = [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes("odd"));
+            const oddColour = odd ? odd.querySelector('.avatar').style.getPropertyValue("--av") : "";
+            node.remove(); state.agents = saved; state.names = ""; renderAgents();
+            return {kept, threw, oddColour};
+        })()""")
+        self.assertIn("avatar", out["kept"])  # still drawn as an avatar after the names changed
+        self.assertEqual(out["threw"], "")  # a tool called "constructor" is just an unknown tool
+        self.assertEqual(out["oddColour"], "#6b7280")
+        self.assertEqual(c.errors, [])
+
+    def test_closing_the_picture_menu_shows_what_changed(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        c.js("""(() => { window.savedAgents = state.agents;
+                 state.agents = [Object.assign({}, state.agents[0], {agent: "menu-one", remote: false, session: null})];
+                 renderAgents(); })()""")
+        c.js("document.querySelector('#agents .picmenu').open = true")
+        c.js("""(() => { state.agents = [Object.assign({}, state.agents[0], {status: "changed while open"})];
+                 renderAgents(); })()""")
+        self.assertNotIn("changed while open", c.js("$('agents').innerText"))  # frozen while choosing
+        c.js("document.querySelector('#agents .picmenu').open = false")
+        c.until("$('agents').innerText.includes('changed while open')", what="the cards to catch up")
+        c.js("state.agents = window.savedAgents; renderAgents()")
+
+    def test_one_machine_shows_no_os_badge(self):
+        c = self.chrome
+        c.until("state.agents.length > 0 && state.tools", what="the agents")
+        self.assertGreater(c.js("document.querySelectorAll('#agents .avatar').length"), 0)
+        self.assertEqual(c.js("document.querySelectorAll('#agents .avatar .os').length"), 0)
+
     def test_attach_a_file(self):
         c = self.chrome
         path = H.TMP / "from-the-page.txt"
