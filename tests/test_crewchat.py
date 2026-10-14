@@ -987,7 +987,7 @@ class Launching(Base):
             return True
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
                 mock.patch.object(crewchat, "stop_process", stop), \
-                mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["opus", "Opus"], ["sonnet", "Sonnet"]]), \
+                mock.patch.object(crewchat, "tool_models", lambda tool: [["opus", "Opus"], ["sonnet", "Sonnet"]]), \
                 mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
@@ -1002,7 +1002,7 @@ class Launching(Base):
         stopped = []
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
                 mock.patch.object(crewchat, "stop_process", lambda pid: stopped.append(pid) or True), \
-                mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["sonnet", "Sonnet"]]):
+                mock.patch.object(crewchat, "tool_models", lambda tool: [["sonnet", "Sonnet"]]):
             with self.assertRaises(urllib.error.HTTPError) as caught:
                 crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertIn("no longer connected", json.loads(caught.exception.read())["error"])
@@ -1022,7 +1022,7 @@ class Launching(Base):
 
     def test_switch_model_refuses_a_model_the_tool_does_not_list(self):
         name = self.closed_session()
-        with mock.patch.object(crewchat, "tool_models", lambda tool, exe: [["opus", "Opus"]]):
+        with mock.patch.object(crewchat, "tool_models", lambda tool: [["opus", "Opus"]]):
             for bad in ("opus; rm -rf ~", "gpt-9"):
                 with self.assertRaises(urllib.error.HTTPError) as caught:
                     crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": bad})
