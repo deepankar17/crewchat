@@ -14,7 +14,7 @@ Quick start
   In a project folder (on any machine that can reach the host):
     python3 crewchat.py join --url ... --code ...
   Every Claude Code or Cursor session opened in that folder then joins the chat by itself, under
-  its own name (claude-macbook, claude-macbook-2, cursor-macbook, ...).
+  its own name: a first name such as Maya (or, with `setup --agent-names place`, claude-macbook).
 
 Security model
 - The server listens on 127.0.0.1 only (not configurable). Reach it from other machines through
@@ -279,7 +279,7 @@ KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "
 AGENT_NAMES = (
     "Ada", "Amara", "Anya", "Arlo", "Asha", "Bea", "Bodhi", "Cleo", "Dara", "Elio", "Emre", "Esme", "Ezra",
     "Faye", "Finn", "Gia", "Hana", "Hugo", "Ines", "Iris", "Ivo", "Jade", "Joon", "Juno", "Kai", "Kemi", "Kira",
-    "Lars", "Leo", "Lina", "Luca", "Maya", "Mika", "Milo", "Nadia", "Nia", "Nico", "Noor", "Odin", "Omar",
+    "Lars", "Levi", "Lina", "Luca", "Maya", "Mika", "Milo", "Nadia", "Nia", "Nico", "Noor", "Odin", "Omar",
     "Otto", "Pia", "Quinn", "Ravi", "Remy", "Rhea", "Rosa", "Sami", "Sana", "Selin", "Tara", "Teo", "Uma",
     "Vera", "Wren", "Yara", "Yuki", "Zara", "Zeke", "Zoe",
 )
@@ -1329,12 +1329,20 @@ class Hub:
     def _remote_names(self):
         return [row["agent"] for dev in self.remote.values() for row in dev["agents"]]
 
+    def _taken_names(self, but=None):
+        """Every name in use, in lower case: agents here and on linked machines, agents being launched,
+        and names that still hold tasks (an agent forgotten while it had some). Caller holds the lock."""
+        now = time.time()
+        names = (list(self.agents) + self._remote_names() + list(self.taken.values())
+                 + [s["name"] for s in self.starts.values() if s.get("name") and s["expires"] > now])
+        return {n.lower() for n in names if n != but}
+
     @property
     def names(self):
         return list(self.agents) + [n for n in self._remote_names() if n not in self.agents] + [OWNER]
 
     def _free_name(self, base):
-        taken = {n.lower() for n in list(self.agents) + self._remote_names()}
+        taken = self._taken_names()
         if base.lower() not in taken:
             return base
         number = 2
@@ -1345,8 +1353,8 @@ class Hub:
     def _agent_name(self, place, client):
         """A new agent's name: a first name nobody here has, or with "agent_names": "place" (and when
         every first name is taken) its tool and folder, as claude-macbook. Caller holds the lock."""
-        if self.machine_config().get("agent_names", "people") != "place":
-            taken = {n.lower() for n in list(self.agents) + self._remote_names()}
+        if self.machine_config().get("agent_names") != "place":
+            taken = self._taken_names()
             free = [n for n in AGENT_NAMES if n.lower() not in taken]
             if free:
                 return secrets.choice(free)
@@ -1551,6 +1559,14 @@ class Hub:
                     or (old["updated"] == 0) != (updated == 0)):
                 self.version += 1
                 self.lock.notify_all()
+            # Two machines may have given two agents one first name at once. Exactly one of them gives
+            # way, the machine with the larger id: its agent takes a free name and is told.
+            mine = str(getattr(self.sync, "device_id", "") or "")
+            theirs = {r["agent"].lower() for r in rows}
+            clashes = [n for n in self.agents if n.lower() in theirs] if mine and mine > str(device_id) else []
+            for name in clashes:
+                agent = self.agents[name]
+                self.rename(name, self._agent_name(agent["place"], agent["client"]), tell=True)
 
     def drop_remote(self, device_id):
         with self.lock:
@@ -1650,6 +1666,7 @@ class Hub:
 
     def send(self, sender, to, text, kind="msg", files=None):
         with self.lock:
+            to = self._named(to)
             self._check_recipient(to, everyone=True)
             msg = self._append(sender, to, text, kind, files=files or None)
             self._changed()
@@ -1730,7 +1747,7 @@ class Hub:
         with self.lock:
             if name:
                 check_name(name)
-                if name.lower() in {n.lower() for n in self.names}:
+                if name.lower() in self._taken_names() | {OWNER.lower()}:
                     raise HubError("there is already an agent called %s" % name)
             if role and role not in self.roles():
                 raise HubError("no role called %s" % role)
@@ -1854,6 +1871,12 @@ class Hub:
         """This machine's settings (its folders, tools, port), wherever this project is kept."""
         root = getattr(self, "machine_root", None)
         return self.roster.config if root is None or Path(root) == Path(self.roster.root) else load_config(root)
+
+    def _named(self, to):
+        """A recipient as written, in any case ("maya" for Maya): its name as the chat knows it."""
+        if not isinstance(to, str) or to in self.names or to == "all":
+            return to
+        return next((n for n in self.names if n.lower() == to.lower()), to)
 
     def _check_recipient(self, to, everyone=False):
         """An agent's name, or with `everyone` also "all" and Owner. Caller holds the lock."""
@@ -5167,11 +5190,10 @@ def cmd_start(args):
     print()
     kinds = {"all": ("claude", "cursor"), "claude": ("claude",), "cursor": ("cursor",)}[args.client]
     where = "this folder" if project == Path.cwd().resolve() else str(project)
-    named = ("%s-%s, %s-%s-2, ..." % (kinds[0], place, kinds[0], place)
-             if config.get("agent_names") == "place" else "with a first name of its own (Maya, Teo, ...)")
+    named = ("named %s-%s, %s-%s-2, ..." % (kinds[0], place, kinds[0], place) if config.get("agent_names") == "place"
+             else "with a first name of its own (Maya, Teo, ...)")
     print("Now open %s in %s. Each new session joins the chat by itself, %s"
-          % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where,
-             ("named " + named) if config.get("agent_names") == "place" else named))
+          % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where, named))
     print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
     print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
     if not (config.get("peers") or config.get("cloud")):
@@ -9698,8 +9720,9 @@ $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
   if (!title) return;
-  if (await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value }))
-    for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+  const fields = ["t-title", "t-depends", "t-areas", "t-where"], sent = fields.map((id) => $(id).value);
+  if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
+    fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
@@ -9887,9 +9910,10 @@ $("l-template").addEventListener("change", () => {
 $("l-role").addEventListener("change", () => applyRole($("l-role").value));
 // A random first name nobody in the chat has yet (the server gives one anyway when the field is empty).
 $("l-dice").addEventListener("click", () => {
-  const taken = new Set(state.agents.map((a) => a.agent.toLowerCase()));
-  const free = (state.agentNames || []).filter((n) => !taken.has(n.toLowerCase()) && n !== $("l-name").value);
+  const taken = new Set(state.agents.map((a) => a.agent.toLowerCase()).concat([$("l-name").value.toLowerCase()]));
+  const free = (state.agentNames || []).filter((n) => !taken.has(n.toLowerCase()));
   if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
+  else $("l-dice").disabled = true;  // every first name is in use
 });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
@@ -10559,7 +10583,9 @@ function fileLinks(files) {
 
 // A message's text, with @name mentions of agents (and of you) as chips. Text only: never HTML.
 const MENTION = /@([A-Za-z][\w.-]{0,31})/g;  // an agent's name, as NAME_RE allows
-const isAgent = (name) => state.agents.some((a) => a.agent === name);
+// An agent's name as the chat knows it, however it was typed ("maya" for Maya), or "".
+const agentNamed = (name) => (state.agents.find((a) => a.agent.toLowerCase() === name.toLowerCase()) || {}).agent || "";
+const isAgent = (name) => !!agentNamed(name);
 function withMentions(text) {
   const out = document.createDocumentFragment();
   let at = 0;
@@ -10854,7 +10880,7 @@ text.addEventListener("keydown", (e) => {
 // "@Maya", "@Maya," or "@Maya:" at the start: the agent's name, without punctuation that follows it.
 function agentIn(word) {
   for (let name = word; name; name = name.slice(0, -1)) {
-    if (isAgent(name)) return name;
+    if (isAgent(name)) return agentNamed(name);
     if (!/[.\-_]$/.test(name)) return "";
   }
   return "";
@@ -10862,7 +10888,7 @@ function agentIn(word) {
 function leadingMention(value) {
   const m = [...value.matchAll(MENTION)][0];
   const name = m && m.index === 0 ? agentIn(m[1]) : "";
-  return name && !/^[\w]/.test(value.slice(1 + name.length)) ? [ "@" + name, name ] : null;
+  return name && !/^[\w]/.test(value.slice(1 + name.length)) ? [value.slice(0, 1 + name.length), name] : null;
 }
 function recipient(value) {
   const m = leadingMention(value);

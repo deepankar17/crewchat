@@ -164,9 +164,9 @@ class RemoteFolder(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.host = H.Machine("host")
+        cls.host = H.Machine("host", agent_names="place")
         cls.host.start()
-        cls.laptop = H.Machine("laptop")
+        cls.laptop = H.Machine("laptop", agent_names="place")
         cls.laptop.join_host(cls.host, place="laptop")
         cls.remote = cls.laptop.agent()
         cls.remote.link()
@@ -198,7 +198,7 @@ class RemoteFolder(unittest.TestCase):
         self.local.call("hub_send", to="Owner", text="ok", files=[str(self.host.folder / "ok.txt")])
 
     def test_a_removed_folder_is_shut_out(self):
-        other = H.Machine("tablet")
+        other = H.Machine("tablet", agent_names="place")
         other.join_host(self.host, place="tablet")
         agent = other.agent()
         agent.link()
@@ -211,7 +211,7 @@ class RemoteFolder(unittest.TestCase):
     def test_join_codes_work_once(self):
         invite = self.host.cli("invite", "--url", self.host.url)
         code = invite.split("--code ")[1].split()[0]
-        a, b = H.Machine("one"), H.Machine("two")
+        a, b = H.Machine("one", agent_names="place"), H.Machine("two", agent_names="place")
         a.cli("join", "--url", self.host.url, "--code", code)
         out = b.cli("join", "--url", self.host.url, "--code", code, check=False)
         self.assertIn("wrong, already used or expired", out)
