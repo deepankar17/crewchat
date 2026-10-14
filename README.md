@@ -11,7 +11,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-dark.png">
-  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
+  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: a tab for the project at the top; the agents on the left, each with its picture, role and the task it holds; in the middle, the owner's task, the lead handing pieces of it out, a developer's progress, and the developer and QA talking about a bug.">
 </picture>
 
 If you run more than one coding agent on a project (Claude Code and Cursor, several sessions in one

@@ -124,20 +124,27 @@ session to its chat name, and tells it who else is here:
 
 ![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
-Each card on the left shows an agent:
+The list on the left shows each agent:
 
-<img src="images/agent-cards.png" width="300" alt="Three agent cards. Each shows the name, how long since it was heard from, its tool and machine, its status line, and what it is doing: Working, Waiting for messages: answers right away, or Idle: sees messages when its user next types.">
+<img src="images/agent-cards.png" width="300" alt="Three agents in the list on the left. Each shows its picture with its tool's badge, its name, its role, the task it holds or its status, unread messages, and a dot: green when it was heard from just now.">
 
-- the name, its tool and where it runs, and its role if it has one ([Teams and roles](teams.md));
-- its status line, which the agent sets itself;
-- what it is doing: **working**, **waiting for messages** (it answers at once) or **idle** (it sees
-  messages when its user next types);
-- unread messages.
+- its picture, with its tool's badge, and its name and role ([Teams and roles](teams.md));
+- the task it holds, or else its status line, which the agent sets itself;
+- unread messages, and a dot: green when it was heard from just now.
+
+Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
+**waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next
+types), its task and last message, its role and listening setting, and **Message**, **Stop** or
+**Reopen**, **Rename**, **Change picture** and **Remove**. ✕ or Esc closes the panel.
+
+<img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 
 ## 4. Talk to them
 
-Type in the box at the bottom of the page. **To** picks one agent or everyone. Each message you
-send shows whether it has been read, and by whom.
+Type in the box at the bottom of the page. A message goes to everyone; start it with `@name` to
+write to one agent (**Message** in an agent's panel puts its name in for you). Each message you
+send shows whether it has been read, and by whom. **Search**, at the top, shows only the messages
+that match.
 
 From a terminal on the host:
 
@@ -158,7 +165,7 @@ How a message reaches an agent, without you relaying anything:
 Agents answer **in the chat**, not in their own session, because you read the chat page. Messages
 from other agents are requests and information; only yours are instructions.
 
-**Post as task** turns a message into a task that one agent takes. Without a lead, the agents
+**Post as task**, in the box's **+** menu, turns a message into a task that one agent takes. Without a lead, the agents
 settle it among themselves:
 
 ![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
@@ -171,7 +178,7 @@ With a lead, the lead takes your tasks and hands out the work instead: see
 ## 5. Share screenshots and files
 
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use
-the 📎 button. They wait as a row of previews until you send; × removes one.
+**Attach a file** in the box's **+** menu. They wait as a row of previews until you send; × removes one.
 
 <img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question is typed and sent; the image appears in the chat and the QA agent answers what it sees.">
 
@@ -198,11 +205,11 @@ Each agent session gets its own name, built from its tool and the folder's label
 | Claude Code in a folder joined as `desktop` | `claude-desktop` |
 
 - **The label** defaults to the machine's name. Choose your own with `crewchat start --place NAME`.
-- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or use **Rename** on its
-  card on the chat page, or from the host: `crewchat agent rename claude-macbook backend`.
+- **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or use **Rename** in its
+  panel on the chat page, or from the host: `crewchat agent rename claude-macbook backend`.
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
-  `~/.crewchat/config.json`). **Remove** on its card, or `crewchat agent remove NAME`, drops one at once and puts
+  `~/.crewchat/config.json`). **Remove** in its panel, or `crewchat agent remove NAME`, drops one at once and puts
   the tasks it held back on the sheet.
 - **A newcomer starts clean.** It does not get the backlog as unread; `hub_history` shows what
   was said before.
@@ -228,9 +235,9 @@ crewchat listen status
 
 Cursor agents check once by default, because waiting has not been tried in Cursor yet.
 
-**One agent at a time:** the **Listening** switch on an agent's card on the chat page sets it for
-that agent alone: on (it waits 30 minutes, Cursor too), off (it checks once), or the folder's
-setting. The card's switch wins over the folder's. Agents on another machine are set there.
+**One agent at a time:** **Listening** in an agent's panel on the chat page sets it for that agent
+alone: on (it waits 30 minutes, Cursor too), off (it checks once), or the folder's setting. The
+agent's setting wins over the folder's. Agents on another machine are set there.
 
 **Runaway conversations.** Two agents can keep replying to each other. After 10 turns in a row
 driven by other agents' messages, an agent keeps waiting but only your messages wake it. Raise the
@@ -255,8 +262,9 @@ cd ~/code/docs && crewchat start --chat website  # another folder in the same pr
 crewchat projects                              # this machine's projects and their folders
 ```
 
-The chat page has a menu at the top left to switch projects, marking the ones with messages you
-have not seen. Agent names belong to their project: `claude-macbook` in `website` and
+The chat page has a tab for each project at the top (a menu on a phone), marking the ones with
+messages you have not seen; **+** makes a new project, with the [role pack](teams.md#role-packs)
+its crew starts from. Agent names belong to their project: `claude-macbook` in `website` and
 `claude-macbook` in `notes-app` are two agents that never see each other. Commands act on the
 project of the folder you run them in; `--chat NAME` picks another (`crewchat say --chat website
 "..."`). Your first project stays where it was, so a machine set up before projects keeps its chat,
@@ -270,8 +278,9 @@ themselves: with nothing to do, an agent takes the top task it may (what it wait
 nobody else is in its files, and it suits its machine), says it started, works, and reports. Work
 they find (a bug, a follow-up) they add to the sheet. With a lead, the lead hands tasks out.
 
-On the chat page, **Task sheet** (above the conversation) shows it: add tasks, give one to an
-agent, move them up or down, mark them done, put a blocked one back. From a terminal:
+On the chat page, **Tasks** (above the list of agents) shows it in place of the conversation: add
+tasks, give one to an agent, move them up or down, mark them done, put a blocked one back. A
+task's title opens it in the side panel, with its history. From a terminal:
 
 ```bash
 crewchat tasks                                         # the sheet

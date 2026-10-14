@@ -83,8 +83,10 @@ class Chrome:
         self.proc.wait(10)
 
 
-@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
-class Page(unittest.TestCase):
+class Signed(unittest.TestCase):
+    """A machine with one agent, and Chrome signed in to its chat page at PATH."""
+    PATH = "/"
+
     @classmethod
     def setUpClass(cls):
         cls.m = H.Machine("page")
@@ -100,6 +102,9 @@ class Page(unittest.TestCase):
         cls.chrome.type_into("input[name=code]", code.lower())  # as typed on a phone
         cls.chrome.js("document.querySelector('form').submit()")
         cls.chrome.until("location.pathname === '/' && !!document.getElementById('log')", what="the chat page")
+        if cls.PATH != "/":
+            cls.chrome.open(cls.m.url + cls.PATH)
+            cls.chrome.until("!!document.getElementById('log')", what="the page at " + cls.PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -108,6 +113,12 @@ class Page(unittest.TestCase):
 
     def log_text(self):
         return self.chrome.js("document.getElementById('log').innerText")
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class Page(Signed):
+    """The page before 0.14, at /classic for one release."""
+    PATH = "/classic"
 
     def test_the_page_shows_the_chat_and_the_agent(self):
         c = self.chrome
@@ -386,7 +397,7 @@ class Page(unittest.TestCase):
         c = self.chrome
         try:
             c.size(375, 812, mobile=True, dark=True)
-            c.open(self.m.url + "/")
+            c.open(self.m.url + self.PATH)
             c.until("!!document.getElementById('log')")
             self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
             bg = c.js("getComputedStyle(document.body).backgroundColor")
@@ -394,7 +405,7 @@ class Page(unittest.TestCase):
             self.assertEqual(c.errors, [])
         finally:
             c.size(1280, 900)
-            c.open(self.m.url + "/")
+            c.open(self.m.url + self.PATH)
             c.until("!!document.getElementById('log')")
 
     def test_add_an_agent_form_opens_and_closes(self):
@@ -406,6 +417,213 @@ class Page(unittest.TestCase):
         self.assertIn("notes-app", c.js("document.getElementById('l-folder').innerText"))
         c.click("#l-cancel")
         self.assertEqual(c.errors, [])
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class NewPage(Signed):
+    """The chat page from 0.14: project tabs, the crew on the left, the space, a side panel."""
+
+    def card(self):
+        return "document.querySelector('#agents .agent[data-agent=%s]')" % json.dumps(self.agent.name)
+
+    def tearDown(self):
+        self.chrome.js("closePanel(); showView('chat'); document.body.classList.remove('rail-open')")
+
+    def test_the_shell(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent in the rail")
+        self.assertEqual(c.js("$('project').textContent"), "Demo")
+        tabs = c.js("[...document.querySelectorAll('#tabs .tab')].map(t => [t.innerText, t.getAttribute('aria-selected')])")
+        self.assertIn(["D\nDemo", "true"], tabs)  # (and one for each other project, all unselected)
+        self.assertEqual([t for t in tabs if t[1] == "true"], [["D\nDemo", "true"]])
+        self.assertIn("1 agent", c.js("$('space-meta').textContent"))
+        self.assertTrue(c.js("$('classic-link').href").endswith("/classic"))
+        self.assertTrue(c.js("$('panel').hidden"))
+        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
+                              ".map(e => e.id || e.className)"), [])
+        self.assertEqual(c.errors, [])
+
+    def test_mention_writes_to_one_agent_and_post_as_task(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.type_into("#text", "@%s hello from the new page" % self.agent.name)
+        c.js("$('text').dispatchEvent(new Event('input'))")
+        c.click("#send")
+        msg = self.m.owner.wait_for("hello from the new page")
+        self.assertEqual(msg["to"], self.agent.name)
+        self.assertIn("hello from the new page", eventually(self.agent.stop_hook, what="the agent to get it"))
+        c.until("!!document.querySelector('#log .msg.own .mention')", what="the mention as a chip")
+        c.click("#as-task")
+        self.assertFalse(c.js("$('task-chip').hidden"))
+        c.type_into("#text", "a task from the new page")
+        c.js("$('text').dispatchEvent(new Event('input'))")
+        c.click("#send")
+        task = self.m.owner.wait_for("a task from the new page")
+        self.assertEqual((task["kind"], task["to"]), ("task", "all"))
+        self.assertTrue(c.js("$('task-chip').hidden"))  # back to a message after sending
+        self.assertEqual(c.errors, [])
+
+    def test_the_agent_panel_opens_sets_a_role_and_closes(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.js(self.card() + ".click()")
+        c.until("!$('panel').hidden && $('panel-title').textContent === %s" % json.dumps(self.agent.name))
+        self.assertTrue(c.js("document.body.classList.contains('panel-open')"))
+        self.assertTrue(c.js(self.card() + ".classList.contains('on')"))
+        texts = c.js("$('panel-body').innerText")
+        for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Rename", "Remove", "Change picture"):
+            self.assertIn(word, texts.upper() if word.isupper() else texts)
+        sel = "#panel select[aria-label='Role for %s']" % self.agent.name
+        c.js("(() => { const s = document.querySelector(%s); s.value = 'reviewer'; s.dispatchEvent(new Event('change')); })()"
+             % json.dumps(sel))
+        eventually(lambda: self.m.owner.row(self.agent.name)["role"] == "reviewer", what="the role to be set")
+        c.until("%s.innerText.includes('Reviewer')" % self.card(), what="the role in the rail")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Message').click()")
+        self.assertTrue(c.js("$('text').value.startsWith('@%s ')" % self.agent.name))
+        c.js("$('text').value = ''")
+        c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+        c.until("$('panel').hidden && !document.body.classList.contains('panel-open')", what="Esc to close the panel")
+        self.assertEqual(c.errors, [])
+
+    def test_session_controls_in_the_panel(self):
+        c = self.chrome
+        c.until("state.agents.length > 0", what="the agents")
+        out = c.js("""(() => {
+            const saved = state.agents, savedModels = toolModels;
+            toolModels = {claude: [["opus", "Opus (latest)"]]};
+            const base = state.agents[0];
+            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
+            state.agents = [
+              row("running-one", {session: {app: "terminal", running: true, since: state.now, tool: "claude", reopen: true}}),
+              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
+              row("far-one", {remote: true, device: "laptop", session: null})];
+            const look = (n) => { openPanel("agent", n); const b = $("panel-body");
+              return {buttons: [...b.querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent),
+                      text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
+                      picture: !!b.querySelector(".picmenu")}; };
+            const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one")};
+            closePanel(); state.agents = saved; toolModels = savedModels; renderAgents();
+            return out;
+        })()""")
+        self.assertIn("Stop", out["running"]["buttons"])
+        self.assertIn("Switch running-one's model", out["running"]["selects"])
+        self.assertIn("Reopen", out["closed"]["buttons"])
+        self.assertIn("Session closed 4 min ago", out["closed"]["text"])
+        self.assertNotIn("Rename", out["far"]["buttons"])  # it runs on another machine: changed there
+        self.assertFalse(out["far"]["picture"])
+        self.assertIn("Runs on laptop", out["far"]["text"])
+        self.assertEqual(c.errors, [])
+
+    def test_roles_in_the_panel(self):
+        c = self.chrome
+        c.js("openPanel('roles')")
+        c.until("$('panel-body').innerText.includes('Software team') && $('panel-body').innerText.includes('Lead')",
+                what="the roles")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'New role').click()")
+        c.until("!!document.querySelector('#panel-body form.roleform')", what="the role form")
+        c.js("""(() => { const f = document.querySelector('#panel-body form');
+            f.querySelector('[aria-label=Name]').value = 'designer';
+            f.querySelector('[aria-label=Label]').value = 'Designer';
+            f.querySelector('textarea').value = 'You design the screens.';
+            f.querySelector('[aria-label=Picture]').value = 'preset:palette';
+            f.requestSubmit(); })()""")
+        c.until("$('panel-title').textContent === 'Designer'", what="the new role's panel")
+        self.assertIn("You design the screens.", c.js("$('panel-body').innerText"))
+        c.until("state.roles.some(r => r.name === 'designer')", what="the role in the page's list")
+        c.js("window.confirm = () => true")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
+        c.until("$('panel-title').textContent === 'Roles' && !$('panel-body').innerText.includes('Designer')",
+                what="the role gone")
+        self.assertEqual(c.errors, [])
+
+    def test_the_task_board_and_a_task_in_the_panel(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        self.assertFalse(c.js("$('tasks').hidden"))
+        self.assertTrue(c.js("$('form').hidden"))
+        c.type_into("#t-title", "Write the welcome screen")
+        c.js("$('task-form').requestSubmit()")
+        c.until("$('sheet').innerText.includes('Write the welcome screen')", what="the new task")
+        c.js("[...document.querySelectorAll('#sheet .open-task')].find(b => b.textContent === 'Write the welcome screen').click()")
+        c.until("$('panel-title').textContent.startsWith('Task #')", what="the task panel")
+        self.assertIn("Write the welcome screen", c.js("$('panel-body').innerText"))
+        self.assertIn("HISTORY", c.js("$('panel-body').innerText").upper())
+        c.click("#tasks .back")
+        self.assertFalse(c.js("$('log').hidden"))
+        self.assertEqual(c.errors, [])
+
+    def test_new_agent_in_four_steps(self):
+        c = self.chrome
+        c.click("#add-agent")
+        c.until("$('launch').open && $('l-folder').options.length > 0", what="the dialog and its folders")
+        self.assertIn("notes-app", c.js("$('l-folder').innerText"))
+        step = "[...document.querySelectorAll('#launch .step')].findIndex(f => !f.hidden)"
+        self.assertEqual(c.js(step), 0)
+        self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, True])
+        c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
+        self.assertEqual(c.js(step), 1)  # a template skips to the workspace
+        self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", "preset:flask"])
+        c.click("#l-next")
+        c.click("#l-next")
+        self.assertEqual(c.js(step), 3)
+        self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [False, True, False])
+        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Briefing")
+        c.click("#l-back")
+        self.assertEqual(c.js(step), 2)
+        self.assertEqual(c.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
+                              ".map(e => e.id || e.className)"), [])
+        c.click("#l-cancel")
+        self.assertEqual(c.errors, [])
+
+    def test_search_hides_what_does_not_match(self):
+        c = self.chrome
+        self.agent.call("hub_send", to="Owner", text="the blue elephant report")
+        c.until("$('log').innerText.includes('blue elephant')", what="the message")
+        c.type_into("#search", "elephant")
+        c.js("$('search').dispatchEvent(new Event('input'))")
+        shown = c.js("[...$('log').children].filter(n => !n.hidden).map(n => n.innerText).join('|')")
+        self.assertIn("elephant", shown)
+        self.assertNotIn("hello", shown.lower().replace("elephant", ""))
+        c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
+        self.assertEqual(c.js("[...$('log').children].filter(n => n.hidden).length"), 0)
+
+    def test_a_new_project_from_the_tab_menu(self):
+        c = self.chrome
+        c.js("$('tab-add').open = true")
+        c.click("#new-project")
+        c.until("$('project-dialog').open && $('p-pack').options.length > 3", what="the dialog and the packs")
+        c.type_into("#p-name", "Cooking channel")
+        c.js("$('p-pack').value = 'youtube'")
+        c.js("$('project-form').requestSubmit()")
+        c.until("location.search.includes('chat=cooking-channel') && $('project').textContent === 'Cooking channel'",
+                what="the new project's page")
+        c.until("[...document.querySelectorAll('#tabs .tab')].length === 2", what="a tab for each project")
+        c.until("state.crew === 'general' && state.roles.some(r => r.title === 'Producer')", what="the YouTube pack")
+        c.js("[...document.querySelectorAll('#tabs .tab')].find(t => t.innerText.includes('Demo')).click()")
+        c.until("$('project').textContent === 'Demo' && state.agents.length > 0", what="back to Demo")
+        self.assertEqual(c.errors, [])
+
+    def test_phone_and_dark_mode(self):
+        c = self.chrome
+        try:
+            c.size(375, 812, mobile=True, dark=True)
+            c.open(self.m.url + "/")
+            c.until("!!%s" % self.card(), what="the page on a phone")
+            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
+            self.assertNotEqual(c.js("getComputedStyle(document.body).backgroundColor"), "rgb(255, 255, 255)")
+            self.assertEqual(c.js("getComputedStyle($('tabs')).display"), "none")  # a picker instead
+            self.assertNotEqual(c.js("getComputedStyle($('projects')).display"), "none")
+            c.click("#rail-open")
+            c.until("$('rail').getBoundingClientRect().left >= 0", what="the drawer to open")
+            c.js(self.card() + ".click()")
+            c.until("!$('panel').hidden", what="the panel")
+            self.assertEqual(c.js("[$('panel').getBoundingClientRect().width, document.body.classList.contains('rail-open')]"),
+                             [375, False])  # a full-screen sheet; the drawer closed
+            self.assertEqual(c.errors, [])
+        finally:
+            c.size(1280, 900)
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")

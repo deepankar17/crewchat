@@ -583,6 +583,7 @@ def role_texts(table):
 
 ROLE_FIELDS = ("label", "description", "picture", "colour", "tool")
 MAX_IMPORT_ROLES = 50
+MAX_PROJECT_NAME = 60
 ROLES_LOCK = threading.Lock()  # one change to a config.json's roles at a time
 
 
@@ -1539,7 +1540,7 @@ class Hub:
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
              "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
-             "os": os_name()}
+             "os": os_name(), "permissions": a.get("permissions", "")}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1682,10 +1683,15 @@ class Hub:
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
-    def new_start(self, name="", role="", task="", permissions="ask"):
+    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions=""):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
-        it, it gets this name, role and first task."""
-        name, role, task = (str(x or "").strip() for x in (name, role, task))
+        it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
+        name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
+        picture = check_picture(self, picture) if picture else ""
+        if colour and not COLOUR_RE.fullmatch(str(colour)):
+            raise HubError("a colour is #rrggbb, or empty for the tool's colour")
+        if len(instructions) > MAX_TEXT:
+            raise HubError("the instructions are too long")
         with self.lock:
             if name:
                 check_name(name)
@@ -1699,22 +1705,26 @@ class Hub:
             self.starts = {k: v for k, v in self.starts.items() if v["expires"] > now}
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
-                                "expires": now + START_TTL}
+                                "picture": picture, "colour": str(colour or "").lower(),
+                                "instructions": instructions, "expires": now + START_TTL}
             return key
 
-    def launch(self, tool, folder, name="", role="", task="", permissions="ask"):
+    def launch(self, tool, folder, name="", role="", task="", permissions="ask", model="", picture="",
+               colour="", instructions=""):
         """Open a new agent session in a connected folder on this machine; it checks in with a
-        start key and gets this name, role and first task, and may do what permissions says
-        without asking (LAUNCH_PERMISSIONS)."""
+        start key and gets this name, role, picture, instructions and first task, and may do what
+        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
+        if model and model not in [m for m, _ in tool_models(tool)]:
+            raise HubError("%s has no model called %s" % (LAUNCH_TOOLS[tool][0], model))
         if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task, permissions)
+        key = self.new_start(name, role, task, permissions, picture, colour, instructions)
         try:
-            launch_agent(tool, folder, key, permissions, self.home)
+            launch_agent(tool, folder, key, permissions, self.home, model)
         except (HubError, OSError) as e:
             with self.lock:
                 self.starts.pop(key, None)
@@ -1759,13 +1769,23 @@ class Hub:
             if name in self.agents:
                 self.agents[name]["permissions"] = spec.get("permissions") or "ask"
                 self._save()
+        if spec.get("picture") or spec.get("colour"):
+            try:
+                self.set_profile(name, spec.get("picture") or None, spec.get("colour") or None)
+            except HubError as e:  # its picture went away in the meantime
+                notes.append("Your picture was not set (%s)." % e)
         if spec["role"]:
             self.set_role(OWNER, name, spec["role"])
+        if spec.get("instructions"):
+            with self.lock:
+                self._append(OWNER, name, spec["instructions"], "msg")
+                self._changed()
         if spec["task"]:
             self.assign(OWNER, name, spec["task"])
         notes.insert(0, "You are %s, in the project %s, started from the crewchat by the owner.%s"
                      % (name, self.roster.project, SESSION_NAME_NOTE % name))
-        waiting = [x for x, on in (("your role's instructions", spec["role"]), ("your first task", spec["task"])) if on]
+        waiting = [x for x, on in (("your role's instructions", spec["role"]), ("the owner's instructions",
+                                   spec.get("instructions")), ("your first task", spec["task"])) if on]
         if waiting:
             notes.append("%s %s in hub_inbox: read it now and start." % (" and ".join(waiting).capitalize(),
                                                                        "are" if len(waiting) > 1 else "is"))
@@ -3706,7 +3726,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4083,9 +4103,9 @@ class Handler(BaseHTTPRequestHandler):
                         extra={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
         elif url.path == "/mcp":
             self._reply(405, b"", extra={"Allow": "POST, DELETE"})
-        elif url.path == "/":
+        elif url.path in ("/", "/classic"):  # /classic: the page before 0.14, for one release
             if self._owner_session():
-                self._html(200, CHAT_PAGE)
+                self._html(200, CHAT_PAGE if url.path == "/" else CLASSIC_PAGE)
             else:
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/login":
@@ -4245,6 +4265,24 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _projects_op(self, data):
+        """The owner makes a new project from the chat page: a name, and the pack its roles start from."""
+        if data.get("op") != "create":
+            raise HubError("op must be create")
+        name = " ".join(str(data.get("name") or "").split())
+        if not name or len(name) > MAX_PROJECT_NAME:
+            raise HubError("a project's name is 1 to %d characters" % MAX_PROJECT_NAME)
+        pack = str(data.get("pack") or DEFAULT_PACK)
+        find_pack(pack, role_packs())
+        base = self.projects.base
+        if find_chat(name, base):
+            raise HubError("there is a project called %s already" % name)
+        chosen = create_project(name, base)
+        if pack != DEFAULT_PACK:
+            save_roles_change(chosen["root"], {"op": "pack", "pack": pack})
+        self.projects.refresh()
+        return {"id": chosen["id"], "name": chosen["name"]}
+
     def _roles(self, data):
         """The owner lists and changes the project's roles and packs (change_roles has the ops)."""
         before = set(self.hub.roles())
@@ -4258,7 +4296,8 @@ class Handler(BaseHTTPRequestHandler):
         """Add an agent: a new agent session on this machine."""
         permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
         self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
-                        data.get("task"), permissions)
+                        data.get("task"), permissions, str(data.get("model") or ""), data.get("picture") or "",
+                        data.get("colour") or "", data.get("instructions") or "")
         return {"ok": True}
 
     def _admin(self, raw):
@@ -4450,10 +4489,12 @@ class Handler(BaseHTTPRequestHandler):
             except HubError as e:
                 self._json(400, {"error": str(e)})
             return
-        if path in ("/api/send", "/api/role", "/api/roles", "/api/agent", "/api/launch", "/api/rules", "/api/skills", "/api/task"):
+        if path in ("/api/send", "/api/role", "/api/roles", "/api/projects", "/api/agent", "/api/launch", "/api/rules",
+                    "/api/skills", "/api/task"):
             if not self._owner_request():
                 return
             action = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
+                      "/api/projects": self._projects_op,
                       "/api/agent": self._agent_op,
                       "/api/launch": self._launch,
                       "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}[path]
@@ -4826,10 +4867,11 @@ def tool_options(tool, permissions="ask", base=None):
     return (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
 
 
-def launch_command(exe, tool, key, permissions="ask", base=None):
-    """The agent's command line. Only the fixed prompt, the key and fixed options reach it: no text
-    typed on the chat page is ever passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base) + [LAUNCH_PROMPT % key]
+def launch_command(exe, tool, key, permissions="ask", base=None, model=""):
+    """The agent's command line. Only the fixed prompt, the key, fixed options and a model from
+    tool_models reach it: no text typed on the chat page is ever passed to a shell."""
+    return ([exe] + tool_options(tool, permissions, base) + (["--model", model] if model else [])
+            + [LAUNCH_PROMPT % key])
 
 
 def macos_script(folder, command, key, title=""):
@@ -4908,10 +4950,10 @@ def resume_command(exe, tool, session, permissions="ask", base=None, model=None)
             + ["--resume=" + session, REOPEN_PROMPT])
 
 
-def launch_agent(tool, folder, key, permissions="ask", root=None):
+def launch_agent(tool, folder, key, permissions="ask", root=None, model=""):
     """Open a terminal window on this machine with a new agent session in folder."""
     exe, base = agent_tool(tool, folder, permissions, root)
-    open_terminal(folder, launch_command(exe, tool, key, permissions, base), key, root=root)
+    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model), key, root=root)
 
 
 def open_terminal(folder, command, key, title="", root=None):
@@ -7301,7 +7343,7 @@ autofocus required maxlength="12"><button>Sign in</button></form>
 <p class="tip">On a phone, sign in, then use <b>Add to Home Screen</b> to keep the chat as an app.
 An iPhone app keeps its own sign-in, so you sign in once more inside it.</p></main></html>"""
 
-CHAT_PAGE = r"""<!doctype html>
+CLASSIC_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -8546,8 +8588,1923 @@ loop();
 </body>
 </html>
 """
+# The chat page (0.14): project tabs, the crew on the left, the space, a side panel. CLASSIC_PAGE is
+# the page before it, at /classic for one release.
+CHAT_PAGE = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>crewchat</title>
+<style>
+/* The chat page: project tabs on top, the crew on the left, the project's space in the middle, a side
+   panel on the right. Soft and rounded, in crewchat's logo blue; light and dark. */
+:root {
+  color-scheme: light dark;
+  --bg: #eef3ff; --panel: #ffffff; --soft: #f6f8ff; --ink: #0b1f55; --text: #1b2440; --muted: #5d6a8f;
+  --line: #dfe7ff; --accent: #2f5fd6; --accent-2: #5b8cff; --deep: #2148ad; --on-accent: #ffffff; --tint: #dfe7ff;
+  --task: #fff6dd; --task-line: #e9cf86; --task-ink: #6b4e00;
+  --ok: #1f8a52; --warn: #b37400; --off: #a3acc4; --err: #c4321f;
+  --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
+  --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
+  --radius: 18px; --shadow: 0 1px 2px rgba(11, 31, 85, 0.06), 0 6px 20px rgba(11, 31, 85, 0.07);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0a1330; --panel: #111c40; --soft: #16234d; --ink: #e8eeff; --text: #dfe6ff; --muted: #9daad3;
+    --line: #24346a; --accent: #5b8cff; --accent-2: #8fb0ff; --deep: #2f5fd6; --on-accent: #0b1f55; --tint: #1c2b5c;
+    --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
+    --ok: #63c58c; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
+    --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
+    --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+[hidden] { display: none !important; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 ui-rounded, "SF Pro Rounded", "Nunito", "Quicksand", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  display: grid; height: 100dvh;
+  grid-template-areas: "top top top" "rail space panel";
+  grid-template-columns: 260px minmax(0, 1fr) 0; grid-template-rows: auto minmax(0, 1fr);
+}
+body.panel-open { grid-template-columns: 260px minmax(0, 1fr) 320px; }
+select, textarea, button, input { font: inherit; color: inherit; }
+button { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 999px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
+button:disabled { opacity: 0.5; cursor: default; }
+button.secondary, .ghost { background: transparent; color: var(--ink); border: 1px solid var(--line); }
+button.link { background: none; border: 0; padding: 0; color: var(--accent); font-size: 13px; border-radius: 0; text-align: left; font-weight: 600; }
+button.icon { background: transparent; color: var(--muted); padding: 6px 10px; font-size: 15px; line-height: 1; }
+button.icon:hover, button.icon.on { background: var(--tint); color: var(--ink); }
+select { background: var(--soft); border: 1px solid var(--line); border-radius: 12px; padding: 6px 10px; max-width: 100%; }
+input[type=text], input[type=search], textarea { background: var(--soft); border: 1px solid var(--line); border-radius: 14px; padding: 8px 12px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.meta { font-size: 12.5px; color: var(--muted); }
+.phone-only { display: none !important; }
+
+/* Top bar: one Chrome-style tab per project. */
+#topbar { grid-area: top; display: flex; align-items: flex-end; gap: 6px; padding: 8px 12px 0; min-width: 0; }
+.brand { display: flex; align-items: center; align-self: center; padding: 0 6px 6px 2px; }
+.logo { width: 28px; height: 28px; flex: none; }
+#tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.tab { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 14px 14px 0 0; max-width: 220px;
+  color: var(--muted); text-decoration: none; white-space: nowrap; flex: none; }
+.tab:hover { background: var(--tint); color: var(--ink); }
+.tab[aria-selected="true"] { background: var(--panel); color: var(--ink); font-weight: 650; }
+.tab .pname { overflow: hidden; text-overflow: ellipsis; }
+.tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
+.tab .unread:empty { width: 8px; }
+.tab.needs .unread, .tab.needs .pav { background: var(--err); }
+.pav { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 22px; height: 22px;
+  border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; }
+.menu { position: relative; }
+.menu > summary { list-style: none; cursor: pointer; }
+.menu > summary::-webkit-details-marker { display: none; }
+#tab-add > summary { padding: 4px 12px; margin-bottom: 4px; border-radius: 99px; color: var(--muted); font-size: 18px; line-height: 1.2; }
+#tab-add > summary:hover { background: var(--tint); color: var(--ink); }
+.menu-list { position: absolute; z-index: 20; top: calc(100% + 4px); left: 0; min-width: 220px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 16px; box-shadow: var(--shadow); padding: 6px; display: flex; flex-direction: column; }
+.menu-list.right, #space-menu .menu-list { left: auto; right: 0; }
+.menu.up .menu-list { top: auto; bottom: calc(100% + 6px); }
+.menu-list button, .menu-list a { background: none; color: var(--text); text-align: left; border-radius: 10px; padding: 8px 12px;
+  font-weight: 500; text-decoration: none; font-size: 14px; }
+.menu-list button:hover, .menu-list a:hover { background: var(--tint); }
+.menu-list button[aria-checked="true"]::after { content: " \2713"; color: var(--accent); }
+.menu-list hr { border: 0; border-top: 1px solid var(--line); margin: 4px 6px; width: auto; }
+#projects { font-weight: 650; }
+#switching { margin: 0 0 6px auto; align-self: center; font-size: 13px; }
+body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity 0.15s; }
+
+/* The rail: Needs you, the crew, New agent. */
+#rail { grid-area: rail; overflow-y: auto; padding: 12px 10px 16px 12px; display: flex; flex-direction: column; gap: 6px; }
+.rail-tools { display: flex; gap: 4px; }
+.rail-tools button { flex: 1; font-size: 13px; font-weight: 600; }
+.rail-head { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 10px 8px 2px; }
+#needs-you { background: var(--panel); border-radius: var(--radius); padding: 8px; box-shadow: var(--shadow); }
+#needs-you .rail-head { margin-top: 2px; color: var(--err); }
+.agent { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; width: 100%;
+  text-align: left; background: transparent; color: var(--text); border-radius: 16px; padding: 8px 10px; font-weight: 400; }
+.agent:hover { background: var(--tint); }
+.agent.on { background: var(--panel); box-shadow: var(--shadow); }
+.agent .avatar { grid-row: span 2; }
+.agent .who { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.agent .name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent .holds .badge { display: inline-block; vertical-align: 1px; max-width: 110px; }
+.agent .holds { grid-column: 2 / 4; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.agent .count { font-size: 11px; font-weight: 700; background: var(--accent); color: var(--on-accent); border-radius: 99px; padding: 0 7px; }
+.badge { font-size: 11px; font-weight: 650; border-radius: 99px; padding: 0 8px; background: var(--tint); color: var(--deep); white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+@media (prefers-color-scheme: dark) { .badge { color: var(--accent-2); } }
+.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; display: inline-block; }
+.dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
+.none { font-size: 13px; color: var(--muted); margin: 4px 8px; }
+.add-agent { margin-top: 6px; background: transparent; color: var(--accent); border: 1.5px dashed var(--line); }
+.add-agent:hover { background: var(--tint); }
+
+/* Avatars (the class names PR 1 gave them). */
+.avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 34px; height: 34px; border-radius: 50%; background: var(--av); }
+.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+.avatar .initials { color: var(--av-ink); font-size: 12.5px; font-weight: 700; letter-spacing: 0.02em; }
+.avatar .emoji { font-size: 18px; line-height: 1; }
+.avatar .mark, .avatar .os { position: absolute; bottom: -3px; height: 14px; min-width: 14px; padding: 0 3px; border-radius: 7px;
+  font-size: 8px; line-height: 14px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
+.avatar .mark { right: -4px; background: var(--mk); color: #fff; font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
+.avatar .os { left: -4px; background: var(--panel); }
+.avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
+.picmenu > summary { cursor: pointer; list-style: none; display: inline-block; }
+.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; align-items: center; }
+.picmenu .picks button { min-width: 34px; padding: 4px 8px; background: var(--soft); color: var(--text); border: 1px solid var(--line); }
+
+/* The space: header, thread, composer. */
+#space { grid-area: space; display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden;
+  background: var(--panel); border-radius: var(--radius) var(--radius) 0 0; box-shadow: var(--shadow); }
+#space-head { display: flex; align-items: center; gap: 12px; padding: 12px 18px; border-bottom: 1px solid var(--line); flex: none; }
+#space-avatar { width: 38px; height: 38px; border-radius: 12px; font-size: 17px; }
+#space-head .titles { min-width: 0; flex: 1; }
+#project { font-size: 17px; margin: 0; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#space-meta { margin: 0; font-size: 12.5px; color: var(--muted); }
+#search { width: 210px; min-width: 0; padding: 7px 12px; }
+#space-menu > summary { padding: 4px 12px; border-radius: 99px; font-size: 20px; line-height: 1; color: var(--muted); }
+#space-menu > summary:hover { background: var(--tint); color: var(--ink); }
+#banner { display: none; flex: none; background: var(--err); color: var(--panel); font-size: 13px; padding: 6px 16px; text-align: center; }
+#banner.show { display: block; }
+#update { display: none; flex: none; align-items: center; gap: 10px; justify-content: center; flex-wrap: wrap;
+  background: var(--task); color: var(--task-ink); font-size: 13px; padding: 6px 16px; }
+#update.show { display: flex; }
+#update a { color: inherit; }
+#update button { border: 0; background: none; color: inherit; font-size: 16px; line-height: 1; padding: 0 4px; }
+#log { flex: 1; min-height: 0; overflow-y: auto; padding: 18px max(18px, calc((100% - 860px) / 2)); }
+.empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 7px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+.day { text-align: center; color: var(--muted); font-size: 12px; margin: 18px 0 10px; }
+.msg { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 0 10px; margin: 0 0 14px; max-width: 88%; }
+.msg > .avatar { grid-row: span 2; align-self: start; margin-top: 2px; }
+.msg .meta { display: flex; gap: 8px; flex-wrap: wrap; align-items: baseline; margin-bottom: 3px; }
+.msg .who { font-weight: 700; font-size: 13.5px; }
+.msg .meta .badge { align-self: center; }
+.msg .to { border: 1px solid var(--line); border-radius: 99px; padding: 0 8px; font-size: 11.5px; }
+.msg .body { background: var(--soft); border-radius: 4px 18px 18px 18px; padding: 9px 14px; white-space: pre-wrap; overflow-wrap: anywhere; justify-self: start; }
+.msg.own { margin-left: auto; grid-template-columns: minmax(0, 1fr); }
+.msg.own .meta { justify-content: flex-end; }
+.msg.own .body { background: var(--tint); color: var(--ink); border-radius: 18px 4px 18px 18px; justify-self: end; }
+.msg.task .body { background: var(--task); color: var(--text); border: 1px solid var(--task-line); border-radius: 16px; justify-self: stretch; }
+.msg.task .label { display: flex; gap: 8px; align-items: center; font-size: 12px; font-weight: 700; color: var(--task-ink); margin-bottom: 4px; letter-spacing: 0.03em; }
+.msg.task .state { margin-left: auto; font-weight: 600; letter-spacing: 0; }
+.msg .receipt { font-size: 11.5px; color: var(--muted); margin-top: 3px; text-align: right; }
+.msg.update .body { background: transparent; border: 1px dashed var(--line); }
+.mention { background: var(--tint); color: var(--deep); border-radius: 99px; padding: 0 6px; font-weight: 600; white-space: nowrap; }
+.msg.own .mention { background: var(--panel); }
+@media (prefers-color-scheme: dark) { .mention { color: var(--accent-2); } }
+.pill { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 0 9px; background: var(--tint); color: var(--ink); }
+.pill.done { background: var(--ok); color: var(--panel); } .pill.blocked { background: var(--err); color: var(--panel); }
+.sys { text-align: center; font-size: 12.5px; color: var(--muted); margin: 4px auto 12px; max-width: 640px; }
+.sys b { font-weight: 650; }
+.sys details { display: inline; } .sys summary { display: inline; cursor: pointer; text-decoration: underline dotted; }
+.sys .prompt { display: block; text-align: left; white-space: pre-wrap; margin: 6px auto 0; background: var(--soft); border-radius: 12px; padding: 8px 12px; color: var(--text); }
+.c0 { color: var(--a0); } .c1 { color: var(--a1); } .c2 { color: var(--a2); } .c3 { color: var(--a3); }
+.c4 { color: var(--a4); } .c5 { color: var(--a5); } .c6 { color: var(--a6); } .c7 { color: var(--a7); }
+.msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
+.msg .body > .files:first-child { margin-top: 0; }
+.msg .file { display: inline-flex; gap: 6px; align-items: baseline; border: 1px solid var(--line); border-radius: 12px; padding: 6px 10px; font-size: 13px; text-decoration: none; background: var(--panel); color: var(--text); }
+.msg .file .s { color: var(--muted); font-size: 12px; }
+.msg .file.image { padding: 0; border: 0; background: none; }
+.msg .file.image img { display: block; max-width: min(320px, 100%); max-height: 240px; border-radius: 12px; }
+
+#form { flex: none; padding: 10px max(18px, calc((100% - 860px) / 2)) max(14px, env(safe-area-inset-bottom)); }
+.pillbox { display: flex; gap: 6px; align-items: flex-end; background: var(--soft); border: 1px solid var(--line); border-radius: 26px; padding: 5px; }
+.pillbox:focus-within { border-color: var(--accent-2); }
+#plus > summary { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 22px; color: var(--accent); }
+#plus > summary:hover { background: var(--tint); }
+#text { flex: 1; min-width: 0; resize: none; max-height: 40dvh; background: transparent; border: 0; padding: 7px 4px; outline: none; }
+#send { padding: 8px 18px; }
+#pending { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+#pending:empty { display: none; }
+.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 12px; padding: 3px 4px 3px 8px; font-size: 12.5px; background: var(--panel); max-width: 100%; }
+.chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 8px; }
+.chip .s { color: var(--muted); }
+.chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
+.chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
+.chip.task { align-self: center; background: var(--task); border-color: var(--task-line); color: var(--task-ink); font-weight: 650; }
+#form.dragging .pillbox { outline: 2px dashed var(--accent); outline-offset: 3px; }
+#error { color: var(--err); font-size: 13px; margin-top: 6px; }
+
+/* Tasks and Commands, in the space in place of the thread. */
+.view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
+#tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
+.tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
+.task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
+.task-form input { flex: 1 1 120px; min-width: 0; font-size: 13.5px; }
+.task-form #t-title { flex: 3 1 260px; }
+#sheet { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+#sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+#sheet td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+#sheet td.meta { font-size: 12px; color: var(--muted); }
+#sheet tr.done td { opacity: 0.55; }
+#sheet tr .open-task { background: none; color: var(--text); padding: 0; border-radius: 0; font-weight: 500; text-align: left; }
+.st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 9px; background: var(--tint); white-space: nowrap; }
+.st.doing, .st.review { background: var(--accent); color: var(--on-accent); }
+.st.done { background: var(--ok); color: var(--panel); } .st.blocked { background: var(--err); color: var(--panel); }
+.acts { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+#sheet .acts { justify-content: flex-end; }
+.acts button, .acts select { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--text); border: 1px solid var(--line); }
+.acts button.danger { color: var(--err); }
+#cmd-filter { width: 100%; font-size: 14px; margin-bottom: 12px; }
+.cmd-group h3 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; font-weight: 650; }
+.cmd { border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 9px 12px; margin-bottom: 6px; }
+.cmd .top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cmd code.u { font-size: 13.5px; font-weight: 600; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
+.cmd p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
+.cmd button { font-size: 12.5px; padding: 3px 12px; background: transparent; color: var(--ink); border: 1px solid var(--line); }
+.cmd button.run { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.cmd input { font-size: 13px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 3px 8px; width: 9em; }
+.cmd pre { margin: 8px 0 0; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
+.cmd pre.bad { border-color: var(--err); }
+
+/* The side panel: an agent, a role, a task, or the project. */
+#panel { grid-area: panel; overflow-y: auto; padding: 12px 14px 20px; min-width: 0; }
+.panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.panel-head h2 { font-size: 15px; margin: 0; flex: 1; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 10px; }
+.card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 6px; }
+.card p { margin: 4px 0; font-size: 13.5px; overflow-wrap: anywhere; }
+.ident { display: flex; gap: 12px; align-items: center; }
+.ident .nm { font-size: 17px; font-weight: 700; color: var(--ink); overflow-wrap: anywhere; }
+.field { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 10px; align-items: center; font-size: 13.5px; margin: 6px 0; }
+.field > span:first-child { color: var(--muted); font-size: 12.5px; }
+.field select, .field input, .field textarea { width: 100%; }
+.card .acts { margin-top: 6px; }
+.rolelist { list-style: none; margin: 0; padding: 0; }
+.rolelist li button { width: 100%; display: flex; align-items: center; gap: 10px; background: none; color: var(--text); text-align: left; font-weight: 500; border-radius: 12px; padding: 6px 8px; }
+.rolelist li button:hover { background: var(--tint); }
+.rolelist .avatar { width: 28px; height: 28px; }
+.prompt-text { white-space: pre-wrap; font-size: 13px; background: var(--soft); border-radius: 12px; padding: 8px 10px; max-height: 260px; overflow-y: auto; }
+.roleform textarea { min-height: 150px; resize: vertical; }
+.linkline { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin: 0; }
+.linkline b { color: var(--ink); font-weight: 650; }
+.linkline .m { white-space: nowrap; }
+.linkline .dot { width: 7px; height: 7px; margin-right: 4px; vertical-align: 1px; }
+#setup h3 { display: flex; justify-content: space-between; align-items: center; }
+#setup .rules { font-size: 13px; white-space: pre-wrap; margin: 0; color: var(--text); max-height: 12em; overflow: auto; }
+#setup ul { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+#setup li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+
+/* Dialogs: New agent (four steps), New project, Project rules. */
+dialog { border: 0; border-radius: 22px; background: var(--panel); color: var(--text); width: min(92vw, 480px); padding: 20px 22px; box-shadow: var(--shadow); }
+dialog::backdrop { background: rgba(11, 31, 85, 0.4); }
+dialog h2 { font-size: 18px; margin: 0 0 4px; color: var(--ink); }
+dialog p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
+dialog label { display: block; font-size: 13px; font-weight: 650; margin: 10px 0 4px; }
+dialog label.check { font-weight: 400; display: inline-flex; gap: 8px; align-items: center; margin: 0; }
+dialog select, dialog input[type=text], dialog textarea { width: 100%; }
+dialog textarea { min-height: 80px; resize: vertical; }
+dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
+dialog fieldset { border: 0; padding: 0; margin: 0; }
+.steps { display: flex; gap: 4px; list-style: none; padding: 0; margin: 10px 0 4px; counter-reset: step; }
+.steps li { flex: 1; font-size: 12px; color: var(--muted); text-align: center; padding: 6px 0; border-radius: 99px; background: var(--soft); counter-increment: step; }
+.steps li::before { content: counter(step) ". "; }
+.steps li.on { background: var(--accent); color: var(--on-accent); font-weight: 650; }
+.steps li.done { background: var(--tint); color: var(--ink); }
+.inline { display: flex; gap: 10px; align-items: center; }
+.swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; background: var(--sw, var(--off)); }
+#l-perms-note.warn { color: var(--err); }
+#launch-note, #rules-note, #project-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
+#rules-input { min-height: 180px; }
+
+/* A phone: the rail becomes a drawer, the panel a full-screen sheet, the tabs a project picker. */
+#scrim { display: none; }
+@media (max-width: 760px) {
+  body, body.panel-open { grid-template-areas: "top" "space"; grid-template-columns: minmax(0, 1fr); }
+  .phone-only { display: inline-flex !important; }
+  .wide-only { display: none !important; }
+  #topbar { align-items: center; padding: 6px 10px; }
+  #tabs, #tab-add { display: none; }
+  #projects { flex: 1; min-width: 0; }
+  #space { border-radius: 0; box-shadow: none; }
+  #space-head { padding: 8px 10px; gap: 8px; }
+  #space-avatar { display: none; }
+  #project { font-size: 15.5px; }
+  #space-meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #search { width: 96px; }
+  #rail { position: fixed; z-index: 40; inset: 0 auto 0 0; width: min(84vw, 300px); background: var(--bg);
+    transform: translateX(-102%); transition: transform 0.2s; box-shadow: var(--shadow); }
+  body.rail-open #rail { transform: none; }
+  body.rail-open #scrim { display: block; position: fixed; inset: 0; z-index: 30; background: rgba(11, 31, 85, 0.35); }
+  #panel { position: fixed; z-index: 50; inset: 0; background: var(--bg); }
+  .msg { max-width: 96%; }
+}
+@media (prefers-reduced-motion: reduce) { #rail { transition: none; } }
+</style>
+</head>
+<body>
+<header id="topbar">
+  <a class="brand wide-only" href="/" title="crewchat">__LOGO__</a>
+  <nav id="tabs" role="tablist" aria-label="Projects"></nav>
+  <details id="tab-add" class="menu">
+    <summary title="Switch to a project, or make one" aria-label="Switch to a project, or make one">+</summary>
+    <div class="menu-list" role="menu">
+      <div id="tab-menu"></div>
+      <hr>
+      <button type="button" id="new-project" role="menuitem">New project…</button>
+    </div>
+  </details>
+  <select id="projects" class="phone-only" aria-label="Project"></select>
+  <p id="switching" role="status" hidden></p>
+</header>
+<aside id="rail" aria-label="The crew">
+  <div class="rail-tools">
+    <button type="button" class="icon" id="view-tasks" aria-pressed="false" title="The task board">Tasks <span id="tasks-count"></span></button>
+    <button type="button" class="icon" id="view-commands" aria-pressed="false" title="Every crewchat command">Commands</button>
+  </div>
+  <section id="needs-you" hidden aria-label="Needs you">
+    <h2 class="rail-head">Needs you</h2>
+    <div id="needs-list"></div>
+  </section>
+  <h2 class="rail-head">Agents</h2>
+  <div id="agents"></div>
+  <button type="button" id="add-agent" class="add-agent">+ New agent</button>
+</aside>
+<div id="scrim"></div>
+<main id="space">
+  <header id="space-head">
+    <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board">☰</button>
+    <span id="space-avatar" class="pav" aria-hidden="true">c</span>
+    <div class="titles"><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
+    <input id="search" type="search" placeholder="Search" aria-label="Search this chat" autocomplete="off">
+    <details id="space-menu" class="menu">
+      <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
+      <div class="menu-list" role="menu">
+        <button type="button" role="menuitem" data-panel="project">Rules, skills and machines</button>
+        <button type="button" role="menuitem" data-panel="roles">Roles</button>
+        <hr>
+        <a role="menuitem" id="classic-link" href="/classic">The classic page</a>
+      </div>
+    </details>
+  </header>
+  <div id="update" role="status"><span>A newer crewchat, <b id="update-version"></b>, is available. Run
+    <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
+    <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
+  <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
+  <section id="tasks" hidden aria-label="Tasks">
+    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2></div>
+    <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
+      what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
+      the lead hands tasks out.</p>
+    <form id="task-form" class="task-form">
+      <input type="text" id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
+      <input type="text" id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
+      <input type="text" id="t-areas" placeholder="files (app/login/)" aria-label="Files">
+      <input type="text" id="t-where" placeholder="machine" aria-label="Machine">
+      <button id="t-add">Add</button>
+    </form>
+    <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
+  </section>
+  <section id="commands" hidden aria-label="Commands">
+    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Commands</h2></div>
+    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
+      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
+      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
+      than the one of the folder you are in.</p>
+    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
+    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
+  </section>
+  <form id="form">
+    <div id="pending" aria-label="Files to send"></div>
+    <div class="pillbox">
+      <details id="plus" class="menu up">
+        <summary title="Attach a file, post as a task, new agent" aria-label="More">+</summary>
+        <div class="menu-list" role="menu">
+          <button type="button" id="attach" role="menuitem">Attach a file</button>
+          <button type="button" id="as-task" role="menuitemcheckbox" aria-checked="false">Post as task</button>
+          <button type="button" id="plus-agent" role="menuitem">New agent</button>
+        </div>
+      </details>
+      <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
+      <input type="file" id="files" multiple hidden>
+      <textarea id="text" rows="1" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
+      <button id="send" disabled>Send</button>
+    </div>
+    <div id="error" role="alert"></div>
+  </form>
+</main>
+<aside id="panel" hidden aria-labelledby="panel-title">
+  <header class="panel-head">
+    <h2 id="panel-title"></h2>
+    <button type="button" class="icon" id="panel-close" aria-label="Close the panel" title="Close (Esc)">✕</button>
+  </header>
+  <div id="panel-body"></div>
+  <div id="pane-project" hidden>
+    <section class="card"><h3>Machines</h3><p id="link" class="linkline"></p></section>
+    <section class="card" id="setup" aria-label="What this project's agents learn">
+      <h3>Project rules <button type="button" class="link" id="rules-edit">Edit</button></h3>
+      <p id="rules-text" class="rules"></p>
+      <h3 style="margin-top:12px">Shared skills <button type="button" class="link" id="skill-add">Add</button></h3>
+      <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
+      <ul id="skills-list"></ul>
+    </section>
+    <section class="card"><h3>How it works</h3>
+      <p class="meta"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent is the lead, it takes your tasks and hands out the work instead.</p>
+      <p class="meta">Agents appear by themselves when a session starts in a connected folder, and drop off after a day of silence. One <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types.</p>
+    </section>
+  </div>
+</aside>
+<dialog id="launch" aria-labelledby="launch-title">
+  <form id="launch-form" method="dialog">
+    <h2 id="launch-title">New agent</h2>
+    <p>Opens a new agent session in a terminal window on the machine that hosts this page. It joins the chat as you set it up here.</p>
+    <ol class="steps" id="l-steps"><li>Identity</li><li>Workspace</li><li>Engine</li><li>Briefing</li></ol>
+    <div id="launch-fields">
+      <fieldset class="step">
+        <label for="l-template">From a template</label><select id="l-template"></select>
+        <label for="l-name">Name (optional)</label><input type="text" id="l-name" maxlength="32" placeholder="for example docs-writer" autocomplete="off">
+        <label for="l-role">Role</label><select id="l-role"></select>
+        <label for="l-picture">Picture</label><select id="l-picture"></select>
+        <label for="l-colour">Colour</label>
+        <div class="inline"><input type="color" id="l-colour" value="#2f5fd6"><label class="check"><input type="checkbox" id="l-colour-tool" checked> The tool's own colour</label></div>
+      </fieldset>
+      <fieldset class="step" hidden>
+        <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
+        <label>Machine</label><p id="l-machine"></p>
+      </fieldset>
+      <fieldset class="step" hidden>
+        <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
+        <label for="l-model">Model</label><select id="l-model"></select>
+        <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
+        <p class="meta" id="l-perms-note"></p>
+      </fieldset>
+      <fieldset class="step" hidden>
+        <label for="l-task">First task (optional)</label><textarea id="l-task" maxlength="4000" placeholder="for example: Write a user guide for the settings screen"></textarea>
+        <label for="l-instructions">Extra instructions (optional)</label><textarea id="l-instructions" maxlength="4000" placeholder="for example: Ask before changing anything under api/"></textarea>
+      </fieldset>
+    </div>
+    <div id="launch-note" role="status"></div>
+    <div class="buttons">
+      <button type="button" class="secondary" id="l-cancel">Cancel</button>
+      <button type="button" class="secondary" id="l-back">Back</button>
+      <button type="button" id="l-next">Next</button>
+      <button type="submit" id="l-start">Start</button>
+    </div>
+  </form>
+</dialog>
+<dialog id="project-dialog" aria-labelledby="project-title">
+  <form id="project-form" method="dialog">
+    <h2 id="project-title">New project</h2>
+    <p>Its own chat, roles and task board. Connect a folder to it later with <code>crewchat start --chat NAME</code> in that folder.</p>
+    <label for="p-name">Name</label><input type="text" id="p-name" maxlength="60" autocomplete="off" required>
+    <label for="p-pack">Its crew</label><select id="p-pack"></select>
+    <div id="project-note" role="status"></div>
+    <div class="buttons"><button type="button" class="secondary" id="p-cancel">Cancel</button><button type="submit" id="p-create">Create</button></div>
+  </form>
+</dialog>
+<dialog id="rules-dialog" aria-labelledby="rules-title">
+  <form id="rules-form" method="dialog">
+    <h2 id="rules-title">Project rules</h2>
+    <p>What every agent in this project should follow: who does what, how to test, what never to do. They get them as a message now, and new sessions read them from the project's guide.</p>
+    <textarea id="rules-input" maxlength="16000" placeholder="For example: The Mac agent does Apple work, the laptop agent Windows. Run the tests before reporting done. Never push to main."></textarea>
+    <div id="rules-note" role="status"></div>
+    <div class="buttons"><button type="button" class="secondary" id="rules-cancel">Cancel</button><button type="submit" id="rules-save">Save</button></div>
+  </form>
+</dialog>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const el = (tag, cls, text) => {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text !== undefined) n.textContent = text;
+  return n;
+};
+const state = { after: -1, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
+                images: [], maxUpload: 20 * 1024 * 1024, pending: [], sheet: [], device: "", crew: "software",
+                agents: [], names: "", title: "crewchat", panel: null, asTask: false, roleInfo: null,
+                now: Date.now() / 1000, lastDay: "" };
+
+// The words the page uses: a software crew works in folders and commits, any other crew in plain words.
+const WORDS = {
+  software: { folder: "Project folder", none: "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use New agent below." },
+  general: { folder: "Folder", none: "No agents yet. Use New agent below, or run crewchat start in a folder and open an agent there." },
+};
+const word = (key) => (WORDS[state.crew] || WORDS.software)[key];
+
+// Colour by position in the roster; agents that have left the chat stay neutral.
+function colour(name) {
+  const i = state.agents.findIndex((a) => a.agent === name);
+  return i < 0 ? "" : "c" + (i % 8);
+}
+
+function ago(seen, now) {
+  if (!seen) return "never";
+  const s = Math.max(0, now - seen);
+  if (s < 90) return "now";
+  if (s < 3600) return Math.round(s / 60) + " min ago";
+  if (s < 86400) return Math.round(s / 3600) + " h ago";
+  return Math.round(s / 86400) + " d ago";
+}
+
+// The project this page shows (?chat=, or the first one): every request names it.
+const CHAT = new URLSearchParams(location.search).get("chat") || "";
+function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "chat=" + encodeURIComponent(CHAT) : path; }
+$("classic-link").href = "/classic" + (CHAT ? "?chat=" + encodeURIComponent(CHAT) : "");
+
+// Projects: a tab each (a picker on a phone). Switching loads the page for the other project: say so at
+// once, so the old chat is not taken for the new one.
+function switchTo(id, name) {
+  const note = $("switching");
+  note.replaceChildren(el("span", "spinner"), "Opening " + name + "…");
+  note.hidden = false;
+  $("projects").disabled = true;
+  document.body.classList.add("switching");
+  location.href = "/?chat=" + encodeURIComponent(id);
+}
+$("projects").addEventListener("change", (e) => {
+  const p = (state.projects || []).find((x) => x.id === e.target.value);
+  switchTo(e.target.value, p ? p.name : e.target.value);
+});
+// Back to this page from the browser's history: it comes back as it was left, mid-switch.
+window.addEventListener("pageshow", (e) => {
+  if (!e.persisted) return;
+  document.body.classList.remove("switching");
+  $("switching").hidden = true;
+  $("projects").disabled = false;
+});
+function seen(id, last) {
+  try {
+    if (last === undefined) return Number(localStorage.getItem("crewchat-seen-" + id) || 0);
+    localStorage.setItem("crewchat-seen-" + id, String(last));
+  } catch (e) {}
+  return 0;
+}
+const letter = (name) => (String(name || "?").trim()[0] || "?").toUpperCase();
+function renderProjects(list, current) {
+  list = list && list.length ? list : [{ id: current, name: state.project || "crewchat", last: 0 }];
+  state.projects = list;
+  const mine = list.find((p) => p.id === current);
+  if (mine) seen(mine.id, mine.last);
+  const key = JSON.stringify(list.map((p) => [p.id, p.name, p.linked, p.id !== current && p.last > seen(p.id)])) + current;
+  if (key === state.projectsKey) return;
+  state.projectsKey = key;
+  const tab = (p) => {
+    const a = el("a", "tab");
+    a.href = "/?chat=" + encodeURIComponent(p.id);
+    a.setAttribute("role", "tab");
+    a.setAttribute("aria-selected", String(p.id === current));
+    a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
+    a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
+    if (p.id !== current && p.last > seen(p.id)) {
+      const dot = el("span", "unread");
+      dot.setAttribute("aria-label", "new messages");
+      a.append(dot);
+    }
+    a.addEventListener("click", (e) => {
+      e.preventDefault();
+      if (p.id !== current) switchTo(p.id, p.name);
+    });
+    return a;
+  };
+  $("tabs").replaceChildren(...list.map(tab));
+  $("tab-menu").replaceChildren(...list.filter((p) => p.id !== current).map((p) => {
+    const b = el("button", "", p.name);
+    b.type = "button"; b.setAttribute("role", "menuitem");
+    b.addEventListener("click", () => switchTo(p.id, p.name));
+    return b;
+  }));
+  const menu = $("projects");
+  if (menu !== document.activeElement) {
+    menu.replaceChildren(...list.map((p) => {
+      const fresh = p.id !== current && p.last > seen(p.id);
+      const option = new Option(p.name + (p.linked ? " (shared)" : "") + (fresh ? "  • new" : ""), p.id);
+      option.selected = p.id === current;
+      return option;
+    }));
+  }
+}
+
+// New project: a name, and the pack its roles start from.
+$("new-project").addEventListener("click", async () => {
+  $("tab-add").open = false;
+  $("p-name").value = ""; $("project-note").textContent = ""; $("p-create").disabled = false;
+  $("project-dialog").showModal();
+  try {
+    const info = await loadRoles();
+    $("p-pack").replaceChildren(...info.packs.map((p) => new Option(p.label + (p.roles.length ? ": " + p.roles.length + " roles" : ""), p.id)));
+  } catch (e) {
+    $("p-pack").replaceChildren(new Option("Software team", "software"));
+  }
+});
+$("p-cancel").addEventListener("click", () => $("project-dialog").close());
+$("project-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("p-create").disabled = true;
+  $("project-note").textContent = "Creating…";
+  try {
+    const made = await postJSON("/api/projects", { op: "create", name: $("p-name").value, pack: $("p-pack").value });
+    switchTo(made.id, made.name);
+  } catch (e) {
+    $("project-note").textContent = e.message;
+    $("p-create").disabled = false;
+  }
+});
+
+async function postJSON(path, body) {
+  const res = await fetch(api(path), { method: "POST", headers: { "Content-Type": "application/json" },
+                                  body: JSON.stringify(body) });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+  return res.json();
+}
+
+// The space shows the chat, the task board or the commands; the rail's buttons and the back arrows switch.
+function showView(view) {
+  $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
+  $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
+  for (const name of ["tasks", "commands"]) {
+    $("view-" + name).classList.toggle("on", view === name);
+    $("view-" + name).setAttribute("aria-pressed", String(view === name));
+  }
+  if (view === "commands") loadCommands();
+  document.body.classList.remove("rail-open");
+  try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
+}
+$("view-tasks").addEventListener("click", () => showView($("tasks").hidden ? "tasks" : "chat"));
+$("view-commands").addEventListener("click", () => showView($("commands").hidden ? "commands" : "chat"));
+for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
+
+// A phone: the rail is a drawer.
+$("rail-open").addEventListener("click", () => document.body.classList.add("rail-open"));
+$("scrim").addEventListener("click", () => document.body.classList.remove("rail-open"));
+
+// Menus (details elements) close when something else is clicked, or on Escape.
+document.addEventListener("click", (e) => {
+  for (const m of document.querySelectorAll("details.menu[open]")) if (!m.contains(e.target)) m.open = false;
+});
+for (const b of document.querySelectorAll("#space-menu [data-panel]"))
+  b.addEventListener("click", () => { $("space-menu").open = false; openPanel(b.dataset.panel); });
+
+// How this machine reaches your others: over Tailscale, with cloud sync (Firestore), or not at all.
+function renderLink(link) {
+  const line = $("link");
+  const parts = [];
+  const dot = (on, label, title) => {
+    const m = el("span", "m");
+    if (title) m.title = title;
+    m.append(el("span", "dot" + (on ? " on" : "")), label);
+    return m;
+  };
+  link = link || { via: "none" };
+  if (link.via === "tailscale") {
+    parts.push(el("b", "", "Linked over Tailscale"));
+    for (const m of link.machines || [])
+      parts.push(dot(m.online, m.name, m.online ? "Reachable now" : "Not reachable just now"));
+    if (!(link.machines || []).length) parts.push("no other machines yet");
+  } else if (link.via === "cloud") {
+    parts.push(el("b", "", "Linked with cloud sync (Firestore)"));
+    parts.push(dot(link.online, link.online ? "online" : "offline"));
+    if (!link.approved) parts.push("waiting for approval on another machine");
+  } else if (link.via === "linked") {
+    parts.push(el("b", "", "Linked with your other machines"));
+  } else {
+    parts.push("This machine only. crewchat connect links another, over Tailscale or with cloud sync.");
+  }
+  if (link.via !== "none" && link.shared === false) parts.push("(this project stays on this machine)");
+  line.replaceChildren();
+  parts.forEach((part, i) => { if (i) line.append(" "); line.append(part); });
+}
+
+// The Commands view: every command for help; the safe ones run here (POST /api/run).
+let commandsLoad = null;  // the one request for the list; null again after a failure, to retry
+function loadCommands() {
+  if (!commandsLoad) commandsLoad = (async () => {
+    try {
+      const res = await fetch(api("/api/commands"), { cache: "no-store" });
+      if (res.status === 401) { location.href = "/login"; return; }
+      if (!res.ok) throw new Error("the host answered " + res.status);
+      renderCommands((await res.json()).groups || []);
+    } catch (e) {
+      commandsLoad = null;
+      $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
+    }
+  })();
+  return commandsLoad;
+}
+const noCommand = el("p", "tasks-help", "No command matches.");
+function renderCommands(groups) {
+  const list = $("cmd-list");
+  list.replaceChildren();
+  for (const group of groups) {
+    const box = el("div", "cmd-group");
+    box.append(el("h3", "", group.group), ...group.commands.map(commandRow));
+    list.append(box);
+  }
+  list.append(noCommand);
+  filterCommands();
+}
+// The search box hides what does not match; rows keep what was typed in them and any output.
+function filterCommands() {
+  const want = $("cmd-filter").value.trim().toLowerCase(), list = $("cmd-list");
+  for (const row of list.querySelectorAll(".cmd")) row.hidden = !!want && !row.dataset.find.includes(want);
+  for (const box of list.querySelectorAll(".cmd-group")) box.hidden = !box.querySelector(".cmd:not([hidden])");
+  noCommand.hidden = !!list.querySelector(".cmd:not([hidden])");
+}
+function commandRow(c) {
+  const row = el("div", "cmd"), top = el("div", "top"), out = el("pre");
+  row.dataset.find = (c.usage + " " + c.text).toLowerCase();
+  out.hidden = true;
+  top.append(el("code", "u", "crewchat " + c.usage));
+  const inputs = {};
+  for (const name of c.needs || []) {
+    const input = el("input");
+    input.placeholder = name.toLowerCase();
+    input.setAttribute("aria-label", name.toLowerCase() + " for crewchat " + c.usage);
+    inputs[name] = input;
+    top.append(input);
+  }
+  const values = () => Object.fromEntries(Object.entries(inputs).map(([name, input]) => [name, input.value.trim()]));
+  // The command as typed in a terminal, with the values filled in where they were given.
+  const filled = () => { const v = values(); return "crewchat " + c.usage.replace(/\b[A-Z]+\b/g, (n) => v[n] || n); };
+  const copy = el("button", "", "Copy");
+  copy.type = "button";
+  copy.addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText(filled()); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
+    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+  });
+  top.append(copy);
+  if (c.run) {
+    const run = el("button", "run", "Run");
+    run.type = "button";
+    run.addEventListener("click", async () => {
+      if (c.ask && !confirm("Run " + filled() + " on the host?")) return;
+      run.disabled = true; run.textContent = "Running…";
+      out.hidden = false; out.className = ""; out.textContent = "";
+      try {
+        const res = await postJSON("/api/run", { usage: c.usage, values: values() });
+        out.textContent = res.output;
+        if (res.code !== 0) out.className = "bad";
+      } catch (e) {
+        out.textContent = e.message; out.className = "bad";
+      } finally {
+        run.disabled = false; run.textContent = "Run";
+      }
+    });
+    top.append(run);
+  }
+  row.append(top, el("p", "", c.text), out);
+  return row;
+}
+$("cmd-filter").addEventListener("input", filterCommands);
+
+// The task sheet: every task of the project, in order, with who holds it. A task opens in the panel.
+async function taskOp(body) {
+  try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
+}
+// The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
+function taskActions(r, parent) {
+  if (r.status === "todo" || r.status === "waiting") {
+    const pick = el("select");
+    pick.setAttribute("aria-label", "Give task " + r.id + " to");
+    pick.append(new Option("Give to…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+    pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
+    parent.append(pick);
+  }
+  const button = (label, title, body, cls) => { const b = actButton(parent, label, title, () => taskOp(body)); if (cls) b.classList.add(cls); };
+  button("↑", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
+  button("↓", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
+  if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
+  if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
+    button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
+  button("×", "Take task " + r.id + " off the sheet", { op: "remove", task: r.id }, "danger");
+}
+function taskMeta(r) {
+  const meta = [];
+  if (r.depends.length) meta.push("waits for " + r.depends.map((d) => "#" + d).join(", "));
+  if (r.areas.length) meta.push("files " + r.areas.join(", "));
+  if (r.where) meta.push("on " + r.where);
+  if (r.to !== "all") meta.push("for " + r.to);
+  if (r.reclaimed) meta.push("reclaimed from " + r.reclaimed);
+  meta.push("from " + (r.from === "Owner" ? "you" : r.from));
+  return meta.join(" · ");
+}
+function renderSheet(rows) {
+  const open = rows.filter((r) => r.status !== "done").length;
+  $("tasks-count").textContent = open ? "(" + open + ")" : "";
+  const body = $("sheet").tBodies[0];
+  if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
+  if (!rows.length) {
+    const row = body.insertRow(); body.replaceChildren(row);
+    const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
+    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
+    return;
+  }
+  body.replaceChildren(...rows.map((r) => {
+    const tr = el("tr", r.status);
+    tr.append(el("td", "meta", "#" + r.id));
+    const what = el("td");
+    const title = el("button", "open-task", r.title);
+    title.type = "button";
+    title.addEventListener("click", () => openPanel("task", r.id));
+    what.append(title, el("div", "meta", taskMeta(r)));
+    tr.append(what);
+    const st = el("td"); st.append(el("span", "st " + r.status, r.status)); tr.append(st);
+    tr.append(el("td", "meta", r.holder || ""));
+    const acts = el("td"); const box = el("div", "acts"); taskActions(r, box); acts.append(box);
+    tr.append(acts);
+    return tr;
+  }));
+}
+$("task-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const title = $("t-title").value.trim();
+  if (!title) return;
+  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
+  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+});
+try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
+
+// The project's rules and shared skills: what its agents learn by themselves.
+function renderSetup(rules, skills) {
+  const text = $("rules-text");
+  text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
+  state.rules = rules || "";
+  const list = $("skills-list");
+  list.replaceChildren(...(skills || []).map((name) => {
+    const item = el("li");
+    const remove = el("button", "link", "Remove");
+    remove.type = "button";
+    remove.setAttribute("aria-label", "Remove the skill " + name);
+    remove.addEventListener("click", async () => {
+      if (!confirm("Remove the skill " + name + " from every folder of this project?")) return;
+      try { await postJSON("/api/skills", { op: "remove", name }); } catch (e) { alert(e.message); }
+    });
+    item.append(el("span", "", name), remove);
+    return item;
+  }));
+  if (!(skills || []).length) list.append(el("li", "", "None yet: Add shares a SKILL.md with every agent."));
+}
+$("rules-edit").addEventListener("click", () => {
+  $("rules-input").value = state.rules || "";
+  $("rules-note").textContent = "";
+  $("rules-dialog").showModal();
+});
+$("rules-cancel").addEventListener("click", () => $("rules-dialog").close());
+$("rules-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("rules-note").textContent = "Saving…";
+  try {
+    await postJSON("/api/rules", { rules: $("rules-input").value });
+    $("rules-dialog").close();
+  } catch (e) {
+    $("rules-note").textContent = e.message;
+  }
+});
+$("skill-add").addEventListener("click", () => $("skill-file").click());
+$("skill-file").addEventListener("change", async () => {
+  const file = $("skill-file").files[0];
+  $("skill-file").value = "";
+  if (!file) return;
+  const suggested = file.name.toLowerCase().replace(/\.md$/, "").replace(/^skill$/, "").replace(/[^a-z0-9-]+/g, "-");
+  const name = prompt("A name for the skill (lowercase letters, digits and -):", suggested);
+  if (!name) return;
+  try {
+    await postJSON("/api/skills", { op: "add", name, files: { "SKILL.md": await file.text() } });
+  } catch (e) { alert(e.message); }
+});
+
+// What New agent offers on this machine (tools, folders, permissions, models): the dialog and the
+// panel's Switch model read it.
+async function launchOptions() {
+  const res = await fetch(api("/api/launch"), { cache: "no-store" });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  const opts = await res.json();
+  toolModels = {};
+  for (const t of opts.tools || []) toolModels[t.id] = t.models || [];
+  return opts;
+}
+
+// New agent, in four steps: identity, workspace, engine, briefing. "From a template" starts from a role
+// (its picture, colour and tool) and goes straight to the workspace.
+let launchTools = [], launchStep = 0;
+function showStep(n) {
+  launchStep = n;
+  document.querySelectorAll("#launch .step").forEach((f, i) => { f.hidden = i !== n; });
+  document.querySelectorAll("#l-steps li").forEach((li, i) => {
+    li.className = i === n ? "on" : i < n ? "done" : "";
+    if (i === n) li.setAttribute("aria-current", "step"); else li.removeAttribute("aria-current");
+  });
+  $("l-back").hidden = n === 0;
+  $("l-next").hidden = n === 3;
+  $("l-start").hidden = n !== 3;
+  const first = document.querySelectorAll("#launch .step")[n].querySelector("select, input, textarea");
+  if (first && $("launch").open) first.focus();
+}
+function roleRow(name) { return state.roles.find((r) => r.name === name); }
+// A role pre-fills the picture, the colour and the tool.
+function applyRole(name) {
+  const r = roleRow(name);
+  if (!r) return;
+  $("l-picture").value = r.picture && [...$("l-picture").options].some((o) => o.value === r.picture) ? r.picture : "";
+  $("l-colour-tool").checked = !r.colour;
+  if (r.colour) $("l-colour").value = r.colour;
+  if (r.tool && launchTools.some((t) => t.id === r.tool && !t.missing)) $("l-tool").value = r.tool;
+  showTool();
+}
+async function openLaunch(role) {
+  const dialog = $("launch"), note = $("launch-note");
+  $("plus").open = false;
+  document.body.classList.remove("rail-open");
+  note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
+  for (const id of ["l-name", "l-task", "l-instructions"]) $(id).value = "";
+  $("l-folder-label").textContent = word("folder");
+  $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
+  const roles = state.roles.map((r) => new Option(r.title, r.name));
+  $("l-role").replaceChildren(new Option("No role", ""), ...roles.map((o) => new Option(o.text, o.value)));
+  $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option("A " + o.text.toLowerCase() + " (" + o.text + " role)", o.value)));
+  $("l-picture").replaceChildren(new Option("Initials", ""), ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id)));
+  $("l-colour-tool").checked = true;
+  showStep(0);
+  dialog.showModal();
+  try {
+    const opts = await launchOptions();
+    launchTools = opts.tools;
+    $("l-tool").replaceChildren(...opts.tools.map((t) => {
+      const option = new Option(t.missing ? t.label + " (not installed)" : t.label, t.id);
+      option.disabled = !!t.missing;
+      option.title = t.missing || "";
+      return option;
+    }));
+    const firstReady = opts.tools.find((t) => !t.missing);
+    if (firstReady) $("l-tool").value = firstReady.id;
+    showTool();
+    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
+    const ready = opts.tools.filter((t) => !t.missing);
+    $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
+    if (role) { $("l-template").value = role; $("l-role").value = role; applyRole(role); showStep(1); }
+    if (!ready.length || !opts.folders.length) {
+      note.textContent = !ready.length
+        ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
+        : "No folder on this machine is connected to this project yet. Run `crewchat start --chat " + (CHAT || "PROJECT") + "` in one first.";
+      $("l-start").disabled = true;
+    } else if (missing) {
+      note.textContent = missing;
+    }
+  } catch (err) {
+    note.textContent = "Could not load the options: " + err.message;
+  }
+}
+// The chosen tool: its colour, its models, and what it may do without asking.
+function showTool() {
+  const tool = launchTools.find((t) => t.id === $("l-tool").value);
+  const info = own(state.tools, $("l-tool").value);
+  $("l-tool-swatch").style.setProperty("--sw", info ? info.colour : "");
+  const models = (tool && tool.models) || [];
+  $("l-model").replaceChildren(new Option("Its default", ""), ...models.map(([id, label]) => new Option(label, id)));
+  $("l-model").disabled = !models.length;
+  if (!$("l-colour-tool").checked) return showPermissions();
+  if (info) $("l-colour").value = info.colour;
+  showPermissions();
+}
+function showPermissions(event) {
+  const pick = $("l-perms"), keep = pick.value;
+  if (!event || event.target !== pick) {  // a tool was picked: its own choices
+    const tool = launchTools.find((t) => t.id === $("l-tool").value);
+    const options = (tool && tool.permissions) || [];
+    pick.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
+    pick.value = options.some(([value]) => value === keep) ? keep : "ask";
+  }
+  $("l-perms-note").textContent = pick.value === "all"
+    ? "Careful: it will run commands and change files with nobody watching. Use it in a folder you can restore (git), on a machine without secrets it could leak."
+    : "When it needs something else, it asks in its terminal window.";
+  $("l-perms-note").className = pick.value === "all" ? "meta warn" : "meta";
+}
+async function startAgent(event) {
+  event.preventDefault();
+  if (launchStep < 3) { showStep(launchStep + 1); return; }  // Enter in a field: on to the next step
+  const note = $("launch-note");
+  $("l-start").disabled = true;
+  note.textContent = "Starting…";
+  try {
+    await postJSON("/api/launch", {
+      tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(), role: $("l-role").value,
+      task: $("l-task").value.trim(), permissions: $("l-perms").value, model: $("l-model").value,
+      picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
+      instructions: $("l-instructions").value.trim() });
+    note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
+    setTimeout(() => $("launch").close(), 4000);
+  } catch (err) {
+    note.textContent = "Not started: " + err.message;
+    $("l-start").disabled = false;
+  }
+}
+$("add-agent").addEventListener("click", () => openLaunch());
+$("plus-agent").addEventListener("click", () => openLaunch());
+$("launch-form").addEventListener("submit", startAgent);
+$("l-cancel").addEventListener("click", () => $("launch").close());
+$("l-back").addEventListener("click", () => showStep(Math.max(0, launchStep - 1)));
+$("l-next").addEventListener("click", () => showStep(Math.min(3, launchStep + 1)));
+$("l-template").addEventListener("change", () => {
+  const role = $("l-template").value;
+  if (!role) return;
+  $("l-role").value = role; applyRole(role); showStep(1);
+});
+$("l-role").addEventListener("change", () => applyRole($("l-role").value));
+$("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
+$("l-colour-tool").addEventListener("change", showTool);
+$("l-tool").addEventListener("change", showTool);
+$("l-perms").addEventListener("change", showPermissions);
+
+function roleTitle(name) {
+  const r = roleRow(name);
+  return r ? r.title : name;
+}
+
+// An owner action from a control: the control waits while it runs; a failure is shown.
+async function postAction(path, body, what, control) {
+  if (control) control.disabled = true;
+  try {
+    await postJSON(path, body);
+    $("error").textContent = "";
+    return true;
+  } catch (err) {
+    (state.panel ? panelNote : (m) => { $("error").textContent = m; })(what + ": " + err.message);
+    return false;
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+function panelNote(text) {
+  const note = $("panel-body").querySelector(".panel-note");
+  if (note) note.textContent = text; else $("error").textContent = text;
+}
+
+function actButton(parent, label, title, onClick) {
+  const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
+  b.addEventListener("click", () => onClick(b)); parent.append(b);
+  return b;
+}
+
+// Its session: Stop while it runs, Reopen (the same conversation) when it does not, Switch model.
+let toolModels = null;  // tool -> [[id, label], ...], from /api/launch, fetched once
+let modelsAsked = false;
+async function loadModels() {
+  if (modelsAsked) return;  // once per page, whatever the answer
+  modelsAsked = true;
+  try {
+    await launchOptions();
+    renderPanel(true);
+  } catch (err) {}
+}
+
+function sessionLine(a) {
+  const s = a.session;
+  if (!s) return "";
+  if (s.running) return s.app === "claude-app" ? "Running in the Claude app" : "Running in Terminal";
+  return "Session closed " + ago(s.since, state.now);
+}
+
+function sessionControls(a, acts, agentOp) {
+  const s = a.session;
+  if (!s || a.remote) return;
+  if (s.running) {
+    actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {
+      if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
+        agentOp({ op: "stop", agent: a.agent }, "Not stopped", b);
+    });
+  } else if (s.reopen) {
+    actButton(acts, "Reopen", "Reopen " + a.agent + "'s conversation", (b) => {
+      const where = s.app === "claude-app"
+        ? "It reopens in a Terminal window. If it is still open in the Claude app, close it there first."
+        : "It reopens in a Terminal window on this machine, with its memory and name.";
+      if (confirm("Reopen " + a.agent + "? " + where)) agentOp({ op: "reopen", agent: a.agent }, "Not reopened", b);
+    });
+  }
+  if (!s.reopen) return;  // switching a model reopens the session
+  loadModels();
+  const models = (toolModels || {})[s.tool] || [];
+  if (!models.length) return;
+  const pick = el("select");
+  pick.setAttribute("aria-label", "Switch " + a.agent + "'s model");
+  pick.append(new Option("Switch model…", ""), ...models.map(([id, label]) => new Option(label, id)));
+  pick.addEventListener("change", () => {
+    const model = pick.value;
+    pick.value = "";
+    if (model && confirm("Switch " + a.agent + " to " + model + "? Its session restarts on that model, same conversation."))
+      agentOp({ op: "model", agent: a.agent, model }, "Model not switched", pick);
+  });
+  acts.append(pick);
+}
+
+function setRole(agent, role, pick) {
+  return postAction("/api/role", { agent, role }, "Role not changed", pick);
+}
+
+// The task an agent is on: the newest one it holds that is not done.
+function heldTask(name) {
+  return state.sheet.filter((r) => r.holder === name && r.status !== "done").slice(-1)[0];
+}
+const DOING = { working: "Working", listening: "Waiting for messages", idle: "Idle" };
+
+// The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
+function renderAgents() {
+  const box = $("agents");
+  box.replaceChildren();
+  if (!state.agents.length) box.append(el("p", "none", word("none")));
+  for (const a of state.agents) {
+    const age = a.seen ? state.now - a.seen : Infinity;
+    const card = el("button", "agent" + (state.panel && state.panel.kind === "agent" && state.panel.id === a.agent ? " on" : ""));
+    card.type = "button";
+    card.dataset.agent = a.agent;
+    card.setAttribute("aria-label", a.agent + (a.role ? ", " + roleTitle(a.role) : "") + ": open");
+    const who = el("span", "who");
+    who.append(el("span", "name " + colour(a.agent), a.agent));
+    const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
+    const closed = a.session && !a.session.running;
+    dot.title = (closed ? "Session closed" : DOING[a.activity] || "Not heard from lately") + " · " + ago(a.seen, state.now);
+    const right = el("span", "inline");
+    if (a.unread) right.append(el("span", "count", String(a.unread)));
+    right.append(dot);
+    const task = heldTask(a.agent);
+    const holds = el("span", "holds");
+    if (a.role) holds.append(el("span", "badge " + a.role, roleTitle(a.role)), " ");
+    holds.append(task ? "#" + task.id + " " + task.title : a.status || dot.title.split(" · ")[0]);
+    card.append(avatar(a), who, right, holds);
+    card.addEventListener("click", () => openPanel("agent", a.agent));
+    box.append(card);
+  }
+  const names = state.agents.map((a) => a.agent).join("\n");
+  if (names !== state.names) {
+    state.names = names;
+    // Names colour by roster position, so repaint what is already on screen.
+    for (const n of $("log").querySelectorAll("[data-cls]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
+  }
+  const looks = state.agents.map((a) => [a.agent, a.client, a.picture, a.colour, a.os, a.device].join(" ")).join("\n");
+  if (looks !== state.looks) {  // a new picture or colour: repaint the ones on messages too
+    state.looks = looks;
+    for (const n of $("log").querySelectorAll(".avatar[data-who]")) n.replaceWith(avatar(agentRow(n.dataset.who)));
+  }
+}
+
+// An agent's picture: its uploaded image, a preset, or its initials, on its colour (the tool's own by
+// default), with its tool's lettermark, and its machine's OS when the chat spans several machines.
+const OS_BADGES = { mac: ["\u{1F34E}", "macOS"], windows: ["\u{1FA9F}", "Windows"], linux: ["\u{1F427}", "Linux"] };
+
+function agentRow(name) {
+  return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
+}
+
+function own(table, key) {
+  return table && Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
+// White or near-black ink on a colour, whichever reads better (WCAG's crossover luminance).
+function inkOn(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex)) return "#fff";
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.179 ? "#111" : "#fff";
+}
+
+function initials(name) {
+  const parts = name.split(/[-_.]+/).filter(Boolean);
+  return parts.slice(0, 2).map((p) => p[0]).join("").toUpperCase() || "?";
+}
+
+const missingPictures = new Set();  // pictures this page could not load: initials from then on
+function avatar(a, cls) {
+  const tool = own(state.tools, a.client) || own(state.tools, "agent") || { colour: "#6b7280", mark: "", label: "" };
+  const fill = a.colour || tool.colour;
+  const box = el("span", "avatar" + (cls ? " " + cls : ""));
+  box.dataset.who = a.agent;
+  box.style.setProperty("--av", fill);
+  box.style.setProperty("--av-ink", inkOn(fill));
+  const letters = () => el("span", "initials", initials(a.agent));
+  const [kind, id] = (a.picture || "").split(":");
+  if (kind === "file" && !missingPictures.has(id)) {
+    const img = el("img");
+    img.alt = ""; img.src = "/files/" + id;
+    img.addEventListener("error", () => { missingPictures.add(id); img.replaceWith(letters()); });
+    box.append(img);
+  } else if (kind === "preset" && own(state.presets, id)) {
+    box.append(el("span", "emoji", state.presets[id]));
+  } else {
+    box.append(letters());
+  }
+  if (tool.mark && a.client) {
+    const mark = el("span", "mark", tool.mark);
+    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
+    box.append(mark);
+  }
+  const os = OS_BADGES[a.os];
+  if (os && manyMachines()) {
+    const badge = el("span", "os", os[0]); badge.title = os[1];
+    box.append(badge);
+  }
+  box.title = a.agent + (tool.label ? " · " + tool.label : "");
+  return box;
+}
+function manyMachines() {
+  return new Set(state.agents.map((r) => r.device)).size > 1;
+}
+
+// The Picture menu: a preset, initials, an image of your own, and a colour.
+function pictureMenu(a, agentOp) {
+  const menu = el("details", "picmenu");
+  const summary = el("summary", "", "Change picture");
+  summary.className = "ghost"; summary.style.cssText = "border-radius:999px;padding:3px 10px;font-size:12.5px";
+  menu.append(summary);
+  const picks = el("div", "picks");
+  const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
+    .then(() => { menu.open = false; });
+  for (const [id, emoji] of Object.entries(state.presets || {}))
+    actButton(picks, emoji, "Picture: " + id, (b) => set({ picture: "preset:" + id }, b));
+  actButton(picks, "Initials", "Picture: initials", (b) => set({ picture: "" }, b));
+  const file = el("input");
+  file.type = "file"; file.accept = "image/png,image/jpeg,image/webp"; file.hidden = true;
+  file.addEventListener("change", async () => {
+    const f = file.files[0]; file.value = "";
+    if (!f) return;
+    // Checked here first, so a refused picture is never uploaded.
+    if (!["image/png", "image/jpeg", "image/webp"].includes(f.type)) return panelNote("Picture not changed: a picture is PNG, JPEG or WebP");
+    if (f.size > 512 * 1024) return panelNote("Picture not changed: a picture is 512 KB at most");
+    try { await set({ picture: "file:" + await uploadFile(f) }); }
+    catch (err) { panelNote("Picture not changed: " + err.message); }
+  });
+  actButton(picks, "Upload…", "Upload a picture (PNG, JPEG or WebP, 512 KB at most)", () => file.click());
+  const tint = el("input");
+  tint.type = "color"; tint.value = a.colour || (own(state.tools, a.client) || {}).colour || "#6b7280";
+  tint.setAttribute("aria-label", "Colour for " + a.agent);
+  tint.addEventListener("change", () => set({ colour: tint.value }, tint));
+  actButton(picks, "Tool colour", "Back to the tool's own colour", (b) => set({ colour: "" }, b));
+  picks.append(file, tint);
+  menu.append(picks);
+  return menu;
+}
+
+// The side panel: an agent, a task, a role, the roles, or the project. Esc or ✕ closes it; it is
+// drawn again as the chat changes, unless the owner is choosing or typing in it.
+function openPanel(kind, id) {
+  state.panel = { kind, id };
+  document.body.classList.remove("rail-open");
+  if (kind === "roles" || kind === "role") loadRoles().then(() => renderPanel(true)).catch(() => {});
+  renderPanel(true);
+  renderAgents();
+}
+function closePanel() {
+  state.panel = null;
+  $("panel").hidden = true;
+  document.body.classList.remove("panel-open");
+  renderAgents();
+}
+$("panel-close").addEventListener("click", closePanel);
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
+  const menu = document.querySelector("details.menu[open]");
+  if (menu) { menu.open = false; return; }
+  if (state.panel) closePanel();
+  else document.body.classList.remove("rail-open");
+});
+function panelBusy() {
+  const body = $("panel-body"), active = document.activeElement;
+  return body.querySelector(".picmenu[open], form.editing") ||
+    (body.contains(active) && ["SELECT", "INPUT", "TEXTAREA"].includes(active.tagName));
+}
+function renderPanel(force) {
+  const p = state.panel;
+  if (!p) return;
+  if (!force && panelBusy()) return;
+  $("panel").hidden = false;
+  document.body.classList.add("panel-open");
+  const body = $("panel-body");
+  $("pane-project").hidden = p.kind !== "project";
+  const draw = { agent: panelAgent, task: panelTask, roles: panelRoles, role: panelRole, project: () => [] }[p.kind];
+  const [title, ...cards] = p.kind === "project" ? ["Rules, skills and machines"] : draw(p.id);
+  $("panel-title").textContent = title;
+  body.replaceChildren(...cards, el("p", "panel-note meta"));
+}
+function card(heading, ...children) {
+  const box = el("section", "card");
+  if (heading) box.append(el("h3", "", heading));
+  box.append(...children);
+  return box;
+}
+function field(label, value) {
+  const row = el("div", "field");
+  row.append(el("span", "", label));
+  row.append(typeof value === "string" ? el("span", "", value) : value);
+  return row;
+}
+const PERMISSIONS = { ask: "Asks first", edits: "Edits files without asking", auto: "Judges what is safe",
+                      all: "Anything, without asking" };
+
+function panelAgent(name) {
+  const a = state.agents.find((x) => x.agent === name);
+  if (!a) return [name, card("", el("p", "meta", name + " is no longer in the chat."))];
+  const remote = a.remote ? "Runs on " + a.device + ": change it there" : "";
+  const agentOp = (body, what, control) => postAction("/api/agent", body, what, control);
+  const tool = own(state.tools, a.client) || {};
+  const head = el("div", "ident");
+  const names = el("div");
+  names.append(el("div", "nm", a.agent));
+  if (a.role) names.append(el("span", "badge " + a.role, roleTitle(a.role)));
+  names.append(el("div", "meta", [tool.label || a.client, a.place + (a.remote ? " on " + a.device : "")].join(" · ")));
+  head.append(avatar(a, "big"), names);
+
+  const now = [];
+  const closed = a.session && !a.session.running;
+  now.push(field("Status", a.status || "No status set"));
+  now.push(field("Doing", closed ? "Its session is closed" : (DOING[a.activity] || "Not heard from lately") + " · " + ago(a.seen, state.now)));
+  if (a.session) now.push(field("Session", sessionLine(a)));
+  const task = heldTask(a.agent);
+  if (task) {
+    const link = el("button", "link", "#" + task.id + " " + task.title);
+    link.type = "button"; link.addEventListener("click", () => openPanel("task", task.id));
+    now.push(field("Task", link));
+  }
+  const last = [...state.messages].reverse().find((m) => m.from === a.agent && m.text && m.kind !== "event");
+  if (last) now.push(field("Said", last.text.length > 160 ? last.text.slice(0, 160) + "…" : last.text));
+  if (a.unread) now.push(field("Unread", a.unread + " message" + (a.unread > 1 ? "s" : "")));
+
+  const pick = el("select");
+  pick.setAttribute("aria-label", "Role for " + a.agent);
+  pick.append(new Option("No role", "none"), ...state.roles.map((r) => new Option(r.title, r.name)));
+  pick.value = a.role || "none";
+  pick.addEventListener("change", () => setRole(a.agent, pick.value, pick));
+  const listen = el("select");
+  listen.setAttribute("aria-label", "Listening for " + a.agent);
+  listen.title = remote || "Wait for messages after each turn (On), check once (Off), or as its folder says";
+  listen.append(new Option("As its folder says", "default"), new Option("On", "on"), new Option("Off", "off"));
+  listen.value = a.listen || "default";
+  listen.disabled = !!remote;
+  listen.addEventListener("change", () => agentOp({ op: "listen", agent: a.agent, mode: listen.value },
+                                                   "Listening not changed", listen));
+  const settings = [field("Role", pick), field("Listening", listen)];
+  if (!a.remote) settings.push(field("Permissions", (PERMISSIONS[a.permissions] || "As it was started") + (a.session ? " (Reopen keeps them)" : "")));
+
+  const acts = el("div", "acts");
+  actButton(acts, "Message", "Write to " + a.agent, () => {
+    text.value = "@" + a.agent + " " + text.value.replace(/^@\S+\s*/, "");
+    fit(); text.focus();
+    if (matchMedia("(max-width: 760px)").matches) closePanel();
+  });
+  sessionControls(a, acts, agentOp);
+  const button = (label, title, run, cls) => {
+    const b = actButton(acts, label, title, run);
+    if (cls) b.classList.add(cls);
+    if (remote) { b.title = remote; b.disabled = true; }
+  };
+  button("Rename", "Rename " + a.agent, (b) => {
+    const name = prompt("New name for " + a.agent + " (letters, digits, - _ .):", a.agent);
+    if (name && name.trim() && name.trim() !== a.agent)
+      agentOp({ op: "rename", agent: a.agent, new: name.trim() }, "Not renamed", b).then((ok) => {
+        if (ok && state.panel) state.panel.id = name.trim();
+      });
+  });
+  if (!remote) acts.append(pictureMenu(a, agentOp));
+  button("Remove", "Remove " + a.agent + " from the chat", (b) => {
+    if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
+                "still open, it joins again the next time it uses crewchat."))
+      agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closePanel(); });
+  }, "danger");
+  const cards = [card("", head), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
+  if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
+  return [a.agent, ...cards];
+}
+
+function panelTask(id) {
+  const r = state.sheet.find((x) => x.id === id);
+  if (!r) return ["Task #" + id, card("", el("p", "meta", "Task #" + id + " is no longer on the sheet."))];
+  const what = [el("p", "", r.title), field("Status", el("span", "st " + r.status, r.status))];
+  if (r.holder) {
+    const who = el("button", "link", r.holder);
+    who.type = "button"; who.addEventListener("click", () => openPanel("agent", r.holder));
+    what.push(field("Holder", who));
+  }
+  if (r.depends.length) what.push(field("Waits for", r.depends.map((d) => "#" + d).join(", ")));
+  if (r.areas.length) what.push(field("Files", r.areas.join(", ")));
+  if (r.where) what.push(field("Machine", r.where));
+  what.push(field("From", r.from === "Owner" ? "you" : r.from));
+  if (r.reclaimed) what.push(field("Reclaimed", "from " + r.reclaimed));
+  const history = state.messages.filter((m) => m.task === r.id || m.id === r.id).slice(-12).map((m) => {
+    const line = el("p", "meta");
+    const when = new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    line.textContent = when + " · " + (m.from === "Owner" ? "You" : m.from) + ": " +
+      (m.kind === "update" ? (state.statuses[m.status] || m.status) + (m.text ? " — " + m.text : "") : m.text).slice(0, 200);
+    return line;
+  });
+  const acts = el("div", "acts");
+  taskActions(r, acts);
+  return ["Task #" + r.id, card("", ...what), card("Actions", acts),
+          card("History", ...(history.length ? history : [el("p", "meta", "Nothing yet.")]))];
+}
+
+// Roles: what the page knows of them (/api/roles), loaded when a role panel opens and after a change.
+async function loadRoles() {
+  state.roleInfo = await postJSON("/api/roles", { op: "list" });
+  return state.roleInfo;
+}
+async function rolesOp(body, what, control) {
+  if (control) control.disabled = true;
+  try {
+    const out = await postJSON("/api/roles", body);
+    await loadRoles();
+    return out;
+  } catch (err) {
+    panelNote(what + ": " + err.message);
+    return null;
+  } finally {
+    if (control) control.disabled = false;
+  }
+}
+function roleAvatar(r) {
+  return avatar({ agent: r.label || r.name, client: r.tool || "", picture: r.picture, colour: r.colour || (own(state.tools, r.tool) || {}).colour || "#2f5fd6" });
+}
+function panelRoles() {
+  const info = state.roleInfo;
+  if (!info) return ["Roles", card("", el("p", "meta", "Loading…"))];
+  const pack = info.packs.find((p) => p.id === info.pack);
+  const list = el("ul", "rolelist");
+  for (const r of info.roles) {
+    const item = el("li"), b = el("button");
+    b.type = "button";
+    const n = state.agents.filter((a) => a.role === r.name).length;
+    const words = el("span");
+    words.append(el("div", "", r.label), el("div", "meta", r.name + (n ? " · " + n + " agent" + (n > 1 ? "s" : "") : "") + (r.source === "yours" ? " · yours" : "")));
+    b.append(roleAvatar(r), words);
+    b.addEventListener("click", () => openPanel("role", r.name));
+    item.append(b); list.append(item);
+  }
+  if (!info.roles.length) list.append(el("li", "meta", "No roles. New role adds one."));
+  const acts = el("div", "acts");
+  actButton(acts, "New role", "Make a new role", () => { state.panel = { kind: "role", id: "", editing: true }; renderPanel(true); });
+  const file = el("input"); file.type = "file"; file.accept = ".json,application/json"; file.hidden = true;
+  file.addEventListener("change", async () => {
+    const f = file.files[0]; file.value = "";
+    if (!f) return;
+    let roles;
+    try { roles = JSON.parse(await f.text()); } catch (e) { return panelNote("Not imported: " + f.name + " is not JSON"); }
+    const out = await rolesOp({ op: "import", roles }, "Not imported");
+    if (out) { renderPanel(true); panelNote("Imported: " + out.imported.join(", ")); }
+  });
+  actButton(acts, "Import…", "Import roles from a file exported by crewchat", () => file.click());
+  actButton(acts, "Export", "Save every role as a file", async () => download("roles.json", await postJSON("/api/roles", { op: "export" })));
+  acts.append(file);
+  const packPick = el("select");
+  packPick.setAttribute("aria-label", "Start over from a pack");
+  packPick.append(new Option("Start over from a pack…", ""), ...info.packs.map((p) => new Option(p.label, p.id)));
+  packPick.addEventListener("change", async () => {
+    const pid = packPick.value; packPick.value = "";
+    const chosen = info.packs.find((p) => p.id === pid);
+    if (chosen && confirm("Start this project's roles over from " + chosen.label + "? Roles you added or changed here go, " +
+                          "and agents whose role it doesn't have lose it."))
+      if (await rolesOp({ op: "pack", pack: pid }, "Not changed", packPick)) renderPanel(true);
+  });
+  const save = el("div", "acts");
+  actButton(save, "Save as a pack…", "Keep these roles as a pack other projects can start from", async (b) => {
+    const label = prompt("A name for the pack:", "");
+    if (!label) return;
+    const id = label.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").replace(/^([^a-z])/, "p-$1").slice(0, 32) || "my-pack";
+    const out = await rolesOp({ op: "save_pack", id, label }, "Not saved", b);
+    if (out) { renderPanel(true); panelNote("Saved as the pack " + out.pack.label + "."); }
+  });
+  return ["Roles", card("Pack", el("p", "", pack ? pack.label : info.pack), packPick, save), card("This project's roles", list), card("", acts)];
+}
+function download(name, data) {
+  const a = el("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2) + "\n"], { type: "application/json" }));
+  a.download = name;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+function panelRole(name) {
+  const info = state.roleInfo;
+  if (!info) return ["Role", card("", el("p", "meta", "Loading…"))];
+  const r = info.roles.find((x) => x.name === name);
+  if (state.panel.editing) return roleForm(r);
+  if (!r) return [name, card("", el("p", "meta", "There is no role called " + name + " now."))];
+  const tool = own(state.tools, r.tool);
+  const head = el("div", "ident");
+  const words = el("div");
+  words.append(el("div", "nm", r.label), el("div", "meta", r.name + " · " + (r.source === "yours" ? "yours" : "from the pack")));
+  head.append(roleAvatar(r), words);
+  const agents = state.agents.filter((a) => a.role === r.name).map((a) => {
+    const b = el("button", "link", a.agent); b.type = "button";
+    b.addEventListener("click", () => openPanel("agent", a.agent));
+    return b;
+  });
+  const who = el("div", "acts");
+  who.append(...(agents.length ? agents : [el("span", "meta", "No agent has it.")]));
+  const acts = el("div", "acts");
+  actButton(acts, "Edit", "Edit " + r.label, () => { state.panel.editing = true; renderPanel(true); });
+  actButton(acts, "Duplicate", "Duplicate " + r.label, async (b) => {
+    const out = await rolesOp({ op: "duplicate", name: r.name }, "Not duplicated", b);
+    if (out) openPanel("role", out.role.name);
+  });
+  actButton(acts, "Export", "Save " + r.label + " as a file", async () =>
+    download(r.name + ".json", await postJSON("/api/roles", { op: "export", names: [r.name] })));
+  actButton(acts, "New agent", "A new agent with this role", () => openLaunch(r.name));
+  const del = actButton(acts, "Delete", "Delete " + r.label, async (b) => {
+    if (!confirm("Delete the role " + r.label + "? Agents that have it lose it, and are told.")) return;
+    if (await rolesOp({ op: "delete", name: r.name }, "Not deleted", b)) openPanel("roles");
+  });
+  del.classList.add("danger");
+  const details = [field("Tool", tool ? tool.label : "Any"), el("h3", "", "What the agent is told"), el("div", "prompt-text", r.description)];
+  return [r.label, card("", head), card("", ...details), card("Agents with it", who), card("Actions", acts)];
+}
+// A role's fields as a form: a new role (r undefined), or changes to one.
+function roleForm(r) {
+  const form = el("form", "roleform editing");
+  const input = (tag, label, value, attrs) => {
+    const n = el(tag);
+    Object.assign(n, attrs || {});
+    n.value = value || "";
+    n.setAttribute("aria-label", label);
+    form.append(field(label, n));
+    return n;
+  };
+  const name = r ? null : input("input", "Name", "", { type: "text", maxLength: 32, placeholder: "for example designer" });
+  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat" });
+  const picture = el("select");
+  picture.setAttribute("aria-label", "Picture");
+  picture.append(new Option("Initials", ""), ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id)));
+  picture.value = r && r.picture.startsWith("preset:") ? r.picture : "";
+  form.append(field("Picture", picture));
+  const tint = el("input"); tint.type = "color"; tint.value = (r && r.colour) || "#2f5fd6";
+  const toolColour = el("input"); toolColour.type = "checkbox"; toolColour.checked = !(r && r.colour);
+  const tintRow = el("span", "inline"), check = el("label", "check");
+  check.append(toolColour, " the tool's own");
+  tint.setAttribute("aria-label", "Colour");
+  tint.addEventListener("input", () => { toolColour.checked = false; });
+  tintRow.append(tint, check);
+  form.append(field("Colour", tintRow));
+  const tool = el("select");
+  tool.setAttribute("aria-label", "Tool");
+  tool.append(new Option("Any tool", ""), ...Object.entries(state.tools || {}).filter(([id]) => id !== "agent").map(([id, t]) => new Option(t.label, id)));
+  tool.value = (r && r.tool) || "";
+  form.append(field("Tool", tool));
+  const description = el("textarea");
+  description.setAttribute("aria-label", "What the agent is told");
+  description.maxLength = 4000;
+  description.value = r ? r.description : "";
+  description.placeholder = "What it does, what it leaves to others, whom it reports to and with which tool.";
+  form.append(el("h3", "", "What the agent is told"), description);
+  const acts = el("div", "acts");
+  const cancel = actButton(acts, "Cancel", "Cancel", () => {
+    if (r) { state.panel.editing = false; renderPanel(true); } else openPanel("roles");
+  });
+  cancel.classList.add("secondary");
+  const save = el("button", "", r ? "Save" : "Create"); save.type = "submit"; acts.append(save);
+  form.append(acts);
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const body = { label: label.value.trim(), description: description.value, picture: picture.value,
+                   colour: toolColour.checked ? "" : tint.value, tool: tool.value };
+    const out = await rolesOp(Object.assign(body, r ? { op: "edit", name: r.name } : { op: "create", name: name.value.trim() }),
+                              r ? "Not saved" : "Not created", save);
+    if (out) { state.panel = { kind: "role", id: out.role.name }; renderPanel(true); }
+  });
+  return [r ? "Edit " + r.label : "New role", card("", form)];
+}
+
+function named(tag, cls, name) {
+  const n = el(tag, cls + " " + colour(name), name);
+  n.dataset.who = name; n.dataset.cls = cls;
+  return n;
+}
+
+function receipt(m) {
+  const targets = m.to === "all" ? state.agents.map((a) => a.agent) : [m.to];
+  const read = state.agents.filter((a) => targets.includes(a.agent) && a.cursor >= m.seq).map((a) => a.agent);
+  if (!read.length) return "Not read yet";
+  if (read.length === targets.length) return targets.length > 1 ? "Read by everyone" : "Read";
+  return "Read by " + read.join(", ");
+}
+
+function sizeText(n) {
+  return n < 1024 ? n + " bytes" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
+}
+
+function fileLinks(files) {
+  const list = el("div", "files");
+  for (const f of files) {
+    const a = el("a", "file");
+    a.href = "/files/" + f.id + "/" + encodeURIComponent(f.name);
+    a.target = "_blank"; a.rel = "noopener";
+    a.title = f.name + " (" + sizeText(f.size) + ")";
+    if (state.images.includes(f.type)) {
+      const img = el("img"); img.src = a.href; img.alt = f.name; img.loading = "lazy";
+      a.classList.add("image"); a.append(img);
+    } else {
+      a.append(el("span", "", "📄 " + f.name), el("span", "s", sizeText(f.size)));
+    }
+    list.append(a);
+  }
+  return list;
+}
+
+// A message's text, with @name mentions of agents (and of you) as chips. Text only: never HTML.
+function withMentions(text) {
+  const out = document.createDocumentFragment();
+  let at = 0;
+  for (const m of text.matchAll(/@([A-Za-z][\w.-]{0,31})/g)) {
+    const known = m[1] === "Owner" || state.agents.some((a) => a.agent === m[1]);
+    if (!known) continue;
+    out.append(text.slice(at, m.index), el("span", "mention", m[1] === "Owner" ? "@you" : m[0]));
+    at = m.index + m[0].length;
+  }
+  out.append(text.slice(at));
+  return out;
+}
+
+function buildMessage(m) {
+  if (m.kind === "event") return el("p", "sys", m.text);
+  if (m.kind === "role") {
+    const line = el("p", "sys");
+    const by = m.from === "Owner" ? el("b", "", "You") : named("b", "", m.from);
+    const what = m.role ? (m.from === m.to ? " took the role " : " made ") : " removed the role of ";
+    line.append(by, document.createTextNode(what));
+    if (m.from !== m.to || !m.role) line.append(named("b", "", m.to));
+    if (m.role) {
+      if (m.from !== m.to) line.append(document.createTextNode(" the "));
+      const more = el("details");
+      more.append(el("summary", "", roleTitle(m.role)), el("span", "prompt", m.text));
+      line.append(more);
+    }
+    return line;
+  }
+  if (m.kind === "take") {
+    const line = el("p", "sys");
+    line.append(named("b", "", m.from), document.createTextNode(" " + m.text.replace(/^I am taking/, "took")));
+    return line;
+  }
+  const mine = m.from === "Owner";
+  const box = el("div", "msg" + (mine ? " own" : "") + (m.kind === "task" ? " task" : "") + (m.kind === "update" ? " update" : ""));
+  box.dataset.id = m.id;
+  if (!mine) box.append(avatar(agentRow(m.from)));
+  const meta = el("div", "meta");
+  meta.append(mine ? el("span", "who", "You") : named("span", "who", m.from));
+  const sender = !mine && agentRow(m.from);
+  if (sender && sender.role) meta.append(el("span", "badge " + sender.role, roleTitle(sender.role)));
+  if (m.to !== "all") meta.append(el("span", "to", "to " + (m.to === "Owner" ? "you" : m.to)));
+  meta.append(el("span", "", new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })));
+  const body = el("div", "body");
+  if (m.kind === "task") {
+    const label = el("div", "label");
+    label.append(el("span", "", "TASK #" + m.id + (m.task ? " · part of #" + m.task : "")), el("span", "state"));
+    body.append(label);
+  }
+  if (m.kind === "update") {
+    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (state.statuses[m.status] || m.status)));
+  }
+  if (m.kind === "ask") meta.append(el("span", "pill", "question" + (m.task ? " · done check #" + m.task : "")));
+  if (m.kind === "answer") {
+    const verdict = { approve: " · approved", changes: " · changes needed" }[m.verdict] || "";
+    meta.append(el("span", "pill" + (m.verdict === "approve" ? " done" : m.verdict === "changes" ? " blocked" : ""),
+                   "answer to #" + m.answers + verdict));
+  }
+  if (m.text) body.append(withMentions(m.text));
+  if (m.files && m.files.length) body.append(fileLinks(m.files));
+  box.append(meta, body);
+  if (mine) box.append(el("div", "receipt"));
+  return box;
+}
+
+function refreshDynamic() {
+  // Only your messages (read receipts) and tasks (who has them, progress) change after they are shown.
+  for (const [m, node] of state.nodes.values()) {
+    if (m.from === "Owner") node.querySelector(".receipt").textContent = receipt(m);
+    if (m.kind === "task") {
+      const who = state.taken[m.id];
+      const p = state.progress[m.id];
+      const st = node.querySelector(".state");
+      st.textContent = (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
+        + (p ? " · " + (state.statuses[p.status] || p.status) : "");
+      st.className = "state" + (who ? " " + colour(who) : "");
+    }
+  }
+}
+
+// Search: what does not match is hidden, new messages too, until the box is cleared.
+function matches(node) {
+  const want = $("search").value.trim().toLowerCase();
+  return !want || node.textContent.toLowerCase().includes(want);
+}
+function applySearch() {
+  for (const node of $("log").children) if (node.id !== "empty") node.hidden = !matches(node);
+}
+$("search").addEventListener("input", applySearch);
+
+function addMessages(list, first) {
+  if (!list.length) return;
+  const log = $("log");
+  $("empty")?.remove();
+  for (const m of list) {
+    if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
+    const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+    if (day !== state.lastDay) { const d = el("p", "day", day); d.hidden = !!$("search").value.trim(); log.append(d); state.lastDay = day; }
+    const node = buildMessage(m);
+    node.hidden = !matches(node);
+    log.append(node);
+    if (node.classList.contains("msg") && (m.from === "Owner" || m.kind === "task")) state.nodes.set(m.id, [m, node]);
+    state.messages.push(m);
+    state.after = m.seq;
+  }
+  if (document.hidden && !first) {
+    state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
+    if (state.missed) document.title = "(" + state.missed + ") " + state.title;
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) { state.missed = 0; document.title = state.title; if (state.wake) state.wake(); }
+});
+window.addEventListener("online", () => { if (state.wake) state.wake(); });
+
+// A newer crewchat: say so until the owner dismisses it, then not again for that version.
+function showUpdate(version, releases) {
+  let dismissed = "";
+  try { dismissed = localStorage.getItem("crewchat-update-dismissed") || ""; } catch (e) {}
+  $("update-version").textContent = version;
+  $("update-notes").href = releases + "/tag/v" + version;
+  $("update").classList.toggle("show", !!version && version !== dismissed);
+}
+$("update-close").addEventListener("click", () => {
+  try { localStorage.setItem("crewchat-update-dismissed", $("update-version").textContent); } catch (e) {}
+  $("update").classList.remove("show");
+});
+
+// The space's header: the project, and how many agents, machines and open tasks it has.
+function renderHeader() {
+  $("space-avatar").textContent = letter(state.project);
+  const machines = new Set(state.agents.map((a) => a.device).concat(state.device ? [state.device] : [])).size || 1;
+  const open = state.sheet.filter((r) => r.status !== "done").length;
+  const plural = (n, one) => n + " " + one + (n === 1 ? "" : "s");
+  $("space-meta").textContent = [plural(state.agents.length, "agent"), plural(machines, "machine"), plural(open, "open task")].join(" · ");
+  document.body.dataset.crew = state.crew;
+}
+
+async function loop() {
+  for (;;) {
+    try {
+      const wait = state.version < 0 ? 0 : 25;
+      // With more messages to catch up on, ask again at once (a version that never matches).
+      const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
+                              { cache: "no-store" });
+      if (res.status === 401) { location.href = "/login"; return; }
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const data = await res.json();
+      state.failures = 0;
+      $("banner").classList.remove("show");
+      const first = state.version < 0;
+      state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
+      state.more = !!data.more;
+      state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
+      state.tools = data.tools || {}; state.presets = data.presets || {};
+      state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
+      state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
+      showUpdate(data.update || "", data.releases || "");
+      if (data.project && data.project + " · crewchat" !== state.title) {
+        state.title = data.project + " · crewchat";
+        state.project = data.project;
+        $("project").textContent = data.project;
+        if (!state.missed) document.title = state.title;
+      }
+      renderProjects(data.projects, data.chat);
+      renderLink(data.link);
+      renderSetup(data.rules, data.skills);
+      renderSheet(state.sheet);
+      renderHeader();
+      const log = $("log");
+      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      const mine = data.messages.some((m) => m.from === "Owner");
+      renderAgents();
+      addMessages(data.messages, first);
+      renderPanel();
+      if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the crew below.";
+      refreshDynamic();
+      // Scroll last: the cards and read receipts above change the list's height.
+      if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;
+    } catch (e) {
+      // One failed request is normal (phone locked, tab in the background, network switch): retry
+      // at once. Only say the server is unreachable when it keeps failing.
+      state.failures = (state.failures || 0) + 1;
+      if (state.failures >= 3) $("banner").classList.add("show");
+      await new Promise((r) => { state.wake = r; setTimeout(r, state.failures < 3 ? 800 : 3000); });
+    }
+  }
+}
+
+// The composer: a pill with + (attach, post as task, new agent), the text and Send. "@name" at the
+// start writes to that agent alone.
+const text = $("text");
+function fit() {
+  text.style.height = "auto";
+  text.style.height = text.scrollHeight + 2 + "px";
+  $("send").disabled = !text.value.trim() && !state.pending.length;
+}
+text.addEventListener("input", fit);
+function addFiles(list) {
+  for (let file of list) {
+    if (file.size > state.maxUpload) { $("error").textContent = file.name + " is too big: " + sizeText(state.maxUpload) + " at most."; continue; }
+    if (/^image\.(png|jpe?g|gif|webp)$/i.test(file.name)) {  // a pasted screenshot: give it a useful name
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
+      file = new File([file], "screenshot-" + stamp + "." + file.name.split(".").pop(), { type: file.type });
+    }
+    state.pending.push(file);
+  }
+  renderPending();
+}
+
+function renderPending() {
+  const box = $("pending");
+  box.replaceChildren(...state.pending.map((file, i) => {
+    const chip = el("span", "chip");
+    if (file.type.startsWith("image/")) { const img = el("img"); img.src = URL.createObjectURL(file); img.alt = ""; chip.append(img); }
+    chip.append(el("span", "n", file.name), el("span", "s", sizeText(file.size)));
+    const drop = el("button", "", "×");
+    drop.type = "button"; drop.setAttribute("aria-label", "Remove " + file.name);
+    drop.addEventListener("click", () => { state.pending.splice(i, 1); renderPending(); });
+    chip.append(drop);
+    return chip;
+  }));
+  fit();
+}
+
+async function uploadFile(file) {
+  const res = await fetch(api("/api/upload"), { method: "POST", body: file,
+    headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } });
+  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
+  return (await res.json()).id;
+}
+
+function setTask(on) {
+  state.asTask = on;
+  $("as-task").setAttribute("aria-checked", String(on));
+  $("task-chip").hidden = !on;
+  text.placeholder = on ? "Describe the task. The crew settles who takes it…" : "Message the crew (@name writes to one)";
+}
+$("as-task").addEventListener("click", () => { setTask(!state.asTask); $("plus").open = false; text.focus(); });
+$("task-off").addEventListener("click", () => setTask(false));
+$("attach").addEventListener("click", () => { $("plus").open = false; $("files").click(); });
+$("files").addEventListener("change", () => { addFiles($("files").files); $("files").value = ""; });
+text.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+$("form").addEventListener("dragover", (e) => { e.preventDefault(); $("form").classList.add("dragging"); });
+$("form").addEventListener("dragleave", () => $("form").classList.remove("dragging"));
+$("form").addEventListener("drop", (e) => {
+  e.preventDefault(); $("form").classList.remove("dragging");
+  addFiles(e.dataTransfer.files);
+});
+
+text.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
+});
+// Who a message goes to: the agent its first word mentions, else everyone.
+function recipient(value) {
+  const m = value.match(/^@([A-Za-z][\w.-]{0,31})(?=\s|$)/);
+  return m && state.agents.some((a) => a.agent === m[1]) ? m[1] : "all";
+}
+$("form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const value = text.value.trim();
+  if (!value && !state.pending.length) return;
+  $("send").disabled = true;
+  $("error").textContent = "";
+  try {
+    const files = [];
+    for (const [i, file] of state.pending.entries()) {
+      $("send").textContent = state.pending.length > 1 ? "Sending " + (i + 1) + "/" + state.pending.length + "…" : "Sending…";
+      files.push(await uploadFile(file));
+    }
+    await postJSON("/api/send", { to: recipient(value), text: value, kind: state.asTask ? "task" : "msg", files });
+    state.pending = []; renderPending();
+    text.value = "";
+    setTask(false);
+  } catch (err) {
+    $("error").textContent = "Not sent: " + err.message + ". Your text and files are still here; try again.";
+  }
+  $("send").textContent = "Send";
+  fit();
+  text.focus();
+});
+
+setInterval(() => { state.now += 30; renderAgents(); renderPanel(); }, 30000);
+loop();
+</script>
+</body>
+</html>
+"""
 LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
+CLASSIC_PAGE = CLASSIC_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 
 
 # --------------------------------------------------------------------------------------------

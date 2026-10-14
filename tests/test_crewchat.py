@@ -863,6 +863,24 @@ class Roles(Base):
             self.assertIn(why, self.op(op="edit", name="qa", **{field: value})["error"])
         self.assertNotIn("x", [r["name"] for r in self.op(op="list")["roles"]])
 
+    def test_the_owner_makes_a_project_from_the_page(self):
+        made = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": " Cooking  show ",
+                                                                             "pack": "youtube"})
+        self.assertEqual(made["name"], "Cooking show")
+        found = crewchat.find_chat(made["id"])
+        self.assertEqual(crewchat.load_config(found["root"])["pack"], "youtube")
+        self.assertIn(made["id"], [p.id for p in self.server.RequestHandlerClass.projects.all()])
+        for body, why in (({"op": "create", "name": "Cooking show"}, "already"), ({"op": "create", "name": ""}, "1 to 60"),
+                          ({"op": "create", "name": "x", "pack": "nope"}, "no pack called nope"), ({"op": "drop"}, "op must be")):
+            self.assertIn(why, self.op_at("/api/projects", **body)["error"])
+        self.assertEqual(self.op_at("/api/projects", token=self.token, op="create", name="sneaky")["status"], 403)
+
+    def op_at(self, path, token=None, **body):
+        try:
+            return crewchat.post_json(self.base + path, token or self.owner, body)
+        except urllib.error.HTTPError as e:
+            return dict(json.loads(e.read()), status=e.code)
+
     def test_save_a_pack_and_start_another_project_from_it(self):
         self.op(op="edit", name="qa", label="Tester")
         self.assertEqual(self.op(op="save_pack", id="studio", label="Studio")["pack"]["id"], "studio")
@@ -1053,8 +1071,9 @@ class Launching(Base):
         self.launched = []
         self.saved = crewchat.launch_agent, crewchat.find_tool
         self.real_launch_agent = crewchat.launch_agent
-        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None: self.launched.append(
-            (tool, folder, key, permissions))
+        self.models = []
+        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="": (
+            self.launched.append((tool, folder, key, permissions)), self.models.append(model))
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
@@ -1116,6 +1135,26 @@ class Launching(Base):
         with self.hub.lock:
             self.hub.redeemed[key]["until"] = 0  # ten minutes on, it is spent for good
         self.assertIn("unknown or has expired", Session(self.base, token).text("hub_link", key=key))
+
+    def test_new_agent_with_a_model_a_picture_a_colour_and_instructions(self):
+        out = self.launch(name="picture-tester", role="qa", task="Test the login", model="sonnet", picture="preset:flask",
+                          colour="#AABBCC", instructions="Ask before touching api/.")
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(self.models[-1], "sonnet")
+        key = self.launched[-1][2]
+        session = Session(self.base, crewchat.read_token(self.place))
+        note = session.text("hub_link", key=key)
+        self.assertIn("the owner's instructions", note)
+        row = next(r for r in self.hub.rows() if r["agent"] == "picture-tester")
+        self.assertEqual((row["picture"], row["colour"], row["permissions"]), ("preset:flask", "#aabbcc", "ask"))
+        inbox = session.text("hub_inbox")
+        self.assertIn("Ask before touching api/.", inbox)
+        self.assertLess(inbox.index("Ask before touching api/."), inbox.index("Test the login"))  # before the task
+        self.assertIn("no model called gpt", self.launch(model="gpt")["error"])
+        self.assertIn("no model called sonnet", self.launch(tool="cursor", model="sonnet")["error"])
+        self.assertIn("no picture preset", self.launch(picture="preset:nope")["error"])
+        self.assertIn("#rrggbb", self.launch(colour="red")["error"])
+        self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="opus")[-3:-1], ["--model", "opus"])
 
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
@@ -1598,8 +1637,9 @@ class Profiles(Base):
 
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
-        status, _, headers = self.raw("/")
-        self.assertEqual((status, headers["Location"]), (303, "/login"))
+        for path in ("/", "/classic"):
+            status, _, headers = self.raw(path)
+            self.assertEqual((status, headers["Location"]), (303, "/login"))
         self.assertEqual(self.raw("/api/poll")[0], 401)
         self.assertEqual(self.raw("/api/send", b"{}", {"Content-Type": "application/json"})[0], 401)
         status, body, headers = self.raw("/login")
@@ -1631,7 +1671,12 @@ class ChatPage(Base):
         status, body, headers = self.raw("/", opener=opener)
         self.assertEqual(status, 200)
         self.assertIn(b"<title>crewchat</title>", body)
+        self.assertIn(b'id="panel"', body)  # the page from 0.14
         self.assertEqual(headers["Cache-Control"], "no-store")
+        status, classic, _ = self.raw("/classic", opener=opener)  # the page before it, for one release
+        self.assertEqual(status, 200)
+        self.assertIn(b'id="views"', classic)
+        self.assertNotIn(b'id="panel"', classic)
         send = lambda obj, extra=None: self.raw(  # noqa: E731
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)
         self.assertEqual(send({"to": "all", "text": "x"}, {"Origin": "https://evil.example"})[0], 403)

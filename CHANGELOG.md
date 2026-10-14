@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- **A new chat page** (new chat page, PR 3 of 5). A tab for each project along the top (with
+  **+** to switch or make a project, choosing the role pack its crew starts from), the crew on the
+  left, the project's space in the middle, and a side panel on the right. Click an agent to open
+  it in the panel: what it is doing, its task and last message, its role, listening and
+  permissions, and Message, Stop or Reopen, Switch model, Rename, Change picture and Remove; a
+  task opens with its history, and **⋯ > Roles** lists the project's roles to read, edit,
+  duplicate, export, delete or import, start over from a pack or save as one. The message box is a
+  pill with **+** (attach a file, post as task, new agent); `@name` at the start writes to one
+  agent, and mentions show as chips. **Search** filters the chat. **New agent** comes in four
+  steps (identity, workspace, engine, briefing) and also sets the agent's picture, colour, model
+  and extra instructions; "From a template" starts from a role. Soft and rounded, in crewchat's
+  blue, light and dark; on a phone the crew is a drawer and the panel a full-screen sheet. The page
+  from before is at `/classic` for one release. A picture is checked before it is uploaded, a
+  picture that can't be loaded is not asked for again, and text on a coloured avatar picks its ink
+  by contrast.
 - **Role packs, for any crew** (new chat page, PR 2 of 5). A project's roles come from a pack:
   software team (today's roles, the default), YouTube channel, Instagram creator, small business,
   or blank. `crewchat start --pack youtube` picks one for a new project, `crewchat roles pack`
