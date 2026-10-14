@@ -456,6 +456,10 @@ class NewPage(Signed):
         self.assertEqual(msg["to"], self.agent.name)
         self.assertIn("hello from the new page", eventually(self.agent.stop_hook, what="the agent to get it"))
         c.until("!!document.querySelector('#log .msg.own .mention')", what="the mention as a chip")
+        name = json.dumps(self.agent.name)
+        self.assertEqual(c.js("[recipient('@' + %s + ': hi'), recipient('@' + %s + '. hi'), recipient('@' + %s + 'x hi'),"
+                              " recipient('hi @' + %s)]" % (name, name, name, name)),
+                         [self.agent.name, self.agent.name, "all", "all"])
         c.click("#as-task")
         self.assertFalse(c.js("$('task-chip').hidden"))
         c.type_into("#text", "a task from the new page")
