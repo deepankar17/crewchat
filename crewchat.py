@@ -606,6 +606,8 @@ def role_texts(table):
 
 ROLE_FIELDS = ("label", "description", "picture", "colour", "tool")
 MAX_IMPORT_ROLES = 50
+NEEDS_LOOKBACK = 2000  # messages scanned for an agent's newest word on a task
+NEEDS_MESSAGES = 20  # unread messages to the owner shown in Needs you
 MAX_PROJECT_NAME = 60
 ROLES_LOCK = threading.Lock()  # one change to a config.json's roles at a time
 
@@ -1639,6 +1641,60 @@ class Hub:
             self.owner_cursor = value
         else:
             self.agents[name]["cursor"] = value
+
+    # Needs you ---------------------------------------------------------------------------------
+    def needs_you(self):
+        """What waits on the owner, most pressing first: blocked tasks (with the agent's question),
+        tasks ready for review, tasks given back or reclaimed and not taken again, and messages to
+        the owner not yet read. Each says how many open tasks wait on it ("blocking")."""
+        rows = self.sheet_rows(view="open")
+        open_ids = {r["id"] for r in rows}
+        waiting_on = {}
+        for r in rows:
+            for d in r["depends"]:
+                waiting_on.setdefault(d, set()).add(r["id"])
+
+        def blocking(mid, seen=None):  # every open task that waits on mid, however far down
+            seen = set() if seen is None else seen
+            for child in waiting_on.get(mid, ()):
+                if child in open_ids and child not in seen:
+                    seen.add(child)
+                    blocking(child, seen)
+            return seen
+
+        with self.lock:
+            last_word = {}  # task -> its newest update from an agent
+            for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
+                if m["kind"] == "update" and m.get("task") and m["from"] != OWNER and m["task"] not in last_word:
+                    last_word[m["task"]] = m
+            given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
+            unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
+        items = []
+        for r in rows:
+            said = last_word.get(r["id"]) or {}
+            kind = ("blocked" if r["status"] == "blocked" else "review" if r["status"] == "review"
+                    else "reclaimed" if r["status"] in ("todo", "waiting") and r.get("reclaimed")
+                    else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
+            if kind:
+                items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": r["holder"] or said.get("from", ""),
+                              "text": said.get("text", "") if said.get("status") == r["status"] or kind == "given_back" else "",
+                              "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
+        for m in unread[-NEEDS_MESSAGES:]:
+            items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
+                          "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
+        order = {"blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
+        items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
+        return items
+
+    def owner_read(self, seq):
+        """The owner has seen the chat up to seq (the page, while it is in front)."""
+        with self.lock:
+            seq = min(int(seq), self.next_seq - 1)
+            if seq > self.owner_cursor:
+                self.owner_cursor = seq
+                self._save()
+                self._changed()
+        return self.owner_cursor
 
     def _unread(self, name):
         cur = self._cursor(name)
@@ -3781,7 +3837,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4212,7 +4268,9 @@ class Handler(BaseHTTPRequestHandler):
             # Tailscale, cloud sync (Firestore) or none: machines link as a whole, through the first project.
             primary = self.projects.primary
             data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub, shared=linked(self.hub))
-            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": linked(p.hub)}
+            data["needs"] = self.hub.needs_you()
+            data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": linked(p.hub),
+                                 "needs": len(data["needs"]) if p.hub is self.hub else len(p.hub.needs_you())}
                                 for p in self.projects.all()]
             self._json(200, data)
         else:
@@ -4327,6 +4385,12 @@ class Handler(BaseHTTPRequestHandler):
 
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
+
+    def _read(self, data):
+        try:
+            return {"read": self.hub.owner_read(int(data.get("seq")))}
+        except (TypeError, ValueError):
+            raise HubError("seq is a message's number")
 
     def _projects_op(self, data):
         """The owner makes a new project from the chat page: a name, and the pack its roles start from."""
@@ -4557,6 +4621,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         owner_actions = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
+                         "/api/read": self._read,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}
         if path in owner_actions:
             if not self._owner_request():
@@ -8731,6 +8796,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .tab .pname { overflow: hidden; text-overflow: ellipsis; }
 .tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
 .tab .unread:empty { width: 8px; }
+.tab .unread:not(:empty) { color: #fff; font-size: 10.5px; font-weight: 700; padding: 0 6px; line-height: 16px; height: 16px; }
 .tab.needs .unread, .tab.needs .pav { background: var(--err); }
 .pav { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 22px; height: 22px;
   border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; }
@@ -8777,6 +8843,24 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .none { font-size: 13px; color: var(--muted); margin: 4px 8px; }
 .add-agent { margin-top: 6px; background: transparent; color: var(--accent); border: 1.5px dashed var(--line); }
 .add-agent:hover { background: var(--tint); }
+
+/* Needs you: what waits on the owner. */
+#needs-list { display: flex; flex-direction: column; gap: 6px; }
+.need { display: block; width: 100%; text-align: left; background: var(--soft); color: var(--text); border-radius: 14px; padding: 8px 10px;
+  font-weight: 400; border-left: 4px solid var(--need, var(--err)); }
+.need:hover { background: var(--tint); }
+.need .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--need, var(--err)); }
+.need .t { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.need .q { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.need .blk { font-size: 11px; font-weight: 650; color: var(--err); }
+#needs-count { background: var(--err); color: #fff; border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
+#needs-count:empty { display: none; }
+.card.needs-card { border-left: 4px solid var(--err); }
+.needs-card textarea { width: 100%; min-height: 70px; resize: vertical; margin-top: 6px; }
+#bell > summary { padding: 4px 10px; border-radius: 99px; font-size: 16px; line-height: 1.2; }
+#bell > summary:hover { background: var(--tint); }
+#bell .menu-list { left: auto; right: 0; min-width: 260px; }
+#bell.off #bell-icon { filter: grayscale(1); opacity: 0.55; }
 
 /* Avatars (the class names PR 1 gave them). */
 .avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
@@ -9046,7 +9130,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <button type="button" class="icon" id="view-commands" aria-pressed="false" title="Every crewchat command">Commands</button>
   </div>
   <section id="needs-you" hidden aria-label="Needs you">
-    <h2 class="rail-head">Needs you</h2>
+    <h2 class="rail-head">Needs you <span id="needs-count"></span></h2>
     <div id="needs-list"></div>
   </section>
   <h2 class="rail-head">Agents</h2>
@@ -9060,6 +9144,16 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <span id="space-avatar" class="pav" aria-hidden="true">c</span>
     <div class="titles"><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
     <input id="search" type="search" placeholder="Search" aria-label="Search this chat" autocomplete="off">
+    <details id="bell" class="menu">
+      <summary title="Notifications" aria-label="Notifications"><span id="bell-icon">🔔</span></summary>
+      <div class="menu-list" id="bell-menu">
+        <p class="meta" style="margin:4px 10px 6px">Tell me, while this page is in the background:</p>
+        <button type="button" data-notify="all" aria-pressed="false">When something needs me</button>
+        <button type="button" data-notify="mentions" aria-pressed="false">Only messages to me</button>
+        <button type="button" data-notify="off" aria-pressed="true">Never</button>
+        <p class="meta" id="bell-note" style="margin:6px 10px 2px"></p>
+      </div>
+    </details>
     <details id="space-menu" class="menu">
       <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
       <div class="menu-list">
@@ -9219,7 +9313,7 @@ const el = (tag, cls, text) => {
   if (text !== undefined) n.textContent = text;
   return n;
 };
-const state = { after: -1, version: -1, lastSaid: {}, byTask: {}, held: {}, nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
+const state = { needs: [], notified: new Set(), after: -1, version: -1, lastSaid: {}, byTask: {}, held: {}, nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
                 images: [], maxUpload: 20 * 1024 * 1024, pending: [], sheet: [], device: "", crew: "software",
                 agents: [], names: "", title: "crewchat", panel: null, asTask: false, roleInfo: null,
                 now: Date.now() / 1000, lastDay: "" };
@@ -9288,7 +9382,7 @@ function renderProjects(list, current) {
   const mine = list.find((p) => p.id === current);
   if (mine) seen(mine.id, mine.last);
   for (const p of list) p.fresh = p.id !== current && p.last > seen(p.id);
-  const key = JSON.stringify(list.map((p) => [p.id, p.name, p.linked, p.fresh])) + current;
+  const key = JSON.stringify(list.map((p) => [p.id, p.name, p.linked, p.fresh, p.needs])) + current;
   if (key === state.projectsKey) return;
   state.projectsKey = key;
   const tab = (p) => {
@@ -9297,7 +9391,8 @@ function renderProjects(list, current) {
     if (p.id === current) a.setAttribute("aria-current", "page");
     a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
     a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
-    if (p.fresh) {
+    if (p.needs) { a.classList.add("needs"); a.append(el("span", "unread", String(p.needs)), el("span", "sr", " (" + p.needs + " need you)")); }
+    if (p.fresh && !p.needs) {
       a.append(el("span", "unread"), el("span", "sr", " (new messages)"));
     }
     a.addEventListener("click", (e) => {
@@ -9316,7 +9411,7 @@ function renderProjects(list, current) {
   const menu = $("projects");
   if (menu !== document.activeElement) {
     menu.replaceChildren(...list.map((p) => {
-      const option = new Option(p.name + (p.linked ? " (shared)" : "") + (p.fresh ? "  • new" : ""), p.id);
+      const option = new Option(p.name + (p.linked ? " (shared)" : "") + (p.needs ? "  • needs you" : p.fresh ? "  • new" : ""), p.id);
       option.selected = p.id === current;
       return option;
     }));
@@ -9698,8 +9793,9 @@ $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
   if (!title) return;
-  if (await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value }))
-    for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
+  const fields = ["t-title", "t-depends", "t-areas", "t-where"], sent = fields.map((id) => $(id).value);
+  if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
+    fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
 
@@ -10341,8 +10437,35 @@ function panelTask(id) {
   });
   const acts = el("div", "acts");
   taskActions(r, acts);
-  return ["Task #" + r.id, card("", ...what), card("Actions", acts),
+  const need = state.needs.find((n) => n.task === r.id);
+  const needCard = need ? [needsCard(need, r)] : [];
+  return ["Task #" + r.id, ...needCard, card("", ...what), card("Actions", acts),
           card("History", ...(history.length ? history : [el("p", "meta", "Nothing yet.")]))];
+}
+
+// A task that needs you: the agent's question or note, and an answer sent to it from here.
+function needsCard(n, r) {
+  const [label] = NEED_LOOK[n.kind] || [""];
+  const box = card(label + (n.agent ? " · " + n.agent : ""));
+  box.classList.add("needs-card");
+  if (n.text) box.append(el("p", "", n.text));
+  if (n.blocking) box.append(el("p", "meta", "It holds up " + n.blocking + " other task" + (n.blocking > 1 ? "s" : "") + "."));
+  const to = r.holder || n.agent;
+  if (to && n.kind !== "given_back" && n.kind !== "reclaimed") {
+    const answer = el("textarea");
+    answer.placeholder = n.kind === "review" ? "What to change, or leave empty and mark it done" : "Your answer to " + to;
+    answer.setAttribute("aria-label", "Answer to " + to);
+    const acts = el("div", "acts");
+    actButton(acts, "Send", "Send your answer to " + to, async (b) => {
+      if (!answer.value.trim()) return;
+      if (await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) {
+        answer.value = ""; panelNote("Sent to " + to + ".");
+      }
+    });
+    if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", (b) => taskOp({ op: "status", task: r.id, status: "done" }));
+    box.append(answer, acts);
+  }
+  return box;
 }
 
 // Roles: what the page knows of them (/api/roles), loaded when a role panel opens and after a change.
@@ -10702,6 +10825,81 @@ $("update-close").addEventListener("click", () => {
   $("update").classList.remove("show");
 });
 
+// Needs you: blocked tasks (with the agent's question), reviews, unread messages to you, tasks given back.
+const NEED_LOOK = { blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
+                    message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"] };
+const needKey = (n) => n.kind + ":" + (n.task || n.id);
+function renderNeeds(needs) {
+  const box = $("needs-list"), key = JSON.stringify(needs);
+  $("needs-you").hidden = !needs.length;
+  $("needs-count").textContent = needs.length ? String(needs.length) : "";
+  if (key === state.needsKey) return;
+  state.needsKey = key;
+  box.replaceChildren(...needs.map((n) => {
+    const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
+    const b = el("button", "need");
+    b.type = "button"; b.style.setProperty("--need", tint);
+    const who = n.agent ? (n.kind === "message" ? " from " : " · ") + n.agent : "";
+    b.append(el("div", "k", label + who),
+             el("div", "t", n.task ? "#" + n.task + " " + (n.title || "") : n.text));
+    if (n.kind !== "message" && n.text) b.append(el("div", "q", n.text));
+    if (n.blocking) b.append(el("div", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
+    b.addEventListener("click", () => {
+      if (n.kind === "message") {
+        if (n.agent) openPanel("agent", n.agent);
+        const node = [...$("log").querySelectorAll(".msg")].find((x) => x.dataset.id === n.id);
+        if (node) { showView("chat"); node.scrollIntoView({ block: "center" }); }
+        markRead(true);
+      } else openPanel("task", n.task);
+    });
+    return b;
+  }));
+}
+// What you have seen of the chat: messages to you count as read while the page is in front.
+function markRead(force) {
+  if (document.hidden || state.after <= (state.readPosted || 0) && !force) return;
+  const mine = state.needs.some((n) => n.kind === "message");
+  if (!mine && !force) { state.readPosted = state.after; return; }
+  state.readPosted = state.after;
+  postJSON("/api/read", { seq: state.after }).catch(() => { state.readPosted = 0; });
+}
+document.addEventListener("visibilitychange", () => markRead());
+
+// Notifications, per project: all that needs you, only messages to you, or none. Only while the page
+// is in the background; a notification opens its item.
+const NOTIFY_KEY = "crewchat-notify-" + (CHAT || "first");
+function notifyMode() {
+  try { return localStorage.getItem(NOTIFY_KEY) || "off"; } catch (e) { return "off"; }
+}
+function showBell() {
+  const mode = notifyMode();
+  for (const b of document.querySelectorAll("[data-notify]")) b.setAttribute("aria-pressed", String(b.dataset.notify === mode));
+  $("bell").classList.toggle("off", mode === "off");
+  const denied = typeof Notification !== "undefined" && Notification.permission === "denied";
+  $("bell-note").textContent = typeof Notification === "undefined" ? "This browser does not show notifications."
+    : denied && mode !== "off" ? "The browser blocks notifications for this page: allow them in its site settings." : "";
+}
+for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("click", async () => {
+  try { localStorage.setItem(NOTIFY_KEY, b.dataset.notify); } catch (e) {}
+  if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "default")
+    await Notification.requestPermission().catch(() => {});
+  showBell();
+});
+showBell();
+function notify(needs) {
+  const fresh = needs.filter((n) => !state.notified.has(needKey(n)));
+  for (const n of needs) state.notified.add(needKey(n));
+  if (state.notifyPrimed === undefined) { state.notifyPrimed = true; return; }  // not what was there on load
+  const mode = notifyMode();
+  if (mode === "off" || !document.hidden || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  for (const n of fresh.filter((x) => mode === "all" || x.kind === "message").slice(0, 3)) {
+    const [label] = NEED_LOOK[n.kind] || [""];
+    const note = new Notification((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
+                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text, tag: needKey(n) });
+    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close(); };
+  }
+}
+
 // The space's header: the project, and how many agents, machines and open tasks it has.
 function renderHeader() {
   $("space-avatar").textContent = letter(state.project);
@@ -10752,6 +10950,9 @@ async function loop() {
       renderLink(data.link);
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
+      state.needs = data.needs || [];
+      renderNeeds(state.needs);
+      notify(state.needs);
       renderHeader();
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
@@ -10766,6 +10967,7 @@ async function loop() {
       refreshDynamic();
       // Scroll last: the cards and read receipts above change the list's height.
       if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;
+      markRead();
     } catch (e) {
       // One failed request is normal (phone locked, tab in the background, network switch): retry
       // at once. Only say the server is unreachable when it keeps failing.

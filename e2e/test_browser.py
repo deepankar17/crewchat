@@ -654,6 +654,39 @@ class NewPage(Signed):
         c.until("$('panel-title').textContent.startsWith('Task #')", what="the task panel")
         self.assertEqual(c.errors, [])
 
+    def test_needs_you_and_notifications(self):
+        c = self.chrome
+        # Notifications, stubbed: the page asks once, and shows them only while it is in the background.
+        c.js("""window.notes = []; window.Notification = class { constructor(t, o) { window.notes.push([t, o.body]); }
+                  close() {} static requestPermission() { Notification.permission = 'granted'; return Promise.resolve('granted'); } };
+                Notification.permission = 'default';""")
+        c.js("$('bell').open = true")
+        c.js("document.querySelector('[data-notify=all]').click()")
+        c.until("Notification.permission === 'granted' && !$('bell').classList.contains('off')", what="the bell on")
+        c.js("$('bell').open = false")
+        tid = c.js("postJSON('/api/task', {op: 'add', title: 'Pick a colour for the login button'}).then(r => r.id)")
+        self.agent.call("hub_take", id=tid)
+        c.js("Object.defineProperty(document, 'hidden', {value: true, configurable: true})")  # the page goes to the back
+        self.agent.call("hub_update", id=tid, status="blocked", note="Blue or green?")
+        c.until("!$('needs-you').hidden && $('needs-list').innerText.includes('Blue or green?')", what="the item")
+        c.until("window.notes.some(n => n[0].includes('Needs you') && n[1].includes('Blue or green?'))", what="a notification")
+        self.assertIn("1", c.js("$('needs-count').textContent"))
+        self.assertTrue(c.js("[...document.querySelectorAll('#tabs .tab')].some(t => t.classList.contains('needs'))"))
+        c.js("delete document.hidden")
+        # The item opens its task, with the question and a way to answer.
+        c.js("document.querySelector('#needs-list .need').click()")
+        c.until("!!document.querySelector('#panel-body .needs-card textarea')", what="the answer box")
+        c.js("""(() => { const t = document.querySelector('#panel-body .needs-card textarea'); t.value = 'Green, please';
+                  [...document.querySelectorAll('#panel-body .needs-card button')].find(b => b.textContent === 'Send').click(); })()""")
+        self.assertIn("Re #%s: Green, please" % tid, eventually(self.agent.stop_hook, what="the agent to get the answer"))
+        self.agent.call("hub_update", id=tid, status="in_progress", note="Green it is")
+        c.until("$('needs-you').hidden || !$('needs-list').innerText.includes('Blue or green?')", what="the item to go")
+        # A message to you is unread until the page is in front, then read.
+        self.agent.call("hub_send", to="Owner", text="Done with the button")
+        c.until("state.version > 0 && !state.needs.some(n => n.kind === 'message')", what="read while in front")
+        c.js("localStorage.removeItem('crewchat-notify-first'); showBell()")
+        self.assertEqual(c.errors, [])
+
     def test_new_agent_in_four_steps(self):
         c = self.chrome
         c.click("#add-agent")

@@ -948,6 +948,65 @@ class Roles(Base):
         self.assertIn("Manager", cli("roles"))
 
 
+class NeedsYou(Base):
+    """What waits on the owner: blocked tasks, reviews, tasks given back, unread messages."""
+
+    def add(self, title, **kw):
+        return crewchat.post_json(self.base + "/api/task", self.owner, dict({"op": "add", "title": title}, **kw))["id"]
+
+    def test_what_needs_the_owner_and_in_what_order(self):
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        api = self.add("Design the API")
+        client = self.add("Build the client", depends=api)
+        self.add("Ship it", depends=client)
+        review = self.add("Write the changelog")
+        back = self.add("Clean the logs")
+        a.text("hub_take", id=api)
+        a.text("hub_update", id=api, status="blocked", note="Which auth: tokens or cookies?")
+        b.text("hub_take", id=review)
+        b.text("hub_update", id=review, status="review", note="Ready for a look")
+        b.text("hub_take", id=back)
+        b.text("hub_update", id=back, status="todo", note="No time, sorry")
+        a.text("hub_send", to="Owner", text="A question for you")
+        needs = self.hub.needs_you()
+        kinds = [(n["kind"], n.get("task") or n.get("text")) for n in needs]
+        self.assertEqual(kinds[:4], [("blocked", api), ("review", review), ("message", "A question for you"),
+                                     ("given_back", back)])
+        blocked = needs[0]
+        self.assertEqual((blocked["agent"], blocked["text"], blocked["blocking"]), (a_name, "Which auth: tokens or cookies?", 2))
+        self.assertEqual(needs[3]["text"], "No time, sorry")
+        # Once handled, an item leaves the list.
+        a.text("hub_update", id=api, status="in_progress", note="Going with tokens")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": review, "status": "done"})
+        msg = needs[2]
+        self.assertEqual(crewchat.post_json(self.base + "/api/read", self.owner, {"seq": msg["seq"]})["read"], msg["seq"])
+        left = [n["kind"] for n in self.hub.needs_you()]
+        self.assertNotIn("blocked", left)
+        self.assertNotIn("review", left)
+        self.assertNotIn("message", left)
+        self.assertIn("given_back", left)
+        b.text("hub_take", id=back)
+        self.assertEqual(self.hub.needs_you(), [])
+
+    def test_the_poll_and_the_tabs_say_so(self):
+        a, _ = self.agent()
+        a.text("hub_send", to="Owner", text="Look at this")
+        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=self.owner_browser()[0])[1])
+        self.assertTrue(any(n["kind"] == "message" for n in poll["needs"]))
+        self.assertGreaterEqual(next(p for p in poll["projects"] if p["id"] == poll["chat"])["needs"], 1)
+        self.assertIn("seq is", self.op_at("/api/read", seq="x")["error"])
+        self.assertEqual(self.op_at("/api/read", token=self.token, seq=1)["status"], 403)
+        crewchat.post_json(self.base + "/api/read", self.owner, {"seq": 10 ** 9})  # never past the last message
+        self.assertEqual(self.hub.owner_cursor, self.hub.next_seq - 1)
+
+    def op_at(self, path, token=None, **body):
+        try:
+            return crewchat.post_json(self.base + path, token or self.owner, body)
+        except urllib.error.HTTPError as e:
+            return dict(json.loads(e.read()), status=e.code)
+
+
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
                     "0000000c4944415408d763f8cfc000000301010018dd8db00000000049454e44ae426082")
 
