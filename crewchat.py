@@ -103,7 +103,7 @@ SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app doe
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "crew")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -501,6 +501,10 @@ def load_config(root=None):
     return data
 
 
+def clean_label(value):
+    return " ".join(str(value or "").split())[:MAX_ROLE_LABEL]
+
+
 def clean_role(spec):
     """A role as crewchat keeps it, {label, description, picture, colour, tool}, from config.json, a
     pack or an import (title and prompt are read too, as before 0.14). None if it has no instructions."""
@@ -510,7 +514,7 @@ def clean_role(spec):
     if not description:
         return None
     tool = str(spec.get("tool") or "")
-    return {"label": " ".join(str(spec.get("label") or spec.get("title") or "").split())[:MAX_ROLE_LABEL],
+    return {"label": clean_label(spec.get("label") or spec.get("title")),
             "description": description[:MAX_ROLE_TEXT], "picture": clean_picture(spec.get("picture")),
             "colour": clean_colour(spec.get("colour")), "tool": tool if tool in TOOLS_INFO else ""}
 
@@ -520,7 +524,7 @@ def clean_pack(spec):
     if not isinstance(spec, dict) or not isinstance(spec.get("roles"), dict):
         return None
     roles = {str(n).lower(): clean_role(r) for n, r in spec["roles"].items() if NAME_RE.match(str(n))}
-    return {"label": " ".join(str(spec.get("label") or "").split())[:MAX_ROLE_LABEL] or "My pack",
+    return {"label": clean_label(spec.get("label")) or "My pack",
             "crew": spec.get("crew") if spec.get("crew") in CREWS else "general",
             "roles": {n: r for n, r in roles.items() if r}}
 
@@ -541,17 +545,16 @@ def role_packs(base=None):
     return out
 
 
-def project_pack(config, packs=None):
+def project_pack(config, packs):
     """The id of the pack a project's roles start from ("software" before 0.14, or if it is gone)."""
     pack = str(config.get("pack") or DEFAULT_PACK)
-    return pack if pack in (packs if packs is not None else role_packs()) else DEFAULT_PACK
+    return pack if pack in packs else DEFAULT_PACK
 
 
-def role_table(config, packs=None):
+def role_table(config, packs):
     """A project's roles, {name: {label, description, picture, colour, tool, source}}: its pack's,
     then the owner's own from config.json ("roles": {name: role}). An owner's role with a pack
     role's name replaces it, and {"deleted": true} takes one of the pack's away."""
-    packs = packs if packs is not None else role_packs()
     out = {}
     for name, spec in packs[project_pack(config, packs)]["roles"].items():
         row = clean_role(spec)
@@ -573,22 +576,24 @@ def role_table(config, packs=None):
     return out
 
 
-def all_roles(config, packs=None):
-    """A project's roles as {name: (label, description)}: what an agent is told when it gets one."""
-    return {name: (row["label"], row["description"]) for name, row in role_table(config, packs).items()}
+def role_texts(table):
+    """Roles as {name: (label, description)}: what an agent is told when it gets one."""
+    return {name: (row["label"], row["description"]) for name, row in table.items()}
 
 
 ROLE_FIELDS = ("label", "description", "picture", "colour", "tool")
-ROLE_OPS = ("list", "create", "edit", "duplicate", "delete", "import", "export", "pack", "save_pack")
 MAX_IMPORT_ROLES = 50
 ROLES_LOCK = threading.Lock()  # one change to a config.json's roles at a time
 
 
 def role_name(value):
-    name = str(value or "").strip().lower()
-    if not NAME_RE.match(name):
-        raise HubError("a role's name is letters, digits, - _ . (32 at most), starting with a letter")
-    return name
+    return check_name(str(value or "").strip().lower())
+
+
+def find_pack(pid, packs):
+    if pid not in packs:
+        raise HubError("no pack called %s. Packs: %s" % (pid, ", ".join(packs)))
+    return packs[pid]
 
 
 def roles_export(table, names=None):
@@ -597,76 +602,97 @@ def roles_export(table, names=None):
         name: {k: row[k] for k in ROLE_FIELDS} for name, row in table.items() if names is None or name in names}}
 
 
-def roles_listing(config, packs):
+def roles_listing(config, packs, table):
     """What the page needs to show and edit a project's roles."""
-    table = role_table(config, packs)
-    return {"pack": project_pack(config, packs),
-            "roles": [dict(row, name=name) for name, row in table.items()],
+    return {"pack": project_pack(config, packs), "roles": [dict(row, name=name) for name, row in table.items()],
             "packs": [{"id": pid, "label": p["label"], "crew": p["crew"], "roles": list(p["roles"]),
                        "saved": bool(p.get("saved"))} for pid, p in packs.items()]}
 
 
 def save_roles_change(root, data):
     """change_roles on a project's config.json, saved (a new pack in the machine's config.json)."""
-    op = str(data.get("op") or "list")
     with ROLES_LOCK:
         config = load_config(root)
-        answer, effects = change_roles(config, op, data, role_packs())
+        answer, effects = change_roles(config, data, role_packs())
         if "saved_pack" in effects:
             mine = load_config()
-            saved = mine.get("packs") if isinstance(mine.get("packs"), dict) else {}
-            saved[effects["saved_pack"][0]] = effects["saved_pack"][1]
-            mine["packs"] = saved
+            if not isinstance(mine.get("packs"), dict):
+                mine["packs"] = {}
+            mine["packs"][effects["saved_pack"][0]] = effects["saved_pack"][1]
             save_config(mine)
-        elif op not in ("list", "export"):
+        elif effects.get("changed"):
             save_config(config, root)
     return answer, effects
 
 
-def change_roles(config, op, data, packs):
-    """One change the owner makes to a project's roles, applied to config (changed in place; the
-    caller saves it). Returns (answer, effects): effects may hold "deleted" (a role agents must lose),
-    "crew" (the crew a new pack brings) and "saved_pack" ((id, pack) for the machine's packs)."""
-    if op not in ROLE_OPS:
-        raise HubError("op is %s" % ", ".join(ROLE_OPS))
-    table = role_table(config, packs)
-    custom = config.get("roles") if isinstance(config.get("roles"), dict) else {}
-    effects = {}
+def _import_rows(spec):
+    """The roles in an import, all checked before any is kept."""
+    if isinstance(spec, dict) and isinstance(spec.get("roles"), (dict, list)):
+        spec = spec["roles"]  # a whole exported file
+    if isinstance(spec, list):
+        if not all(isinstance(r, dict) for r in spec):
+            raise HubError("roles to import are a list of roles, each with a name")
+        spec = {r.get("name"): r for r in spec}
+    if not isinstance(spec, dict) or not spec:
+        raise HubError("nothing to import: give roles as exported by crewchat")
+    if len(spec) > MAX_IMPORT_ROLES:
+        raise HubError("import at most %d roles at once" % MAX_IMPORT_ROLES)
+    rows = {}
+    for raw, role in spec.items():
+        name = role_name(raw)
+        rows[name] = clean_role(role)
+        if rows[name] is None:
+            raise HubError("the role %s has no description" % name)
+    return rows
 
-    def existing(key="name"):
-        name = role_name(data.get(key))
+
+def change_roles(config, data, packs):
+    """One change the owner makes to a project's roles (data["op"]), applied to config in place; the
+    caller saves it. Returns (answer, effects): effects["changed"] when config changed, and
+    effects["saved_pack"], (id, pack), for the machine's packs."""
+    op = str(data.get("op") or "list")
+    table = role_table(config, packs)
+    if op == "list":
+        return roles_listing(config, packs, table), {}
+    if op == "export":
+        names = data.get("names")
+        return roles_export(table, set(map(str, names)) if isinstance(names, list) else None), {}
+    if op == "save_pack":  # this project's roles, as a pack other projects can start from
+        pid = role_name(data.get("id"))
+        if pid in ROLE_PACKS:
+            raise HubError("%s is a built-in pack; choose another name" % pid)
+        crew = data.get("crew") if data.get("crew") in CREWS else packs[project_pack(config, packs)]["crew"]
+        pack = clean_pack({"label": data.get("label") or pid, "crew": crew, "roles": roles_export(table)["roles"]})
+        return {"pack": dict(pack, id=pid)}, {"saved_pack": (pid, pack)}
+    if not isinstance(config.get("roles"), dict):
+        config["roles"] = {}
+    custom = config["roles"]
+
+    def existing():
+        name = role_name(data.get("name"))
         if name not in table:
             raise HubError("no role called %s" % name)
         return name
 
     def keep(name, spec):
-        row = clean_role(spec)
-        if row is None:
+        custom[name] = clean_role(spec)
+        if custom[name] is None:
+            del custom[name]
             raise HubError("a role needs a description: what the agent is told to do")
-        custom[name] = row
-        config["roles"] = custom
-        return dict(row, name=name)
+        return {"role": dict(custom[name], name=name)}
 
-    if op == "list":
-        return roles_listing(config, packs), effects
-    if op == "export":
-        names = data.get("names")
-        return roles_export(table, set(map(str, names)) if isinstance(names, list) else None), effects
     if op == "create":
         name = role_name(data.get("name"))
         if name in table:
             raise HubError("there is a role called %s already" % name)
-        return {"role": keep(name, {k: data.get(k) for k in ROLE_FIELDS})}, effects
-    if op == "edit":
+        answer = keep(name, {k: data.get(k) for k in ROLE_FIELDS})
+    elif op == "edit":
         name = existing()
-        spec = dict(table[name])
-        spec.update({k: data[k] for k in ROLE_FIELDS if k in data})
-        return {"role": keep(name, spec)}, effects
-    if op == "duplicate":
+        answer = keep(name, dict(table[name], **{k: data[k] for k in ROLE_FIELDS if k in data}))
+    elif op == "duplicate":
         name = existing()
-        new = data.get("new")
-        if new:
-            new = role_name(new)
+        if data.get("new"):
+            new = role_name(data["new"])
         else:
             new, number = name + "-copy", 2
             while new in table:
@@ -674,55 +700,27 @@ def change_roles(config, op, data, packs):
             new = role_name(new[:32])
         if new in table:
             raise HubError("there is a role called %s already" % new)
-        spec = dict(table[name], label=(table[name]["label"] + " (copy)")[:MAX_ROLE_LABEL])
-        return {"role": keep(new, spec)}, effects
-    if op == "delete":
+        answer = keep(new, dict(table[name], label=table[name]["label"] + " (copy)"))
+    elif op == "delete":
         name = existing()
         if name in packs[project_pack(config, packs)]["roles"]:
             custom[name] = {"deleted": True}  # one of the pack's: kept away
         else:
             custom.pop(name, None)
-        config["roles"] = custom
-        effects["deleted"] = name
-        return {"deleted": name}, effects
-    if op == "import":
-        spec = data.get("roles")
-        if isinstance(spec, dict) and isinstance(spec.get("roles"), (dict, list)):
-            spec = spec["roles"]  # a whole exported file
-        if isinstance(spec, list):
-            if not all(isinstance(r, dict) for r in spec):
-                raise HubError("roles to import are a list of roles, each with a name")
-            spec = {r.get("name"): r for r in spec}
-        if not isinstance(spec, dict) or not spec:
-            raise HubError("nothing to import: give roles as exported by crewchat")
-        if len(spec) > MAX_IMPORT_ROLES:
-            raise HubError("import at most %d roles at once" % MAX_IMPORT_ROLES)
-        rows = {}
-        for raw, role in spec.items():
-            name = role_name(raw)
-            row = clean_role(role)
-            if row is None:
-                raise HubError("the role %s has no description" % name)
-            rows[name] = row
-        custom.update(rows)  # all or nothing: checked above before any is kept
-        config["roles"] = custom
-        return {"imported": sorted(rows)}, effects
-    if op == "pack":
+        answer = {"deleted": name}
+    elif op == "import":
+        rows = _import_rows(data.get("roles"))
+        custom.update(rows)
+        answer = {"imported": sorted(rows)}
+    elif op == "pack":
         pid = str(data.get("pack") or "")
-        if pid not in packs:
-            raise HubError("no pack called %s. Packs: %s" % (pid, ", ".join(packs)))
+        find_pack(pid, packs)
         config["pack"] = pid
         config["roles"] = {}  # a project starts over from its new pack
-        effects["crew"] = packs[pid]["crew"]
-        return roles_listing(config, packs), effects
-    # save_pack: this project's roles, kept as a pack other projects can start from.
-    pid = role_name(data.get("id"))
-    if pid in ROLE_PACKS:
-        raise HubError("%s is a built-in pack; choose another name" % pid)
-    crew = data.get("crew") if data.get("crew") in CREWS else packs[project_pack(config, packs)]["crew"]
-    pack = clean_pack({"label": data.get("label") or pid, "crew": crew, "roles": roles_export(table)["roles"]})
-    effects["saved_pack"] = (pid, pack)
-    return {"pack": dict(pack, id=pid)}, effects
+        answer = roles_listing(config, packs, role_table(config, packs))
+    else:
+        raise HubError("op is list, create, edit, duplicate, delete, import, export, pack or save_pack")
+    return answer, {"changed": True}
 
 
 def save_config(config, root=None):
@@ -774,23 +772,31 @@ class Roster:
 
     def _mtimes(self):
         out = []
-        for path in (self.root / "config.json", self.root / "tokens", home() / "config.json"):  # the last: saved packs
+        paths = [self.root / "config.json", self.root / "tokens"]
+        if self.root != home():
+            paths.append(home() / "config.json")  # the machine's saved packs
+        for path in paths:
             try:
                 out.append(path.stat().st_mtime_ns)
             except OSError:
                 out.append(0)
         return tuple(out)
 
-    def refresh(self):
+    def refresh(self, force=False):
+        """Read the settings and tokens again if they changed on disk (or force: a change was just
+        written, maybe within the clock's last tick)."""
         stamp = self._mtimes()
-        if stamp == self._stamp:
+        if stamp == self._stamp and not force:
             return
         config = load_config(self.root)
         self.config = config
-        self.packs = role_packs()
-        self.role_rows = role_table(config, self.packs)
-        self.roles = {name: (row["label"], row["description"]) for name, row in self.role_rows.items()}
-        self.pack = project_pack(config, self.packs)
+        packs = role_packs()
+        self.pack = project_pack(config, packs)
+        self.crew = packs[self.pack]["crew"]
+        self.role_rows = role_table(config, packs)
+        self.roles = role_texts(self.role_rows)
+        self.page_roles = [{"name": n, "title": r["label"], "picture": r["picture"], "colour": r["colour"],
+                            "tool": r["tool"], "source": r["source"]} for n, r in self.role_rows.items()]
         self.project = str(config["project"])
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
@@ -914,6 +920,7 @@ class Project:
         self.primary = primary
         self.roster = Roster(self.root)
         self.hub = Hub(self.roster)
+        self.hub.drop_missing_roles()  # config.json may have changed while the server was down
         self.hub.chat_key = "" if primary else self.root.name  # how this machine files its folders
         self.hub.machine_root = self.root if primary else self.root.parent.parent
 
@@ -1027,7 +1034,6 @@ class Hub:
         self.claim_gen = {}  # task id -> times given back: claims across machines use a new key after each
         self.reclaim = None  # minutes a holder may be silent before its task is reclaimed (0: never; None: RECLAIM_DEFAULT), set by a "plan" message
         self.advisor_check = False  # a task can be marked done only after the advisor approves it, set by a "plan" message
-        self.crew = ""  # "software" or "general": the words the chat page uses ("": the pack's), set by a "plan" message
         self.renamed = {}  # old task id -> new: open tasks from before the chat was linked (adopt_open_tasks)
         self.owner_cursor = 0
         self.web = {}  # sha256(chat page session id) -> expiry
@@ -1102,7 +1108,6 @@ class Hub:
         self.claim_gen = {str(k): int(v) for k, v in data.get("claim_gen", {}).items()}
         self.reclaim = data.get("reclaim") if isinstance(data.get("reclaim"), int) else None
         self.advisor_check = bool(data.get("advisor_check"))
-        self.crew = data.get("crew") if data.get("crew") in CREWS else ""
         self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
@@ -1128,7 +1133,6 @@ class Hub:
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
-            "crew": self.crew,
         }, private=True, indent=None)
 
     def _changed(self):
@@ -1258,9 +1262,6 @@ class Hub:
                     ask is not None and msg["from"] == ask["to"] and msg["from"] != ask["from"])):
                 row["verdict"] = msg["verdict"]
                 self._save()
-        elif kind == "plan" and not msg.get("task") and msg.get("crew") in CREWS:
-            self.crew = msg["crew"]  # the project's setting
-            self._save()
         elif kind == "plan" and not msg.get("task") and msg.get("advisor"):
             self.advisor_check = msg["advisor"] == "on"  # the project's setting
             self._save()
@@ -2026,16 +2027,14 @@ class Hub:
             self._changed()
             return value
 
-    def set_crew(self, crew):
-        """The owner sets the project's crew: "software" (the page talks of folders and commits) or
-        "general". It travels as a message, so every machine keeps the same."""
-        if crew not in CREWS:
-            raise HubError("a crew is %s" % " or ".join(CREWS))
+    def drop_missing_roles(self):
+        """Take away the roles this project no longer has (deleted, or not in its new pack), telling
+        each agent that had one. The server does this after a change and when it starts."""
+        roles = self.roles()
         with self.lock:
-            if crew != self.crew:
-                self._append(OWNER, "all", "", "plan", crew=crew)
-                self._changed()
-        return crew
+            gone = [n for n, a in self.agents.items() if a.get("role") and a["role"] not in roles]
+        for name in gone:
+            self.set_role(OWNER, name, "")
 
     def update(self, agent, mid, status, note):
         """Progress on a task, sent to whoever coordinates it: the lead, or else whoever posted it."""
@@ -2516,11 +2515,9 @@ class Hub:
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
                 "agents": self._rows(),
-                "roles": [{"name": k, "title": row["label"], "label": row["label"], "picture": row["picture"],
-                           "colour": row["colour"], "tool": row["tool"], "source": row["source"]}
-                          for k, row in self.roster.role_rows.items()],  # instructions: /api/roles
+                "roles": self.roster.page_roles,  # their instructions come from /api/roles
                 "pack": self.roster.pack,
-                "crew": self.crew or self.roster.packs[self.roster.pack]["crew"],
+                "crew": self.roster.crew,
                 "statuses": STATUSES,
                 "tools": TOOLS_INFO,
                 "presets": PICTURE_PRESETS,
@@ -4246,14 +4243,9 @@ class Handler(BaseHTTPRequestHandler):
     def _roles(self, data):
         """The owner lists and changes the project's roles and packs (change_roles has the ops)."""
         answer, effects = save_roles_change(self.roster.root, data)
-        self.roster._stamp = None  # read it again now, even if the clock didn't move
-        self.roster.refresh()
-        if effects.get("deleted"):
-            for row in self.hub.rows():
-                if row.get("role") == effects["deleted"] and not row.get("remote"):
-                    self.hub.set_role(OWNER, row["agent"], "")
-        if effects.get("crew"):
-            self.hub.set_crew(effects["crew"])
+        if effects.get("changed"):
+            self.roster.refresh(force=True)
+            self.hub.drop_missing_roles()
         return answer
 
     def _launch(self, data):
@@ -4555,7 +4547,9 @@ def owner_token():
 CURRENT_CHAT = None  # the project owner commands act on: --chat, or the one of the folder they run in
 
 
-def owner_call(path, body, chat=None):
+def owner_call(path, body, chat=None, offline=None):
+    """POST to the chat server here as the owner. With offline, a server that isn't running calls
+    offline() for the answer instead of stopping."""
     chat = chat or CURRENT_CHAT
     try:
         return post_json(local_url() + path, owner_token(), body, headers={"X-Crewchat-Chat": chat} if chat else None)
@@ -4565,6 +4559,8 @@ def owner_call(path, body, chat=None):
         except ValueError:
             die("the server answered HTTP %d" % e.code)
     except (urllib.error.URLError, OSError) as e:
+        if offline:
+            return offline()
         die("the chat server is not running here (%s). Start it with `crewchat serve` or "
             "`crewchat service install`." % getattr(e, "reason", e))
 
@@ -4977,8 +4973,12 @@ def cmd_start(args):
     project = Path(args.folder or ".").resolve()
     if not project.is_dir():
         die("%s is not a folder" % project)
-    if args.pack and args.pack not in role_packs():
-        die("no pack called %s. Packs: %s" % (args.pack, ", ".join(role_packs())))
+    packs = role_packs()
+    if args.pack:
+        try:
+            find_pack(args.pack, packs)
+        except HubError as e:
+            die(str(e))
     print(banner())
     print()
     first = not (home() / "config.json").exists()
@@ -5019,7 +5019,7 @@ def cmd_start(args):
                   "chat page, top left)." % chosen["name"])
         if (created or first) and args.pack:
             owner_call("/api/roles", {"op": "pack", "pack": args.pack}, chat=chosen["id"])
-            print("- Its roles come from the pack \"%s\" (`crewchat roles` lists them)." % role_packs()[args.pack]["label"])
+            print("- Its roles come from the pack \"%s\" (`crewchat roles` lists them)." % packs[args.pack]["label"])
         if others:
             print("- Added %s to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
             print("  `crewchat places` lists its folders; `crewchat place remove %s` takes this one out." % place)
@@ -5360,22 +5360,14 @@ def cmd_role(args):
 
 
 def roles_change(data):
-    """A change to the project's roles: through the server when it runs here, so agents that lose a
-    role are told and a new pack's crew reaches every machine; else straight into config.json."""
-    try:
-        return post_json(local_url() + "/api/roles", owner_token(), data,
-                         headers={"X-Crewchat-Chat": CURRENT_CHAT} if CURRENT_CHAT else None)
-    except urllib.error.HTTPError as e:
+    """A change to the project's roles: through the server when it runs here, else straight into
+    config.json (the server takes away roles that are gone when it starts)."""
+    def offline():
         try:
-            die(json.loads(e.read().decode("utf-8")).get("error", "HTTP %d" % e.code))
-        except ValueError:
-            die("the server answered HTTP %d" % e.code)
-    except (urllib.error.URLError, OSError):
-        pass
-    try:
-        return save_roles_change(project_root(), data)[0]
-    except HubError as e:
-        die(str(e))
+            return save_roles_change(project_root(), data)[0]
+        except HubError as e:
+            die(str(e))
+    return owner_call("/api/roles", data, offline=offline)
 
 
 def cmd_roles(args):
@@ -5384,8 +5376,8 @@ def cmd_roles(args):
     packs = role_packs()
     table = role_table(config, packs)
     if args.action == "list":
-        pack = packs[project_pack(config, packs)]
-        print("Pack: %s (%s)\n" % (project_pack(config, packs), pack["label"]))
+        pid = project_pack(config, packs)
+        print("Pack: %s (%s)\n" % (pid, packs[pid]["label"]))
         for name, row in table.items():
             print("  %-12s %s%s" % (name, row["label"], " (yours)" if row["source"] == "yours" else ""))
         print("\nGive an agent a role: crewchat role AGENT ROLE (or use the menu on its card in the chat page).")
@@ -5422,7 +5414,7 @@ def cmd_roles(args):
     name = args.name.lower()
     if args.action == "pack":
         roles_change({"op": "pack", "pack": name})
-        print("This project's roles start over from the pack %s. Agents keep the roles they have." % name)
+        print("This project's roles start over from the pack %s. Agents whose role it doesn't have lose it." % name)
     elif args.action == "save-pack":
         roles_change({"op": "save_pack", "id": name, "label": args.label or args.title})
         print("Saved this project's roles as the pack %s. Use it in another project with: "
@@ -5444,7 +5436,6 @@ def cmd_roles(args):
             roles_change(dict(fields, op="edit", name=name))
             print("Role %s changed. Agents that have it are told the new instructions when they next get it." % name)
         else:
-            fields.setdefault("label", name.replace("-", " ").capitalize())
             roles_change(dict(fields, op="create", name=name))
             print("Role %s saved. Give it to an agent with: crewchat role AGENT %s" % (name, name))
     else:

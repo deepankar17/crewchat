@@ -538,7 +538,7 @@ class Teams(Base):
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
         poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
         qa = next(r for r in poll["roles"] if r["name"] == "qa")
-        self.assertEqual((qa["title"], qa["label"], qa["picture"], qa["source"]), ("QA", "QA", "preset:flask", "pack"))
+        self.assertEqual((qa["title"], qa["picture"], qa["source"]), ("QA", "preset:flask", "pack"))
         self.assertNotIn("description", qa)  # instructions come from /api/roles, not every poll
 
     def test_there_is_one_lead(self):
@@ -645,10 +645,10 @@ class RolePacks(unittest.TestCase):
         self.packs = dict(crewchat.ROLE_PACKS)
 
     def change(self, config, op, **data):
-        return crewchat.change_roles(config, op, data, self.packs)[0]
+        return crewchat.change_roles(config, dict(data, op=op), self.packs)[0]
 
     def test_a_project_from_before_packs_has_the_software_roles(self):
-        self.assertEqual(crewchat.all_roles({}, self.packs), crewchat.ROLES)
+        self.assertEqual(crewchat.role_texts(crewchat.role_table({}, self.packs)), crewchat.ROLES)
         self.assertEqual(crewchat.project_pack({"pack": "gone"}, self.packs), "software")
         old = {"roles": {"designer": {"title": "Designer", "prompt": "You design."}}}
         row = crewchat.role_table(old, self.packs)["designer"]
@@ -697,11 +697,11 @@ class RolePacks(unittest.TestCase):
         self.assertEqual(crewchat.role_table(config, self.packs)["qa"]["source"], "yours")
         self.change(config, "delete", name="docs")
         self.assertEqual(config["roles"]["docs"], {"deleted": True})
-        self.assertNotIn("docs", crewchat.all_roles(config, self.packs))
+        self.assertNotIn("docs", crewchat.role_table(config, self.packs))
         with self.assertRaisesRegex(crewchat.HubError, "no role called docs"):
             self.change(config, "edit", name="docs", label="Docs")
-        listing, effects = crewchat.change_roles(config, "pack", {"pack": "youtube"}, self.packs)
-        self.assertEqual((config["pack"], config["roles"], effects), ("youtube", {}, {"crew": "general"}))
+        listing, effects = crewchat.change_roles(config, {"op": "pack", "pack": "youtube"}, self.packs)
+        self.assertEqual((config["pack"], config["roles"], effects), ("youtube", {}, {"changed": True}))
         self.assertEqual([r["name"] for r in listing["roles"]][:2], ["lead", "researcher"])
         with self.assertRaisesRegex(crewchat.HubError, "no pack called nope"):
             self.change(config, "pack", pack="nope")
@@ -729,7 +729,7 @@ class RolePacks(unittest.TestCase):
             config = {}
             with self.assertRaisesRegex(crewchat.HubError, why):
                 self.change(config, "import", roles=bad)
-            self.assertNotIn("roles", config)
+            self.assertFalse(config.get("roles"))
 
     def test_saved_packs(self):
         config = {"pack": "instagram"}
@@ -773,8 +773,7 @@ class Roles(Base):
         mine = crewchat.load_config()
         mine.pop("packs", None)
         crewchat.save_config(mine)
-        self.hub.roster._stamp = None
-        self.hub.roster.refresh()
+        self.hub.roster.refresh(force=True)
 
     def op(self, token=None, **body):
         try:
@@ -797,8 +796,7 @@ class Roles(Base):
                        picture="preset:palette", tool="cursor")["role"]
         self.assertEqual(role["name"], "designer")
         page = {r["name"]: r for r in self.poll()["roles"]}
-        self.assertEqual((page["designer"]["title"], page["designer"]["label"], page["designer"]["tool"]),
-                         ("Designer", "Designer", "cursor"))
+        self.assertEqual((page["designer"]["title"], page["designer"]["tool"]), ("Designer", "cursor"))
         session, name = self.agent()
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "designer"})
         self.assertIn("You design screens.", session.text("hub_inbox"))
@@ -814,17 +812,33 @@ class Roles(Base):
         self.assertNotIn("docs", [r["name"] for r in self.poll()["roles"]])
         self.assertIn("no role called docs", self.op(op="edit", name="docs", label="x")["error"])
 
-    def test_a_pack_sets_the_crew_for_every_machine(self):
+    def test_a_pack_sets_the_crew_and_takes_away_roles_it_does_not_have(self):
+        session, name = self.agent()
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "qa"})
+        session.text("hub_inbox")
         self.assertEqual(self.poll()["crew"], "software")
         listing = self.op(op="pack", pack="youtube")
         self.assertEqual(listing["pack"], "youtube")
         poll = self.poll()
         self.assertEqual((poll["pack"], poll["crew"]), ("youtube", "general"))
+        self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")  # no qa in youtube
+        self.assertIn("You no longer have a role", session.text("hub_inbox"))
         self.assertEqual(next(r for r in poll["roles"] if r["name"] == "lead")["title"], "Producer")
-        plan = [m for m in self.hub.messages if m["kind"] == "plan" and m.get("crew")][-1]
-        self.assertEqual(plan["crew"], "general")  # travels to linked machines like the reclaim setting
         self.op(op="pack", pack="software")
         self.assertEqual(self.poll()["crew"], "software")
+
+    def test_a_role_removed_while_the_server_was_down_is_taken_away_when_it_starts(self):
+        self.op(op="create", name="designer", description="You design.")
+        session, name = self.agent()
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "designer"})
+        session.text("hub_inbox")
+        config = crewchat.load_config(self.root)
+        del config["roles"]["designer"]  # as `crewchat roles remove` does with no server
+        crewchat.save_config(config, self.root)
+        self.hub.roster.refresh(force=True)
+        self.hub.drop_missing_roles()  # what a starting server does
+        self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")
+        self.assertIn("You no longer have a role", session.text("hub_inbox"))
 
     def test_save_a_pack_and_start_another_project_from_it(self):
         self.op(op="edit", name="qa", label="Tester")
@@ -836,7 +850,7 @@ class Roles(Base):
         self.assertIn("Pack: software", cli("roles"))
         cli("roles", "add", "designer", "--prompt", "You design.", "--label", "Designer", "--picture", "palette",
             "--colour", "#112233", "--tool", "claude")
-        row = crewchat.role_table(crewchat.load_config(self.root))["designer"]
+        row = crewchat.role_table(crewchat.load_config(self.root), crewchat.role_packs())["designer"]
         self.assertEqual((row["picture"], row["colour"], row["tool"]), ("preset:palette", "#112233", "claude"))
         cli("roles", "add", "designer", "--label", "Screen designer")  # a change keeps the instructions
         self.assertIn("Screen designer\n\nYou design.", cli("roles", "show", "designer"))
