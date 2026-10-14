@@ -1238,7 +1238,7 @@ class Hub:
         """After the server read the process list: if an agent's session started or ended since the
         last look, the chat page hears it."""
         with self.lock:
-            running = {n: process_running(a["session"], _PROCESSES[1]) for n, a in self.agents.items() if a.get("session")}
+            running = {n: process_running(a["session"], _PROCESSES) for n, a in self.agents.items() if a.get("session")}
             if running != self._running:
                 self._running = running
                 self._changed()
@@ -1248,7 +1248,7 @@ class Hub:
         session = agent.get("session")
         if not session:
             return None
-        return {"app": session.get("app", "terminal"), "running": process_running(session, _PROCESSES[1]),
+        return {"app": session.get("app", "terminal"), "running": process_running(session, _PROCESSES),
                 "since": session.get("since", 0), "tool": session.get("tool", "claude"),
                 "reopen": session.get("tool", "claude") in REOPEN_TOOLS}
 
@@ -2192,7 +2192,7 @@ class Hub:
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life, or the session report it was asked for)."""
-        table = _PROCESSES[1]  # as the server last read it: never ps here
+        table = _PROCESSES  # as the server last read it: never ps here
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
         with self.lock:
@@ -2283,10 +2283,7 @@ class Hub:
             session = dict(self._session_of(name, "stop"))
         if not process_running(session):
             raise HubError("%s is not running" % name)
-        try:
-            end_session(session)
-        except HubError as e:
-            raise HubError("%s: %s" % (name, e))
+        end_session(name, session)
         with self.lock:
             if (self.agents.get(name) or {}).get("session", {}).get("pid") == session["pid"]:
                 self.agents[name]["session"]["since"] = time.time()  # closed since now
@@ -2314,13 +2311,16 @@ class Hub:
         exe, base = agent_tool(tool, folder, permissions, self.home)
         return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
 
-    def reopen_agent(self, name, model=None, plan=None):
+    def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
         memory, same name (its hooks get its own link key), same permissions. It is told to carry
         on, so its hooks report the new process and read the chat."""
-        session, folder, command = plan or self._reopen_plan(name, model)
-        if plan is None and process_running(session):
+        session, folder, command = self._reopen_plan(name)
+        if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
+        self._open_again(name, None, session, folder, command)
+
+    def _open_again(self, name, model, session, folder, command):
         with self.lock:
             key = next((k for k, v in self.links.items() if v == name), None)
             if key is None:  # its link was lost: a new one, tied to the same name
@@ -2341,16 +2341,14 @@ class Hub:
         """The owner switches an agent to another model: its session is stopped (its tasks stay
         its own) and reopened on that model, same conversation. Everything reopening needs is
         checked first, so a failure never leaves it stopped."""
-        plan = self._reopen_plan(name, model if isinstance(model, str) and MODEL_RE.fullmatch(model) else None)
-        session, tool = plan[0], plan[0].get("tool", "claude")
-        if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, plan[2][0])]:
-            raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
+        with self.lock:
+            tool = self._session_of(name, "switch").get("tool", "claude")
+        if model not in [m[0] for m in tool_models(tool)]:
+            raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS.get(tool, (tool,))[0]))
+        session, folder, command = self._reopen_plan(name, model)
         if process_running(session):
-            try:
-                end_session(session)
-            except HubError as e:
-                raise HubError("%s: %s" % (name, e))
-        self.reopen_agent(name, model, plan)
+            end_session(name, session)
+        self._open_again(name, model, session, folder, command)
 
     def _wants_session(self, name, table):
         """Should this agent's hook report its session again? After a Reopen (the same session id,
@@ -4453,16 +4451,21 @@ def launch_options(config, root=None, chat=""):
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t, exe) if exe and t in REOPEN_TOOLS else []},
+                           "models": tool_models(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
+
+
+def tool_options(tool, permissions="ask", base=None):
+    """The options an agent tool starts with: its base options (as this copy knows them) and the
+    chosen permissions. The same for a new agent and a reopened one."""
+    return (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
 
 
 def launch_command(exe, tool, key, permissions="ask", base=None):
     """The agent's command line. Only the fixed prompt, the key and fixed options reach it: no text
     typed on the chat page is ever passed to a shell."""
-    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-    return [exe] + options + [LAUNCH_PROMPT % key]
+    return [exe] + tool_options(tool, permissions, base) + [LAUNCH_PROMPT % key]
 
 
 def macos_script(folder, command, key, title=""):
@@ -4524,37 +4527,21 @@ REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_i
 REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
-MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-_MODELS = {}  # exe -> (when, models): Cursor's list takes a few seconds to fetch
 
 
-def tool_models(tool, exe):
-    """The models an agent tool can be switched to: [[id, label], ...]. Claude Code takes its
-    aliases; Cursor's agent lists its own (`cursor-agent models`), kept for 10 minutes."""
-    if tool == "claude":
-        return CLAUDE_MODELS
-    when, models = _MODELS.get(exe, (0, None))
-    if models is None or time.time() - when > 600:
-        try:
-            out = subprocess.run([exe, "models"], capture_output=True, text=True, timeout=60).stdout
-        except (OSError, subprocess.SubprocessError):
-            out = ""
-        models = []
-        for line in out.splitlines():
-            model, sep, label = line.strip().partition(" - ")
-            if sep and MODEL_RE.fullmatch(model):
-                models.append([model, label.strip()])
-        _MODELS[exe] = (time.time(), models)
-    return models
+def tool_models(tool):
+    """The models an agent tool can be switched to: [[id, label], ...]. Only Claude Code's aliases
+    for now: switching restarts the conversation, which only Claude Code can do from here."""
+    return CLAUDE_MODELS if tool == "claude" else []
 
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
     if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
-    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
     # One argument, so an id can never be taken for an option of its own.
-    return [exe] + options + (["--model", model] if model else []) + ["--resume=" + session, REOPEN_PROMPT]
+    return ([exe] + tool_options(tool, permissions, base) + (["--model", model] if model else [])
+            + ["--resume=" + session, REOPEN_PROMPT])
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None):
@@ -5537,7 +5524,7 @@ def process_table(pids=None):
     return table
 
 
-_PROCESSES = [0.0, {}]  # when, the agents' processes as refresh_processes last read them
+_PROCESSES = {}  # the agents' processes as refresh_processes last read them
 SESSIONS_EVERY = 5  # seconds between the server's looks at its agents' processes
 
 
@@ -5546,14 +5533,16 @@ def refresh_processes(projects):
     `ps`), and tell each project's page when an agent's session started or ended."""
     hubs = [project.hub for project in projects.all()]
     pids = sorted({pid for hub in hubs for pid in hub.session_pids()})
-    _PROCESSES[:] = [time.time(), process_table(pids)]
+    table = process_table(pids)
+    _PROCESSES.clear()
+    _PROCESSES.update(table)
     for hub in hubs:
         hub.check_sessions()
 
 
 def forget_process(pid):
     """An agent's process that was just stopped: the cards show it closed without waiting."""
-    _PROCESSES[1] = {k: v for k, v in _PROCESSES[1].items() if k != pid}
+    _PROCESSES.pop(pid, None)
 
 
 def session_checks(projects):
@@ -5597,17 +5586,17 @@ def process_running(session, table=None):
     return bool(row and row[1] == started and AGENT_COMMAND.get(tool, AGENT_COMMAND["claude"]).search(row[2]))
 
 
-def end_session(session):
+def end_session(name, session):
     """Stop an agent's process and wait (outside any lock, up to 10 s) for it to end. HubError if it
     does not."""
     if not stop_process(session["pid"]):
-        raise HubError("could not stop it")
+        raise HubError("%s: could not stop it" % name)
     for _ in range(40):
         if not process_running(session):
             forget_process(session["pid"])
             return
         time.sleep(0.25)
-    raise HubError("it did not stop; try again")
+    raise HubError("%s: it did not stop; try again" % name)
 
 
 def stop_process(pid):

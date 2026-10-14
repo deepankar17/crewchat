@@ -1028,15 +1028,9 @@ class Launching(Base):
                     crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": bad})
                 self.assertIn("no model", json.loads(caught.exception.read())["error"])
 
-    def test_models_come_from_the_tool(self):
-        listing = "Available models\n\nauto - Auto (current, default)\ngpt-5.3-codex - Codex 5.3\n" \
-                  "claude-sonnet-5-thinking-high - Claude Sonnet 5 1M Thinking\nnot a model line\n"
-        with mock.patch.object(crewchat.subprocess, "run", lambda *a, **kw: mock.Mock(stdout=listing, returncode=0)):
-            crewchat._MODELS.clear()
-            self.assertEqual(crewchat.tool_models("cursor", "/x/cursor-agent"),
-                             [["auto", "Auto (current, default)"], ["gpt-5.3-codex", "Codex 5.3"],
-                              ["claude-sonnet-5-thinking-high", "Claude Sonnet 5 1M Thinking"]])
-        self.assertEqual([m[0] for m in crewchat.tool_models("claude", "/x/claude")], ["fable", "opus", "sonnet", "haiku"])
+    def test_models_are_claude_codes_aliases(self):
+        self.assertEqual([m[0] for m in crewchat.tool_models("claude")], ["fable", "opus", "sonnet", "haiku"])
+        self.assertEqual(crewchat.tool_models("cursor"), [])  # it cannot be switched from here yet
 
     def test_the_window_is_titled_with_the_agents_name(self):
         script = crewchat.macos_script("/tmp/x", ["/x/claude"], "start-0123456789abcdef", title="it's me")
@@ -1170,7 +1164,7 @@ class AgentCards(Base):
         _, name = self.agent()
         self.hub.agents[name]["session"] = {"id": "sess-0011-abc", "pid": 999999, "started": "x", "app": "terminal",
                                             "tool": "claude", "folder": "/tmp", "since": time.time()}
-        crewchat._PROCESSES[:] = [time.time(), {}]
+        crewchat._PROCESSES.clear()
         with mock.patch.object(crewchat, "process_table", mock.Mock(side_effect=AssertionError("ps under the lock"))):
             self.assertFalse(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
         before = self.hub.version  # the server's refresher finds it running, and the page hears it
@@ -1194,7 +1188,7 @@ class AgentCards(Base):
         started = crewchat.process_table()[proc.pid][1]
         self.hub.agents[name]["session"] = {"id": "sess-0002-abc", "pid": proc.pid, "started": started, "app": app,
                                             "tool": "claude", "folder": "/tmp", "since": time.time()}
-        crewchat._PROCESSES[:] = [time.time(), crewchat.process_table([proc.pid])]  # as the server's look would
+        crewchat._PROCESSES.clear(); crewchat._PROCESSES.update(crewchat.process_table([proc.pid]))  # as the server's look would
         return proc
 
     @unittest.skipIf(os.name == "nt", "a stand-in process with another name needs POSIX exec")
