@@ -185,6 +185,25 @@ Things to know:
 - **The session gets only a one-time key** on its command line. Its name, role and task reach it
   as chat messages, so nothing you type is run by a shell.
 
+## Stop, reopen or switch an agent's model
+
+Each agent's card on the chat page says where its session runs: **in the Claude app**, **in
+Terminal**, or **closed** (and since when). Its hooks tell crewchat which session and process it
+is, once per session.
+
+- **Stop** ends its session (after you confirm). It stays on the list; what it held goes back on
+  the sheet.
+- **Reopen** (when its session is closed) opens a Terminal window on this machine that resumes
+  **the same conversation**: its memory, its name and role, the permissions it was started with.
+  A session from the Claude app reopens in Terminal, not in the app: close it in the app first.
+- **Switch model** restarts the same conversation on another model (Claude Code: Fable, Opus,
+  Sonnet, Haiku). Its tasks stay its own.
+
+For now Reopen and Switch model are for Claude Code; a Cursor agent has Stop, and you open it again
+in Cursor. These act on agents of the machine that hosts the page. Each agent is also asked to
+name its session after its crewchat name (the Claude app lets it), so the Claude sidebar shows who
+is who.
+
 ## Your own roles
 
 ```bash

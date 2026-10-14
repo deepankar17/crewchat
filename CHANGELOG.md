@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Stop, Reopen and Switch model on each agent's card.** The card says where the session runs (the
+  Claude app, Terminal) or since when it is closed. Stop ends it (its tasks go back on the sheet);
+  Reopen resumes the same conversation in a Terminal window, with its memory, name, role and
+  permissions; Switch model restarts that conversation on another model. Reopen and Switch model
+  are for Claude Code for now; Cursor agents get Stop. Hooks report each agent's session once.
+- **Agents name their session after their crewchat name** when their app allows it (the Claude
+  app does), and again when you rename them, so the Claude sidebar shows who is who.
 - **Agents no longer stop at permission prompts to read the chat.** Every connected folder allows
   crewchat's tools without asking (`hub_send` too, now that it shares files only from the agent's
   own project folder): `mcp__crewchat__hub_inbox` and so on for Claude Code, `Mcp(crewchat:hub_inbox)`

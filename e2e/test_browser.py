@@ -154,6 +154,47 @@ class Page(unittest.TestCase):
         self.assertIn("Your role in this chat is now: QA", self.agent.stop_hook())
         c.until("document.getElementById('agents').innerText.includes('QA')")
 
+    def test_session_controls_follow_its_state(self):
+        c = self.chrome
+        c.until("state.agents.length > 0", what="the agents")
+        # Rows as the server sends them (the page's own data), drawn by the page's own code.
+        out = c.js("""(() => {
+            const saved = state.agents, savedModels = toolModels;
+            toolModels = {claude: [["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]};
+            const base = state.agents[0];
+            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
+            state.agents = [
+              row("running-one", {session: {app: "terminal", running: true, since: state.now - 60, tool: "claude", reopen: true}}),
+              row("in-the-app", {session: {app: "claude-app", running: true, since: state.now, tool: "claude", reopen: true}}),
+              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
+              row("closed-cursor", {session: {app: "terminal", running: false, since: state.now, tool: "cursor", reopen: false}}),
+              row("far-one", {remote: true, device: "laptop", session: null}),
+              row("never-reported", {session: null})];
+            state.names = "";
+            renderAgents();
+            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
+            const buttons = (n) => [...card(n).querySelectorAll('button')].map(b => b.textContent);
+            const out = {
+              running: buttons("running-one"), app: card("in-the-app").innerText,
+              closed: buttons("closed-one"), closedText: card("closed-one").innerText,
+              far: buttons("far-one"), never: buttons("never-reported"), cursor: buttons("closed-cursor"),
+              models: [...card("running-one").querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
+            };
+            state.agents = saved; toolModels = savedModels; state.names = ""; renderAgents();  // as the server says
+            return out;
+        })()""")
+        self.assertIn("Stop", out["running"])
+        self.assertNotIn("Reopen", out["running"])
+        self.assertIn("Running in the Claude app", out["app"])
+        self.assertIn("Reopen", out["closed"])
+        self.assertNotIn("Stop", out["closed"])
+        self.assertIn("Session closed 4 min ago", out["closedText"])
+        for name in ("far", "never", "cursor"):  # no session it could act on here (Cursor: not yet)
+            self.assertNotIn("Stop", out[name])
+            self.assertNotIn("Reopen", out[name])
+        self.assertIn("Switch running-one's model", out["models"])
+        self.assertEqual(c.errors, [])
+
     def test_attach_a_file(self):
         c = self.chrome
         path = H.TMP / "from-the-page.txt"
