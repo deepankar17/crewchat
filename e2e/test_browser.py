@@ -663,6 +663,7 @@ class NewPage(Signed):
 
     def test_needs_you_and_notifications(self):
         c = self.chrome
+        self.addCleanup(c.js, "delete document.hidden; try { localStorage.removeItem(notifyKey()); } catch (e) {} showBell()")
         # Notifications, stubbed: the page asks once, and shows them only while it is in the background.
         c.js("""window.notes = []; window.Notification = class { constructor(t, o) { window.notes.push([t, o.body]); }
                   close() {} static requestPermission() { Notification.permission = 'granted'; return Promise.resolve('granted'); } };
@@ -677,11 +678,11 @@ class NewPage(Signed):
         self.agent.call("hub_update", id=tid, status="blocked", note="Blue or green?")
         c.until("!$('needs-you').hidden && $('needs-list').innerText.includes('Blue or green?')", what="the item")
         c.until("window.notes.some(n => n[0].includes('Needs you') && n[1].includes('Blue or green?'))", what="a notification")
-        self.assertIn("1", c.js("$('needs-count').textContent"))
+        self.assertGreaterEqual(int(c.js("$('needs-count').textContent")), 1)
         self.assertTrue(c.js("[...document.querySelectorAll('#tabs .tab')].some(t => t.classList.contains('needs'))"))
         c.js("delete document.hidden")
         # The item opens its task, with the question and a way to answer.
-        c.js("document.querySelector('#needs-list .need').click()")
+        c.js("[...document.querySelectorAll('#needs-list .need')].find(b => b.innerText.includes('Blue or green?')).click()")
         c.until("!!document.querySelector('#panel-body .needs-card textarea')", what="the answer box")
         c.js("""(() => { const t = document.querySelector('#panel-body .needs-card textarea'); t.value = 'Green, please';
                   [...document.querySelectorAll('#panel-body .needs-card button')].find(b => b.textContent === 'Send').click(); })()""")
@@ -690,8 +691,9 @@ class NewPage(Signed):
         c.until("$('needs-you').hidden || !$('needs-list').innerText.includes('Blue or green?')", what="the item to go")
         # A message to you is unread until the page is in front, then read.
         self.agent.call("hub_send", to="Owner", text="Done with the button")
-        c.until("state.version > 0 && !state.needs.some(n => n.kind === 'message')", what="read while in front")
-        c.js("localStorage.removeItem('crewchat-notify-first'); showBell()")
+        c.until("$('log').innerText.includes('Done with the button')", what="the message on the page")
+        c.js("$('log').scrollTop = $('log').scrollHeight; markRead()")
+        c.until("!state.needs.some(n => n.kind === 'message')", what="read while in front")
     def test_dragging_a_card_with_the_mouse(self):
         c = self.chrome
         c.click("#view-tasks")

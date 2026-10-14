@@ -1662,7 +1662,12 @@ class Hub:
     def needs_you(self):
         """What waits on the owner, most pressing first: blocked tasks (with the agent's question),
         tasks ready for review, tasks given back or reclaimed and not taken again, and messages to
-        the owner not yet read. Each says how many open tasks wait on it ("blocking")."""
+        the owner not yet read. Each says how many open tasks wait on it ("blocking"). Worked out
+        again only when the chat changed (every page polls it, for every project)."""
+        cached = getattr(self, "_needs", None)
+        if cached and cached[0] == self.version:
+            return cached[1]
+        version = self.version
         rows = self.sheet_rows(view="open")
         open_ids = {r["id"] for r in rows}
         waiting_on = {}
@@ -1682,7 +1687,7 @@ class Hub:
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
-                if m["kind"] == "update" and m.get("task") and m["from"] != OWNER and m["task"] not in last_word:
+                if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
@@ -1692,6 +1697,8 @@ class Hub:
             kind = ("blocked" if r["status"] == "blocked" else "review" if r["status"] == "review"
                     else "reclaimed" if r["status"] in ("todo", "waiting") and r.get("reclaimed")
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
+            if kind in ("blocked", "review") and r.get("note") == OWNER:
+                continue  # the owner set it so: nothing waits on the owner
             if kind:
                 # Named after whoever wrote the note (any agent may update a task), so an answer goes back
                 # to the agent that asked; a reclaimed task, after the agent it was taken from.
@@ -1705,6 +1712,7 @@ class Hub:
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
         order = {"blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
         items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
+        self._needs = (version, items)
         return items
 
     def owner_read(self, seq):
@@ -10538,7 +10546,7 @@ function needsCard(n, r) {
         if (!await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) return;
         answer.value = "";
       }
-      taskOp({ op: "status", task: r.id, status: "done" });
+      postAction("/api/task", { op: "status", task: r.id, status: "done" }, "Not marked done", b);
     });
     box.append(answer, acts);
   }
@@ -10942,7 +10950,8 @@ function renderNeeds(needs) {
 // What you have seen of the chat: messages to you count as read while the page is in front.
 // (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
 function markRead(upto) {
-  const seen = !document.hidden && document.hasFocus() && !$("log").hidden;
+  const log = $("log");
+  const seen = !document.hidden && document.hasFocus() && !log.hidden && log.scrollHeight - log.scrollTop - log.clientHeight < 80;
   const seq = upto || (seen ? state.after : 0);
   if (!seq || seq <= (state.readPosted || 0)) return;
   if (!upto && !state.needs.some((n) => n.kind === "message" && n.seq <= seq)) return;
@@ -10954,9 +10963,10 @@ window.addEventListener("focus", () => markRead());
 
 // Notifications, per project: all that needs you, only messages to you, or none. Only while the page
 // is in the background; a notification opens its item.
-const NOTIFY_KEY = "crewchat-notify-" + (CHAT || "first");
+// Kept by the project's id (the page at "/" learns it from the first poll), in this browser.
+const notifyKey = () => "crewchat-notify-" + (state.chat || CHAT || "first");
 function notifyMode() {
-  try { return localStorage.getItem(NOTIFY_KEY) || "off"; } catch (e) { return "off"; }
+  try { return localStorage.getItem(notifyKey()) || "off"; } catch (e) { return "off"; }
 }
 function showBell() {
   const mode = notifyMode();
@@ -10968,15 +10978,22 @@ function showBell() {
     : denied && mode !== "off" ? "The browser blocks notifications for this page: allow them in its site settings." : "";
 }
 for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("click", async () => {
-  try { localStorage.setItem(NOTIFY_KEY, b.dataset.notify); } catch (e) {}
+  try { localStorage.setItem(notifyKey(), b.dataset.notify); } catch (e) {}
   if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "default")
     await new Promise((done) => { const p = Notification.requestPermission(done); if (p && p.then) p.then(done, done); });
   if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "denied")
-    try { localStorage.setItem(NOTIFY_KEY, "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
+    try { localStorage.setItem(notifyKey(), "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
   showBell();
   if (typeof Notification !== "undefined" && Notification.permission === "denied") $("bell-note").textContent = "The browser blocks notifications for this page: allow them in its site settings, then turn them on here.";
 });
 showBell();
+function Notice(title, options) {
+  try { return new Notification(title, options); }
+  catch (e) {  // Android Chrome: only a service worker may show one
+    navigator.serviceWorker?.ready.then((reg) => reg.showNotification(title, options)).catch(() => {});
+    return {};
+  }
+}
 function notify(needs) {
   const fresh = needs.filter((n) => !state.notified.has(needKey(n)));
   state.notified = new Set(needs.map(needKey));  // one that leaves and comes back notifies again
@@ -10986,14 +11003,14 @@ function notify(needs) {
   const wanted = fresh.filter((x) => mode === "all" || x.kind === "message");
   for (const n of wanted.slice(0, 3)) {
     const [label] = NEED_LOOK[n.kind] || [""];
-    const note = new Notification((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
+    const note = Notice((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
                                   { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text,
-                                    tag: (CHAT || "first") + ":" + needKey(n) });
-    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close(); };
+                                    tag: (state.chat || CHAT) + ":" + needKey(n) });
+    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close?.(); };
   }
   if (wanted.length > 3) {
-    const more = new Notification((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (CHAT || "first") + ":more" });
-    more.onclick = () => { window.focus(); more.close(); };
+    const more = Notice((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (state.chat || CHAT) + ":more" });
+    more.onclick = () => { window.focus(); more.close?.(); };
   }
 }
 
@@ -11048,8 +11065,9 @@ async function loop() {
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
       state.needs = data.needs || [];
+      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); }
       renderNeeds(state.needs);
-      notify(state.needs);
+      try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;

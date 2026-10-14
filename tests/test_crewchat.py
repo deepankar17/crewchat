@@ -1040,6 +1040,12 @@ class NeedsYou(Base):
         self.assertEqual((item["agent"], item["holder"], item["text"]), (b_name, a_name, "OK to drop the old tables?"))
         a.text("hub_update", id=mid, status="in_progress", note="carrying on")
 
+    def test_what_the_owner_blocked_is_not_listed_back(self):
+        mid = self.add("Wait for the designer")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "blocked"})
+        self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
+
     def test_a_long_chain_of_tasks_is_counted_without_recursion(self):
         first = prev = self.add("Step 0")
         for i in range(1, 1200):
