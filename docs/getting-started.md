@@ -132,6 +132,11 @@ The list on the left shows each agent:
 - the task it holds, or else its status line, which the agent sets itself;
 - unread messages, and a dot: green when it was heard from just now.
 
+While an agent works, its line in the list says what it is doing, from its tool calls:
+**Editing LoginViewModel.kt**, **Running npm test**, **Searching the code**; and a line under the
+chat says who is working. Only a file's name and a command's program are shown, never their
+arguments or contents.
+
 Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
 **waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next
 types), its task and last message, its role and listening setting, and **Message**, **Stop** or

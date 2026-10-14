@@ -11014,7 +11014,8 @@ function notify(needs) {
 
 // Who is working right now, under the thread: "Maya is editing Login.kt…".
 function renderWorking() {
-  const busy = state.agents.filter((a) => a.activity === "working" && state.now - a.seen < 90 && !(a.session && !a.session.running));
+  const busy = state.agents.filter((a) => a.activity === "working" && state.now - a.seen < 90 && !(a.session && !a.session.running))
+    .sort((a, b) => !!b.doing - !!a.doing);  // one that says what it does first
   const line = $("working");
   line.hidden = !busy.length || $("log").hidden;
   if (!busy.length) return;
