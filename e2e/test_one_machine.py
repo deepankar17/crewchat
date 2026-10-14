@@ -51,7 +51,8 @@ class OneMachine(unittest.TestCase):
         out = self.m.cli("start", "--no-service", "--no-open", "--chat", "Demo", cwd=site)
         self.assertIn('Added %s to the project "Demo", as "website".' % site.resolve(), out)
         agent = self.m.agent(folder=site)
-        self.assertRegex(agent.link(), r"^claude-website(-\d+)?$")
+        self.assertRegex(agent.link(), r"^[A-Z][a-z]+$")  # a first name of its own
+        self.assertEqual(self.m.owner.row(agent.name)["place"], "website")
         self.assertTrue(self.m.owner.sees(agent.name))
         self.assertIn("website", self.m.cli("places"))
 
@@ -59,9 +60,11 @@ class OneMachine(unittest.TestCase):
     def test_sessions_join_with_their_own_names(self):
         a, b = self.linked(), self.linked()
         c = self.linked("cursor")
-        self.assertRegex(a.name, r"^claude-alpha(-\d+)?$")
         self.assertNotEqual(a.name, b.name)
-        self.assertRegex(c.name, r"^cursor-alpha(-\d+)?$")
+        for agent, client in ((a, "claude"), (b, "claude"), (c, "cursor")):
+            self.assertRegex(agent.name, r"^[A-Z][a-z]+$")  # a first name of its own
+            row = self.m.owner.row(agent.name)
+            self.assertEqual((row["client"], row["place"]), (client, "alpha"))
         listing = a.call("hub_agents")
         for agent in (a, b, c):
             self.assertIn(agent.name, listing)
