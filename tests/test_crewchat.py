@@ -1030,6 +1030,27 @@ class NeedsYou(Base):
         b.text("hub_take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
 
+    def test_a_note_is_credited_to_the_agent_that_wrote_it(self):
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        mid = self.add("Migrate the database")
+        a.text("hub_take", id=mid)
+        b.text("hub_update", id=mid, status="blocked", note="OK to drop the old tables?")  # not b's task
+        item = next(n for n in self.hub.needs_you() if n.get("task") == mid)
+        self.assertEqual((item["agent"], item["holder"], item["text"]), (b_name, a_name, "OK to drop the old tables?"))
+        a.text("hub_update", id=mid, status="in_progress", note="carrying on")
+
+    def test_a_long_chain_of_tasks_is_counted_without_recursion(self):
+        first = prev = self.add("Step 0")
+        for i in range(1, 1200):
+            prev = self.add("Step %d" % i, depends=prev)
+        a, _ = self.agent()
+        a.text("hub_take", id=first)
+        a.text("hub_update", id=first, status="blocked", note="stuck")
+        item = next(n for n in self.hub.needs_you() if n.get("task") == first)
+        self.assertEqual(item["blocking"], 1199)
+        a.text("hub_update", id=first, status="done", note="unstuck")
+
     def test_the_poll_and_the_tabs_say_so(self):
         a, _ = self.agent()
         a.text("hub_send", to="Owner", text="Look at this")

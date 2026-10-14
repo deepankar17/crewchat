@@ -1670,12 +1670,13 @@ class Hub:
             for d in r["depends"]:
                 waiting_on.setdefault(d, set()).add(r["id"])
 
-        def blocking(mid, seen=None):  # every open task that waits on mid, however far down
-            seen = set() if seen is None else seen
-            for child in waiting_on.get(mid, ()):
-                if child in open_ids and child not in seen:
-                    seen.add(child)
-                    blocking(child, seen)
+        def blocking(mid):  # every open task that waits on mid, however far down (no recursion: chains can be long)
+            seen, todo = set(), [mid]
+            while todo:
+                for child in waiting_on.get(todo.pop(), ()):
+                    if child in open_ids and child not in seen:
+                        seen.add(child)
+                        todo.append(child)
             return seen
 
         with self.lock:
@@ -1692,8 +1693,12 @@ class Hub:
                     else "reclaimed" if r["status"] in ("todo", "waiting") and r.get("reclaimed")
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
             if kind:
-                items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": r["holder"] or said.get("from", ""),
-                              "text": said.get("text", "") if said.get("status") == r["status"] or kind == "given_back" else "",
+                # Named after whoever wrote the note (any agent may update a task), so an answer goes back
+                # to the agent that asked; a reclaimed task, after the agent it was taken from.
+                fits = said.get("status") == r["status"] or kind == "given_back" and said.get("status") == "todo"
+                agent = (r.get("reclaimed") if kind == "reclaimed" else said.get("from") if fits else r["holder"]) or ""
+                items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": agent, "holder": r["holder"],
+                              "text": said.get("text", "") if fits else "",
                               "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
@@ -8765,7 +8770,7 @@ CHAT_PAGE = r"""<!doctype html>
   --bg: #eef3ff; --panel: #ffffff; --soft: #f6f8ff; --ink: #0b1f55; --text: #1b2440; --muted: #5d6a8f;
   --line: #dfe7ff; --accent: #2f5fd6; --accent-2: #5b8cff; --deep: #2148ad; --on-accent: #ffffff; --tint: #dfe7ff;
   --task: #fff6dd; --task-line: #e9cf86; --task-ink: #6b4e00;
-  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f;
+  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f; --err-ink: #ffffff;
   --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
   --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
   --radius: 18px; --shadow: 0 1px 2px rgba(11, 31, 85, 0.06), 0 6px 20px rgba(11, 31, 85, 0.07);
@@ -8775,7 +8780,7 @@ CHAT_PAGE = r"""<!doctype html>
     --bg: #0a1330; --panel: #111c40; --soft: #16234d; --ink: #e8eeff; --text: #dfe6ff; --muted: #9daad3;
     --line: #24346a; --accent: #5b8cff; --accent-2: #8fb0ff; --deep: #2f5fd6; --on-accent: #0b1f55; --tint: #1c2b5c;
     --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
-    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
+    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5; --err-ink: #3d0a07;
     --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
     --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
@@ -8818,7 +8823,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .tab .pname { overflow: hidden; text-overflow: ellipsis; }
 .tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
 .tab .unread:empty { width: 8px; }
-.tab .unread:not(:empty) { color: #fff; font-size: 10.5px; font-weight: 700; padding: 0 6px; line-height: 16px; height: 16px; }
+.tab .unread:not(:empty) { color: var(--err-ink); font-size: 10.5px; font-weight: 700; padding: 0 6px; line-height: 16px; height: 16px; }
 .tab.needs .unread, .tab.needs .pav { background: var(--err); }
 .pav { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 22px; height: 22px;
   border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; }
@@ -8871,11 +8876,13 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .need { display: block; width: 100%; text-align: left; background: var(--soft); color: var(--text); border-radius: 14px; padding: 8px 10px;
   font-weight: 400; border-left: 4px solid var(--need, var(--err)); }
 .need:hover { background: var(--tint); }
-.need .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--need, var(--err)); }
+.need > span { display: block; }
+.need .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
 .need .t { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .need .q { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.need .blk { font-size: 11px; font-weight: 650; color: var(--err); }
-#needs-count { background: var(--err); color: #fff; border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
+.need .blk { font-size: 11px; font-weight: 650; color: var(--ink); }
+#needs-list { max-height: 45vh; overflow-y: auto; }
+#needs-count { background: var(--err); color: var(--err-ink); border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
 #needs-count:empty { display: none; }
 .card.needs-card { border-left: 4px solid var(--err); }
 .needs-card textarea { width: 100%; min-height: 70px; resize: vertical; margin-top: 6px; }
@@ -9154,7 +9161,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   </div>
   <section id="needs-you" hidden aria-label="Needs you">
     <h2 class="rail-head">Needs you <span id="needs-count"></span></h2>
-    <div id="needs-list"></div>
+    <div id="needs-list" role="list"></div>
+    <p id="needs-said" class="sr" role="status"></p>
   </section>
   <h2 class="rail-head">Agents</h2>
   <div id="agents"></div>
@@ -9174,7 +9182,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
         <button type="button" data-notify="all" aria-pressed="false">When something needs me</button>
         <button type="button" data-notify="mentions" aria-pressed="false">Only messages to me</button>
         <button type="button" data-notify="off" aria-pressed="true">Never</button>
-        <p class="meta" id="bell-note" style="margin:6px 10px 2px"></p>
+        <p class="meta" id="bell-note" role="status" style="margin:6px 10px 2px"></p>
       </div>
     </details>
     <details id="space-menu" class="menu">
@@ -9415,7 +9423,10 @@ function renderProjects(list, current) {
     if (p.id === current) a.setAttribute("aria-current", "page");
     a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
     a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
-    if (p.needs) { a.classList.add("needs"); a.append(el("span", "unread", String(p.needs)), el("span", "sr", " (" + p.needs + " need you)")); }
+    if (p.needs) {
+      const n = el("span", "unread", String(p.needs)); n.setAttribute("aria-hidden", "true");
+      a.classList.add("needs"); a.append(n, el("span", "sr", " (" + p.needs + " need you)"));
+    }
     if (p.fresh && !p.needs) {
       a.append(el("span", "unread"), el("span", "sr", " (new messages)"));
     }
@@ -9488,6 +9499,7 @@ function showView(view) {
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
   if (view === "commands") loadCommands();
+  if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
@@ -10507,20 +10519,27 @@ function needsCard(n, r) {
   const box = card(label + (n.agent ? " · " + n.agent : ""));
   box.classList.add("needs-card");
   if (n.text) box.append(el("p", "", n.text));
+  if (n.agent && n.holder && n.agent !== n.holder) box.append(el("p", "meta", "Written by " + n.agent + "; the task is " + n.holder + "'s."));
   if (n.blocking) box.append(el("p", "meta", "It holds up " + n.blocking + " other task" + (n.blocking > 1 ? "s" : "") + "."));
-  const to = r.holder || n.agent;
+  const to = n.agent || r.holder;
   if (to && n.kind !== "given_back" && n.kind !== "reclaimed") {
     const answer = el("textarea");
     answer.placeholder = n.kind === "review" ? "What to change, or leave empty and mark it done" : "Your answer to " + to;
     answer.setAttribute("aria-label", "Answer to " + to);
     const acts = el("div", "acts");
     actButton(acts, "Send", "Send your answer to " + to, async (b) => {
-      if (!answer.value.trim()) return;
+      if (!answer.value.trim()) { answer.focus(); return panelNote("Write your answer first."); }
       if (await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) {
         answer.value = ""; panelNote("Sent to " + to + ".");
       }
     });
-    if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", (b) => taskOp({ op: "status", task: r.id, status: "done" }));
+    if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", async (b) => {
+      if (answer.value.trim()) {  // what was typed goes too, first
+        if (!await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) return;
+        answer.value = "";
+      }
+      taskOp({ op: "status", task: r.id, status: "done" });
+    });
     box.append(answer, acts);
   }
   return box;
@@ -10895,35 +10914,43 @@ function renderNeeds(needs) {
   $("needs-count").textContent = needs.length ? String(needs.length) : "";
   if (key === state.needsKey) return;
   state.needsKey = key;
+  const known = state.needsShown || new Set(), added = needs.filter((n) => !known.has(needKey(n)));
+  if (state.needsShown && added.length)  // a new item is said, not the whole list
+    $("needs-said").textContent = added.length + " new: " + added.map((n) => (NEED_LOOK[n.kind] || [""])[0] + (n.task ? " #" + n.task : "") + (n.agent ? " from " + n.agent : "")).join("; ");
+  state.needsShown = new Set(needs.map(needKey));
   box.replaceChildren(...needs.map((n) => {
     const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
     const b = el("button", "need");
+    b.setAttribute("role", "listitem");
     b.type = "button"; b.style.setProperty("--need", tint);
     const who = n.agent ? (n.kind === "message" ? " from " : " · ") + n.agent : "";
-    b.append(el("div", "k", label + who),
-             el("div", "t", n.task ? "#" + n.task + " " + (n.title || "") : n.text));
-    if (n.kind !== "message" && n.text) b.append(el("div", "q", n.text));
-    if (n.blocking) b.append(el("div", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
+    b.append(el("span", "k", label + who),
+             el("span", "t", n.task ? "#" + n.task + " " + (n.title || "") : n.text));
+    if (n.kind !== "message" && n.text) b.append(el("span", "q", n.text));
+    if (n.blocking) b.append(el("span", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
     b.addEventListener("click", () => {
       if (n.kind === "message") {
         if (n.agent) openPanel("agent", n.agent);
         const node = [...$("log").querySelectorAll(".msg")].find((x) => x.dataset.id === n.id);
         if (node) { showView("chat"); node.scrollIntoView({ block: "center" }); }
-        markRead(true);
+        markRead(n.seq);
       } else openPanel("task", n.task);
     });
     return b;
   }));
 }
 // What you have seen of the chat: messages to you count as read while the page is in front.
-function markRead(force) {
-  if (document.hidden || state.after <= (state.readPosted || 0) && !force) return;
-  const mine = state.needs.some((n) => n.kind === "message");
-  if (!mine && !force) { state.readPosted = state.after; return; }
-  state.readPosted = state.after;
-  postJSON("/api/read", { seq: state.after }).catch(() => { state.readPosted = 0; });
+// (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
+function markRead(upto) {
+  const seen = !document.hidden && document.hasFocus() && !$("log").hidden;
+  const seq = upto || (seen ? state.after : 0);
+  if (!seq || seq <= (state.readPosted || 0)) return;
+  if (!upto && !state.needs.some((n) => n.kind === "message" && n.seq <= seq)) return;
+  state.readPosted = seq;
+  postJSON("/api/read", { seq }).catch(() => { state.readPosted = 0; });
 }
 document.addEventListener("visibilitychange", () => markRead());
+window.addEventListener("focus", () => markRead());
 
 // Notifications, per project: all that needs you, only messages to you, or none. Only while the page
 // is in the background; a notification opens its item.
@@ -10935,6 +10962,7 @@ function showBell() {
   const mode = notifyMode();
   for (const b of document.querySelectorAll("[data-notify]")) b.setAttribute("aria-pressed", String(b.dataset.notify === mode));
   $("bell").classList.toggle("off", mode === "off");
+  $("bell").querySelector("summary").setAttribute("aria-label", "Notifications: " + { all: "when something needs you", mentions: "messages to you", off: "off" }[mode]);
   const denied = typeof Notification !== "undefined" && Notification.permission === "denied";
   $("bell-note").textContent = typeof Notification === "undefined" ? "This browser does not show notifications."
     : denied && mode !== "off" ? "The browser blocks notifications for this page: allow them in its site settings." : "";
@@ -10942,21 +10970,30 @@ function showBell() {
 for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("click", async () => {
   try { localStorage.setItem(NOTIFY_KEY, b.dataset.notify); } catch (e) {}
   if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "default")
-    await Notification.requestPermission().catch(() => {});
+    await new Promise((done) => { const p = Notification.requestPermission(done); if (p && p.then) p.then(done, done); });
+  if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "denied")
+    try { localStorage.setItem(NOTIFY_KEY, "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
   showBell();
+  if (typeof Notification !== "undefined" && Notification.permission === "denied") $("bell-note").textContent = "The browser blocks notifications for this page: allow them in its site settings, then turn them on here.";
 });
 showBell();
 function notify(needs) {
   const fresh = needs.filter((n) => !state.notified.has(needKey(n)));
-  for (const n of needs) state.notified.add(needKey(n));
+  state.notified = new Set(needs.map(needKey));  // one that leaves and comes back notifies again
   if (state.notifyPrimed === undefined) { state.notifyPrimed = true; return; }  // not what was there on load
   const mode = notifyMode();
   if (mode === "off" || !document.hidden || typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  for (const n of fresh.filter((x) => mode === "all" || x.kind === "message").slice(0, 3)) {
+  const wanted = fresh.filter((x) => mode === "all" || x.kind === "message");
+  for (const n of wanted.slice(0, 3)) {
     const [label] = NEED_LOOK[n.kind] || [""];
     const note = new Notification((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
-                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text, tag: needKey(n) });
+                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text,
+                                    tag: (CHAT || "first") + ":" + needKey(n) });
     note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close(); };
+  }
+  if (wanted.length > 3) {
+    const more = new Notification((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (CHAT || "first") + ":more" });
+    more.onclick = () => { window.focus(); more.close(); };
   }
 }
 
