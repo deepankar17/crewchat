@@ -262,6 +262,16 @@ def scene_team(b):
     b.js("openPanel('roles')")
     time.sleep(0.8)
     b.shoot("roles-panel", "#panel", pad=0)
+    # Needs you: a blocked task with its question, and its panel.
+    blocked = chat.hub.add_row(O, "Pick the default theme")["id"]
+    chat.hub.add_row(O, "Ship the settings screen", depends=blocked)
+    lead_name = list(chat.hub.agents)[0]
+    chat.hub.take(lead_name, blocked)
+    chat.hub.update(lead_name, blocked, "blocked", "Should the default follow the system setting, or always be light?")
+    time.sleep(1.5)
+    b.js("openPanel('task', %s)" % json.dumps(blocked))
+    time.sleep(0.6)
+    b.shoot("needs-you")
     b.js("closePanel(); showView('tasks'); $('as-board').click()")
     time.sleep(0.5)
     b.shoot("task-board")

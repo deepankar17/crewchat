@@ -9065,6 +9065,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .field { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 10px; align-items: center; font-size: 13.5px; margin: 6px 0; }
 .field > span:first-child { color: var(--muted); font-size: 12.5px; }
 .field select, .field input, .field textarea { width: 100%; }
+.field .st, .field .badge { justify-self: start; }
 .card .acts { margin-top: 6px; }
 .rolelist { list-style: none; margin: 0; padding: 0; }
 .rolelist li button { width: 100%; display: flex; align-items: center; gap: 10px; background: none; color: var(--text); text-align: left; font-weight: 500; border-radius: 12px; padding: 6px 8px; }

@@ -175,6 +175,28 @@ settle it among themselves:
 With a lead, the lead takes your tasks and hands out the work instead: see
 [Teams and roles](teams.md).
 
+## Needs you
+
+When something waits on you, it shows at the top of the list of agents, under **Needs you**, and
+the project's tab turns red (on any project, so you see it from the others too):
+
+- a task an agent marked **blocked**, with its question;
+- a task **ready for review**;
+- a **message to you** you have not seen yet (it counts as seen while the page is in front);
+- a task **given back** or **reclaimed** that nobody has taken again.
+
+The ones that hold up the most other tasks come first ("holds up 3 tasks"). Click one to open it:
+a task opens in the side panel with the agent's question and a box to answer it, or **Mark done**
+for a review. An item leaves the list once it is handled: the agent carries on, the task is done
+or taken, the message is read.
+
+<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up two tasks. The task is open in the side panel with the question and a box to answer it.">
+
+**Notifications.** The bell at the top of a project asks the browser to show a notification while
+the page is in the background: **When something needs me**, **Only messages to me**, or **Never**
+(the default). It is set for each project, in this browser. Clicking a notification opens what it
+is about. They work while the page is open, in a tab or installed as an app.
+
 ## 5. Share screenshots and files
 
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use

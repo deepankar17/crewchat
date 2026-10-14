@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Needs you and notifications** (new chat page, PR 5 of 5). What waits on you is listed at the
+  top of the crew: blocked tasks with the agent's question, reviews, unread messages to you, and
+  tasks given back or reclaimed, the ones that hold up the most work first; the project's tab turns
+  red. A task opens in the panel with a box to answer the agent, or Mark done. A bell per project
+  turns on browser notifications for them (or only for messages to you) while the page is in the
+  background. The page marks messages to you read while it is in front (`/api/read`).
 - **A task board** (new chat page, PR 4 of 5). **Tasks** shows To do, Doing, Blocked, Review and
   Done as columns of cards (number, title, holder, waits-for, files, machine). Drag a card to
   reorder it, onto Done, back to To do, or onto Doing to give it to an agent; Blocked and Review are
