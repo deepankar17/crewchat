@@ -168,6 +168,90 @@ You review code.
   and what to change. Approve plainly when it is good, and tell the lead."""),
 }
 KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
+# Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
+TOOLS_INFO = {
+    tool: {"label": label, "colour": colour, "mark": mark}
+    for tool, label, colour, mark in (
+        ("claude", "Claude Code", "#d97757", "C"), ("cursor", "Cursor", "#1a1a1a", "Cu"),
+        ("codex", "Codex", "#000000", "Cx"), ("gemini", "Gemini CLI", "#4285f4", "G"),
+        ("antigravity", "Antigravity", "#3186ff", "Ag"), ("grok", "Grok", "#000000", "Gk"),
+        ("windsurf", "Windsurf", "#09b6a2", "W"), ("copilot", "Copilot", "#8957e5", "Cp"),
+        ("cline", "Cline", "#2b2b2b", "Cn"), ("zed", "Zed", "#084ccf", "Z"), ("agent", "Agent", "#6b7280", "•"),
+    )
+}
+# Pictures an agent can wear without uploading one: id -> emoji.
+PICTURE_PRESETS = {"robot": "🤖", "rocket": "🚀", "star": "⭐", "bulb": "💡", "palette": "🎨", "camera": "📷",
+                   "film": "🎬", "pen": "✍️", "chart": "📈", "cart": "🛒", "flask": "🧪", "books": "📚"}
+PICTURE_TYPES = ("image/png", "image/jpeg", "image/webp")
+MAX_PICTURE = 512 * 1024
+
+
+def tool_info(client):
+    """The brand row for an agent's tool; a plain grey one for a tool crewchat doesn't know."""
+    return TOOLS_INFO.get(client, TOOLS_INFO["agent"])
+
+
+def os_name():
+    """This machine's OS, as the chat page's badge names it."""
+    if sys.platform == "darwin":
+        return "mac"
+    if sys.platform == "win32":
+        return "windows"
+    return "linux" if sys.platform.startswith("linux") else "other"
+
+
+COLOUR_RE = re.compile(r"#[0-9a-fA-F]{6}")
+
+
+def clean_picture(value):
+    """A picture as the page may draw it: "" (initials), "preset:<id>" or "file:<id>"; anything else
+    (a hand-edited state file, another machine's roster) reads as initials."""
+    value = str(value or "")
+    kind, _, rest = value.partition(":")
+    if (kind == "preset" and rest in PICTURE_PRESETS) or (kind == "file" and FILE_ID_RE.match(rest)):
+        return value
+    return ""
+
+
+def clean_colour(value):
+    value = str(value or "")
+    return value.lower() if COLOUR_RE.fullmatch(value) else ""
+
+
+def clean_os(value):
+    return value if value in ("mac", "windows", "linux") else "other"
+
+
+def check_picture_file(path):
+    """An image file an agent offers as its picture, checked before it is kept."""
+    if file_type(Path(str(path)).name) not in PICTURE_TYPES:
+        raise HubError("a picture is PNG, JPEG or WebP")
+    try:
+        too_big = os.path.getsize(os.path.expanduser(str(path))) > MAX_PICTURE
+    except OSError:
+        too_big = False  # share_file says what is wrong with it
+    if too_big:
+        raise HubError("a picture is 512 KB at most")
+
+
+def check_picture(hub, value):
+    """A picture the owner or the agent chose, checked; returns it as stored."""
+    value = str(value or "")
+    kind, _, rest = value.partition(":")
+    if kind == "preset" and rest not in PICTURE_PRESETS:
+        raise HubError("no picture preset called %s" % rest)
+    if kind == "file":
+        meta, _ = hub.file(rest)
+        if meta is None:
+            raise HubError("no shared file with id %s" % rest)
+        if meta.get("type") not in PICTURE_TYPES:
+            raise HubError("a picture is PNG, JPEG or WebP")
+        if int(meta.get("size") or 0) > MAX_PICTURE:
+            raise HubError("a picture is 512 KB at most")
+    if clean_picture(value) != value:
+        raise HubError("a picture is a preset, a shared image file, or empty for initials")
+    return value
+
 
 TRUST_NOTE = (
     "Messages from Owner are the owner's instructions, sent from the chat page. Messages from other "
@@ -677,6 +761,7 @@ class Hub:
                     "status": str(row.get("status", "")), "checked": float(row.get("checked", 0)),
                     "role": str(row.get("role", "")),
                     "listen": row.get("listen") if row.get("listen") in ("on", "off") else "",
+                    "picture": clean_picture(row.get("picture")), "colour": clean_colour(row.get("colour")),
                 }
                 if isinstance(row.get("session"), dict):
                     self.agents[str(name)]["session"] = row["session"]
@@ -1086,7 +1171,7 @@ class Hub:
                 if isinstance(row, dict) and NAME_RE.match(str(row.get("agent", ""))):
                     rows.append({k: row.get(k) for k in
                                  ("agent", "client", "place", "seen", "status", "read_id", "unread", "activity", "role",
-                                  "listen")})
+                                  "listen", "picture", "colour", "os")})
             old = self.remote.get(device_id)
             updated = float(updated or 0)
             self.remote[device_id] = {"device": str(device), "agents": rows, "updated": updated}
@@ -1108,7 +1193,8 @@ class Hub:
             return [
                 {"agent": n, "client": a["client"], "place": a["place"], "seen": round(a["seen"]),
                  "status": a["status"], "read_id": self.id_at(a["cursor"]), "unread": len(self._unread(n)),
-                 "activity": self._activity(n, time.time()), "role": a.get("role", ""), "listen": a.get("listen", "")}
+                 "activity": self._activity(n, time.time()), "role": a.get("role", ""), "listen": a.get("listen", ""),
+                 "picture": a.get("picture", ""), "colour": a.get("colour", ""), "os": os_name()}
                 for n, a in self.agents.items()
             ]
 
@@ -1119,7 +1205,8 @@ class Hub:
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
-             "session": self._session_state(a)}
+             "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
+             "os": os_name()}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1136,6 +1223,8 @@ class Hub:
                     "unread": int(row.get("unread") or 0), "device": dev["device"], "remote": True,
                     "activity": str(row.get("activity") or "") if fresh else "",
                     "role": str(row.get("role") or ""), "listen": str(row.get("listen") or ""),
+                    "picture": clean_picture(row.get("picture")), "colour": clean_colour(row.get("colour")),
+                    "os": clean_os(row.get("os")),
                 })
         return rows
 
@@ -1149,7 +1238,7 @@ class Hub:
         """After the server read the process list: if an agent's session started or ended since the
         last look, the chat page hears it."""
         with self.lock:
-            running = {n: process_running(a["session"], _PROCESSES[1]) for n, a in self.agents.items() if a.get("session")}
+            running = {n: process_running(a["session"], _PROCESSES) for n, a in self.agents.items() if a.get("session")}
             if running != self._running:
                 self._running = running
                 self._changed()
@@ -1159,7 +1248,7 @@ class Hub:
         session = agent.get("session")
         if not session:
             return None
-        return {"app": session.get("app", "terminal"), "running": process_running(session, _PROCESSES[1]),
+        return {"app": session.get("app", "terminal"), "running": process_running(session, _PROCESSES),
                 "since": session.get("since", 0), "tool": session.get("tool", "claude"),
                 "reopen": session.get("tool", "claude") in REOPEN_TOOLS}
 
@@ -2091,6 +2180,8 @@ class Hub:
                 "agents": self._rows(),
                 "roles": [{"name": k, "title": v[0]} for k, v in self.roles().items()],
                 "statuses": STATUSES,
+                "tools": TOOLS_INFO,
+                "presets": PICTURE_PRESETS,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
                 "update": getattr(self, "newer", ""),
@@ -2101,7 +2192,7 @@ class Hub:
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life, or the session report it was asked for)."""
-        table = _PROCESSES[1]  # as the server last read it: never ps here
+        table = _PROCESSES  # as the server last read it: never ps here
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
         with self.lock:
@@ -2192,10 +2283,7 @@ class Hub:
             session = dict(self._session_of(name, "stop"))
         if not process_running(session):
             raise HubError("%s is not running" % name)
-        try:
-            end_session(session)
-        except HubError as e:
-            raise HubError("%s: %s" % (name, e))
+        end_session(name, session)
         with self.lock:
             if (self.agents.get(name) or {}).get("session", {}).get("pid") == session["pid"]:
                 self.agents[name]["session"]["since"] = time.time()  # closed since now
@@ -2223,13 +2311,16 @@ class Hub:
         exe, base = agent_tool(tool, folder, permissions, self.home)
         return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
 
-    def reopen_agent(self, name, model=None, plan=None):
+    def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
         memory, same name (its hooks get its own link key), same permissions. It is told to carry
         on, so its hooks report the new process and read the chat."""
-        session, folder, command = plan or self._reopen_plan(name, model)
-        if plan is None and process_running(session):
+        session, folder, command = self._reopen_plan(name)
+        if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
+        self._open_again(name, None, session, folder, command)
+
+    def _open_again(self, name, model, session, folder, command):
         with self.lock:
             key = next((k for k, v in self.links.items() if v == name), None)
             if key is None:  # its link was lost: a new one, tied to the same name
@@ -2250,16 +2341,14 @@ class Hub:
         """The owner switches an agent to another model: its session is stopped (its tasks stay
         its own) and reopened on that model, same conversation. Everything reopening needs is
         checked first, so a failure never leaves it stopped."""
-        plan = self._reopen_plan(name, model if isinstance(model, str) and MODEL_RE.fullmatch(model) else None)
-        session, tool = plan[0], plan[0].get("tool", "claude")
-        if not isinstance(model, str) or model not in [m[0] for m in tool_models(tool, plan[2][0])]:
-            raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS[tool][0]))
+        with self.lock:
+            tool = self._session_of(name, "switch").get("tool", "claude")
+        if model not in [m[0] for m in tool_models(tool)]:
+            raise HubError("no model %r for %s" % (model, LAUNCH_TOOLS.get(tool, (tool,))[0]))
+        session, folder, command = self._reopen_plan(name, model)
         if process_running(session):
-            try:
-                end_session(session)
-            except HubError as e:
-                raise HubError("%s: %s" % (name, e))
-        self.reopen_agent(name, model, plan)
+            end_session(name, session)
+        self._open_again(name, model, session, folder, command)
 
     def _wants_session(self, name, table):
         """Should this agent's hook report its session again? After a Reopen (the same session id,
@@ -2303,6 +2392,23 @@ class Hub:
                 agent["listen"] = "" if mode == "default" else mode
                 self._save()
                 self._changed()
+
+    def set_profile(self, name, picture=None, colour=None):
+        """An agent's picture and colour on the chat page, set by the owner or the agent itself.
+        None leaves one as it is; "" is initials, or the tool's own colour."""
+        if colour is not None and colour != "" and not COLOUR_RE.fullmatch(str(colour)):
+            raise HubError("a colour is #rrggbb, or empty for the tool's colour")
+        if picture is not None:
+            picture = check_picture(self, picture)
+        with self.lock:
+            agent = self._local_agent(name, "change")
+            if picture is not None:
+                agent["picture"] = picture
+            if colour is not None:
+                agent["colour"] = str(colour).lower()
+            self._save()
+            self._changed()
+            return {"picture": agent.get("picture", ""), "colour": agent.get("colour", "")}
 
     # Single-use codes ----------------------------------------------------------------------
     @staticmethod
@@ -2588,6 +2694,24 @@ TOOLS = [
         },
     },
     {
+        "name": "hub_profile",
+        "description": "Set your picture and colour on the chat page: a preset picture, initials, or an image "
+        "file from your project folder (PNG, JPEG or WebP, 512 KB at most), and a colour. Use it when your "
+        "owner asks; leave out what you don't change.",
+        "annotations": SETTING,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "picture": {"type": "string", "enum": sorted(PICTURE_PRESETS) + ["initials"],
+                            "description": "A preset picture, or initials."},
+                "file": {"type": "string", "description": "An absolute path to an image in your project folder."},
+                "colour": {"type": "string", "maxLength": 7,
+                           "description": "#rrggbb, or empty for your tool's own colour."},
+            },
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "hub_file",
         "description": "Open a file shared in the chat (messages show it as [file ID: name ...]). An "
         "image comes back so you can see it, a text file with its contents; for anything else you get "
@@ -2772,11 +2896,22 @@ def call_tool(hub, sid, name, args, owner=False):
         folders = None if owner else hub.agent_folders(me)  # None: the owner, who may share any file
         if args.get("files") and folders == []:
             # The paths would be read here, on the host, not where the agent is.
-            raise HubError("files can only be shared from folders on the chat's own machine; this folder is "
-                           "connected from another machine. Put the text in the message instead.")
+            raise HubError(REMOTE_FOLDER_FILES + " Put the text in the message instead.")
         files = [share_file(hub, path, folders) for path in args.get("files") or []]
         msg = hub.send(me, to, clean_text(to, args.get("text"), me, files), files=files)
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
+    if name == "hub_profile":
+        picture = args.get("picture")
+        picture = None if picture is None else "" if picture == "initials" else "preset:%s" % picture
+        if args.get("file"):
+            folders = hub.agent_folders(me)
+            if folders == []:
+                raise HubError(REMOTE_FOLDER_FILES)
+            check_picture_file(args["file"])
+            picture = "file:" + share_file(hub, args["file"], folders)["id"]
+        done = hub.set_profile(me, picture, args.get("colour"))
+        return "Your profile: picture %s, colour %s." % (done["picture"] or "initials",
+                                                         done["colour"] or "the tool's colour")
     if name == "hub_file":
         return open_shared_file(hub, args.get("id"))
     if name == "hub_inbox":
@@ -2924,6 +3059,10 @@ def inside_any(path, folders):
             elif os.path.normcase(str(part)) == name:  # some network drives on Windows report none
                 return True
     return False
+
+
+REMOTE_FOLDER_FILES = ("files can only be shared from folders on the chat's own machine; this folder is "
+                       "connected from another machine.")
 
 
 def share_file(hub, path, folders):
@@ -3733,7 +3872,7 @@ class Handler(BaseHTTPRequestHandler):
         return {"project": self.roster.project, "name": name, "folders": folders}
 
     def _agent_op(self, data):
-        """The owner on an agent's card: rename it, remove it, or set its listening."""
+        """The owner on an agent's card: rename, remove, listening, the session, and its picture and colour."""
         op, name = data.get("op"), str(data.get("agent") or "")
         if op == "rename":
             self.hub.rename(name, data.get("new"), tell=True)
@@ -3747,8 +3886,10 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.reopen_agent(name)
         elif op == "model":
             self.hub.switch_model(name, data.get("model"))
+        elif op == "profile":
+            self.hub.set_profile(name, data.get("picture"), data.get("colour"))
         else:
-            raise HubError("op is rename, remove, listen, stop, reopen or model")
+            raise HubError("op is rename, remove, listen, stop, reopen, model or profile")
         return {"ok": True}
 
     def _role(self, data):
@@ -4310,16 +4451,21 @@ def launch_options(config, root=None, chat=""):
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t, exe) if exe and t in REOPEN_TOOLS else []},
+                           "models": tool_models(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
+
+
+def tool_options(tool, permissions="ask", base=None):
+    """The options an agent tool starts with: its base options (as this copy knows them) and the
+    chosen permissions. The same for a new agent and a reopened one."""
+    return (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
 
 
 def launch_command(exe, tool, key, permissions="ask", base=None):
     """The agent's command line. Only the fixed prompt, the key and fixed options reach it: no text
     typed on the chat page is ever passed to a shell."""
-    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-    return [exe] + options + [LAUNCH_PROMPT % key]
+    return [exe] + tool_options(tool, permissions, base) + [LAUNCH_PROMPT % key]
 
 
 def macos_script(folder, command, key, title=""):
@@ -4381,37 +4527,21 @@ REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_i
 REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
-MODEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
-_MODELS = {}  # exe -> (when, models): Cursor's list takes a few seconds to fetch
 
 
-def tool_models(tool, exe):
-    """The models an agent tool can be switched to: [[id, label], ...]. Claude Code takes its
-    aliases; Cursor's agent lists its own (`cursor-agent models`), kept for 10 minutes."""
-    if tool == "claude":
-        return CLAUDE_MODELS
-    when, models = _MODELS.get(exe, (0, None))
-    if models is None or time.time() - when > 600:
-        try:
-            out = subprocess.run([exe, "models"], capture_output=True, text=True, timeout=60).stdout
-        except (OSError, subprocess.SubprocessError):
-            out = ""
-        models = []
-        for line in out.splitlines():
-            model, sep, label = line.strip().partition(" - ")
-            if sep and MODEL_RE.fullmatch(model):
-                models.append([model, label.strip()])
-        _MODELS[exe] = (time.time(), models)
-    return models
+def tool_models(tool):
+    """The models an agent tool can be switched to: [[id, label], ...]. Only Claude Code's aliases
+    for now: switching restarts the conversation, which only Claude Code can do from here."""
+    return CLAUDE_MODELS if tool == "claude" else []
 
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
     if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
-    options = (LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
     # One argument, so an id can never be taken for an option of its own.
-    return [exe] + options + (["--model", model] if model else []) + ["--resume=" + session, REOPEN_PROMPT]
+    return ([exe] + tool_options(tool, permissions, base) + (["--model", model] if model else [])
+            + ["--resume=" + session, REOPEN_PROMPT])
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None):
@@ -5394,7 +5524,7 @@ def process_table(pids=None):
     return table
 
 
-_PROCESSES = [0.0, {}]  # when, the agents' processes as refresh_processes last read them
+_PROCESSES = {}  # the agents' processes as refresh_processes last read them
 SESSIONS_EVERY = 5  # seconds between the server's looks at its agents' processes
 
 
@@ -5403,14 +5533,16 @@ def refresh_processes(projects):
     `ps`), and tell each project's page when an agent's session started or ended."""
     hubs = [project.hub for project in projects.all()]
     pids = sorted({pid for hub in hubs for pid in hub.session_pids()})
-    _PROCESSES[:] = [time.time(), process_table(pids)]
+    table = process_table(pids)
+    _PROCESSES.clear()
+    _PROCESSES.update(table)
     for hub in hubs:
         hub.check_sessions()
 
 
 def forget_process(pid):
     """An agent's process that was just stopped: the cards show it closed without waiting."""
-    _PROCESSES[1] = {k: v for k, v in _PROCESSES[1].items() if k != pid}
+    _PROCESSES.pop(pid, None)
 
 
 def session_checks(projects):
@@ -5454,17 +5586,17 @@ def process_running(session, table=None):
     return bool(row and row[1] == started and AGENT_COMMAND.get(tool, AGENT_COMMAND["claude"]).search(row[2]))
 
 
-def end_session(session):
+def end_session(name, session):
     """Stop an agent's process and wait (outside any lock, up to 10 s) for it to end. HubError if it
     does not."""
     if not stop_process(session["pid"]):
-        raise HubError("could not stop it")
+        raise HubError("%s: could not stop it" % name)
     for _ in range(40):
         if not process_running(session):
             forget_process(session["pid"])
             return
         time.sleep(0.25)
-    raise HubError("it did not stop; try again")
+    raise HubError("%s: it did not stop; try again" % name)
 
 
 def stop_process(pid):
@@ -6776,6 +6908,22 @@ h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywher
 .agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
 .agent .top { display: flex; align-items: center; gap: 8px; }
 .agent .name { font-weight: 600; overflow-wrap: anywhere; }
+.avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 28px; height: 28px; border-radius: 50%; background: var(--av); box-shadow: 0 0 0 1px var(--off); }
+.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+.avatar .initials { color: var(--av-ink); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
+.avatar .emoji { font-size: 16px; line-height: 1; }
+.avatar .mark, .avatar .os { position: absolute; bottom: -4px; height: 13px; min-width: 13px; padding: 0 2px;
+  border-radius: 7px; font-size: 7.5px; line-height: 13px; text-align: center;
+  box-shadow: 0 0 0 1.5px var(--panel), 0 0 0 2.5px var(--off); }
+.avatar .mark { right: -5px; background: var(--mk); color: #fff; font-weight: 700; }
+.avatar .os { left: -5px; background: var(--panel); }
+.msg .meta .avatar { width: 20px; height: 20px; align-self: center; }
+.msg .meta .avatar .initials { font-size: 8.5px; } .msg .meta .avatar .emoji { font-size: 12px; }
+.msg .meta .avatar .mark, .msg .meta .avatar .os { display: none; }
+.picmenu > summary { cursor: pointer; font-size: 12px; color: var(--accent); list-style: none; display: inline; }
+.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
+.picmenu .picks button { min-width: 30px; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
 .dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
 .agent .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
@@ -7475,6 +7623,7 @@ function agentActions(a) {
       agentOp({ op: "remove", agent: a.agent }, "Not removed", b);
   });
   sessionControls(a, acts, agentOp);
+  if (!remote) acts.append(pictureMenu(a, agentOp));
   const listen = el("select");
   listen.setAttribute("aria-label", "Listening for " + a.agent);
   listen.title = remote || "Wait for messages after each turn (On), check once (Off), or as its folder says";
@@ -7546,6 +7695,7 @@ function setRole(agent, role, pick) {
 function renderAgents() {
   const box = $("agents");
   if (box.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;  // menu open
+  if (box.querySelector(".picmenu[open]")) return;  // choosing a picture
   box.replaceChildren();
   if (!state.agents.length) box.append(el("p", "none", "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use Add an agent above."));
   for (const a of state.agents) {
@@ -7554,7 +7704,7 @@ function renderAgents() {
     const top = el("div", "top");
     const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.setAttribute("aria-hidden", "true");
-    top.append(dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
+    top.append(avatar(a), dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
     // The role goes under the name: names are long and the card is narrow.
     const where = el("div", "where");
     if (a.role) where.append(el("span", "badge " + a.role, roleTitle(a.role)), document.createTextNode(" "));
@@ -7581,8 +7731,100 @@ function renderAgents() {
     select.replaceChildren(new Option("Everyone", "all"), ...state.agents.map((a) => new Option(a.agent, a.agent)));
     select.value = [...select.options].some((o) => o.value === keep) ? keep : "all";
     // Names colour by roster position, so repaint what is already on screen.
-    for (const n of $("log").querySelectorAll("[data-who]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
+    for (const n of $("log").querySelectorAll("[data-cls]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
   }
+  const looks = state.agents.map((a) => [a.agent, a.client, a.picture, a.colour, a.os, a.device].join(" ")).join("\n");
+  if (looks !== state.looks) {  // a new picture or colour: repaint the ones on messages too
+    state.looks = looks;
+    for (const n of $("log").querySelectorAll(".avatar[data-who]")) n.replaceWith(avatar(agentRow(n.dataset.who)));
+  }
+}
+
+// An agent's picture: its uploaded image, a preset, or its initials, on its colour (the tool's own by
+// default), with its tool's lettermark, and its machine's OS when the chat spans several machines.
+const OS_BADGES = { mac: ["\u{1F34E}", "macOS"], windows: ["\u{1FA9F}", "Windows"], linux: ["\u{1F427}", "Linux"] };
+
+function agentRow(name) {
+  return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
+}
+
+function own(table, key) {
+  return table && Object.hasOwn(table, key) ? table[key] : undefined;
+}
+
+function inkOn(hex) {
+  if (!/^#[0-9a-f]{6}$/i.test(hex)) return "#fff";
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
+    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 ? "#111" : "#fff";
+}
+
+function initials(name) {
+  const parts = name.split(/[-_.]+/).filter(Boolean);
+  return parts.slice(0, 2).map((p) => p[0]).join("").toUpperCase() || "?";
+}
+
+function avatar(a) {
+  const tool = own(state.tools, a.client) || own(state.tools, "agent") || { colour: "#6b7280", mark: "", label: "" };
+  const fill = a.colour || tool.colour;
+  const box = el("span", "avatar");
+  box.dataset.who = a.agent;
+  box.style.setProperty("--av", fill);
+  box.style.setProperty("--av-ink", inkOn(fill));
+  const letters = () => el("span", "initials", initials(a.agent));
+  const [kind, id] = (a.picture || "").split(":");
+  if (kind === "file") {
+    const img = el("img");
+    img.alt = ""; img.src = "/files/" + id;
+    img.addEventListener("error", () => img.replaceWith(letters()));
+    box.append(img);
+  } else if (kind === "preset" && own(state.presets, id)) {
+    box.append(el("span", "emoji", state.presets[id]));
+  } else {
+    box.append(letters());
+  }
+  if (tool.mark) {
+    const mark = el("span", "mark", tool.mark);
+    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
+    box.append(mark);
+  }
+  const os = OS_BADGES[a.os];
+  if (os && new Set(state.agents.map((r) => r.device)).size > 1) {
+    const badge = el("span", "os", os[0]); badge.title = os[1];
+    box.append(badge);
+  }
+  box.title = a.agent + (tool.label ? " · " + tool.label : "");
+  return box;
+}
+
+// The card's Picture menu: a preset, initials, an image of your own, and a colour.
+function pictureMenu(a, agentOp) {
+  const menu = el("details", "picmenu");
+  menu.append(el("summary", "", "Picture"));
+  menu.addEventListener("toggle", () => { if (!menu.open) renderAgents(); });  // cards wait while it is open
+  const picks = el("div", "picks");
+  const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
+    .then(() => { menu.open = false; });
+  for (const [id, emoji] of Object.entries(state.presets || {}))
+    actButton(picks, emoji, "Picture: " + id, (b) => set({ picture: "preset:" + id }, b));
+  actButton(picks, "Initials", "Picture: initials", (b) => set({ picture: "" }, b));
+  const file = el("input");
+  file.type = "file"; file.accept = "image/png,image/jpeg,image/webp"; file.hidden = true;
+  file.addEventListener("change", async () => {
+    const f = file.files[0]; file.value = "";
+    if (!f) return;
+    try { await set({ picture: "file:" + await uploadFile(f) }); }
+    catch (err) { $("error").textContent = "Picture not changed: " + err.message; }
+  });
+  actButton(picks, "Upload\u2026", "Upload a picture (PNG, JPEG or WebP, 512 KB at most)", () => file.click());
+  const tint = el("input");
+  tint.type = "color"; tint.value = a.colour || (own(state.tools, a.client) || {}).colour || "#6b7280";
+  tint.setAttribute("aria-label", "Colour for " + a.agent);
+  tint.addEventListener("change", () => set({ colour: tint.value }, tint));
+  actButton(picks, "Tool colour", "Back to the tool's own colour", (b) => set({ colour: "" }, b));
+  picks.append(file, tint);
+  menu.append(picks);
+  return menu;
 }
 
 function named(tag, cls, name) {
@@ -7646,6 +7888,7 @@ function buildMessage(m) {
   const box = el("div", "msg" + (own ? " own" : "") + (m.kind === "task" ? " task" : "") + (m.kind === "update" ? " update" : ""));
   box.dataset.id = m.id;
   const meta = el("div", "meta");
+  if (!own) meta.append(avatar(agentRow(m.from)));
   meta.append(own ? el("span", "who", "You") : named("span", "who", m.from));
   if (m.to !== "all") meta.append(el("span", "to", "to " + (m.to === "Owner" ? "you" : m.to)));
   meta.append(el("span", "", new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })));
@@ -7740,6 +7983,7 @@ async function loop() {
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
+      state.tools = data.tools || {}; state.presets = data.presets || {};
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       showUpdate(data.update || "", data.releases || "");
       if (data.project && data.project + " · crewchat" !== state.title) {

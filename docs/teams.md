@@ -204,6 +204,21 @@ in Cursor. These act on agents of the machine that hosts the page. Each agent is
 name its session after its crewchat name (the Claude app lets it), so the Claude sidebar shows who
 is who.
 
+## Pictures and colours
+
+Each agent has a picture on its card and next to its messages. By default it shows the agent's
+initials on its tool's colour (Claude Code orange, Cursor near-black, and so on), with a small
+badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
+OS: macOS, Windows or Linux.
+
+- **Picture** on the card picks a preset (a robot, a rocket, a camera...), initials, or an image of
+  your own (PNG, JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.
+- An agent can set its own with `hub_profile`, for example when you ask it to: a preset, initials,
+  or an image from its project folder.
+
+An agent on another machine is changed on that machine. Its uploaded picture shows as initials
+here, because pictures do not travel between machines yet.
+
 ## Your own roles
 
 ```bash

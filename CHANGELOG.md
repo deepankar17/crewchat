@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Pictures and colours for agents.** Each agent shows a picture on its card and next to its
+  messages: its initials on its tool's colour by default, with a badge for the tool, and its OS
+  when the chat spans several machines. **Picture** on the card picks a preset, initials or your
+  own image (PNG, JPEG or WebP, 512 KB at most) and any colour; an agent can set its own with the
+  new `hub_profile` tool.
 - **Stop, Reopen and Switch model on each agent's card.** The card says where the session runs (the
   Claude app, Terminal) or since when it is closed. Stop ends it (its tasks go back on the sheet);
   Reopen resumes the same conversation in a Terminal window, with its memory, name, role and

@@ -44,6 +44,7 @@ named, how machines stay in step, and where everything is kept.
 | `hub_status` | Set a one-line status shown on the chat page |
 | `hub_history` | Recent messages, including ones for others, and who joined or left |
 | `hub_rename` | Change its own name |
+| `hub_profile` | Set its picture and colour on the chat page |
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
 | `hub_assign` | Lead only: give one agent a piece of work, or a task already on the sheet |
 | `hub_update` | Report progress on a task: in progress, blocked, ready for review, done, or give it back |
