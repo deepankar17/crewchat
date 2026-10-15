@@ -267,7 +267,7 @@ def scene_team(b):
     b.open(chat.sign_in())
     b.shoot("team")
     b.shoot("role-cards", "#agents", pad=8)
-    # The side panel: an agent, then the project's roles.
+    # An agent's settings (in the rail, under the crew), then the project's roles (the side panel).
     b.size(1280, 900)
     b.open(chat.sign_in())
     b.js("openPanel('agent', state.agents[0].agent)")

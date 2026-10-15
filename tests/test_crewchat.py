@@ -1393,6 +1393,103 @@ class Launching(Base):
         self.assertIn("#rrggbb", self.launch(colour="red")["error"])
         self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="opus")[-3:-1], ["--model", "opus"])
 
+    def agent_op(self, **body):
+        try:
+            return crewchat.post_json(self.base + "/api/agent", self.owner, body)
+        except urllib.error.HTTPError as e:
+            return {"status": e.code, "error": json.loads(e.read())["error"]}
+
+    def linked(self, **launch):
+        self.assertEqual(self.launch(**launch), {"ok": True})
+        session = Session(self.base, crewchat.read_token(self.place))
+        session.text("hub_link", key=self.launched[-1][2])
+        return session.me
+
+    def test_a_new_agent_gets_a_random_3d_picture_unless_initials_are_asked_for(self):
+        pictures = [self.hub.agents[self.linked()]["picture"] for _ in range(4)]
+        self.assertTrue(all(p.startswith("art:") and p[4:] in crewchat.ART_PICTURES for p in pictures), pictures)
+        self.assertEqual(len(set(pictures)), 4)  # one nobody here has, while any is free
+        self.assertEqual(self.hub.agents[self.linked(picture="initials")]["picture"], "")
+        self.assertEqual(self.hub.agents[self.linked(picture="art:owl")]["picture"], "art:owl")
+
+    def test_an_agent_with_no_recorded_session_starts_again_as_itself(self):
+        name = self.linked(role="docs")
+        self.assertIsNone(self.hub.agents[name].get("session"))  # its hooks never reported one
+        row = lambda: next(r for r in self.hub.rows() if r["agent"] == name)  # noqa: E731
+        self.assertTrue(row()["startable"])
+        self.assertEqual(self.agent_op(op="start", agent=name), {"ok": True})
+        self.assertFalse(row()["startable"])  # started a moment ago: not twice
+        self.assertIn("is running or starting already", self.agent_op(op="start", agent=name)["error"])
+        tool, folder, again, _ = self.launched[-1]
+        self.assertEqual((tool, folder), ("claude", str(self.folder)))  # in its folder
+        self.assertEqual(self.hub.links[again], name)  # with a link key of its own (its start key has expired)
+        self.assertFalse(again.startswith("start-"))
+        self.assertIn("Owner started a new session for %s in %s" % (name, self.folder.name),
+                      [m["text"] for m in self.hub.history(5)])
+        session = Session(self.base, crewchat.read_token(self.place))
+        self.assertIn("This session is %s again" % name, session.text("hub_link", key=again))
+        self.assertEqual(session.me, name)
+        self.assertEqual(self.hub.agents[name]["role"], "docs")
+        self.assertNotIn("starting", self.hub.agents[name])  # it checked in: no more waiting for it
+        with self.hub.lock:
+            self.hub.waiting[name] = 1  # its stop hook is waiting for messages: it is open
+        try:
+            self.assertFalse(row()["startable"])
+            self.assertIn("is running or starting already", self.agent_op(op="start", agent=name)["error"])
+        finally:
+            with self.hub.lock:
+                self.hub.waiting.pop(name, None)
+        self.assertEqual(self.agent_op(op="start", agent="nobody")["status"], 400)
+        with self.hub.lock:  # a recorded conversation, closed: Reopen is the way back
+            self.hub.agents[name]["session"] = {"id": "0" * 8 + "-0000-0000-0000-" + "0" * 12, "pid": 999999,
+                                                "started": "x", "app": "terminal", "tool": "claude", "since": 0}
+        try:
+            self.assertIn("use Reopen", self.agent_op(op="start", agent=name)["error"])
+        finally:
+            with self.hub.lock:
+                self.hub.agents[name].pop("session", None)
+
+    def test_a_start_the_server_runs_never_starts_or_registers_a_server(self):
+        saved, up = os.environ.get("CREWCHAT_FROM_SERVER"), crewchat.server_up
+        os.environ["CREWCHAT_FROM_SERVER"] = "1"
+        crewchat.server_up = lambda config: False  # the server did not answer the child in time
+        before = crewchat.load_config()
+        try:
+            with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+                crewchat.ensure_server(dict(before), argparse.Namespace(no_service=True, keep_awake=False))
+            self.assertIn("did not answer", str(e.exception))
+            self.assertEqual(crewchat.load_config().get("service"), before.get("service"))  # not turned off
+        finally:
+            crewchat.server_up = up
+            if saved is None:
+                os.environ.pop("CREWCHAT_FROM_SERVER", None)
+            else:
+                os.environ["CREWCHAT_FROM_SERVER"] = saved
+
+    def test_a_folder_is_connected_from_the_page(self):
+        def connect(path):
+            try:
+                return crewchat.post_json(self.base + "/api/folders", self.owner, {"op": "connect", "path": path})
+            except urllib.error.HTTPError as e:
+                return {"status": e.code, "error": json.loads(e.read())["error"]}
+        self.assertIn("type the folder's path", connect("  ")["error"])
+        self.assertIn("full path", connect("code/app")["error"])
+        self.assertIn("there is no folder", connect(str(self.folder / "missing"))["error"])
+        self.assertIn("a project's own folder", connect("~")["error"])
+        self.assertIn("a project's own folder", connect(str(Path.home().parent))["error"])  # above home too
+        self.assertIn("a project's own folder", connect(str(crewchat.home()))["error"])
+        self.assertIn("a project's own folder", connect(str(crewchat.home() / "tokens"))["error"])
+        folder = Path(tempfile.mkdtemp(prefix="connect-", dir=TMP)).resolve()
+        out = connect(str(folder))  # `crewchat start` in it
+        self.assertEqual(out["path"], str(folder))
+        self.assertIn(str(folder), [f["path"] for f in out["folders"]])
+        opener, _ = self.owner_browser()
+        options = json.loads(self.raw("/api/launch", opener=opener)[1])
+        self.assertIn(str(folder), [f["path"] for f in options["folders"]])
+        elsewhere = Path(tempfile.mkdtemp(prefix="elsewhere-", dir=TMP)).resolve()
+        cli("start", str(elsewhere), "--no-open", "--no-service", "--chat", "connect-other")
+        self.assertIn("is in the project \"connect-other\"", connect(str(elsewhere))["error"])  # one project per folder
+
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
         self.assertEqual(self.launch(tool="vim")["status"], 400)
@@ -1687,7 +1784,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen, model or profile", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, start, model or profile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()
@@ -1792,7 +1889,8 @@ class Profiles(Base):
 
     def test_owner_sets_a_preset_and_a_colour(self):
         _, name = self.agent()
-        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("", ""))
+        self.assertTrue(self.row(name)["picture"].startswith("art:"))  # a random 3D picture to begin with
+        self.assertEqual(self.row(name)["colour"], "")
         self.assertEqual(self.row(name)["os"], crewchat.os_name())
         self.assertEqual(self.op(op="profile", agent=name, picture="preset:rocket", colour="#FF8800"), {"ok": True})
         self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("preset:rocket", "#ff8800"))

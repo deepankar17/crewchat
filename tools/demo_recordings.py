@@ -365,7 +365,7 @@ def scene_task(r):
 
 
 def scene_roles(r):
-    """Give roles in the agent panel; the lead hands out the work; the board shows it move."""
+    """Give roles in the agent's settings (in the rail); the lead hands out the work; the board shows it move."""
     chat = shots.Chat("Notes App")
     maya, teo, wren = crew(chat, roles=())
     chat.quiet()
@@ -375,9 +375,9 @@ def scene_roles(r):
     for name, role in ((maya, "lead"), (teo, "developer"), (wren, "qa")):
         r.click('#agents .agent[data-agent="%s"]' % name, 600)
         time.sleep(0.7)
-        r.choose('#panel-body select[aria-label="Role for %s"]' % name, role)
+        r.choose('#agent-pane-body select[aria-label="Role for %s"]' % name, role)
         time.sleep(0.9)
-    r.click("#panel-close", 500)
+    r.click("#agent-pane-close", 500)
     post_task(r, "Add a dark theme to the settings screen.")
     time.sleep(1.0)
     task = chat.hub.history(1)[0]["id"]
