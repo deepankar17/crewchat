@@ -485,11 +485,11 @@ class NewPage(Signed):
         pic = "document.querySelector('#panel .picbutton')"
         self.assertTrue(c.js("%s.getAttribute('aria-label') === %s" % (pic, json.dumps("Change %s's picture" % self.agent.name))))
         c.js(pic + ".click()")
-        c.until("document.querySelector('#panel .picmenu').open && %s.getAttribute('aria-expanded') === 'true'" % pic,
+        c.until("!document.querySelector('#panel .picmenu').hidden && %s.getAttribute('aria-expanded') === 'true'" % pic,
                 what="the picture menu to open")
         self.assertGreater(c.js("document.querySelectorAll('#panel .picmenu .picks button.art').length"), 10)
         c.js(pic + ".click()")
-        c.until("!document.querySelector('#panel .picmenu').open", what="the picture menu to close")
+        c.until("document.querySelector('#panel .picmenu').hidden", what="the picture menu to close")
         sel = "#panel select[aria-label='Role for %s']" % self.agent.name
         c.js("(() => { const s = document.querySelector(%s); s.value = 'reviewer'; s.dispatchEvent(new Event('change')); })()"
              % json.dumps(sel))
@@ -561,12 +561,15 @@ class NewPage(Signed):
             state.agents = [
               row("running-one", {session: {app: "terminal", running: true, since: state.now, tool: "claude", reopen: true}}),
               row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
-              row("far-one", {remote: true, device: "laptop", session: null})];
+              row("far-one", {remote: true, device: "laptop", session: null}),
+              row("unrecorded-one", {session: null, startable: true, activity: "", seen: state.now - 3600}),
+              row("busy-one", {session: null, startable: false})];
             const look = (n) => { openPanel("agent", n); const b = $("panel-body");
               return {buttons: [...b.querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent),
                       text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
                       picture: !!b.querySelector(".picmenu"), nameField: !!b.querySelector(".namefield")}; };
-            const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one")};
+            const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one"),
+                         unrecorded: look("unrecorded-one"), busy: look("busy-one")};
             closePanel(); state.agents = saved; state.models = savedModels; renderAgents(true);
             return out;
         })()""")
@@ -574,6 +577,10 @@ class NewPage(Signed):
         self.assertIn("Switch running-one's model", out["running"]["selects"])
         self.assertIn("Reopen", out["closed"]["buttons"])
         self.assertIn("Session closed 4 min ago", out["closed"]["text"])
+        self.assertNotIn("Start again", out["closed"]["buttons"])  # its own conversation reopens instead
+        self.assertIn("Start again", out["unrecorded"]["buttons"])  # no conversation recorded: a new session
+        self.assertNotIn("Reopen", out["unrecorded"]["buttons"])
+        self.assertNotIn("Start again", out["busy"]["buttons"])
         self.assertNotIn("Remove", out["far"]["buttons"])  # it runs on another machine: changed there
         self.assertFalse(out["far"]["nameField"])
         self.assertFalse(out["far"]["picture"])

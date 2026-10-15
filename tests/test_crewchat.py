@@ -1415,10 +1415,15 @@ class Launching(Base):
     def test_an_agent_with_no_recorded_session_starts_again_as_itself(self):
         name = self.linked(role="docs")
         self.assertIsNone(self.hub.agents[name].get("session"))  # its hooks never reported one
+        row = lambda: next(r for r in self.hub.rows() if r["agent"] == name)  # noqa: E731
+        self.assertTrue(row()["startable"])
         self.assertEqual(self.agent_op(op="start", agent=name), {"ok": True})
+        self.assertFalse(row()["startable"])  # started a moment ago: not twice
+        self.assertIn("is running or starting already", self.agent_op(op="start", agent=name)["error"])
         tool, folder, again, _ = self.launched[-1]
         self.assertEqual((tool, folder), ("claude", str(self.folder)))  # in its folder
         self.assertEqual(self.hub.links[again], name)  # with a link key of its own (its start key has expired)
+        self.assertFalse(again.startswith("start-"))
         self.assertIn("Owner started a new session for %s in %s" % (name, self.folder.name),
                       [m["text"] for m in self.hub.history(5)])
         session = Session(self.base, crewchat.read_token(self.place))
@@ -1426,9 +1431,11 @@ class Launching(Base):
         self.assertEqual(session.me, name)
         self.assertEqual(self.hub.agents[name]["role"], "docs")
         with self.hub.lock:
+            self.hub.agents[name]["starting"] = 0
             self.hub.waiting[name] = 1  # its stop hook is waiting for messages: it is open
         try:
-            self.assertIn("is running now", self.agent_op(op="start", agent=name)["error"])
+            self.assertFalse(row()["startable"])
+            self.assertIn("is running or starting already", self.agent_op(op="start", agent=name)["error"])
         finally:
             with self.hub.lock:
                 self.hub.waiting.pop(name, None)
@@ -1445,8 +1452,11 @@ class Launching(Base):
         self.assertIn("there is no folder", connect(str(self.folder / "missing"))["error"])
         self.assertIn("a project's own folder", connect("~")["error"])
         self.assertIn("a project's own folder", connect(str(crewchat.home()))["error"])
+        self.assertIn("a project's own folder", connect(str(crewchat.home() / "tokens"))["error"])
         folder = Path(tempfile.mkdtemp(prefix="connect-", dir=TMP)).resolve()
-        self.assertEqual(connect(str(folder)), {"path": str(folder)})  # `crewchat start` in it
+        out = connect(str(folder))  # `crewchat start` in it
+        self.assertEqual(out["path"], str(folder))
+        self.assertIn(str(folder), [f["path"] for f in out["folders"]])
         opener, _ = self.owner_browser()
         options = json.loads(self.raw("/api/launch", opener=opener)[1])
         self.assertIn(str(folder), [f["path"] for f in options["folders"]])
@@ -1748,7 +1758,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen, model or profile", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, start, model or profile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()
@@ -1853,7 +1863,8 @@ class Profiles(Base):
 
     def test_owner_sets_a_preset_and_a_colour(self):
         _, name = self.agent()
-        self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("", ""))
+        self.assertTrue(self.row(name)["picture"].startswith("art:"))  # a random 3D picture to begin with
+        self.assertEqual(self.row(name)["colour"], "")
         self.assertEqual(self.row(name)["os"], crewchat.os_name())
         self.assertEqual(self.op(op="profile", agent=name, picture="preset:rocket", colour="#FF8800"), {"ok": True})
         self.assertEqual((self.row(name)["picture"], self.row(name)["colour"]), ("preset:rocket", "#ff8800"))

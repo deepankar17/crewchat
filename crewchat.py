@@ -364,8 +364,8 @@ def check_profile(hub, picture=None, colour=None):
 
 
 def check_picture(hub, value):
-    """A picture the owner or the agent chose, checked; returns it as stored."""
-    value = str(value or "")
+    """A picture the owner or the agent chose, checked; returns it as stored ("initials" is "")."""
+    value = "" if value == "initials" else str(value or "")
     kind, _, rest = value.partition(":")
     if kind == "preset" and rest not in PICTURE_PRESETS:
         raise HubError("no picture preset called %s" % rest)
@@ -814,9 +814,10 @@ class Roster:
             paths.append(home() / "config.json")  # the machine's saved packs
         for path in paths:
             try:
-                out.append(path.stat().st_mtime_ns)
+                st = path.stat()
+                out.append((st.st_mtime_ns, st.st_ino, st.st_size))  # a file written in place of it is a new inode
             except OSError:
-                out.append(0)
+                out.append(None)
         return tuple(out)
 
     def refresh(self, force=False):
@@ -1609,7 +1610,8 @@ class Hub:
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
-             "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
+             "session": self._session_state(a), "startable": self.startable(n),
+             "picture": a.get("picture", ""), "colour": a.get("colour", ""),
              "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now)}
             for n, a in self.agents.items()
         ]
@@ -1825,10 +1827,8 @@ class Hub:
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
-        # "" keeps the random picture every new agent gets; "initials" asks for initials instead.
-        initials = picture == "initials"
-        picture, colour = check_profile(self, "" if initials else picture or "", colour or "")
-        picture = "initials" if initials else picture
+        # No picture keeps the random one every new agent gets; "initials" asks for initials instead.
+        picture, colour = check_profile(self, picture or None, colour or "")
         if len(instructions) > MAX_TEXT:
             raise HubError("the instructions are too long")
         with self.lock:
@@ -1910,10 +1910,9 @@ class Hub:
                 if spec.get("model"):
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
                 self._save()
-        if spec.get("picture") or spec.get("colour"):
-            picture = spec.get("picture") or None
+        if spec.get("picture") is not None or spec.get("colour"):
             try:
-                self.set_profile(name, "" if picture == "initials" else picture, spec.get("colour") or None)
+                self.set_profile(name, spec.get("picture"), spec.get("colour") or None)
             except HubError as e:  # its picture went away in the meantime
                 notes.append("Your picture was not set (%s)." % e)
         if spec["role"]:
@@ -2859,42 +2858,63 @@ class Hub:
             raise HubError("%s is still running: stop it first" % name)
         self._open_again(name, None, session, folder, command)
 
+    def startable(self, name):
+        """Can the owner start a new session for this local agent (Start again)? Its tool can be
+        started from the page, it has no conversation to reopen, it is not waiting for messages, and
+        it was not just started. Caller holds the lock."""
+        agent, session = self.agents[name], self._session_state(self.agents[name])
+        return (agent.get("client") in LAUNCH_TOOLS and not self.waiting.get(name)
+                and not (session and (session["running"] or session["reopen"]))
+                and time.time() - float(agent.get("starting") or 0) >= REOPEN_WAIT)
+
     def start_again(self, name):
         """The owner starts a new session for a local agent whose own one cannot be reopened (crewchat
         recorded none): in the agent's folder, with its link key, so it checks in as the same agent,
         with its name, role, picture and tasks. The old conversation's memory is gone; the chat is not."""
         with self.lock:
             agent = self._local_agent(name, "start")
-            if self.waiting.get(name):  # its stop hook is waiting for messages: the session is open
-                raise HubError("%s is running now" % name)
-            session = agent.get("session")
-            if session and process_running(session):
-                raise HubError("%s is still running: stop it first" % name)
-            tool = agent.get("client")
+            session = dict(agent.get("session") or {})
+        running = bool(session) and process_running(session)  # a process lookup: not under the lock
+        with self.lock:
+            agent = self._local_agent(name, "start")
+            if running or not self.startable(name):  # waiting for messages, or started a moment ago
+                raise HubError("%s is running or starting already" % name)
+            tool = agent["client"]
             permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
-        if tool not in LAUNCH_TOOLS:
-            raise HubError("only Claude Code and Cursor agents can be started from the page")
-        folder = next((str(f) for f in self.agent_folders(name) if self._connected_folder(str(f))), None)
+        connected = {f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)}
+        folder = next((str(f) for f in self.agent_folders(name) if str(f) in connected), None)
         if folder is None:
             raise HubError("%s's folder is not connected to this project on this machine any more" % name)
         if permissions not in LAUNCH_PERMISSIONS[tool]:
             permissions = "ask"
-        with self.lock:  # a new link key tied to its name (a start key it joined with has expired)
+        if model not in [m for m, _ in tool_models(tool)]:
+            model = ""
+        with self.lock:
+            key = self._link_key(name)
+        try:
+            launch_agent(tool, folder, key, permissions, self.home, model)
+        except (HubError, OSError) as e:
+            raise HubError(str(e))
+        with self.lock:
+            if name in self.agents:
+                self.agents[name]["starting"] = time.time()  # until it checks in, Start again waits
+            self._event("Owner started a new session for %s in %s" % (name, Path(folder).name))
+            self._save()
+            self._changed()
+
+    def _link_key(self, name):
+        """The link key an agent's hooks use, made anew if it was lost. Not a start key: those
+        are spent ten minutes after the launch. Caller holds the lock."""
+        key = next((k for k, v in self.links.items() if v == name and not k.startswith("start-")), None)
+        if key is None:
             key = secrets.token_urlsafe(12)
             self.links[key] = name
             self._save()
-        launch_agent(tool, folder, key, permissions, self.home, model)
-        with self.lock:
-            self._event("Owner started a new session for %s in %s" % (name, Path(folder).name))
-            self._changed()
+        return key
 
     def _open_again(self, name, model, session, folder, command):
         with self.lock:
-            key = next((k for k, v in self.links.items() if v == name), None)
-            if key is None:  # its link was lost: a new one, tied to the same name
-                key = secrets.token_urlsafe(12)
-                self.links[key] = name
-                self._save()
+            key = self._link_key(name)
         open_terminal(folder, command, key, title=name, root=self.home)
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
@@ -3470,7 +3490,7 @@ def call_tool(hub, sid, name, args, owner=False):
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
     if name == "hub_profile":
         picture = args.get("picture")
-        picture = None if picture is None else "" if picture == "initials" else (
+        picture = picture if picture in (None, "initials") else (
             "art:%s" if picture in ART_PICTURES else "preset:%s") % picture
         if args.get("file"):
             folders = hub.agent_folders(me)
@@ -3948,7 +3968,7 @@ def connect_folder(path, chat, root=None):
     if not folder.is_dir():
         raise HubError("there is no folder at %s" % folder)
     # Not the whole disk or home: a folder's .claude settings in the home folder are every session's.
-    if folder == Path(folder.anchor) or folder == Path.home().resolve() or folder == Path(root or home()).resolve():
+    if folder == Path(folder.anchor) or folder == Path.home().resolve() or inside_any(folder, {Path(root or home())}):
         raise HubError("pick a project's own folder, not %s" % folder)
     done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open", "--no-service"], root)
     if done["code"] != 0:
@@ -4555,8 +4575,8 @@ class Handler(BaseHTTPRequestHandler):
         if data.get("op") != "connect":
             raise HubError("unknown op")
         path = connect_folder(data.get("path"), self.project.id, self.projects.base)
-        self.projects.primary.roster.refresh(force=True)  # the machine's folders and the folder's token, just written
-        return {"path": path}
+        self.projects.primary.roster.refresh()  # the machine's folders and the folder's token, just written
+        return {"path": path, "folders": launch_folders(self.hub.machine_config(), self.roster.root, self.hub.chat_key)}
 
     def _launch(self, data):
         """Add an agent: a new agent session on this machine."""
@@ -9101,7 +9121,6 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
-.picmenu > summary { display: none; }
 .picbutton { position: relative; padding: 0; background: none; border-radius: 50%; flex: none; }
 .picbutton .picedit { position: absolute; right: -2px; bottom: -2px; width: 22px; height: 22px; border-radius: 50%;
   display: grid; place-items: center; font-size: 12px; background: var(--panel); color: var(--ink);
@@ -9110,7 +9129,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .picmenu .picks button.art { padding: 2px; border-radius: 50%; min-width: 0; }
 .picmenu .picks button.art img { width: 34px; height: 34px; display: block; }
 .avatar img.art { border-radius: 0; object-fit: contain; width: 92%; height: 92%; }
-.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; align-items: center; }
+.picmenu .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; align-items: center; }
 .picmenu .picks button { min-width: 34px; padding: 4px 8px; background: var(--soft); color: var(--text); border: 1px solid var(--line); }
 
 /* The space: header, thread, composer. */
@@ -10238,11 +10257,10 @@ async function connectFolder() {
   $("launch-note").textContent = "Connecting " + path + "…";
   try {
     const out = await postJSON("/api/folders", { op: "connect", path });
-    const opts = await launchOptions();
-    showFolders(opts.folders, out.path);
-    launchNote(opts.folders);
+    showFolders(out.folders, out.path);
+    launchNote(out.folders);
     $("l-path").value = "";
-    if (!$("launch-note").textContent) $("launch-note").textContent = "Connected " + out.path + ".";
+    $("launch-note").textContent = ["Connected " + out.path + ".", $("launch-note").textContent].join(" ").trim();
   } catch (err) {
     $("launch-note").textContent = "Not connected: " + err.message;
   } finally {
@@ -10363,7 +10381,7 @@ function sessionControls(a, acts, agentOp) {
   if (a.remote) return;
   if (!s || (!s.running && !s.reopen)) {
     // No conversation to reopen (crewchat recorded none): a new session that checks in as this agent.
-    if (["claude", "cursor"].includes(a.client) && a.activity !== "listening" && !isWorking(a))
+    if (a.startable && !isWorking(a))
       actButton(acts, "Start again", "Start a new session as " + a.agent, (b) => {
         if (confirm("Start a new session as " + a.agent + "? Its last conversation was not recorded, so a new one opens in a "
                     + "Terminal window in its folder, with the same name, role and tasks. If it is still open somewhere, close it first."))
@@ -10541,22 +10559,22 @@ function manyMachines() {
   return state.many;
 }
 
-// The pictures to choose from in a menu: initials, the 3D pictures, the emoji presets.
-// "" is the random 3D picture every new agent gets.
+// The pictures to choose from in a menu: a random one ("", what every new agent gets), the 3D
+// pictures, the emoji presets.
 function pictureOptions() {
   return [new Option("A random 3D picture", ""),
           ...Object.entries(state.art || {}).map(([id, label]) => new Option(label + " (3D)", "art:" + id)),
           ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id))];
 }
 
-// The Picture menu: a 3D picture, an emoji, initials, an image of your own, and a colour.
-// The picture itself opens it (pictureButton); its own summary is hidden.
+// The Picture menu: a 3D picture, an emoji, initials, an image of your own, and a colour. The
+// picture itself opens it (pictureButton).
 function pictureMenu(a, agentOp) {
-  const menu = el("details", "picmenu");
-  menu.append(el("summary", "", "Change picture"));
+  const menu = el("div", "picmenu");
+  menu.hidden = true;
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
-    .then(() => { menu.open = false; });
+    .then(() => { menu.hidden = true; });
   for (const [id, label] of Object.entries(state.art || {})) {
     const b = actButton(picks, "", "Picture: " + label, (b) => set({ picture: "art:" + id }, b));
     const img = el("img"); img.alt = ""; img.src = "/pictures/" + id + ".webp"; b.append(img);
@@ -10625,7 +10643,7 @@ document.addEventListener("keydown", (e) => {
 });
 // Not drawn again while the owner is in it: choosing, typing, or on one of its buttons.
 function panelBusy() {
-  return $("panel-body").querySelector(".picmenu[open], form.editing") || $("panel-body").contains(document.activeElement);
+  return $("panel-body").querySelector(".picmenu:not([hidden]), form.editing") || $("panel-body").contains(document.activeElement);
 }
 function renderPanel(force) {
   const p = state.panel;
@@ -10720,7 +10738,7 @@ function panelAgent(name) {
                 "still open, it joins again the next time it uses crewchat."))
       agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closePanel(); });
   }, "danger");
-  const cards = [card("", head, ...(menu ? [menu] : [])), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
+  const cards = [card("", ...[head, menu].filter(Boolean)), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
   if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
   return [a.agent, ...cards];
 }
@@ -10730,10 +10748,12 @@ function pictureButton(a, menu) {
   const b = el("button", "picbutton");
   b.type = "button"; b.title = "Change picture";
   b.setAttribute("aria-label", "Change " + a.agent + "'s picture");
-  b.setAttribute("aria-expanded", String(menu.open));
+  b.setAttribute("aria-expanded", "false");
   b.append(avatar(a, "big"), el("span", "picedit", "✎"));
-  b.addEventListener("click", () => { menu.open = !menu.open; });
-  menu.addEventListener("toggle", () => b.setAttribute("aria-expanded", String(menu.open)));
+  b.addEventListener("click", () => {
+    menu.hidden = !menu.hidden;
+    b.setAttribute("aria-expanded", String(!menu.hidden));
+  });
   return b;
 }
 
