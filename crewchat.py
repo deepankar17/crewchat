@@ -9240,7 +9240,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 /* Tasks and Commands, in the space in place of the thread. */
 .view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
-#tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
+#tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
 #tasks.board-on { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
@@ -9305,6 +9305,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 
 /* The side panel: an agent, a role, a task, or the project. */
 #panel { grid-area: panel; overflow-y: auto; padding: 12px 14px 20px; min-width: 0; }
+#agent-pane { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+#agent-pane .card { padding: 10px 12px; }
+#agent-pane .field { grid-template-columns: 82px minmax(0, 1fr); }
 .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .panel-head h2 { font-size: 15px; margin: 0; flex: 1; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 10px; }
@@ -9418,6 +9421,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   <h2 class="rail-head">Agents</h2>
   <div id="agents"></div>
   <button type="button" id="add-agent" class="add-agent">+ New agent</button>
+  <section id="agent-pane" hidden aria-labelledby="agent-pane-title">
+    <header class="panel-head">
+      <h2 id="agent-pane-title" tabindex="-1"></h2>
+      <button type="button" class="icon" id="agent-pane-close" aria-label="Close the agent's settings" title="Close (Esc)">✕</button>
+    </header>
+    <div id="agent-pane-body"></div>
+  </section>
 </aside>
 <div id="scrim"></div>
 <main id="space">
@@ -9479,15 +9489,6 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
     <table id="sheet" hidden><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
-  <section id="commands" hidden aria-label="Commands">
-    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Commands</h2></div>
-    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
-      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
-      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
-      than the one of the folder you are in.</p>
-    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
-    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
-  </section>
   <p id="working" aria-live="off" hidden></p>
   <form id="form">
     <div id="pending" aria-label="Files to send"></div>
@@ -9515,6 +9516,14 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <button type="button" class="icon" id="panel-close" aria-label="Close the panel" title="Close (Esc)">✕</button>
   </header>
   <div id="panel-body"></div>
+  <div id="commands" hidden>
+    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
+      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
+      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
+      than the one of the folder you are in.</p>
+    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
+    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
+  </div>
   <div id="pane-project" hidden>
     <section class="card"><h3>Machines</h3><p id="link" class="linkline"></p></section>
     <section class="card" id="setup" aria-label="What this project's agents learn">
@@ -9749,12 +9758,9 @@ function postJSON(path, body) {
 // The space shows the chat, the task board or the commands; the rail's buttons and the back arrows switch.
 function showView(view) {
   $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
-  $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
-  for (const name of ["tasks", "commands"]) {
-    $("view-" + name).classList.toggle("on", view === name);
-    $("view-" + name).setAttribute("aria-pressed", String(view === name));
-  }
-  if (view === "commands") loadCommands();
+  $("tasks").hidden = view !== "tasks";
+  $("view-tasks").classList.toggle("on", view === "tasks");
+  $("view-tasks").setAttribute("aria-pressed", String(view === "tasks"));
   renderWorking();
   if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
@@ -9762,7 +9768,7 @@ function showView(view) {
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
 $("view-tasks").addEventListener("click", () => showView($("tasks").hidden ? "tasks" : "chat"));
-$("view-commands").addEventListener("click", () => showView($("commands").hidden ? "commands" : "chat"));
+$("view-commands").addEventListener("click", () => (state.panel && state.panel.kind === "commands" ? closePanel() : openPanel("commands")));
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
 // A phone: the rail is a drawer.
@@ -9896,7 +9902,7 @@ function taskOp(body) {
 }
 // Where an action's error is shown: the panel, the task board, or under the message box.
 function showError(text) {
-  if (state.panel && $("panel-body").querySelector(".panel-note")) return panelNote(text);
+  if ((state.panel || state.agentPane) && paneNote()) return panelNote(text);
   ($("tasks").hidden ? $("error") : $("tasks-note")).textContent = text;
 }
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
@@ -10123,7 +10129,7 @@ $("task-form").addEventListener("submit", async (event) => {
   if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
     fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
-try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
+try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 function renderSetup(rules, skills) {
@@ -10364,8 +10370,15 @@ async function postAction(path, body, what, control) {
     if (control) control.disabled = false;
   }
 }
+// The note line of the pane the owner is in: the agent's (in the rail) or the side panel's.
+function paneNote() {
+  const agent = $("agent-pane-body"), side = $("panel-body");
+  const box = agent.contains(document.activeElement) ? agent : side.contains(document.activeElement) ? side
+    : state.agentPane ? agent : side;
+  return box.querySelector(".panel-note");
+}
 function panelNote(text) {
-  const note = $("panel-body").querySelector(".panel-note");
+  const note = paneNote();
   if (note) note.textContent = text; else $("error").textContent = text;
 }
 
@@ -10445,9 +10458,11 @@ function doing(a) {
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
 // The agent open in the panel is marked in the rail, without drawing the rail again.
 function markOpen() {
-  const p = state.panel;
+  const commands = !!state.panel && state.panel.kind === "commands";
+  $("view-commands").classList.toggle("on", commands);
+  $("view-commands").setAttribute("aria-pressed", String(commands));
   for (const card of $("agents").querySelectorAll(".agent")) {
-    const on = !!p && p.kind === "agent" && p.id === card.dataset.agent;
+    const on = state.agentPane === card.dataset.agent;
     card.classList.toggle("on", on);
     if (on) card.setAttribute("aria-current", "true"); else card.removeAttribute("aria-current");
   }
@@ -10614,9 +10629,12 @@ function pictureMenu(a, agentOp) {
   return menu;
 }
 
-// The side panel: an agent, a task, a role, the roles, or the project. Esc or ✕ closes it; it is
-// drawn again as the chat changes, unless the owner is choosing or typing in it.
+// The side panel: a task, a role, the roles, the project or the commands (an agent opens in the rail,
+// under the crew). Esc or ✕ closes it; it is drawn again as the chat changes, unless the owner is
+// choosing or typing in it.
 function openPanel(kind, id) {
+  if (kind === "agent") return openAgent(id);
+  if (kind === "commands") loadCommands();
   const from = document.activeElement;
   if (!state.panel) state.panelFrom = from && from !== document.body ? from : null;  // focus goes back there
   state.panel = { kind, id };
@@ -10636,6 +10654,39 @@ function closePanel() {
   state.panelFrom = null;
   if (back) back.focus();
 }
+// An agent's settings, in the rail under the crew: its card again opens and closes them.
+function openAgent(name) {
+  if (state.agentPane === name && $("agents").contains(document.activeElement)) return closeAgent();
+  state.agentPane = name;
+  if (matchMedia("(max-width: 760px)").matches) document.body.classList.add("rail-open");  // the rail is a drawer
+  renderAgentPane(true);
+  markOpen();
+  $("agent-pane").scrollIntoView({ block: "nearest" });
+  $("agent-pane-title").focus({ preventScroll: true });
+}
+function closeAgent() {
+  const name = state.agentPane;
+  state.agentPane = null;
+  $("agent-pane").hidden = true;
+  markOpen();
+  $("agents").querySelector('[data-agent="' + CSS.escape(name || "") + '"]')?.focus();
+}
+function agentPaneBusy() {
+  const body = $("agent-pane-body");
+  return body.querySelector(".picmenu:not([hidden])") || body.contains(document.activeElement);
+}
+function renderAgentPane(force) {
+  const name = state.agentPane;
+  if (!name) return;
+  const key = JSON.stringify([name, state.version, Math.floor(state.now / 60)]);
+  if (!force && (key === state.agentPaneKey || agentPaneBusy())) return;
+  state.agentPaneKey = key;
+  $("agent-pane").hidden = false;
+  const [title, ...cards] = panelAgent(name);
+  $("agent-pane-title").textContent = title;
+  $("agent-pane-body").replaceChildren(...cards, el("p", "panel-note meta"));
+}
+$("agent-pane-close").addEventListener("click", closeAgent);
 // The roles panels' data: loaded, or the error and a way to try again.
 function loadRolesInto() {
   state.rolesError = "";
@@ -10646,7 +10697,8 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
   const menu = document.querySelector("details.menu[open]");
   if (menu) { menu.open = false; menu.querySelector("summary").focus(); return; }
-  if (state.panel) closePanel();
+  if (state.agentPane && ($("agent-pane").contains(document.activeElement) || !state.panel)) closeAgent();
+  else if (state.panel) closePanel();
   else document.body.classList.remove("rail-open");
 });
 // Not drawn again while the owner is in it: choosing, typing, or on one of its buttons.
@@ -10663,8 +10715,9 @@ function renderPanel(force) {
   document.body.classList.add("panel-open");
   const body = $("panel-body");
   $("pane-project").hidden = p.kind !== "project";
-  const draw = { agent: panelAgent, task: panelTask, roles: panelRoles, role: panelRole,
-                 project: () => ["Rules, skills and machines"] }[p.kind];
+  $("commands").hidden = p.kind !== "commands";
+  const draw = { task: panelTask, roles: panelRoles, role: panelRole, project: () => ["Rules, skills and machines"],
+                 commands: () => ["Commands"] }[p.kind];
   const [title, ...cards] = draw(p.id);
   $("panel-title").textContent = title;
   body.replaceChildren(...cards, el("p", "panel-note meta"));
@@ -10733,7 +10786,7 @@ function panelAgent(name) {
     const m = leadingMention(text.value);
     text.value = "@" + a.agent + " " + (m ? text.value.slice(m[0].length).replace(/^[,:]?\s*/, "") : text.value);
     fit(); text.focus();
-    if (matchMedia("(max-width: 760px)").matches) closePanel();
+    if (matchMedia("(max-width: 760px)").matches) document.body.classList.remove("rail-open");
   });
   sessionControls(a, acts, agentOp);
   const button = (label, title, run, cls) => {
@@ -10744,7 +10797,7 @@ function panelAgent(name) {
   button("Remove", "Remove " + a.agent + " from the chat", (b) => {
     if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
                 "still open, it joins again the next time it uses crewchat."))
-      agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closePanel(); });
+      agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closeAgent(); });
   }, "danger");
   const cards = [card("", ...[head, menu].filter(Boolean)), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
   if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
@@ -10787,9 +10840,8 @@ function nameField(a, agentOp) {
     const ok = await agentOp({ op: "rename", agent: a.agent, new: name }, "Not renamed", input);
     busy = false;
     done = !!ok;
-    const p = state.panel;
     if (ok) a.agent = name;  // the row as the next poll will have it
-    if (ok && p && p.kind === "agent" && p.id !== name) openPanel("agent", name);
+    if (ok && state.agentPane && state.agentPane !== name) { state.agentPane = name; renderAgentPane(true); }
     else if (!ok) input.value = a.agent;
   };
   input.addEventListener("keydown", (e) => {
@@ -11441,6 +11493,7 @@ async function loop() {
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
         loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
+      renderAgentPane();
       if (first && $("empty")) $("empty").replaceWith(welcome());
       refreshDynamic();
       // Scroll last: the cards and read receipts above change the list's height.
@@ -11626,7 +11679,7 @@ $("form").addEventListener("submit", async (e) => {
 
 setInterval(() => {
   state.now += 30;
-  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); }  // "N min ago" moves on
+  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); renderAgentPane(); }  // "N min ago" moves on
 }, 30000);
 loop();
 </script>

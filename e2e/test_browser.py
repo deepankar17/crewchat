@@ -431,7 +431,7 @@ class NewPage(Signed):
         return "document.querySelector('#agents .agent[data-agent=%s]')" % json.dumps(self.agent.name)
 
     def tearDown(self):
-        self.chrome.js("closePanel(); showView('chat'); document.body.classList.remove('rail-open')")
+        self.chrome.js("closePanel(); if (state.agentPane) closeAgent(); showView('chat'); document.body.classList.remove('rail-open')")
 
     def test_the_shell(self):
         c = self.chrome
@@ -474,42 +474,59 @@ class NewPage(Signed):
         c = self.chrome
         c.until("!!%s" % self.card(), what="the agent")
         c.js(self.card() + ".click()")
-        c.until("!$('panel').hidden && $('panel-title').textContent === %s" % json.dumps(self.agent.name))
-        self.assertTrue(c.js("document.body.classList.contains('panel-open')"))
+        c.until("!$('agent-pane').hidden && $('agent-pane-title').textContent === %s" % json.dumps(self.agent.name))
+        self.assertTrue(c.js("$('panel').hidden"))  # in the rail, under the crew: the side panel is for the project
+        self.assertTrue(c.js("$('rail').contains($('agent-pane'))"))
         self.assertTrue(c.js(self.card() + ".classList.contains('on')"))
-        texts = c.js("$('panel-body').innerText")
-        self.assertEqual(c.js("document.querySelector('#panel input[aria-label^=\"Name for\"]').value"), self.agent.name)
+        texts = c.js("$('agent-pane-body').innerText")
+        self.assertEqual(c.js("document.querySelector('#agent-pane input[aria-label^=\"Name for\"]').value"), self.agent.name)
         for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Remove"):
             self.assertIn(word, texts.upper() if word.isupper() else texts)
         # The picture itself opens the picture menu, and closes it again.
-        pic = "document.querySelector('#panel .picbutton')"
+        pic = "document.querySelector('#agent-pane .picbutton')"
         self.assertTrue(c.js("%s.getAttribute('aria-label') === %s" % (pic, json.dumps("Change %s's picture" % self.agent.name))))
         c.js(pic + ".click()")
-        c.until("!document.querySelector('#panel .picmenu').hidden && %s.getAttribute('aria-expanded') === 'true'" % pic,
+        c.until("!document.querySelector('#agent-pane .picmenu').hidden && %s.getAttribute('aria-expanded') === 'true'" % pic,
                 what="the picture menu to open")
-        self.assertGreater(c.js("document.querySelectorAll('#panel .picmenu .picks button.art').length"), 10)
+        self.assertGreater(c.js("document.querySelectorAll('#agent-pane .picmenu .picks button.art').length"), 10)
         c.js(pic + ".click()")
-        c.until("document.querySelector('#panel .picmenu').hidden", what="the picture menu to close")
-        sel = "#panel select[aria-label='Role for %s']" % self.agent.name
+        c.until("document.querySelector('#agent-pane .picmenu').hidden", what="the picture menu to close")
+        sel = "#agent-pane select[aria-label='Role for %s']" % self.agent.name
         c.js("(() => { const s = document.querySelector(%s); s.value = 'reviewer'; s.dispatchEvent(new Event('change')); })()"
              % json.dumps(sel))
         eventually(lambda: self.m.owner.row(self.agent.name)["role"] == "reviewer", what="the role to be set")
         c.until("%s.innerText.includes('Reviewer')" % self.card(), what="the role in the rail")
-        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Message').click()")
+        c.js("[...$('agent-pane-body').querySelectorAll('button')].find(b => b.textContent === 'Message').click()")
         self.assertTrue(c.js("$('text').value.startsWith('@%s ')" % self.agent.name))
         c.js("$('text').value = ''")
         c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
-        c.until("$('panel').hidden && !document.body.classList.contains('panel-open')", what="Esc to close the panel")
+        c.until("$('agent-pane').hidden && !%s.classList.contains('on')" % self.card(), what="Esc to close the agent's settings")
 
     def test_keyboard_focus_goes_into_the_panel_and_back(self):
         c = self.chrome
         c.until("!!%s" % self.card(), what="the agent")
         c.js(self.card() + ".focus(); " + self.card() + ".click()")
-        c.until("document.activeElement === $('panel-title')", what="focus in the panel")
-        c.js("renderAgents(true); renderPanel(true)")  # the chat moved on meanwhile
+        c.until("document.activeElement === $('agent-pane-title')", what="focus in the agent's settings")
+        c.js("renderAgents(true); renderAgentPane(true)")  # the chat moved on meanwhile
         self.assertTrue(c.js(self.card() + ".classList.contains('on') && %s.getAttribute('aria-current') === 'true'" % self.card()))
-        c.js("$('panel-close').click()")
+        c.js("$('agent-pane-close').click()")
         c.until("document.activeElement === %s" % self.card(), what="focus back on the agent")
+        self.assertEqual(c.errors, [])
+
+    def test_commands_open_in_the_side_panel_beside_an_agents_settings(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.js(self.card() + ".click()")
+        c.until("!$('agent-pane').hidden", what="the agent's settings")
+        c.click("#view-commands")
+        c.until("!$('panel').hidden && $('panel-title').textContent === 'Commands' && !$('commands').hidden",
+                what="the commands in the side panel")
+        c.until("document.querySelectorAll('#panel #cmd-list .cmd').length > 40", what="the commands")
+        self.assertFalse(c.js("$('agent-pane').hidden"))  # both at once: the agent on the left, the commands on the right
+        self.assertEqual(c.js("$('view-commands').getAttribute('aria-pressed')"), "true")
+        self.assertFalse(c.js("$('log').hidden"))  # the chat stays in the middle
+        c.click("#view-commands")
+        c.until("$('panel').hidden && $('view-commands').getAttribute('aria-pressed') === 'false'", what="Commands to close")
         self.assertEqual(c.errors, [])
 
     def test_errors_on_the_task_board_are_shown_there_and_keep_the_task(self):
@@ -538,14 +555,14 @@ class NewPage(Signed):
         c = self.chrome
         c.until("!!%s" % self.card(), what="the agent")
         c.js(self.card() + ".click()")
-        field = "document.querySelector('#panel .namefield input')"
+        field = "document.querySelector('#agent-pane .namefield input')"
         c.until("!!" + field, what="the name field")
         c.js("(() => { const f = %s; f.value = 'bad name!'; f.dispatchEvent(new FocusEvent('blur')); })()" % field)
-        self.assertIn("Not renamed", c.js("$('panel-body').innerText"))
+        self.assertIn("Not renamed", c.js("$('agent-pane-body').innerText"))
         self.assertEqual(c.js(field + ".value"), self.agent.name)
         c.js("(() => { const f = %s; f.value = 'Nova'; f.dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter'})); })()" % field)
         eventually(lambda: "Nova" in [r["agent"] for r in self.m.owner.poll()["agents"]], what="the rename")
-        c.until("$('panel-title').textContent === 'Nova'", what="the panel to follow the new name")
+        c.until("$('agent-pane-title').textContent === 'Nova'", what="the panel to follow the new name")
         c.js("(() => { const f = %s; f.value = %s; f.dispatchEvent(new FocusEvent('blur')); })()" % (field, json.dumps(self.agent.name)))
         eventually(lambda: self.agent.name in [r["agent"] for r in self.m.owner.poll()["agents"]], what="the name back")
         self.assertEqual(c.errors, [])
@@ -564,13 +581,13 @@ class NewPage(Signed):
               row("far-one", {remote: true, device: "laptop", session: null}),
               row("unrecorded-one", {session: null, startable: true, activity: "", seen: state.now - 3600}),
               row("busy-one", {session: null, startable: false})];
-            const look = (n) => { openPanel("agent", n); const b = $("panel-body");
+            const look = (n) => { openPanel("agent", n); const b = $("agent-pane-body");
               return {buttons: [...b.querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent),
                       text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
                       picture: !!b.querySelector(".picmenu"), nameField: !!b.querySelector(".namefield")}; };
             const out = {running: look("running-one"), closed: look("closed-one"), far: look("far-one"),
                          unrecorded: look("unrecorded-one"), busy: look("busy-one")};
-            closePanel(); state.agents = saved; state.models = savedModels; renderAgents(true);
+            closeAgent(); state.agents = saved; state.models = savedModels; renderAgents(true);
             return out;
         })()""")
         self.assertIn("Stop", out["running"]["buttons"])
@@ -815,6 +832,10 @@ class NewPage(Signed):
             c.click("#rail-open")
             c.until("$('rail').getBoundingClientRect().left >= 0", what="the drawer to open")
             c.js(self.card() + ".click()")
+            c.until("!$('agent-pane').hidden", what="the agent's settings")
+            self.assertTrue(c.js("document.body.classList.contains('rail-open')"))  # in the drawer, under the crew
+            self.assertLessEqual(c.js("$('agent-pane').getBoundingClientRect().right"), 375)
+            c.click("#view-commands")
             c.until("!$('panel').hidden", what="the panel")
             self.assertEqual(c.js("[$('panel').getBoundingClientRect().width, document.body.classList.contains('rail-open')]"),
                              [375, False])  # a full-screen sheet; the drawer closed
