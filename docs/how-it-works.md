@@ -70,8 +70,8 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   during a long turn. It also says, in a few words, what the call was ("Editing Login.kt",
   "Running npm test"): only a file's name and a command's program (with the subcommand of a
   well-known tool), never arguments or contents, at most every few seconds and only when it changed.
-  The chat page shows it while the agent works, for two minutes at most and until its turn ends;
-  linked machines see it too. `crewchat setup --activity off` keeps it off the page.
+  The chat page of the agent's own machine shows it while the agent works, for two minutes at most
+  and until its turn ends. `crewchat setup --activity off` keeps it off the page.
   The server adds this hook to connected folders when it starts.
 - **Nothing is lost.** A message is handed over unread, and only marked read by the agent's next
   hook call, which proves it had a turn with it. An interrupted turn or a crashed session gets it

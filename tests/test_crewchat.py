@@ -1015,6 +1015,16 @@ class Activity(Base):
         self.assertEqual(bash("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "")
         self.assertEqual(bash("git commit -m 'a secret message'"), "Running git commit")
         self.assertEqual(bash("echo 'unbalanced"), "")
+        for cmd, said in (("cd x\nnpm test", "Running npm test"), ("sudo npm install", "Running npm install"),
+                          ("env X=1 npm test", "Running npm test"), ("timeout 60 npm test", "Running npm test"),
+                          ("nohup npm start &", "Running npm start"), ("pytest secretdir", "Running pytest"),
+                          ("npx some-internal-pkg", "Running npx"), ("make deploy-prod-db", "Running make")):
+            self.assertEqual(bash(cmd), said, cmd)
+        self.assertEqual(say("claude", {"tool_name": "Edit", "tool_input": {"file_path": "C:\\Users\\me\\Login.kt"}}),
+                         "Editing Login.kt")
+        self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": ["a", "b"]}}), "Reading")
+        self.assertEqual(say("cursor", {"tool_name": "hub_send"}), "")
+        self.assertEqual(say("cursor", {"tool_name": "browser_navigate", "command": "npx @playwright/mcp"}), "Using browser_navigate")
         for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
             for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
                         say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}})):
