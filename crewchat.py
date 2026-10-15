@@ -1704,13 +1704,13 @@ class Hub:
 
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
-            answered = {}  # task -> the newest answer the owner sent it ("Re #12: ...", as Needs you sends one)
+            answered = {}  # (task, agent) -> the newest answer the owner sent it ("Re #12: ...", as Needs you sends one)
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
                 if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
-                said = m["from"] == OWNER and m["kind"] == "msg" and re.match(r"Re #(A?\d+): ", m["text"])
-                if said and said.group(1) not in answered:
-                    answered[said.group(1)] = m["seq"]
+                reply = m["from"] == OWNER and m["kind"] == "msg" and re.match(r"Re #([A-Za-z]*\d+): ", m["text"])
+                if reply:
+                    answered.setdefault((reply.group(1), m["to"]), m["seq"])
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
         items = []
@@ -1721,8 +1721,8 @@ class Hub:
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
             if kind in ("blocked", "review") and r.get("note") == OWNER:
                 continue  # the owner set it so: nothing waits on the owner
-            if kind in ("blocked", "review") and answered.get(r["id"], 0) > said.get("seq", 0):
-                continue  # answered since the agent asked: it is the agent's turn
+            if kind == "blocked" and answered.get((r["id"], said.get("from") or r["holder"]), 0) > said.get("seq", 0):
+                continue  # the agent that asked has its answer since: its turn (a review waits for Mark done)
             if kind:
                 # Named after whoever wrote the note (any agent may update a task), so an answer goes back
                 # to the agent that asked; a reclaimed task, after the agent it was taken from.
@@ -9759,6 +9759,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <p id="search-none" class="none" role="status" hidden>No message here matches the search.</p>
   <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
@@ -11365,7 +11366,7 @@ function roleForm(r) {
     return n;
   };
   const name = r ? null : input("input", "Name", "", { type: "text", maxLength: 32, placeholder: "for example designer" });
-  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat", required: true });
+  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat (empty: from its name)" });
   const picture = el("select");
   picture.setAttribute("aria-label", "Picture");
   picture.append(...pictureOptions());
@@ -11567,18 +11568,12 @@ const searchWant = () => $("search").value.trim().toLowerCase();
 function applySearch() {
   const want = searchWant();
   $("log").classList.toggle("searching", !!want);
-  let any = false;
-  for (const node of $("log").children) {
-    if (node.id === "empty" || node.id === "search-none") continue;
-    node.hidden = !matches(node, want);
-    any = any || !node.hidden;
-  }
-  let none = $("search-none");
-  if (want && !any) {
-    if (!none) { none = el("p", "none"); none.id = "search-none"; none.setAttribute("role", "status"); }
-    none.textContent = "No message here matches “" + $("search").value.trim() + "”.";
-    $("log").append(none);
-  } else if (none) none.remove();
+  for (const node of $("log").children) if (node.id !== "empty") node.hidden = !matches(node, want);
+  searchNote();
+}
+// Searching, with nothing shown: say so (again as messages arrive).
+function searchNote() {
+  $("search-none").hidden = !searchWant() || [...$("log").children].some((n) => !n.hidden && n.id !== "empty");
 }
 $("search").addEventListener("input", applySearch);
 
@@ -11622,6 +11617,7 @@ function addMessages(list, first) {
     remember(m);
     state.after = m.seq;
   }
+  if (searchWant()) searchNote();
   if (document.hidden && !first) {
     state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
     if (state.missed) document.title = "(" + state.missed + ") " + state.title;
@@ -11678,10 +11674,12 @@ function renderNeeds(needs) {
         if (node) {
           node.scrollIntoView({ block: "center" });
           node.classList.remove("flash"); void node.offsetWidth; node.classList.add("flash");
+          setTimeout(() => node.classList.remove("flash"), 1700);
         }
-        if (n.agent && !leadingMention(text.value)) { text.value = "@" + n.agent + " " + text.value; fit(); }
-        text.focus();
-        document.body.classList.remove("rail-open");
+        if (state.agents.some((a) => a.agent === n.agent) && !leadingMention(text.value)) {
+          text.value = "@" + n.agent + " " + text.value; fit();
+        }
+        text.focus({ preventScroll: true });
         markRead(n.seq);
       } else openPanel("task", n.task);
     });

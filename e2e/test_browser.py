@@ -838,13 +838,16 @@ class NewPage(Signed):
         c = self.chrome
         # A search that matches nothing says so, and the note goes with the search.
         c.js("$('search').value = 'zzz-nothing'; $('search').dispatchEvent(new Event('input'))")
-        self.assertIn("No message here matches", c.js("$('search-none') ? $('search-none').textContent : ''"))
+        self.assertFalse(c.js("$('search-none').hidden"))
+        self.agent.call("hub_send", to="Owner", text="zzz-nothing after all")  # a match arriving during the search
+        c.until("$('search-none').hidden && $('log').innerText.includes('zzz-nothing after all')", what="the match shown")
         c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
-        self.assertFalse(c.js("!!$('search-none')"))
+        self.assertTrue(c.js("$('search-none').hidden"))
         # New agent's templates read as their role's name; no install notes for tools that are not here.
         c.js("openLaunch()")
         c.until("$('l-template').options.length > 1", what="the templates")
         self.assertIn("Lead role", c.js("[...$('l-template').options].map(o => o.text)"))
+        self.assertNotIn("Needs", c.js("$('launch-note').textContent"))  # no install notes for tools not here
         c.click("#l-cancel")
         # An agent silent for long is not shown working, whatever its hooks said last.
         self.assertEqual(c.js("doing({activity: 'working', seen: state.now - 1200})"), "Not heard from lately")
@@ -854,8 +857,8 @@ class NewPage(Signed):
         self.addCleanup(c.js, "delete document.hidden")
         self.agent.call("hub_send", to="Owner", text="Can you look at the build?")
         c.until("$('needs-list').innerText.includes('Can you look at the build?')", what="the message in Needs you")
-        c.js("delete document.hidden; $('text').value = ''")
-        c.js("[...document.querySelectorAll('#needs-list .need')].find(b => b.innerText.includes('look at the build')).click()")
+        c.js("""delete document.hidden; $('text').value = '';
+                [...document.querySelectorAll('#needs-list .need')].find(b => b.innerText.includes('look at the build')).click()""")
         self.assertEqual(c.js("$('text').value"), "@%s " % self.agent.name)
         self.assertTrue(c.js("[...document.querySelectorAll('#log .msg.flash')].some(m => m.innerText.includes('look at the build'))"))
         self.assertTrue(c.js("$('agent-pane').hidden"))
