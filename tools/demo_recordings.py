@@ -116,6 +116,12 @@ class Recorder:
 
     def open(self, url, wait=1.5):
         self.send("Page.navigate", {"url": url})
+        origin = "/".join(url.split("/")[:3])
+        for _ in range(100):  # the new page, loaded (a sign-in redirects once more)
+            time.sleep(0.1)
+            if self.js("location.href.startsWith(%s) && !location.pathname.startsWith('/login')"
+                       " && document.readyState === 'complete'" % json.dumps(origin)) or not origin.startswith("http"):
+                break
         time.sleep(wait)
         self.js(CURSOR_JS)
 
@@ -186,6 +192,27 @@ class Recorder:
                                                  "windowsVirtualKeyCode": 13, "text": "\r" if kind == "keyDown" else ""})
         time.sleep(0.4)
 
+    def key(self, name, code=9):
+        """A key such as Tab, which picks the agent the @ list offers."""
+        for kind in ("keyDown", "keyUp"):
+            self.send("Input.dispatchKeyEvent", {"type": kind, "key": name, "code": name, "windowsVirtualKeyCode": code})
+        time.sleep(0.4)
+
+    def choose(self, selector, value, ms=600):
+        """Pick an option in a select, as a person would: point at it, then the choice shows."""
+        self.point(selector, ms)
+        self.js("(() => { const s = document.querySelector(%s); s.value = %s; s.dispatchEvent(new Event('change')); })()"
+                % (json.dumps(selector), json.dumps(value)))
+        time.sleep(0.3)
+
+    def tag(self, selector, text):
+        """A selector for the element among selector's matches whose text is text (a button by its label)."""
+        found = self.js("(() => { const e = [...document.querySelectorAll(%s)].find((e) => e.textContent.trim() === %s);"
+                        " if (e) e.dataset.demo = %s; return !!e; })()" % (json.dumps(selector), json.dumps(text), json.dumps(text)))
+        if not found:
+            raise RuntimeError("no %s says %r" % (selector, text))
+        return "[data-demo=%s]" % json.dumps(text)
+
     def close(self):
         self.browser.close()
 
@@ -210,7 +237,14 @@ def save(name, frames, gif_width=960, video=True):
         small.append(frame)
         delays.append(d)
         last = frame
-    paletted = [f.quantize(colors=128, method=Image.MEDIANCUT, dither=Image.NONE) for f in small]
+    # One palette for the whole GIF, from frames across it: frames then differ only where the
+    # picture changed, which keeps the file small.
+    picks = small[::max(1, len(small) // 24)]
+    board = Image.new("RGB", (small[0].width, small[0].height * len(picks)))
+    for i, f in enumerate(picks):
+        board.paste(f, (0, i * f.height))
+    palette = board.quantize(colors=255, method=Image.MEDIANCUT, dither=Image.NONE)
+    paletted = [f.quantize(palette=palette, dither=Image.NONE) for f in small]
     path = GIFS / (name + ".gif")
     paletted[0].save(path, save_all=True, append_images=paletted[1:], duration=[round(d * 1000) for d in delays],
                      loop=0, optimize=True, disposal=1)
@@ -238,145 +272,210 @@ def save(name, frames, gif_width=960, video=True):
 # ------------------------------------------------------------------------------------------
 # Scenes
 # ------------------------------------------------------------------------------------------
-def team(chat):
-    lead = chat.agent(status="Coordinating", activity="listening")
-    dev = chat.agent(status="Persisting the theme choice", activity="listening")
-    qa = chat.agent("laptop", "cursor", status="Testing", activity="listening")
-    return lead, dev, qa
+def named(chat, name, place="macbook", client="claude", status="", activity="listening", role=""):
+    """An agent with a first name of our choosing (the hub picks one at random), so the scripts can
+    say who answers."""
+    chat.hub._agent_name = lambda place, client: name
+    try:
+        chat.agent(place, client, status, activity)
+    finally:
+        del chat.hub._agent_name
+    if role:
+        chat.hub.set_role(O, name, role)
+    return name
+
+
+def busy(chat, name, doing):
+    """An agent at work, and what its tool calls show on the page (as its hooks would report)."""
+    chat.doing(name, "working")
+    with chat.hub.lock:
+        chat.hub.agents[name].update(doing=doing, doing_at=time.time(), seen=time.time())
+        chat.hub._changed()
+
+
+def heard(chat, name):
+    """The agent has read everything so far (the receipt under the owner's message)."""
+    with chat.hub.lock:
+        chat.hub.agents[name]["cursor"] = chat.hub.next_seq - 1
+        chat.hub._changed()
+
+
+def crew(chat, roles=True):
+    maya = named(chat, "Maya", status="Coordinating", role="lead" if roles else "")
+    teo = named(chat, "Teo", "laptop", "cursor", status="Settings screen", role="developer" if roles else "")
+    wren = named(chat, "Wren", status="Testing", role="qa" if roles else "")
+    return maya, teo, wren
+
+
+def post_task(r, text):
+    """The composer's + menu, Post as task, and the task."""
+    r.click("#plus summary", 600)
+    time.sleep(0.5)
+    r.click("#as-task", 450)
+    r.type(text)
+    r.enter()
 
 
 def scene_talk(r):
-    """You write; an agent waiting for messages answers at once."""
+    """@ an agent's name to write to it; it answers at once, and the rail shows what it is doing."""
     chat = shots.Chat("Notes App")
-    a = chat.agent(status="Free", activity="listening")
-    b = chat.agent("laptop", "cursor", status="Settings screen", activity="working")
-    chat.say(a, "all", "Login screen is done; tests pass locally.")
+    maya, teo, wren = crew(chat)
+    busy(chat, teo, "Editing SettingsScreen.kt")
+    chat.quiet()
+    chat.say(teo, "all", "Login screen is done; tests pass locally.")
     chat.read_all()
     r.size(1280, 720)
     r.open(chat.sign_in())
     r.start()
     r.click("#text")
-    r.type("Can someone check why the login test fails on CI?")
+    r.type("@Wr", 0.12)
+    time.sleep(0.8)
+    r.key("Tab")
+    r.type("can you check why the login test fails on CI?")
     r.enter()
+    time.sleep(1.0)
+    heard(chat, wren)
+    busy(chat, wren, "Reading LoginViewModelTest.kt")
+    time.sleep(1.4)
+    chat.say(wren, O, "On it. It passes locally, so I'll compare the CI logs with my run.")
+    chat.hub.set_status(wren, "Flaky login test on CI")
     time.sleep(1.2)
-    chat.doing(a, "working")
-    with chat.hub.lock:
-        chat.hub.agents[a]["cursor"] = chat.hub.next_seq - 1
-        chat.hub._changed()
-    time.sleep(1.6)
-    chat.say(a, O, "On it. It passes locally, so I'll compare the CI logs with my run.")
-    chat.hub.set_status(a, "Flaky login test on CI")
-    time.sleep(2.4)
-    chat.say(a, O, "Found it: CI is slower, and the test waits only 100 ms for the token refresh. Fixed in fix/login-test.")
-    chat.doing(a, "listening")
+    busy(chat, wren, "Running gradlew")
+    time.sleep(2.0)
+    chat.say(wren, O, "Found it: CI is slower, and the test waits only 100 ms for the token refresh. Fixed in fix/login-test.")
+    chat.doing(wren, "listening")
     frames = r.stop(2.2)
     chat.stop()
     return frames
 
 
 def scene_task(r):
-    """A task: every agent bids, exactly one takes it."""
+    """Post as task: every agent bids, exactly one takes it; the board follows it to Done."""
     chat = shots.Chat("Notes App")
-    a = chat.agent(status="Free", activity="listening")
-    b = chat.agent("macbook", "cursor", status="Dark theme", activity="listening")
-    c = chat.agent("windows", "claude", status="Free", activity="listening")
-    chat.read_all()
+    maya, teo, wren = crew(chat, roles=False)
+    chat.hub.set_status(maya, "Free")
+    chat.hub.set_status(wren, "Free")
+    chat.quiet()
     r.size(1280, 720)
     r.open(chat.sign_in())
     r.start()
-    r.click("#task")
-    r.click("#text", 500)
-    r.type("Find out why the login test is flaky.")
-    r.enter()
+    post_task(r, "Find out why the login test is flaky.")
     time.sleep(1.0)
     task = chat.hub.history(1)[0]["id"]
-    for name, text in ((a, "BID #%s: yes. I wrote that test and I'm free."),
-                       (b, "BID #%s: no. I'm in the middle of the dark theme."),
-                       (c, "BID #%s: yes, but claude-macbook knows that code better.")):
+    for name, text in ((maya, "BID #%s: yes. I wrote that test and I'm free."),
+                       (teo, "BID #%s: no. I'm in the middle of the settings screen."),
+                       (wren, "BID #%s: yes, but Maya knows that code better.")):
         chat.doing(name, "working")
         time.sleep(0.9)
         chat.say(name, "all", text % task)
-    time.sleep(1.0)
-    chat.hub.take(a, task)
-    chat.hub.set_status(a, "Flaky login test")
-    for name in (b, c):
         chat.doing(name, "listening")
-    time.sleep(2.0)
-    chat.say(a, O, "Found it: the test waited 100 ms for the token refresh, which takes up to 300 ms on CI. Fixed.")
-    frames = r.stop(2.4)
+    time.sleep(0.8)
+    chat.hub.take(maya, task)
+    busy(chat, maya, "Reading LoginViewModelTest.kt")
+    time.sleep(1.2)
+    r.click("#view-tasks", 600)
+    time.sleep(1.6)
+    chat.hub.update(maya, task, "review", "Fixed: the test waited 100 ms for the token refresh, which takes up to 300 ms on CI.")
+    chat.doing(maya, "listening")
+    time.sleep(1.8)
+    r.click("#needs-list .need", 600)
+    time.sleep(1.2)
+    r.click(r.tag("#panel-body .needs-card button", "Mark done"), 600)
+    time.sleep(1.4)
+    r.click("#panel-close", 500)
+    frames = r.stop(2.0)
     chat.stop()
     return frames
 
 
 def scene_roles(r):
-    """Give roles from the cards; the lead hands out the work; progress flows back."""
+    """Give roles in the agent panel; the lead hands out the work; the board shows it move."""
     chat = shots.Chat("Notes App")
-    lead, dev, qa = team(chat)
-    chat.read_all()
+    maya, teo, wren = crew(chat, roles=False)
+    chat.quiet()
     r.size(1280, 720)
     r.open(chat.sign_in())
     r.start()
-    for i, (name, role) in enumerate(((lead, "lead"), (dev, "developer"), (qa, "qa"))):
-        sel = '#agents .agent:nth-child(%d) .rolepick' % (i + 1)
-        r.point(sel, 600)
-        r.js("(() => { const s = document.querySelector(%s); s.value = %s; s.dispatchEvent(new Event('change')); })()"
-             % (json.dumps(sel), json.dumps(role)))
-        time.sleep(1.0)
-    r.click("#task", 600)
-    r.click("#text", 400)
-    r.type("Add a dark theme to the settings screen.")
-    r.enter()
-    time.sleep(1.2)
-    task = chat.hub.history(1)[0]["id"]
-    chat.hub.take(lead, task)
+    for name, role in ((maya, "lead"), (teo, "developer"), (wren, "qa")):
+        r.click('#agents .agent[data-agent="%s"]' % name, 600)
+        time.sleep(0.7)
+        r.choose('#panel-body select[aria-label="Role for %s"]' % name, role)
+        time.sleep(0.9)
+    r.click("#panel-close", 500)
+    post_task(r, "Add a dark theme to the settings screen.")
     time.sleep(1.0)
-    piece = chat.hub.assign(lead, dev, "Build the theme switch and keep the choice in DataStore.", task)
-    time.sleep(1.4)
-    chat.hub.update(dev, piece["id"], "in_progress", "Started on the switch.")
-    time.sleep(1.4)
-    chat.say(dev, qa, "Theme switch is ready to test: Settings > Theme.")
-    chat.hub.update(dev, piece["id"], "review", "Ready for QA.")
-    time.sleep(1.6)
-    chat.hub.update(qa, piece["id"], "done", "Passes, including after a restart.")
+    task = chat.hub.history(1)[0]["id"]
+    chat.hub.take(maya, task)
+    busy(chat, maya, "Reading SettingsScreen.kt")
+    time.sleep(1.0)
+    r.click("#view-tasks", 600)
+    time.sleep(0.8)
+    build = chat.hub.assign(maya, teo, "Build the theme switch and keep the choice in DataStore.", task)["id"]
+    time.sleep(0.6)
+    check = chat.hub.assign(maya, wren, "Test the theme switch, also after a restart.", task)["id"]
+    chat.doing(maya, "listening")
     time.sleep(1.2)
-    chat.say(lead, O, "The dark theme is done and tested.")
+    busy(chat, teo, "Editing ThemeRepository.kt")
+    chat.hub.update(teo, build, "review", "Theme switch is ready to test: Settings > Theme.")
+    time.sleep(1.4)
+    busy(chat, wren, "Running gradlew")
+    time.sleep(1.2)
+    chat.hub.update(wren, build, "done", "Passes, including after a restart.")
+    chat.hub.update(wren, check, "done", "Tested on Android 14 and 12.")
+    chat.doing(teo, "listening")
+    chat.doing(wren, "listening")
+    time.sleep(1.4)
+    chat.hub.update(maya, task, "done", "Switch built by Teo, tested by Wren.")
+    time.sleep(1.2)
+    r.click("#view-tasks", 600)  # back to the chat, at its newest message
+    r.js("$('log').scrollTo({top: $('log').scrollHeight, behavior: 'smooth'})")
+    time.sleep(0.8)
+    chat.say(maya, O, "The dark theme is done and tested. Should the default follow the system setting?")
     frames = r.stop(2.4)
     chat.stop()
     return frames
 
 
 def scene_add_agent(r):
-    """Add an agent from the page; it joins with its name, role and task."""
+    """+ New agent, in four steps; it joins with its name, role and first task."""
     chat = shots.Chat("Notes App")
-    lead = chat.agent(status="Coordinating", activity="listening")
-    chat.hub.set_role(O, lead, "lead")
+    named(chat, "Maya", status="Coordinating", role="lead")
     chat.quiet()
     started = {}
     old_options, old_launch, old_folders = crewchat.launch_options, crewchat.launch_agent, crewchat.launch_folders
     folder = [{"path": "/Users/you/code/notes-app", "name": "notes-app", "place": "macbook"}]
-    crewchat.launch_folders = lambda config, root=None: folder
-    crewchat.launch_options = lambda config, root=None: {
-        "tools": [{"id": "claude", "label": "Claude Code"}, {"id": "cursor", "label": "Cursor"}], "folders": folder}
-    crewchat.launch_agent = lambda tool, folder, key, edits=False, root=None: started.update(key=key)
+    crewchat.launch_folders = lambda config, root=None, chat="": folder
+    crewchat.launch_options = lambda config, root=None, chat="": {"tools": [
+        {"id": t, "label": label, "models": crewchat.tool_models(t),
+         "permissions": [[k, v[0]] for k, v in crewchat.LAUNCH_PERMISSIONS[t].items()]}
+        for t, (label, _) in crewchat.LAUNCH_TOOLS.items()], "folders": folder}
+    crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="": started.update(key=key)
     try:
         r.size(1280, 720)
         r.open(chat.sign_in())
         r.start()
         r.click("#add-agent")
-        time.sleep(0.8)
+        time.sleep(0.9)
         r.click("#l-name", 600)
-        r.type("docs-writer")
-        r.point("#l-role", 500)
-        r.js("(() => { const s = $('l-role'); s.value = 'docs'; s.dispatchEvent(new Event('change')); })()")
+        r.type("Iris")
+        r.choose("#l-role", "docs", 500)
+        time.sleep(0.6)
+        r.click("#l-next", 500)
+        time.sleep(1.0)
+        r.click("#l-next", 500)
+        time.sleep(0.6)
+        r.choose("#l-perms", "edits", 500)
+        time.sleep(0.8)
+        r.click("#l-next", 500)
         r.click("#l-task", 500)
         r.type("Write a user guide for the settings screen.", 0.04)
         r.click("#l-start", 600)
         time.sleep(2.4)
         session = chat.hub.open_session("macbook", "claude")  # the new terminal window's agent checks in
         chat.hub.start_link(session, started["key"])
-        chat.doing("docs-writer", "working")
-        time.sleep(2.0)
-        chat.say("docs-writer", O, "Hi, I'm docs-writer. Reading the settings code, then I'll start the guide.")
+        busy(chat, "Iris", "Reading SettingsScreen.kt")
+        time.sleep(1.8)
+        chat.say("Iris", O, "Hi, I'm Iris, on the docs. Reading the settings code, then I'll start the guide.")
         frames = r.stop(2.4)
     finally:
         crewchat.launch_options, crewchat.launch_agent, crewchat.launch_folders = old_options, old_launch, old_folders
@@ -394,8 +493,9 @@ def scene_files(r):
                     "Notifications</span><span>On</span></div><div class=row><span>Language</span><span>English</span></div>")
     shot = r.snapshot(page.as_uri(), 360, 300)
     chat = shots.Chat("Notes App")
-    qa = chat.agent(status="Testing the theme switch", activity="listening")
-    chat.read_all()
+    maya, teo, wren = crew(chat)
+    chat.hub.set_status(wren, "Testing the theme switch")
+    chat.quiet()
     r.size(1280, 720)
     r.open(chat.sign_in())
     meta = chat.hub.add_file("image.png", shot, "image/png")  # so the page can fetch it from its own server
@@ -405,32 +505,52 @@ def scene_files(r):
         const dt = new DataTransfer(); dt.items.add(new File([b], "image.png", {type: "image/png"}));
         $("text").dispatchEvent(new ClipboardEvent("paste", {clipboardData: dt, bubbles: true, cancelable: true})); })()""" % meta["id"])
     time.sleep(1.0)
-    r.type("After a restart the theme is Light again. What do you see?")
+    r.type("@Wr", 0.12)
+    time.sleep(0.6)
+    r.key("Tab")
+    r.type("after a restart the theme is Light again. What do you see?")
     r.enter()
-    time.sleep(1.4)
-    chat.doing(qa, "working")
+    time.sleep(1.2)
+    heard(chat, wren)
+    busy(chat, wren, "Reading image.png")
     time.sleep(1.8)
-    chat.say(qa, O, "I see it: Theme shows Light after the restart. It's the DataStore read; I'll tell the developer.")
+    chat.say(wren, O, "I see it: Theme shows Light after the restart. It's the DataStore read; I'll tell Teo.")
+    time.sleep(1.0)
+    chat.say(wren, teo, "The theme resets to Light after a restart: Owner's screenshot shows it. Is DataStore read too early?")
+    chat.doing(wren, "listening")
     frames = r.stop(2.4)
     chat.stop()
     return frames
 
 
 def scene_phone(r):
+    """On the phone: Needs you, an agent's question, and the answer."""
     chat = shots.Chat("Notes App")
-    lead, dev, qa = team(chat)
-    chat.hub.set_role(O, lead, "lead")
+    maya, teo, wren = crew(chat)
+    busy(chat, teo, "Editing Theme.kt")
     chat.quiet()
-    chat.say(lead, O, "Dark theme: done and tested. Should the default follow the system setting?")
+    task = chat.hub.add_row(O, "Pick the default theme")["id"]
+    chat.hub.add_row(O, "Ship the settings screen", depends=task)
+    chat.hub.take(maya, task)
+    chat.hub.update(maya, task, "blocked", "Should the default follow the system setting, or always be light?")
     chat.read_all()
     r.size(390, 760, scale=2, mobile=True)
     r.open(chat.sign_in(), wait=2)
     r.start()
-    r.click("#text", 600)
-    r.type("Yes, follow the system setting by default.", 0.05)
-    r.enter()
-    time.sleep(1.5)
-    chat.say(lead, O, "Will do. claude-macbook-2 is on it.")
+    r.click("#rail-open", 600)
+    time.sleep(1.2)
+    r.click("#needs-list .need", 600)
+    time.sleep(1.2)
+    r.click("#panel-body .needs-card textarea", 600)
+    r.type("Follow the system setting by default.", 0.05)
+    r.click(r.tag("#panel-body .needs-card button", "Send"), 500)
+    time.sleep(1.4)
+    heard(chat, maya)
+    chat.hub.update(maya, task, "in_progress", "The default follows the system setting now.")
+    time.sleep(1.0)
+    r.click("#panel-close", 500)
+    time.sleep(0.6)
+    chat.say(maya, O, "Will do: the default follows the system setting. Teo is on it.")
     frames = r.stop(2.2)
     chat.stop()
     return frames
