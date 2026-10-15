@@ -2361,7 +2361,7 @@ class OtherNames(Base):
         path.write_text(json.dumps(data))
 
     def stdio(self, folder, lines=b"", home=None):
-        env = dict(os.environ, HOME=str(home or self.user))
+        env = dict(os.environ, HOME=str(home or self.user), USERPROFILE=str(home or self.user))  # Windows: USERPROFILE
         return subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--project", str(folder)],
                               input=lines, capture_output=True, env=env, timeout=60)
 
