@@ -2302,7 +2302,10 @@ class Joining(Base):
         self.assertIn('- Added %s to the project "notes-app", as "site".' % site, out)
         self.assertIn("notes-app  [--chat notes-app]", cli("projects"))
         # Agents in different projects do not see or reach each other.
-        here, here_name = self.agent()
+        here, _ = self.agent()
+        # Names are random per project, so both could get the same one: give this one its own.
+        here_name = "first-project-agent"
+        self.assertIn("You are now %s." % here_name, here.text("hub_rename", name=here_name))
         token = crewchat.read_token(place, entry["root"])
         there = Session(self.base, token)
         there_name = there.me
