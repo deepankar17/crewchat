@@ -1604,7 +1604,7 @@ class Launching(Base):
         if tomllib:
             with mock.patch.object(crewchat, "run_command", return_value=['C:\\Users\\Ünï "q"\\crewchat.exe']):
                 crewchat.install_codex()
-            parsed = tomllib.loads(path.read_text())
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(parsed["mcp_servers"]["crewchat"], {"command": 'C:\\Users\\Ünï "q"\\crewchat.exe',
                                                                  "args": ["stdio", "--local-only"]})
             self.assertEqual(parsed["mcp_servers"]["other"], {"command": "other"})
