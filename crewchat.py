@@ -99,6 +99,9 @@ RECLAIM_MINUTES = (10, 7 * 24 * 60)  # a task's holder may be silent this long b
 RECLAIM_EVERY = 60  # seconds between the server's checks for silent holders
 RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
 ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
+DOING_EVERY = 4  # ... and what it is doing, when that changed, at most this often (seconds)
+DOING_FRESH = 120  # seconds the page shows what an agent was doing
+DOING_WAKE = 8  # a new "doing" wakes the chat pages at most this often per agent (seconds)
 SERVICE_LABEL = "io.crewchat.hub"
 SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app does), name it %s."
 MAX_CHAIN_LIMIT = 50
@@ -1587,6 +1590,10 @@ class Hub:
                 for n, a in self.agents.items()
             ]
 
+    def _doing(self, agent, now):
+        """What an agent was doing a moment ago (a tool call), or "" once it is old news."""
+        return agent.get("doing", "") if now - float(agent.get("doing_at") or 0) < DOING_FRESH else ""
+
     def _rows(self):
         now = time.time()
         rows = [
@@ -1595,7 +1602,7 @@ class Hub:
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
              "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
-             "os": os_name(), "permissions": a.get("permissions", "")}
+             "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now)}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1613,7 +1620,7 @@ class Hub:
                     "activity": str(row.get("activity") or "") if fresh else "",
                     "role": str(row.get("role") or ""), "listen": str(row.get("listen") or ""),
                     "picture": clean_picture(row.get("picture")), "colour": clean_colour(row.get("colour")),
-                    "os": clean_os(row.get("os")),
+                    "os": clean_os(row.get("os")), "doing": "",  # what agents do stays on their own machine
                 })
         return rows
 
@@ -2694,7 +2701,7 @@ class Hub:
                 "releases": RELEASES,
             }
 
-    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None):
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing=""):
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life, or the session report it was asked for)."""
@@ -2708,9 +2715,20 @@ class Hub:
                 return {"link": True}
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
+                doing = clean_doing(doing)
+                if doing and self.machine_config().get("activity") == "off":
+                    doing = ""  # the owner keeps what agents do off the page
+                if doing:
+                    now = time.time()
+                    if doing != agent.get("doing") and now - agent.get("doing_woke", 0) >= DOING_WAKE:
+                        agent["doing_woke"] = now  # the pages hear of it now; a quicker change, with the next news
+                        self._changed()
+                    agent["doing"], agent["doing_at"] = doing, now
                 if session:  # the report it was asked for (wants_session)
                     self._keep_session(name, session)
                 return {}
+            if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
+                self._changed()
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -3702,10 +3720,11 @@ COMMANDS = [
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
-        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place]",
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off]",
          "Change settings: the chat's name, the local port, the address other machines use, how many turns in "
          "a row an agent may take on other agents' messages before only you can wake it (default 10), and how new "
-         "agents are named: a first name (people) or their tool and folder (place).", None),
+         "agents are named: a first name (people) or their tool and folder (place), and whether the page shows what agents are "
+         "doing (--activity).", None),
     ]),
     ("The server", [
         ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
@@ -4683,7 +4702,7 @@ class Handler(BaseHTTPRequestHandler):
                 session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
-                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session)
+                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session, data.get("doing"))
                 out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
@@ -4805,7 +4824,7 @@ def free_port(start):
     return start
 
 
-def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None):
+def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
     config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
@@ -4819,6 +4838,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
         config["max_chain"] = int(max_chain)  # Roster.max_chain keeps it within bounds
     if agent_names:
         config["agent_names"] = agent_names
+    if activity:
+        config["activity"] = activity
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -4830,7 +4851,7 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
 
 def cmd_setup(args):
     config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None),
-                        getattr(args, "agent_names", None))
+                        getattr(args, "agent_names", None), getattr(args, "activity", None))
     print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
@@ -6267,6 +6288,69 @@ def session_report(client, session, project):
     return dict(found, id=session, tool=client, folder=str(project)) if found else None
 
 
+# Programs whose second word is a subcommand worth showing ("npm test"); for any other program only its name.
+SUBCOMMAND_TOOLS = {"git", "npm", "yarn", "pnpm", "bun", "deno", "docker", "cargo", "go", "kubectl", "gradle",
+                    "gradlew", "pip", "pip3", "uv", "poetry", "dotnet", "mvn", "mvnw", "bundle", "rails", "swift",
+                    "flutter", "dart", "brew", "gh", "terraform", "helm"}
+COMMAND_WRAPPERS = {"sudo", "time", "env", "nohup", "nice", "command", "exec", "xargs"}  # the program comes after them
+TOOL_WORDS = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Write": "Writing", "NotebookEdit": "Editing",
+              "Grep": "Searching the code", "Glob": "Searching the code", "WebFetch": "Reading the web",
+              "WebSearch": "Searching the web", "Task": "Working with a helper", "Agent": "Working with a helper",
+              "TodoWrite": "Planning"}
+
+
+def clean_doing(value):
+    return " ".join(str(value or "").split())[:80]
+
+
+def tool_summary(client, data):
+    """What an agent's tool call was, in a few safe words for the chat page: a file's name, a command's
+    program (and a well-known tool's subcommand), never their arguments or what was read or written."""
+    name = str(data.get("tool_name") or "")
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    if client == "cursor" and not name:  # afterFileEdit sends a file, afterShellExecution a command
+        if data.get("file_path"):
+            name, args = "Edit", {"file_path": data["file_path"]}
+        elif data.get("command"):
+            name, args = "Bash", {"command": data["command"]}
+    if not name or "crewchat" in name or name.startswith("hub_"):
+        return ""  # the chat's own tools: what they do shows in the chat already
+
+    def base(path):  # a file's own name, from either kind of path
+        return re.split(r"[\\/]", path)[-1][:60] if isinstance(path, str) else ""
+
+    if name in TOOL_WORDS and name in ("Read", "Edit", "MultiEdit", "Write", "NotebookEdit"):
+        return (TOOL_WORDS[name] + " " + base(args.get("file_path") or args.get("notebook_path"))).strip()
+    if name in TOOL_WORDS:
+        return TOOL_WORDS[name]
+    if name == "Bash":
+        command = args.get("command")
+        if not isinstance(command, str):
+            return ""
+        try:  # shell words, quotes and escapes as the shell reads them; a new line ends a command
+            words = shlex.split(command.replace("\n", " ; "), posix=True)
+        except ValueError:
+            return ""
+        part = []
+        for w in words + [";"]:
+            if w not in (";", "&&", "||", "|", "&"):
+                part.append(w)
+                continue
+            while part and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", part[0]) or part[0] in COMMAND_WRAPPERS
+                            or part[0] == "timeout" or part[0].startswith("-") or (part[0].isdigit())):
+                part.pop(0)  # FOO=1, sudo, time, timeout 60, their options: the program follows
+            if part and part[0] not in ("cd", "export", "set", "source", "."):
+                prog = base(part[0])
+                if not re.fullmatch(r"[A-Za-z][\w.+-]{0,23}", prog):
+                    return ""  # not a program's name (a path with odd parts, a token)
+                sub = part[1] if (len(part) > 1 and prog.split(".")[0] in SUBCOMMAND_TOOLS
+                                  and re.fullmatch(r"[a-z][a-z-]{1,20}", part[1])) else ""
+                return "Running " + prog + (" " + sub if sub else "")
+            part = []
+        return ""
+    return "Using " + name if re.fullmatch(r"[\w.-]{1,40}", name) else ""
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -6280,8 +6364,10 @@ def run_hook(client, event):
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
-    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY:
-        return  # after every tool call: return at once unless a minute passed
+    doing = tool_summary(client, data) if event == "tool" else ""
+    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY and (
+            not doing or doing == state.get("doing") or time.time() - float(state.get("doing_at") or 0) < DOING_EVERY):
+        return  # after every tool call: return at once unless a minute passed, or it does something new
     project = find_project(client)
     config = client_config(project, client) if project else None
     if config is None or hooks_off(project):
@@ -6309,7 +6395,7 @@ def run_hook(client, event):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
                                           "ignored": ignored, "alive": state.get("alive", 0),
-                                          }))
+                                          "doing": state.get("doing", ""), "doing_at": state.get("doing_at", 0)}))
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
@@ -6318,10 +6404,13 @@ def run_hook(client, event):
         # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
         # above), so a long turn without a crewchat tool does not look silent. Never waits or delivers.
         state["alive"] = time.time()
+        if doing:
+            state["doing"], state["doing_at"] = doing, time.time()
         save(chain, pending, asks)
-        post_json(base + "/api/hook", token, {"key": key, "event": "tool"}, timeout=5)
+        post_json(base + "/api/hook", token, {"key": key, "event": "tool", "doing": doing}, timeout=5)
         return
 
+    state["doing"] = ""  # a turn begins or ends: the next tool call is news again, as the server forgot it too
     if event == "prompt":
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
@@ -8899,6 +8988,23 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #bell .menu-list { left: auto; right: 0; min-width: 260px; }
 #bell.off #bell-icon { filter: grayscale(1); opacity: 0.55; }
 
+/* Live: who is working, and on what. */
+.dot.working { background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(31, 138, 82, 0.45); } 60% { box-shadow: 0 0 0 5px rgba(31, 138, 82, 0); } }
+.agent .holds .doing { color: var(--ok-strong); font-weight: 600; }
+@media (prefers-color-scheme: dark) { .agent .holds .doing { color: var(--ok); } }
+#working { margin: 0; padding: 2px max(18px, calc((100% - 860px) / 2)); font-size: 12.5px; color: var(--muted); flex: none; }
+#working .dots::after { content: "…"; display: inline-block; animation: blink 1.2s steps(3) infinite; width: 1.2em; overflow: hidden; vertical-align: bottom; }
+@keyframes blink { 0% { width: 0.3em; } 100% { width: 1.2em; } }
+.msg, .sys { animation: rise 0.18s ease-out; }
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .dot.working, .msg, .sys, #working .dots::after { animation: none; } }
+.welcome { max-width: 520px; margin: 10vh auto 0; text-align: center; color: var(--muted); }
+.welcome img { width: 96px; height: 96px; }
+.welcome h2 { color: var(--ink); font-size: 20px; margin: 8px 0 4px; }
+.welcome .acts { justify-content: center; margin-top: 14px; gap: 8px; }
+.welcome .acts button { padding: 8px 16px; font-size: 14px; }
+
 /* Avatars (the class names PR 1 gave them). */
 .avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
   width: 34px; height: 34px; border-radius: 50%; background: var(--av); }
@@ -8950,6 +9056,17 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg .to { border: 1px solid var(--line); border-radius: 99px; padding: 0 8px; font-size: 11.5px; }
 .msg .body { background: var(--soft); border-radius: 4px 18px 18px 18px; padding: 9px 14px; white-space: pre-wrap; overflow-wrap: anywhere; justify-self: start; }
 .msg.own { margin-left: auto; grid-template-columns: minmax(0, 1fr); }
+.msg { position: relative; }
+.msg.cont { margin-top: -10px; }
+#log.searching .msg.cont { margin-top: 0; }
+#log.searching .msg.cont > .meta { position: static; width: auto; height: auto; clip-path: none; }
+#log.searching .msg.cont > .avatar { visibility: visible; height: auto; }
+.msg.cont > .avatar { visibility: hidden; height: 0; }
+.msg.cont > .meta { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.msg .reply { position: absolute; right: -6px; top: -4px; font-size: 12px; padding: 2px 10px; background: var(--panel); color: var(--accent);
+  border: 1px solid var(--line); opacity: 0; transition: opacity 0.12s; }
+.msg:hover .reply, .msg:focus-within .reply, .msg .reply:focus-visible { opacity: 1; }
+@media (hover: none) { .msg .reply { opacity: 0.75; } }
 .msg.own .meta { justify-content: flex-end; }
 .msg.own .body { background: var(--tint); color: var(--ink); border-radius: 18px 4px 18px 18px; justify-self: end; }
 .msg.task .body { background: var(--task); color: var(--text); border: 1px solid var(--task-line); border-radius: 16px; justify-self: stretch; }
@@ -8978,6 +9095,15 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #form { flex: none; padding: 10px max(18px, calc((100% - 860px) / 2)) max(14px, env(safe-area-inset-bottom)); }
 .pillbox { display: flex; gap: 6px; align-items: flex-end; background: var(--soft); border: 1px solid var(--line); border-radius: 26px; padding: 5px; }
 .pillbox:focus-within { border-color: var(--accent-2); }
+.pillbox { position: relative; }
+.mentions { position: absolute; left: 44px; bottom: calc(100% + 6px); min-width: 220px; background: var(--panel); border-radius: 14px;
+  box-shadow: var(--shadow); border: 1px solid var(--line); padding: 4px; z-index: 30; display: flex; flex-direction: column; }
+.mentions [role=option] { cursor: pointer; display: flex; align-items: center; gap: 8px; background: none; color: var(--text); text-align: left;
+  border-radius: 10px; padding: 5px 8px; font-weight: 500; font-size: 13.5px; }
+.mentions [role=option][aria-selected="true"], .mentions [role=option]:hover { background: var(--tint); }
+.mentions .avatar { width: 24px; height: 24px; } .mentions .avatar .initials { font-size: 9.5px; }
+.mentions .avatar .mark, .mentions .avatar .os { display: none; }
+.mentions .r { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 #plus > summary { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
   font-size: 22px; color: var(--accent); }
 #plus > summary:hover { background: var(--tint); }
@@ -9245,6 +9371,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
     <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
   </section>
+  <p id="working" aria-live="off" hidden></p>
   <form id="form">
     <div id="pending" aria-label="Files to send"></div>
     <div class="pillbox">
@@ -9258,7 +9385,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       </details>
       <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
       <input type="file" id="files" multiple hidden>
-      <textarea id="text" rows="1" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
+      <div id="mentions" class="mentions" role="listbox" aria-label="Agents" hidden></div>
+      <textarea id="text" rows="1" aria-autocomplete="list" aria-controls="mentions" aria-expanded="false" aria-haspopup="listbox" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
       <button id="send" disabled>Send</button>
     </div>
     <div id="error" role="alert"></div>
@@ -9507,6 +9635,7 @@ function showView(view) {
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
   if (view === "commands") loadCommands();
+  renderWorking();
   if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
   document.body.classList.remove("rail-open");
@@ -10149,6 +10278,10 @@ function heldTask(name) {
   return own(state.held, name);
 }
 const DOING = { working: "Working", listening: "Waiting for messages", idle: "Idle" };
+// At work right now: its hooks say so, it was heard from lately, and its session is not closed.
+function isWorking(a) {
+  return a.activity === "working" && state.now - a.seen < 300 && !(a.session && !a.session.running);
+}
 function doing(a) {
   return a.session && !a.session.running ? "Its session is closed" : DOING[a.activity] || "Not heard from lately";
 }
@@ -10179,7 +10312,8 @@ function renderAgents(force) {
     card.dataset.agent = a.agent;
     const who = el("span", "who");
     who.append(el("span", "name " + colour(a.agent), a.agent));
-    const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
+    const working = isWorking(a);
+    const dot = el("span", "dot" + (working ? " working" : age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.title = doing(a) + " · " + ago(a.seen, state.now);
     const right = el("span", "inline");
     if (a.unread) right.append(el("span", "count", String(a.unread)), el("span", "sr", " unread"));
@@ -10187,7 +10321,8 @@ function renderAgents(force) {
     const task = heldTask(a.agent);
     const holds = el("span", "holds");
     if (a.role) holds.append(el("span", "badge " + a.role, roleTitle(a.role)), " ");
-    holds.append(task ? "#" + task.id + " " + task.title : a.status || doing(a));
+    if (working && a.doing) holds.append(el("span", "doing", a.doing));
+    else holds.append(task ? "#" + task.id + " " + task.title : a.status || doing(a));
     card.append(avatar(a), who, right, holds);
     card.addEventListener("click", () => openPanel("agent", a.agent));
     box.append(card);
@@ -10406,7 +10541,7 @@ function panelAgent(name) {
 
   const now = [];
   now.push(field("Status", a.status || "No status set"));
-  now.push(field("Doing", doing(a) + " · " + ago(a.seen, state.now)));
+  now.push(field("Doing", (a.doing && isWorking(a) ? a.doing : doing(a)) + " · " + ago(a.seen, state.now)));
   if (a.session) now.push(field("Session", sessionLine(a)));
   const task = heldTask(a.agent);
   if (task) {
@@ -10833,6 +10968,18 @@ function buildMessage(m) {
   if (m.files && m.files.length) body.append(fileLinks(m.files));
   box.append(meta, body);
   if (mine) box.append(el("div", "receipt"));
+  else {
+    const reply = el("button", "reply", "Reply");
+    reply.type = "button"; reply.title = "Write to " + m.from; reply.setAttribute("aria-label", "Reply to " + m.from);
+    reply.addEventListener("click", () => {
+      const to = agentNamed(m.from);
+      if (!to) return showError(m.from + " is no longer in the chat.");
+      const lead = leadingMention(text.value);
+      text.value = "@" + to + " " + (lead ? text.value.slice(lead[0].length).trimStart() : text.value);
+      fit(); text.focus();
+    });
+    box.append(reply);
+  }
   return box;
 }
 
@@ -10863,15 +11010,41 @@ const searchText = new WeakMap();
 function matches(node, want) {
   if (!want) return true;
   if (node.classList.contains("day")) return false;
-  if (!searchText.has(node)) searchText.set(node, node.textContent.toLowerCase());
+  if (!searchText.has(node)) {
+    const parts = node.querySelectorAll(":scope > .meta, :scope > .body");
+    searchText.set(node, (parts.length ? [...parts].map((p) => p.textContent).join(" ") : node.textContent).toLowerCase());
+  }
   return searchText.get(node).includes(want);
 }
 const searchWant = () => $("search").value.trim().toLowerCase();
 function applySearch() {
   const want = searchWant();
+  $("log").classList.toggle("searching", !!want);
   for (const node of $("log").children) if (node.id !== "empty") node.hidden = !matches(node, want);
 }
 $("search").addEventListener("input", applySearch);
+
+// An empty chat: what to do first.
+function welcome() {
+  const box = el("div", "welcome");
+  box.id = "empty";
+  const img = el("img"); img.alt = ""; img.src = "/pictures/bot.webp";
+  const acts = el("div", "acts");
+  actButton(acts, "New agent", "Start a new agent", () => openLaunch());
+  actButton(acts, "Post a task", "Write a task for the crew", () => { setTask(true); text.focus(); });
+  actButton(acts, "Roles", "See the project's roles", () => openPanel("roles"));
+  box.append(img, el("h2", "", "Your crew's chat starts here"),
+             el("p", "", state.agents.length ? "Say hello, or post a task: the crew settles who takes it."
+                                            : "Add an agent, or open Claude Code or Cursor in a connected folder: it joins by itself."), acts);
+  return box;
+}
+
+// A message right after another from the same sender (within 5 minutes, same day, plain) joins it:
+// no second name and picture.
+function groupWith(m, prev) {
+  return prev && prev.from === m.from && m.from !== "Owner" && m.kind === "msg" && prev.kind === "msg" &&
+    m.to === prev.to && m.ts - prev.ts < 300;
+}
 
 function addMessages(list, first) {
   if (!list.length) return;
@@ -10880,8 +11053,11 @@ function addMessages(list, first) {
   for (const m of list) {
     if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
+    const sameDay = day === state.lastDay;
     if (day !== state.lastDay) { const d = el("p", "day", day); d.hidden = !!searchWant(); log.append(d); state.lastDay = day; }
     const node = buildMessage(m);
+    if (groupWith(m, state.lastShown) && sameDay) node.classList.add("cont");
+    state.lastShown = m;
     node.hidden = !matches(node, searchWant());
     log.append(node);
     if (node.classList.contains("msg") && (m.from === "Owner" || m.kind === "task")) state.nodes.set(m.id, [m, node]);
@@ -11014,6 +11190,19 @@ function notify(needs) {
   }
 }
 
+// Who is working right now, under the thread: "Maya is editing Login.kt…".
+function renderWorking() {
+  const busy = state.agents.filter(isWorking)
+    .sort((a, b) => !!b.doing - !!a.doing);  // one that says what it does first
+  const line = $("working");
+  line.hidden = !busy.length || $("log").hidden;
+  if (!busy.length) return;
+  const one = busy[0];
+  const what = busy.length === 1 && one.doing ? " is " + one.doing.charAt(0).toLowerCase() + one.doing.slice(1)
+    : busy.length === 1 ? " is working" : busy.length === 2 ? " and " + busy[1].agent + " are working" : " and " + (busy.length - 1) + " others are working";
+  line.replaceChildren(el("b", "", one.agent), what, el("span", "dots"));
+}
+
 // The space's header: the project, and how many agents, machines and open tasks it has.
 function renderHeader() {
   $("space-avatar").textContent = letter(state.project);
@@ -11073,12 +11262,13 @@ async function loop() {
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       const mine = data.messages.some((m) => m.from === "Owner");
       renderAgents();
+      renderWorking();
       addMessages(data.messages, first);
       // Roles changed (here or in another tab): what the roles panels show is read again.
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
         loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
-      if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the crew below.";
+      if (first && $("empty")) $("empty").replaceWith(welcome());
       refreshDynamic();
       // Scroll last: the cards and read receipts above change the list's height.
       if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;
@@ -11164,7 +11354,59 @@ $("form").addEventListener("drop", (e) => {
   addFiles(e.dataTransfer.files);
 });
 
+// "@" in the message box: the agents whose name starts with what follows, to pick with the arrows
+// and Enter or Tab, or a click.
+const mention = { at: -1, items: [], on: 0 };
+function mentionQuery() {
+  const upto = text.value.slice(0, text.selectionStart);
+  const m = upto.match(/(?:^|\s)@([\w.-]{0,32})$/);  // a name being typed (NAME_RE's letters)
+  return m ? { at: upto.length - m[1].length - 1, q: m[1].toLowerCase() } : null;
+}
+function showMentions() {
+  const found = mentionQuery(), box = $("mentions");
+  if (!found || found.q !== mention.q) mention.on = 0;  // a new word: from the top
+  mention.q = found ? found.q : null;
+  mention.items = found ? state.agents.filter((a) => a.agent.toLowerCase().startsWith(found.q)).slice(0, 6) : [];
+  box.hidden = !mention.items.length;
+  text.setAttribute("aria-expanded", String(!box.hidden));
+  if (box.hidden) { text.removeAttribute("aria-activedescendant"); return; }
+  mention.at = found.at; mention.on = Math.min(mention.on, mention.items.length - 1);
+  text.setAttribute("aria-activedescendant", "mention-" + mention.on);
+  box.replaceChildren(...mention.items.map((a, i) => {
+    const b = el("div");
+    b.id = "mention-" + i; b.setAttribute("role", "option"); b.setAttribute("aria-selected", String(i === mention.on));
+    b.append(avatar(a), el("span", "", a.agent), el("span", "r", a.role ? roleTitle(a.role) : ""));
+    b.addEventListener("mousedown", (e) => { e.preventDefault(); pickMention(i); });
+    return b;
+  }));
+}
+function pickMention(i) {
+  const a = mention.items[i], end = text.selectionStart;
+  if (!a) return;
+  text.value = text.value.slice(0, mention.at) + "@" + a.agent + " " + text.value.slice(end);
+  const caret = mention.at + a.agent.length + 2;
+  text.setSelectionRange(caret, caret);
+  closeMentions(); mention.on = 0; fit();
+}
+function closeMentions() {
+  $("mentions").hidden = true;
+  text.setAttribute("aria-expanded", "false");
+  text.removeAttribute("aria-activedescendant");
+}
+text.addEventListener("input", showMentions);
+text.addEventListener("click", showMentions);  // the caret moved: the list follows it
+text.addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) showMentions(); });
+text.addEventListener("blur", closeMentions);
 text.addEventListener("keydown", (e) => {
+  if (!$("mentions").hidden && mention.items.length && !e.isComposing) {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      mention.on = (mention.on + (e.key === "ArrowDown" ? 1 : -1) + mention.items.length) % mention.items.length;
+      return showMentions();
+    }
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); return pickMention(mention.on); }
+    if (e.key === "Escape") { e.stopPropagation(); closeMentions(); return; }
+  }
   if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); if (!$("send").disabled) $("form").requestSubmit(); }
 });
 // Who a message goes to: the agent its first word mentions, else everyone.
@@ -11211,7 +11453,7 @@ $("form").addEventListener("submit", async (e) => {
 
 setInterval(() => {
   state.now += 30;
-  if (!document.hidden) { renderAgents(); renderPanel(); }  // "N min ago" moves on
+  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); }  // "N min ago" moves on
 }, 30000);
 loop();
 </script>
@@ -11258,6 +11500,8 @@ def build_parser():
     p.add_argument("--url", help="address other machines use, e.g. https://host.tailnet.ts.net")
     p.add_argument("--max-chain", type=int, help="turns in a row an agent may take on chat messages alone "
                    "before only you can wake it (default %d, at most %d)" % (MAX_CHAIN, MAX_CHAIN_LIMIT))
+    p.add_argument("--activity", choices=["on", "off"], help="show on the chat page what each agent is doing, from its "
+                   "tool calls (a file's name, a command's program; on by default)")
     p.add_argument("--agent-names", choices=["people", "place"], help="how new agents are named: a first "
                    "name such as Maya (people, the default), or after their tool and folder, such as claude-macbook (place)")
     p.set_defaults(fn=cmd_setup)

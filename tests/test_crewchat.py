@@ -989,6 +989,74 @@ class Roles(Base):
         self.assertIn("Manager", cli("roles"))
 
 
+class Activity(Base):
+    """What an agent is doing, from its tool calls, in a few safe words."""
+
+    def test_a_tool_call_in_a_few_safe_words(self):
+        say = crewchat.tool_summary
+        self.assertEqual(say("claude", {"tool_name": "Edit", "tool_input": {"file_path": "/x/app/Login.kt"}}), "Editing Login.kt")
+        self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": "/secret/dir/.env"}}), "Reading .env")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
+                         "Running npm test")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "cd app && ./gradlew assemble"}}),
+                         "Running gradlew assemble")
+        self.assertEqual(say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}}), "Running curl")
+        self.assertEqual(say("claude", {"tool_name": "Grep", "tool_input": {"pattern": "password"}}), "Searching the code")
+        self.assertEqual(say("claude", {"tool_name": "mcp__crewchat__hub_send"}), "")
+        self.assertEqual(say("cursor", {"file_path": "/a/b/Theme.kt"}), "Editing Theme.kt")
+        self.assertEqual(say("cursor", {"command": "pytest -q"}), "Running pytest")
+        self.assertEqual(say("claude", {"tool_name": "<img src=x>"}), "")
+        # Never an argument: only a known tool's subcommand; quotes and escapes read as the shell does.
+        bash = lambda cmd: say("claude", {"tool_name": "Bash", "tool_input": {"command": cmd}})  # noqa: E731
+        self.assertEqual(bash("echo hunter2 | tee x"), "Running echo")
+        self.assertEqual(bash("cat credentials"), "Running cat")
+        self.assertEqual(bash('PGPASSWORD="a; secretword more" psql -h db'), "Running psql")
+        self.assertEqual(bash("X=a\\ secretpart npm test"), "Running npm test")
+        self.assertEqual(bash("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "")
+        self.assertEqual(bash("git commit -m 'a secret message'"), "Running git commit")
+        self.assertEqual(bash("echo 'unbalanced"), "")
+        for cmd, said in (("cd x\nnpm test", "Running npm test"), ("sudo npm install", "Running npm install"),
+                          ("env X=1 npm test", "Running npm test"), ("timeout 60 npm test", "Running npm test"),
+                          ("nohup npm start &", "Running npm start"), ("pytest secretdir", "Running pytest"),
+                          ("npx some-internal-pkg", "Running npx"), ("make deploy-prod-db", "Running make")):
+            self.assertEqual(bash(cmd), said, cmd)
+        self.assertEqual(say("claude", {"tool_name": "Edit", "tool_input": {"file_path": "C:\\Users\\me\\Login.kt"}}),
+                         "Editing Login.kt")
+        self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": ["a", "b"]}}), "Reading")
+        self.assertEqual(say("cursor", {"tool_name": "hub_send"}), "")
+        self.assertEqual(say("cursor", {"tool_name": "browser_navigate", "command": "npx @playwright/mcp"}), "Using browser_navigate")
+        for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
+            for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
+                        say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}})):
+                self.assertNotIn(leaked, out)
+
+    def test_the_page_shows_it_while_fresh(self):
+        session, name = self.agent()
+        key = "k" * 16
+        session.text("hub_link", key=key)
+        hook = lambda **body: crewchat.post_json(self.base + "/api/hook", self.token, dict({"key": key}, **body))  # noqa: E731
+        hook(event="tool", doing="Editing Login.kt")
+        row = lambda: next(r for r in self.hub.rows() if r["agent"] == name)  # noqa: E731
+        self.assertEqual(row()["doing"], "Editing Login.kt")
+        with self.hub.lock:
+            self.hub.agents[name]["doing_at"] -= crewchat.DOING_FRESH + 1
+        self.assertEqual(row()["doing"], "")  # old news
+        hook(event="tool", doing="Running pytest")
+        hook(event="stop", wait=0)  # a turn ended: what it last did is old news too
+        self.assertEqual(row()["doing"], "")
+        config = crewchat.load_config()
+        config["activity"] = "off"
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            hook(event="tool", doing="Editing Secret.kt")
+            self.assertEqual(row()["doing"], "")  # the owner keeps it off the page
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+
 class NeedsYou(Base):
     """What waits on the owner: blocked tasks, reviews, tasks given back, unread messages."""
 
