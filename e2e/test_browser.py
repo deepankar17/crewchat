@@ -479,8 +479,17 @@ class NewPage(Signed):
         self.assertTrue(c.js(self.card() + ".classList.contains('on')"))
         texts = c.js("$('panel-body').innerText")
         self.assertEqual(c.js("document.querySelector('#panel input[aria-label^=\"Name for\"]').value"), self.agent.name)
-        for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Remove", "Change picture"):
+        for word in ("NOW", "SETTINGS", "ACTIONS", "Message", "Remove"):
             self.assertIn(word, texts.upper() if word.isupper() else texts)
+        # The picture itself opens the picture menu, and closes it again.
+        pic = "document.querySelector('#panel .picbutton')"
+        self.assertTrue(c.js("%s.getAttribute('aria-label') === %s" % (pic, json.dumps("Change %s's picture" % self.agent.name))))
+        c.js(pic + ".click()")
+        c.until("document.querySelector('#panel .picmenu').open && %s.getAttribute('aria-expanded') === 'true'" % pic,
+                what="the picture menu to open")
+        self.assertGreater(c.js("document.querySelectorAll('#panel .picmenu .picks button.art').length"), 10)
+        c.js(pic + ".click()")
+        c.until("!document.querySelector('#panel .picmenu').open", what="the picture menu to close")
         sel = "#panel select[aria-label='Role for %s']" % self.agent.name
         c.js("(() => { const s = document.querySelector(%s); s.value = 'reviewer'; s.dispatchEvent(new Event('change')); })()"
              % json.dumps(sel))

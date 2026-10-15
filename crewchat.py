@@ -1365,13 +1365,21 @@ class Hub:
                 return secrets.choice(free)
         return self._free_name("%s-%s" % (client, place))
 
+    def _random_picture(self):
+        """A 3D picture for a new agent, one nobody here or on a linked machine has while any is free.
+        Caller holds the lock."""
+        used = {a.get("picture") for a in self.agents.values()}
+        used.update(row.get("picture") for dev in self.remote.values() for row in dev["agents"])
+        pictures = ["art:" + p for p in ART_PICTURES]
+        return secrets.choice([p for p in pictures if p not in used] or pictures)
+
     def _new_agent(self, place, client):
         now = time.time()
         name = self._agent_name(place, client)
         self.agents[name] = {
             "place": place, "client": client, "created": now, "seen": now, "active": now,
             "cursor": self.next_seq - 1,  # a newcomer does not inherit the backlog as unread
-            "status": "", "checked": now, "role": "",
+            "status": "", "checked": now, "role": "", "picture": self._random_picture(),
         }
         self._event("%s joined (%s on %s)" % (name, client, place))
         return name
@@ -1817,7 +1825,10 @@ class Hub:
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
-        picture, colour = check_profile(self, picture or "", colour or "")
+        # "" keeps the random picture every new agent gets; "initials" asks for initials instead.
+        initials = picture == "initials"
+        picture, colour = check_profile(self, "" if initials else picture or "", colour or "")
+        picture = "initials" if initials else picture
         if len(instructions) > MAX_TEXT:
             raise HubError("the instructions are too long")
         with self.lock:
@@ -1900,8 +1911,9 @@ class Hub:
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
                 self._save()
         if spec.get("picture") or spec.get("colour"):
+            picture = spec.get("picture") or None
             try:
-                self.set_profile(name, spec.get("picture") or None, spec.get("colour") or None)
+                self.set_profile(name, "" if picture == "initials" else picture, spec.get("colour") or None)
             except HubError as e:  # its picture went away in the meantime
                 notes.append("Your picture was not set (%s)." % e)
         if spec["role"]:
@@ -2846,6 +2858,35 @@ class Hub:
         if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
         self._open_again(name, None, session, folder, command)
+
+    def start_again(self, name):
+        """The owner starts a new session for a local agent whose own one cannot be reopened (crewchat
+        recorded none): in the agent's folder, with its link key, so it checks in as the same agent,
+        with its name, role, picture and tasks. The old conversation's memory is gone; the chat is not."""
+        with self.lock:
+            agent = self._local_agent(name, "start")
+            if self.waiting.get(name):  # its stop hook is waiting for messages: the session is open
+                raise HubError("%s is running now" % name)
+            session = agent.get("session")
+            if session and process_running(session):
+                raise HubError("%s is still running: stop it first" % name)
+            tool = agent.get("client")
+            permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
+        if tool not in LAUNCH_TOOLS:
+            raise HubError("only Claude Code and Cursor agents can be started from the page")
+        folder = next((str(f) for f in self.agent_folders(name) if self._connected_folder(str(f))), None)
+        if folder is None:
+            raise HubError("%s's folder is not connected to this project on this machine any more" % name)
+        if permissions not in LAUNCH_PERMISSIONS[tool]:
+            permissions = "ask"
+        with self.lock:  # a new link key tied to its name (a start key it joined with has expired)
+            key = secrets.token_urlsafe(12)
+            self.links[key] = name
+            self._save()
+        launch_agent(tool, folder, key, permissions, self.home, model)
+        with self.lock:
+            self._event("Owner started a new session for %s in %s" % (name, Path(folder).name))
+            self._changed()
 
     def _open_again(self, name, model, session, folder, command):
         with self.lock:
@@ -3866,14 +3907,22 @@ def run_listed_command(usage, values=None, chat=""):
             argv.append(part)
     if spec.get("chat") and chat:
         argv += ["--chat", chat]
+    return run_crewchat(argv)
+
+
+def run_crewchat(argv, root=None):
+    """`crewchat ...` in a separate process, for the page; returns {code, output}. root: the machine's
+    crewchat folder (CREWCHAT_HOME) when it is not the default."""
     env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
+    if root is not None:
+        env["CREWCHAT_HOME"] = str(root)
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
     if not RUN_SLOTS.acquire(blocking=False):
         raise HubError("two commands are still running; wait for one to finish")
     try:
         done = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env, cwd=str(home()),
-                              creationflags=flags, encoding="utf-8", errors="replace")
+                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env,
+                              cwd=str(root or home()), creationflags=flags, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         return {"code": -1, "output": "Still running after %d seconds, so it was stopped." % RUN_TIMEOUT}
     except OSError as e:
@@ -3886,13 +3935,35 @@ def run_listed_command(usage, values=None, chat=""):
     return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
 
 
+def connect_folder(path, chat, root=None):
+    """The owner connects a folder on this machine to a project from the chat page's New agent:
+    `crewchat start` in it, as in a terminal. Returns the folder as the launch options list it."""
+    raw = str(path or "").strip()
+    if not raw:
+        raise HubError("type the folder's path")
+    folder = Path(os.path.expanduser(raw))
+    if not folder.is_absolute():
+        raise HubError("type the folder's full path, such as ~/code/my-app")
+    folder = folder.resolve()
+    if not folder.is_dir():
+        raise HubError("there is no folder at %s" % folder)
+    # Not the whole disk or home: a folder's .claude settings in the home folder are every session's.
+    if folder == Path(folder.anchor) or folder == Path.home().resolve() or folder == Path(root or home()).resolve():
+        raise HubError("pick a project's own folder, not %s" % folder)
+    done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open", "--no-service"], root)
+    if done["code"] != 0:
+        lines = [line for line in done["output"].splitlines() if line.strip()]
+        raise HubError(re.sub(r"^(- |crewchat: )", "", lines[-1]) if lines else "crewchat start failed")
+    return str(folder)
+
+
 def link_info(hub, shared=True):
     """How this machine reaches the others, for the page: the link says (over Tailscale, with cloud
     sync through Firestore), or not at all."""
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4430,12 +4501,14 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.stop_agent(name)
         elif op == "reopen":
             self.hub.reopen_agent(name)
+        elif op == "start":
+            self.hub.start_again(name)
         elif op == "model":
             self.hub.switch_model(name, data.get("model"))
         elif op == "profile":
             self.hub.set_profile(name, data.get("picture"), data.get("colour"))
         else:
-            raise HubError("op is rename, remove, listen, stop, reopen, model or profile")
+            raise HubError("op is rename, remove, listen, stop, reopen, start, model or profile")
         return {"ok": True}
 
     def _role(self, data):
@@ -4476,6 +4549,14 @@ class Handler(BaseHTTPRequestHandler):
             with self.hub.lock:
                 self.hub._changed()  # every page shows the new roles
         return answer
+
+    def _folders(self, data):
+        """The owner connects a folder on this machine to this project, for New agent."""
+        if data.get("op") != "connect":
+            raise HubError("unknown op")
+        path = connect_folder(data.get("path"), self.project.id, self.projects.base)
+        self.projects.primary.roster.refresh(force=True)  # the machine's folders and the folder's token, just written
+        return {"path": path}
 
     def _launch(self, data):
         """Add an agent: a new agent session on this machine."""
@@ -4676,7 +4757,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         owner_actions = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
-                         "/api/read": self._read,
+                         "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}
         if path in owner_actions:
             if not self._owner_request():
@@ -8891,9 +8972,10 @@ body {
   font: 15px/1.5 ui-rounded, "SF Pro Rounded", "Nunito", "Quicksand", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   display: grid; height: 100dvh;
   grid-template-areas: "top top top" "rail space panel";
-  grid-template-columns: 260px minmax(0, 1fr) 0; grid-template-rows: auto minmax(0, 1fr);
+  --rail-width: 260px;
+  grid-template-columns: var(--rail-width) minmax(0, 1fr) 0; grid-template-rows: auto minmax(0, 1fr);
 }
-body.panel-open { grid-template-columns: 260px minmax(0, 1fr) 320px; }
+body.panel-open { grid-template-columns: var(--rail-width) minmax(0, 1fr) 320px; }
 select, textarea, button, input { font: inherit; color: inherit; }
 button { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 999px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -8908,9 +8990,12 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .phone-only { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
-/* Top bar: one Chrome-style tab per project. */
+/* Top bar: the name over the rail, then one Chrome-style tab per project over the chat. */
 #topbar { grid-area: top; display: flex; align-items: flex-end; gap: 6px; padding: 8px 12px 0; min-width: 0; }
-.brand { display: flex; align-items: center; align-self: center; padding: 0 6px 6px 2px; }
+.brand { display: flex; align-items: center; align-self: center; gap: 10px; padding: 0 6px 6px 2px; flex: none;
+  width: calc(var(--rail-width) - 18px); color: var(--ink); text-decoration: none; }  /* 18px: the bar's padding and gap */
+.wordmark { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+.wordmark b { color: var(--accent); font-weight: 800; }
 .logo { width: 28px; height: 28px; flex: none; }
 #tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .tab { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 14px 14px 0 0; max-width: 220px;
@@ -9016,7 +9101,12 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
-.picmenu > summary { cursor: pointer; list-style: none; display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; }
+.picmenu > summary { display: none; }
+.picbutton { position: relative; padding: 0; background: none; border-radius: 50%; flex: none; }
+.picbutton .picedit { position: absolute; right: -2px; bottom: -2px; width: 22px; height: 22px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 12px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); box-shadow: var(--shadow); opacity: 0.85; transition: opacity 0.15s, transform 0.15s; }
+.picbutton:hover .picedit, .picbutton:focus-visible .picedit, .picbutton[aria-expanded="true"] .picedit { opacity: 1; transform: scale(1.08); }
 .picmenu .picks button.art { padding: 2px; border-radius: 50%; min-width: 0; }
 .picmenu .picks button.art img { width: 34px; height: 34px; display: block; }
 .avatar img.art { border-radius: 0; object-fit: contain; width: 92%; height: 92%; }
@@ -9275,7 +9365,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 </head>
 <body>
 <header id="topbar">
-  <a class="brand wide-only" href="/" title="crewchat">__LOGO__</a>
+  <a class="brand wide-only" href="/" title="crewchat">__LOGO__<span class="wordmark">crew<b>chat</b></span></a>
   <nav id="tabs" aria-label="Projects"></nav>
   <details id="tab-add" class="menu">
     <summary title="Switch to a project, or make one" aria-label="Switch to a project, or make one">+</summary>
@@ -9431,6 +9521,9 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       </fieldset>
       <fieldset class="step" hidden>
         <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
+        <label for="l-path">Or connect one</label>
+        <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
+          <button type="button" class="secondary" id="l-connect">Connect</button></div>
         <label>Machine</label><p id="l-machine"></p>
       </fieldset>
       <fieldset class="step" hidden>
@@ -10099,7 +10192,7 @@ async function openLaunch(role) {
   const roles = state.roles.map((r) => new Option(r.title, r.name));
   $("l-role").replaceChildren(new Option("No role", ""), ...roles.map((o) => new Option(o.text, o.value)));
   $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option("A " + o.text.toLowerCase() + " (" + o.text + " role)", o.value)));
-  $("l-picture").replaceChildren(...pictureOptions());
+  $("l-picture").replaceChildren(...pictureOptions(), new Option("Initials", "initials"));
   $("l-colour-tool").checked = true;
   showStep(0);
   dialog.showModal();
@@ -10115,20 +10208,45 @@ async function openLaunch(role) {
     const firstReady = opts.tools.find((t) => !t.missing);
     if (firstReady) $("l-tool").value = firstReady.id;
     if ($("l-role").value) applyRole($("l-role").value); else showTool();  // a role picked meanwhile
-    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
-    const ready = opts.tools.filter((t) => !t.missing);
-    $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
+    showFolders(opts.folders);
     if (role) { $("l-template").value = role; $("l-role").value = role; applyRole(role); showStep(1); }
-    if (!ready.length || !opts.folders.length) {
-      note.textContent = !ready.length
-        ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
-        : "No folder on this machine is connected to this project yet. Run `crewchat start --chat " + (CHAT || "PROJECT") + "` in one first.";
-      $("l-start").disabled = true;
-    } else if (missing) {
-      note.textContent = missing;
-    }
+    launchNote(opts.folders);
   } catch (err) {
     note.textContent = "Could not load the options: " + err.message;
+  }
+}
+function showFolders(folders, pick) {
+  $("l-folder").replaceChildren(...(folders.length ? folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path))
+    : [new Option("None connected yet: type one below", "")]));
+  $("l-folder").disabled = !folders.length;
+  if (pick) $("l-folder").value = pick;
+}
+// What stops a start (no tool, no folder), or the tools that are missing.
+function launchNote(folders) {
+  const ready = launchTools.filter((t) => !t.missing);
+  const missing = launchTools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
+  $("launch-note").textContent = !ready.length
+    ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then come back."
+    : !folders.length ? "No folder on this machine is in this project yet: type one's path under Or connect one." : missing;
+  $("l-start").disabled = !ready.length || !folders.length;
+}
+// The owner connects a folder to this project (`crewchat start` in it, on this machine).
+async function connectFolder() {
+  const path = $("l-path").value.trim(), button = $("l-connect");
+  if (!path || button.disabled) return;
+  button.disabled = true;
+  $("launch-note").textContent = "Connecting " + path + "…";
+  try {
+    const out = await postJSON("/api/folders", { op: "connect", path });
+    const opts = await launchOptions();
+    showFolders(opts.folders, out.path);
+    launchNote(opts.folders);
+    $("l-path").value = "";
+    if (!$("launch-note").textContent) $("launch-note").textContent = "Connected " + out.path + ".";
+  } catch (err) {
+    $("launch-note").textContent = "Not connected: " + err.message;
+  } finally {
+    button.disabled = false;
   }
 }
 // The chosen tool: its colour, its models, and what it may do without asking.
@@ -10194,6 +10312,8 @@ $("l-dice").addEventListener("click", () => {
   if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
   else $("l-dice").disabled = true;  // every first name is in use
 });
+$("l-connect").addEventListener("click", connectFolder);
+$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connectFolder(); } });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
@@ -10240,7 +10360,17 @@ function sessionLine(a) {
 
 function sessionControls(a, acts, agentOp) {
   const s = a.session;
-  if (!s || a.remote) return;
+  if (a.remote) return;
+  if (!s || (!s.running && !s.reopen)) {
+    // No conversation to reopen (crewchat recorded none): a new session that checks in as this agent.
+    if (["claude", "cursor"].includes(a.client) && a.activity !== "listening" && !isWorking(a))
+      actButton(acts, "Start again", "Start a new session as " + a.agent, (b) => {
+        if (confirm("Start a new session as " + a.agent + "? Its last conversation was not recorded, so a new one opens in a "
+                    + "Terminal window in its folder, with the same name, role and tasks. If it is still open somewhere, close it first."))
+          agentOp({ op: "start", agent: a.agent }, "Not started", b);
+      });
+    return;
+  }
   if (s.running) {
     actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {
       if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
@@ -10412,16 +10542,18 @@ function manyMachines() {
 }
 
 // The pictures to choose from in a menu: initials, the 3D pictures, the emoji presets.
+// "" is the random 3D picture every new agent gets.
 function pictureOptions() {
-  return [new Option("Initials", ""),
+  return [new Option("A random 3D picture", ""),
           ...Object.entries(state.art || {}).map(([id, label]) => new Option(label + " (3D)", "art:" + id)),
           ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id))];
 }
 
 // The Picture menu: a 3D picture, an emoji, initials, an image of your own, and a colour.
+// The picture itself opens it (pictureButton); its own summary is hidden.
 function pictureMenu(a, agentOp) {
   const menu = el("details", "picmenu");
-  menu.append(el("summary", "ghost", "Change picture"));
+  menu.append(el("summary", "", "Change picture"));
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
     .then(() => { menu.open = false; });
@@ -10537,7 +10669,8 @@ function panelAgent(name) {
   names.append(remote ? el("div", "nm", a.agent) : nameField(a, agentOp));
   if (a.role) names.append(el("span", "badge " + a.role, roleTitle(a.role)));
   names.append(el("div", "meta", [tool.label || a.client, a.place + (a.remote ? " on " + a.device : "")].join(" · ")));
-  head.append(avatar(a, "big"), names);
+  const menu = remote ? null : pictureMenu(a, agentOp);
+  head.append(menu ? pictureButton(a, menu) : avatar(a, "big"), names);
 
   const now = [];
   now.push(field("Status", a.status || "No status set"));
@@ -10582,15 +10715,26 @@ function panelAgent(name) {
     if (cls) b.classList.add(cls);
     if (remote) { b.title = remote; b.disabled = true; }
   };
-  if (!remote) acts.append(pictureMenu(a, agentOp));
   button("Remove", "Remove " + a.agent + " from the chat", (b) => {
     if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
                 "still open, it joins again the next time it uses crewchat."))
       agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closePanel(); });
   }, "danger");
-  const cards = [card("", head), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
+  const cards = [card("", head, ...(menu ? [menu] : [])), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
   if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
   return [a.agent, ...cards];
+}
+
+// The agent's picture, as a button that opens and closes its Picture menu.
+function pictureButton(a, menu) {
+  const b = el("button", "picbutton");
+  b.type = "button"; b.title = "Change picture";
+  b.setAttribute("aria-label", "Change " + a.agent + "'s picture");
+  b.setAttribute("aria-expanded", String(menu.open));
+  b.append(avatar(a, "big"), el("span", "picedit", "✎"));
+  b.addEventListener("click", () => { menu.open = !menu.open; });
+  menu.addEventListener("toggle", () => b.setAttribute("aria-expanded", String(menu.open)));
+  return b;
 }
 
 // The agent's name, editable where it stands (as in a bot builder): Enter or leaving the field saves,
