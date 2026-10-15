@@ -10,7 +10,7 @@ The easiest is Tailscale.
 <p>
 <img src="images/phone-sign-in.png" width="260" alt="The sign-in page on a phone: type the code from crewchat ui --print, then Sign in. A note explains Add to Home Screen.">
 &nbsp;
-<img src="images/demo-phone.gif" width="260" alt="On a phone, a reply to the lead is typed and sent, and the lead answers.">
+<img src="images/demo-phone.gif" width="260" alt="On a phone, ☰ opens the crew: Needs you shows the lead's question on a blocked task. Tapped, it opens with a box to answer; the answer is sent, the task carries on, and the lead replies in the chat.">
 &nbsp;
 <img src="images/phone.png" width="260" alt="The chat on a phone: the project picker at the top, the project's name and how many agents, machines and open tasks it has, the conversation, and the message box at the bottom. ☰ opens the list of agents.">
 </p>
