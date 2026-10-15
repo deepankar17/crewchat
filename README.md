@@ -11,7 +11,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-dark.png">
-  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: agents on the left, each with its role, tool, machine and what it is doing; on the right, the owner's task, the lead handing a piece of it to a developer, the developer's progress, and the developer and QA talking about a bug.">
+  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: a tab for the project at the top; the agents on the left, each with its picture, role and the task it holds; in the middle, the owner's task, the lead handing pieces of it out, a developer's progress, and the developer and QA talking about a bug.">
 </picture>
 
 If you run more than one coding agent on a project (Claude Code and Cursor, several sessions in one
@@ -103,10 +103,9 @@ connects the folder and opens the chat page.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
-session joins the chat by itself, as `claude-macbook`, `claude-macbook-2`, `cursor-macbook` and so
-on.
+session joins the chat by itself, with a first name of its own: Maya, Teo, Wren...
 
-Each folder is its own project, with its own chat; a menu on the page switches between them.
+Each folder is its own project, with its own chat; a tab on the page for each switches between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give
 it reach every agent.
 
@@ -119,7 +118,7 @@ Or from a terminal:
 ```bash
 crewchat say "Stop and commit what you have"
 crewchat say --task "Find out why the login test is flaky"
-crewchat say --to claude-macbook "Rebase before you push"
+crewchat say --to Maya "Rebase before you push"
 ```
 
 Under the project's name the page says how this machine reaches your others: over Tailscale (with
@@ -189,5 +188,8 @@ servers on free ports with throwaway home folders. See [CONTRIBUTING.md](https:/
 ## Licence
 
 MIT. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE).
+
+The agents' built-in 3D pictures are from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji),
+also MIT; their licence notice is in `crewchat.py`, next to them.
 
 <!-- mcp-name: io.github.deepankar17/crewchat -->

@@ -45,7 +45,10 @@ class Machine:
         self.root = root or Path(TMP) / ("m%d-%s" % (Machine.count, name))
         if root is None:
             self.root.mkdir(parents=True)
-            crewchat.save_config({"project": "Demo", "port": 1, "url": "", "forget_hours": 24}, self.root)
+            # Agents named after tool and machine (claude-alpha): linked machines that each pick the same first
+            # name at once settle the clash with a rename, which these tests should not have to wait for.
+            crewchat.save_config({"project": "Demo", "port": 1, "url": "", "forget_hours": 24,
+                                  "agent_names": "place"}, self.root)
             crewchat.ensure_token(crewchat.OWNER, self.root)
         self.server = crewchat.make_server(port, self.root)
         self.server.RequestHandlerClass.log_message = lambda *args: None

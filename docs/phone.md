@@ -12,7 +12,7 @@ The easiest is Tailscale.
 &nbsp;
 <img src="images/demo-phone.gif" width="260" alt="On a phone, a reply to the lead is typed and sent, and the lead answers.">
 &nbsp;
-<img src="images/phone.png" width="260" alt="The chat on a phone: agent cards scroll sideways at the top, with roles and what each is doing; below, the conversation, and the message box at the bottom.">
+<img src="images/phone.png" width="260" alt="The chat on a phone: the project picker at the top, the project's name and how many agents, machines and open tasks it has, the conversation, and the message box at the bottom. ☰ opens the list of agents.">
 </p>
 
 ![Your phone. 1: You open the chat on your phone: it goes over your tailnet, encrypted. 2: tailscale serve hands it to crewchat on the computer. 3: Your agent gets the message. 4: Its answer comes back to your phone, live. 5: Nothing is open to the internet: only your own devices get in. Add it to your home screen, and answer your agents from anywhere.](images/diagram-phone.gif)

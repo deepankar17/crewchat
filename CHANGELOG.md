@@ -2,6 +2,47 @@
 
 ## Unreleased
 
+- **What each agent is doing, live.** An agent's tool calls show in its line of the list and its
+  panel while it works ("Editing LoginViewModel.kt", "Running npm test", "Searching the code"): a
+  file's name and a command's program only, never arguments or contents. A line under the chat says
+  who is working, a working agent's dot pulses, new messages ease in, an empty chat offers the
+  first steps (New agent, Post a task, Roles), `@` in the message box suggests agents, Reply on a
+  message writes back to its sender, and messages in a row from one agent are grouped. The tool-call hook sends this at most every few
+  seconds, when it changes; `crewchat setup --activity off` keeps it off the page.
+- **Needs you and notifications** (new chat page, PR 5 of 5). What waits on you is listed at the
+  top of the crew: blocked tasks with the agent's question, reviews, unread messages to you, and
+  tasks given back or reclaimed, the ones that hold up the most work first; the project's tab turns
+  red. A task opens in the panel with a box to answer the agent, or Mark done. A bell per project
+  turns on browser notifications for them (or only for messages to you) while the page is in the
+  background. The page marks messages to you read while it is in front (`/api/read`).
+- **A task board** (new chat page, PR 4 of 5). **Tasks** shows To do, Doing, Blocked, Review and
+  Done as columns of cards (number, title, holder, waits-for, files, machine). Drag a card to
+  reorder it, onto Done, back to To do, or onto Doing to give it to an agent; Blocked and Review are
+  the agents'. Filter by agent, role or machine; Done folds to the last 20; **List** keeps the
+  table. One column at a time on a phone. `/api/task` moves a task `before:ID` or to the `end`.
+- **Agents get first names.** A new agent is called Maya, Teo, Wren... (one nobody in the chat has)
+  instead of `claude-macbook`; its tool and folder still show next to it. `crewchat setup
+  --agent-names place` keeps the old names. **New agent** has a 🎲 button for a random name, and an
+  agent's name is a field in its panel to change it.
+- **A new chat page** (new chat page, PR 3 of 5). A tab for each project along the top (with
+  **+** to switch or make a project, choosing the role pack its crew starts from), the crew on the
+  left, the project's space in the middle, and a side panel on the right. Click an agent to open
+  it in the panel: what it is doing, its task and last message, its role, listening and
+  permissions, and Message, Stop or Reopen, Switch model, Change picture and Remove (its name is a field
+  you click to rename); a
+  task opens with its history, and **⋯ > Roles** lists the project's roles to read, edit,
+  duplicate, export, delete or import, start over from a pack or save as one. The message box is a
+  pill with **+** (attach a file, post as task, new agent); `@name` at the start writes to one
+  agent, and mentions show as chips. **Search** filters the chat. **New agent** comes in four
+  steps (identity, workspace, engine, briefing) and also sets the agent's picture, colour, model
+  and extra instructions; "From a template" starts from a role. Soft and rounded, in crewchat's
+  blue, light and dark; on a phone the crew is a drawer and the panel a full-screen sheet. The page
+  from before is at `/classic` for one release. A picture is checked before it is uploaded, a
+  picture that can't be loaded is not asked for again, and text on a coloured avatar picks its ink
+  by contrast.
+- **16 built-in 3D pictures** for agents and roles (a robot, a coder, an artist, a scientist, an
+  owl...), from Microsoft's Fluent Emoji (MIT licence), served by crewchat itself. Every pack's
+  roles now come with one; agents can pick them with `hub_profile` too.
 - **Role packs, for any crew** (new chat page, PR 2 of 5). A project's roles come from a pack:
   software team (today's roles, the default), YouTube channel, Instagram creator, small business,
   or blank. `crewchat start --pack youtube` picks one for a new project, `crewchat roles pack`

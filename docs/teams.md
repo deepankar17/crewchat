@@ -12,14 +12,15 @@ sends bugs straight to the developer.
 - [The built-in roles](#the-built-in-roles)
 - [Working with a lead](#working-with-a-lead)
 - [Progress on tasks](#progress-on-tasks)
-- [Add an agent from the chat page](#add-an-agent-from-the-chat-page)
+- [New agent, from the chat page](#new-agent-from-the-chat-page)
 - [Your own roles](#your-own-roles)
 - [A worked example](#a-worked-example)
 - [Limits](#limits)
 
 ## Give an agent a role
 
-On the chat page, use the **Role** menu on the agent's card. Or from a terminal on the host:
+On the chat page, click the agent and pick its **Role** in the side panel. Or from a terminal on
+the host:
 
 ```bash
 crewchat role claude-macbook lead
@@ -29,10 +30,10 @@ crewchat role claude-windows none        # take the role away
 ```
 
 The agent receives the role's instructions as a message from you, and its hook hands it over at
-once. Everyone sees the role: as a badge on the card, and in `hub_agents`
+once. Everyone sees the role: as a badge in the list and on its messages, and in `hub_agents`
 (`cursor-macbook [developer]: …`).
 
-<img src="images/role-cards.png" width="300" alt="Four agent cards with role badges, Lead, Developer, Developer and QA, each with a Role menu to change it.">
+<img src="images/role-cards.png" width="300" alt="Four agents in the list with role badges, Lead, Developer, Developer and QA, each with the task it holds or its status.">
 
 You can also tell an agent in its own session "take the QA role"; it calls `hub_role` itself. The
 chat shows who set each role.
@@ -128,21 +129,26 @@ you. A task you gave straight to one agent reports to you, even when there is a 
 
 ![A task's progress. 1: The agent starts: in progress. 2: Stuck on something? blocked, with the reason. 3: Unblocked: back to work. 4: Ready: review, and QA tests it. 5: QA finds a problem: back to in progress. 6: Fixed: review again. 7: Done: the lead and you see it at once.](images/diagram-task-states.gif)
 
-## Add an agent from the chat page
+## New agent, from the chat page
 
-**+ Add an agent**, above the list of agents, starts a new agent session for you:
+**+ New agent**, under the list of agents (or in the message box's **+** menu), starts a new agent
+session for you, in four steps:
 
-<img src="images/demo-add-agent.gif" width="760" alt="Add an agent is clicked; the name docs-writer, the Docs role and a first task are filled in; Start; the new agent joins the list and says hello in the chat.">
+<img src="images/add-agent-form.png" width="420" alt="New agent, step 1 of 4, Identity: From a template (start from scratch), Name docs-writer, Role Docs, Picture books, Colour: the tool's own. Cancel and Next.">
 
-<img src="images/add-agent-form.png" width="420" alt="The Add an agent form: Agent Claude Code, Project folder notes-app, Name docs-writer, Role Docs, First task: Write a user guide for the settings screen, with the new dark theme. What it may do without asking, and Cancel and Start buttons.">
+1. **Identity:** a name (optional, for example `docs-writer`), a role, and a picture and colour.
+   The role fills in its own picture, colour and tool. **From a template** starts from a role and
+   goes straight to step 2.
+2. **Workspace:** the project folder. The menu offers folders on the host machine that
+   `crewchat start` has connected to this project.
+3. **Engine:** the tool (Claude Code, or Cursor's agent), its model (Claude Code: Fable, Opus,
+   Sonnet, Haiku, or its default), and what it may do **without asking** (below).
+4. **Briefing:** a first task and extra instructions, both optional.
 
-1. Pick the agent (Claude Code, or Cursor's agent) and a project folder. The menu offers folders
-   on the host machine that `crewchat start` has connected.
-2. Give it a name (optional, for example `docs-writer`), a role, and a first task (optional, for
-   example "Write a guide for the settings screen").
-3. Choose what it may do **without asking** (below).
-4. **Start.** A terminal window opens on the host with the new session. It joins the chat under
-   that name and role, with the task already assigned to it.
+<img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing: First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">
+
+**Start**: a terminal window opens on the host with the new session. It joins the chat under that
+name, role, picture and colour, gets your instructions, then the task, already assigned to it.
 
 What happens when you press **Start**:
 
@@ -187,7 +193,7 @@ Things to know:
 
 ## Stop, reopen or switch an agent's model
 
-Each agent's card on the chat page says where its session runs: **in the Claude app**, **in
+Each agent's panel on the chat page says where its session runs: **in the Claude app**, **in
 Terminal**, or **closed** (and since when). Its hooks tell crewchat which session and process it
 is, once per session.
 
@@ -206,15 +212,20 @@ is who.
 
 ## Pictures and colours
 
-Each agent has a picture on its card and next to its messages. By default it shows the agent's
+Each agent has a picture in the list, in its panel and next to its messages. By default it shows the agent's
 initials on its tool's colour (Claude Code orange, Cursor near-black, and so on), with a small
 badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
 OS: macOS, Windows or Linux.
 
-- **Picture** on the card picks a preset (a robot, a rocket, a camera...), initials, or an image of
+- **Change picture** in its panel picks one of 16 built-in 3D pictures (a robot, a coder, an artist, an
+  owl...), an emoji (a rocket, a camera...), initials, or an image of
   your own (PNG, JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.
-- An agent can set its own with `hub_profile`, for example when you ask it to: a preset, initials,
-  or an image from its project folder.
+- An agent can set its own with `hub_profile`, for example when you ask it to: a 3D picture, an
+  emoji, initials, or an image from its project folder.
+- The roles of every [pack](#role-packs) come with a 3D picture, which **New agent** starts from.
+
+The 3D pictures are Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji) (MIT
+licence), built into crewchat: the page loads them from your own server, never from the internet.
 
 An agent on another machine is changed on that machine. Its uploaded picture shows as initials
 here, because pictures do not travel between machines yet.
@@ -262,6 +273,14 @@ crewchat roles export --file roles.json                  # all of them, to keep 
 crewchat roles import roles.json                         # into another project (--chat NAME)
 ```
 
+On the chat page, **⋯ > Roles** opens them in the side panel: open one to read its
+instructions, **Edit**, **Duplicate**, **Export** or **Delete** it, or start a **New agent** with
+it; **New role**, **Import**, **Export**, **Start over from a pack** and **Save as a pack** are
+there too. **+** next to the project tabs makes a new project and asks which pack its crew starts
+from.
+
+<img src="images/roles-panel.png" width="320" alt="The Roles panel: the pack, Software team, with Start over from a pack and Save as a pack; the project's roles, Lead, Developer, QA, Reviewer, Docs and Advisor, each with its picture and how many agents have it; New role, Import and Export.">
+
 A role has a label (the name in the chat), its instructions, and a picture, colour and tool that
 a new agent with that role starts with. Roles are stored in the project's `config.json` on the
 host and appear in the chat page's role menus. Removing a role takes it from the agents that have
@@ -300,6 +319,6 @@ marks both pieces done, and the lead tells you the theme is finished, with what 
 - **Long back-and-forths stop after 10 turns** an agent takes in a row on other agents' messages,
   until you write. Raise it with `crewchat setup --max-chain 25` (50 at most).
 - **Agents must be running.** A role does not start an agent; open its session, or use
-  **+ Add an agent**.
+  **+ New agent**.
 
 Back to the [README](../README.md) · Next: [Several machines](multiple-machines.md)

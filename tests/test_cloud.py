@@ -67,7 +67,9 @@ class Machine:
         Machine.count += 1
         self.root = Path(TMP) / ("m%d-%s" % (Machine.count, name))
         self.root.mkdir(parents=True)
-        crewchat.save_config({"project": "Demo"}, self.root)
+        # Agents named after tool and machine (claude-mac): two machines that each pick the same first name
+        # at once settle the clash with a rename, which these tests should not have to wait for.
+        crewchat.save_config({"project": "Demo", "agent_names": "place"}, self.root)
         self.link = Link(store)
         self.device = cloud.Device(self.root)
         self.device.create(name)

@@ -253,6 +253,29 @@ def scene_team(b):
     b.open(chat.sign_in())
     b.shoot("team")
     b.shoot("role-cards", "#agents", pad=8)
+    # The side panel: an agent, then the project's roles.
+    b.size(1280, 900)
+    b.open(chat.sign_in())
+    b.js("openPanel('agent', state.agents[0].agent)")
+    time.sleep(0.5)
+    b.shoot("agent-panel")
+    b.js("openPanel('roles')")
+    time.sleep(0.8)
+    b.shoot("roles-panel", "#panel", pad=0)
+    # Needs you: a blocked task with its question, and its panel.
+    blocked = chat.hub.add_row(O, "Pick the default theme")["id"]
+    chat.hub.add_row(O, "Ship the settings screen", depends=blocked)
+    lead_name = list(chat.hub.agents)[0]
+    chat.hub.take(lead_name, blocked)
+    chat.hub.update(lead_name, blocked, "blocked", "Should the default follow the system setting, or always be light?")
+    time.sleep(1.5)
+    b.js("openPanel('task', %s)" % json.dumps(blocked))
+    time.sleep(0.6)
+    b.shoot("needs-you")
+    b.js("closePanel(); showView('tasks'); $('as-board').click()")
+    time.sleep(0.5)
+    b.shoot("task-board")
+    b.js("showView('chat')")
     chat.stop()
 
 
@@ -306,10 +329,13 @@ def scene_add_agent(b):
         b.size(1100, 760)
         b.open(chat.sign_in())
         b.js("""(async () => { await openLaunch(); await new Promise(r => setTimeout(r, 400));
-            $("l-name").value = "docs-writer"; $("l-role").value = "docs";
+            $("l-name").value = "docs-writer"; $("l-role").value = "docs"; applyRole("docs");
             $("l-task").value = "Write a user guide for the settings screen, with the new dark theme."; })()""")
         time.sleep(0.4)
         b.shoot("add-agent-form", "#launch", pad=0)
+        b.js("showStep(3)")
+        time.sleep(0.3)
+        b.shoot("add-agent-briefing", "#launch", pad=0)
     finally:
         crewchat.launch_options = old
     chat.stop()

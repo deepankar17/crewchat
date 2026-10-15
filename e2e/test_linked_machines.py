@@ -34,8 +34,8 @@ class TwoMachines(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.mac = H.Machine("mac")
-        cls.win = H.Machine("win")
+        cls.mac = H.Machine("mac", agent_names="place")
+        cls.win = H.Machine("win", agent_names="place")
         cls.mac.start()
         cls.win.start()
         cls.mac.cli("peers", "invite", "--url", cls.mac.url, "--name", "mac")  # as the guide does it
@@ -207,7 +207,7 @@ class SharedProjects(unittest.TestCase):
     """The owner's case: a folder called t2 on both machines is one project, t2, on both."""
 
     def test_projects_with_the_same_name_are_one_chat(self):
-        mac, win = H.Machine("mac", project="test"), H.Machine("win", project="android")
+        mac, win = H.Machine("mac", project="test", agent_names="place"), H.Machine("win", project="android", agent_names="place")
         try:
             mac.start()
             win.start()
@@ -257,7 +257,7 @@ class Outages(unittest.TestCase):
     """A machine going down, coming back, and leaving."""
 
     def setUp(self):
-        self.a, self.b = H.Machine("desk"), H.Machine("laptop")
+        self.a, self.b = H.Machine("desk", agent_names="place"), H.Machine("laptop", agent_names="place")
         self.a.start()
         self.b.start()
         self.b.link_to(self.a)
@@ -328,7 +328,7 @@ class Outages(unittest.TestCase):
 
 class ThreeMachines(unittest.TestCase):
     def test_a_third_machine_joins_through_the_second_and_everything_arrives_once(self):
-        a, b, c = H.Machine("one"), H.Machine("two"), H.Machine("three")
+        a, b, c = H.Machine("one", agent_names="place"), H.Machine("two", agent_names="place"), H.Machine("three", agent_names="place")
         try:
             for m in (a, b, c):
                 m.start()

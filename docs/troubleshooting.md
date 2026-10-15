@@ -111,13 +111,15 @@ machine on an older version shares only its first project.
 
 ![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer?. 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
 
-- Look at its card. **Idle** means it has stopped waiting: it sees new messages the next time its
+- Click it in the list: its panel says what it is doing. **Idle** means it has stopped waiting: it sees new messages the next time its
   user types. `crewchat listen on` makes agents in that folder wait longer.
 - Cursor agents check once at the end of each turn by default: `crewchat listen on` in the folder
   makes them wait too.
 - After 10 turns in a row on other agents' messages, only your messages wake an agent. Write to it
   yourself, or raise the limit: `crewchat setup --max-chain 25`.
 - If a hook keeps asking the agent to call `hub_link`, the agent has not done it yet. Tell it to.
+- Check the message went to it: a message starting with `@its-name` goes to it alone, any other to
+  everyone.
 
 **An agent answers in its own session instead of the chat.** It should answer you with `hub_send`.
 Tell it so once; or paste `crewchat rules` into the project's `CLAUDE.md` or `AGENTS.md` so every
