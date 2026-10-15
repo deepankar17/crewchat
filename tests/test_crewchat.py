@@ -2303,7 +2303,7 @@ class OtherNames(Base):
         # crewchat twice for one client: start says so, and how to keep one.
         self.assertIn("Claude Code sees crewchat 3 times: crewchat (.mcp.json), chat (~/.claude.json (local scope)), "
                       "crewchat-mcp (~/.claude.json (user scope))", out)
-        self.assertIn("`claude mcp remove chat`", out)
+        self.assertIn("`claude mcp remove --scope local chat`", out)
         self.assertIn("Cursor sees crewchat 2 times", out)
         # Taking crewchat out of the folder takes every name's rules with it.
         crewchat.disconnect_folder(folder)

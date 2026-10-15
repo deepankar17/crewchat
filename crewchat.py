@@ -5958,9 +5958,10 @@ def duplicate_note(project, client, root=None):
     if len({name for name, _ in found}) < 2:
         return None
     where = ", ".join("%s (%s)" % (name, place) for name, place in found)
-    extra = next(name for name, _ in found if name != SERVER_NAME)
-    fix = ("`claude mcp remove %s` (add --scope user for one in user scope)" % extra if client == "claude"
-           else "taking %s out of its mcp.json" % extra)
+    extra, place = next((name, place) for name, place in found if name != SERVER_NAME)
+    scope = next((s for s in ("user", "local") if "(%s scope)" % s in place), "project")
+    fix = ("`claude mcp remove --scope %s %s`" % (scope, extra) if client == "claude"
+           else "take %s out of %s" % (extra, place))
     return ("%s sees crewchat %d times: %s. Its agents get every chat tool twice; one is enough. "
             "Both work and both are allowed without asking. To keep one: %s."
             % ({"claude": "Claude Code", "cursor": "Cursor"}[client], len(found), where, fix))
