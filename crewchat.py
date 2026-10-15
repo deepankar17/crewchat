@@ -3865,6 +3865,8 @@ COMMANDS = [
         ("hooks off [--project FOLDER]", "Keep a folder's sessions out of the chat: no request to join, no messages handed over.", None),
         ("hooks on [--project FOLDER]", "Let them back in.", None),
         ("hooks status [--project FOLDER]", "Show the setting.", None),
+        ("hooks refresh", "Write every connected folder's hooks again for this crewchat (after a reinstall moved it).",
+         {"argv": ["hooks", "refresh"]}),
         ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
         ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
         ("invite [--local] [--place NAME] [--client all|claude|cursor|generic] [--url URL]",
@@ -4911,8 +4913,24 @@ def owner_tool(name, **arguments):
 
 
 def self_command():
-    """How to run this same program again, for hooks and services: [python, script]."""
+    """How to run this same program again: [python, script]."""
     return [Path(sys.executable).as_posix(), Path(__file__).resolve().as_posix()]
+
+
+def launcher():
+    """An installed crewchat's own command (the uv tool's bin/crewchat), or None for a checkout. It
+    stays put when uv rebuilds the tool, perhaps on another Python, unlike this file's path; and if
+    crewchat is gone, running it fails in the shell (not with Python's exit 2, which Claude Code's
+    hooks take as "block")."""
+    folder = tool_folder()
+    exe = folder / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat") if folder else None
+    return exe if exe and exe.is_file() else None
+
+
+def run_command():
+    """How hooks and the login service run crewchat: its launcher, else Python and this script."""
+    exe = launcher()
+    return [exe.as_posix()] if exe else self_command()
 
 
 # --------------------------------------------------------------------------------------------
@@ -5942,9 +5960,9 @@ def git_exclude(project, paths):
 
 def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
-    # cmd and PowerShell, whichever shell the agent's tool uses for hooks.
-    python, script = (p if " " not in p else '"%s"' % p for p in self_command())
-    return "%s %s hook %s %s" % (python, script, client, event)
+    # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
+    # installed crewchat runs by its own launcher.
+    return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
 def is_our_hook(command):
@@ -6318,6 +6336,9 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
+SERVER_GONE_SECS = 15  # a hook gives up on a server unreachable this long in a row (a restart takes less)
+
+
 def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None):
     """Ask the server for this session's messages without marking them read.
 
@@ -6331,6 +6352,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
     """
     begun = time.time()
     deadline = begun + wait_total
+    failing = None  # since when the server has not answered
     while True:
         # Round up, so the last call waits out the remainder instead of asking again and again.
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
@@ -6338,6 +6360,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         try:
             out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
                                                         "chain": chain}, timeout=MAX_WAIT + 30)
+            failing = None
             if out.get("session") == "want" and report:
                 found, report = report(), None
                 if found:  # a quick call of its own, so a long wait above is not held up
@@ -6345,8 +6368,11 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
-            # The server is restarting or briefly unreachable. While listening, keep trying.
-            if time.time() + 5 >= deadline:
+            # The server is restarting or briefly unreachable: while listening, keep trying. One that
+            # stays unreachable is off (crewchat stopped, or the folder used without it): give up
+            # soon, so the agent's session is not held up waiting for it.
+            failing = failing or time.time()
+            if time.time() + 5 >= deadline or time.time() - failing >= SERVER_GONE_SECS:
                 raise
             time.sleep(3)
             continue
@@ -6856,7 +6882,32 @@ def serve_unconnected(start, stdin=None, stdout=None):
             stdout.flush()
 
 
+def refresh_hooks():
+    """Bring the hooks of every folder connected on this machine up to this copy of crewchat now, as
+    the server does when it starts (upgrade_folders): an update or a reinstall can move crewchat
+    (another Python, another folder), and hooks still pointing at the old one fail, even with the
+    server off. Returns the folders whose hooks changed."""
+    done = []
+    for path in sorted(load_config().get("folders") or {}):
+        try:
+            if Path(path).is_dir() and update_hooks(path):
+                done.append(path)
+        except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
+            print("- Could not update crewchat's hooks in %s: %s" % (path, e))
+    return done
+
+
 def cmd_hooks(args):
+    if args.mode == "refresh":
+        if not (home() / "config.json").exists():
+            print("No folder is connected on this machine yet.")
+            return
+        done = refresh_hooks()
+        if not server_up(load_config()):  # no restart follows to do it (update, install.sh): the service too
+            refresh_service()
+        print("Updated the hooks in %d connected folder%s for crewchat %s; the others were up to date." % (
+            len(done), "" if len(done) == 1 else "s", __version__))
+        return
     project = Path(args.project or ".").resolve()
     path = project / ".crewchat-hooks"
     if args.mode == "off":
@@ -6909,8 +6960,7 @@ def cmd_listen(args):
 # Start at login
 # --------------------------------------------------------------------------------------------
 def launchd_plist(keep_awake):
-    python, script = self_command()
-    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + [python, script, "serve"]
+    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + run_command() + ["serve"]
     log = (home() / "hub.log").as_posix()
     env = ""
     if os.environ.get("CREWCHAT_HOME"):
@@ -6936,11 +6986,10 @@ def launchd_plist(keep_awake):
 
 
 def systemd_unit():
-    python, script = self_command()
     env = "Environment=CREWCHAT_HOME=%s\n" % home().as_posix() if os.environ.get("CREWCHAT_HOME") else ""
     return ("[Unit]\nDescription=crewchat: group chat for AI coding agents\n\n[Service]\n"
-            "ExecStart=\"%s\" \"%s\" serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
-            % (python, script, env))
+            "ExecStart=%s serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+            % (" ".join('"%s"' % p for p in run_command()), env))
 
 
 def run(command):
@@ -7059,8 +7108,7 @@ def cmd_service(args):
     if not (mac or linux):
         die("starting at login is automated on macOS, Linux and Windows only. Run `crewchat serve` instead.")
     uid = os.getuid()
-    plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-    unit = Path.home() / ".config" / "systemd" / "user" / "crewchat.service"
+    plist, unit = service_file(mac=True), service_file(mac=False)
     if args.action == "install":
         if mac:
             run(["launchctl", "bootout", "gui/%d/%s" % (uid, SERVICE_LABEL)])
@@ -7204,15 +7252,21 @@ def reclaim_checks(projects):
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
 
 
+def service_file(mac=None):
+    """The login service's file: launchd's plist on macOS, the systemd user unit elsewhere."""
+    if mac is None:
+        mac = sys.platform == "darwin"
+    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if mac
+            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+
+
 def service_installed():
     """Is crewchat's login service set up, and for this chat? A machine has one such service; it
     belongs to another chat when it was set up with another CREWCHAT_HOME, and is then left alone."""
     if os.name == "nt":
         return windows_service() is not None
-    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
-            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
     try:
-        text = path.read_text(encoding="utf-8")
+        text = service_file().read_text(encoding="utf-8")
     except OSError:
         return False
     return service_home_is_ours(re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)",
@@ -7262,8 +7316,7 @@ def start_server(config):
             else:
                 start_background()
         elif sys.platform == "darwin":
-            plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)]).returncode != 0:
+            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(service_file())]).returncode != 0:
                 run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
         else:
             run(["systemctl", "--user", "start", "crewchat.service"])
@@ -7280,8 +7333,7 @@ def service_present():
     """Does this machine have crewchat's login service at all, for this chat or another one?"""
     if os.name == "nt":
         return run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0 or run_entry() is not None
-    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")).exists() or \
-        (Path.home() / ".config" / "systemd" / "user" / "crewchat.service").exists()
+    return service_file(mac=True).exists() or service_file(mac=False).exists()
 
 
 def cmd_resume(_args):
@@ -7291,6 +7343,7 @@ def cmd_resume(_args):
     config = load_config()
     if server_up(config):
         return
+    refresh_service()
     supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
     if (supported and config.get("service") is not False and not service_installed()
             and not service_present()):
@@ -7312,9 +7365,33 @@ def cmd_stop(_args):
     print("Start it again with `crewchat restart`%s." % (", or log in again" if service_installed() else ""))
 
 
+def refresh_service():
+    """A login service written by another copy of crewchat (before an update or a reinstall moved it)
+    still runs that copy, which may be gone: write this copy's in its place, keeping --keep-awake.
+    macOS and Linux (Windows' task keeps pythonw, which has no console); the server is stopped. Only an
+    installed crewchat does it: a checkout or a uvx copy restarting must not take the service over."""
+    if os.name == "nt" or launcher() is None or not service_installed():
+        return
+    mac = sys.platform == "darwin"
+    path = service_file()
+    try:
+        old = path.read_text(encoding="utf-8")
+        new = launchd_plist("/usr/bin/caffeinate" in old) if mac else systemd_unit()
+        if new == old:
+            return
+        if mac:
+            run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])  # start_server loads it again
+        path.write_text(new, encoding="utf-8")
+        if not mac:
+            run(["systemctl", "--user", "daemon-reload"])
+    except OSError as e:  # never what stops a restart
+        print("- Could not update crewchat's login service (%s); `crewchat service install` does." % e)
+
+
 def cmd_restart(_args):
     config = load_config()
     stop_server(config)
+    refresh_service()
     start_server(config)
     print("crewchat %s is running at %s." % (__version__, local_url(config)))
 
@@ -7392,7 +7469,8 @@ def windows_update_script(uv, specs, crewchat_exe, folder, pid):
                      "'Not on PyPI yet; installing it from its GitHub release.' } }" % install(spec))
     lines.append("if (-not $done) { & %s; $done = $LASTEXITCODE -eq 0 }" % install(specs[-1]))
     lines += [
-        "if ($done) { & %s resume; Write-Host ''; & %s --version }" % (quote(crewchat_exe), quote(crewchat_exe)),
+        "if ($done) { & %s hooks refresh; & %s resume; Write-Host ''; & %s --version }"
+        % (quote(crewchat_exe), quote(crewchat_exe), quote(crewchat_exe)),
         "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
         "Write-Host ''",
         "Read-Host 'Press Enter to close'",
@@ -7411,7 +7489,7 @@ def cmd_update(args):
     uv = find_uv()
     local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
     if os.name == "nt" and uv and not local:
-        exe = Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
+        exe = launcher() or Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
         script = windows_update_script(uv, update_specs(version), exe, tool_folder() or Path(__file__).parent,
                                        os.getpid())
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", script],
@@ -7430,8 +7508,13 @@ def cmd_update(args):
         else:
             if subprocess.run([uv] + UV_INSTALL + [specs[-1]], env=env).returncode != 0:
                 die("the update did not install; crewchat %s is still in place." % __version__)
+        # The new copy, not this one: uv rebuilt the tool, perhaps on another Python, so this
+        # process's script may be gone. It writes the folders' hooks for itself, then restarts.
+        new = run_command()
+        subprocess.run(new + ["hooks", "refresh"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)  # quietly: an older release has no `hooks refresh`
         if running:
-            subprocess.run(self_command() + ["restart"], env=env)  # a fresh process runs the new code
+            subprocess.run(new + ["restart"], env=env)
         return
     fetch = ("cat %s" % shlex.quote(str(Path(local) / "install.sh")) if local and Path(local).is_dir() else
              "curl -LsSf %s" % INSTALL_SH if shutil.which("curl") else
@@ -12033,7 +12116,8 @@ def build_parser():
     p.set_defaults(fn=cmd_listen)
 
     p = sub.add_parser("hooks", help="switch this project's hooks off (its sessions stay out of the chat) or on")
-    p.add_argument("mode", choices=["on", "off", "status"])
+    p.add_argument("mode", choices=["on", "off", "status", "refresh"],
+                   help="refresh: write every connected folder's hooks again for this crewchat (after a reinstall)")
     p.add_argument("--project")
     p.set_defaults(fn=cmd_hooks)
 
