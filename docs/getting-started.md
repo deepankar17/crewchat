@@ -138,10 +138,19 @@ chat says who is working. Only a file's name and a command's program are shown (
 subcommand for well-known tools such as `npm test` or `git commit`), never arguments or contents.
 It stays on the machine the agent runs on. `crewchat setup --activity off` keeps it off the page.
 
-Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
-**waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next
-types), its task and last message, its role and listening setting, and **Message**, **Stop** or
-**Reopen**, **Change picture** and **Remove**. Its name is a field: click it, type, Enter. ✕ or Esc closes the panel.
+Click an agent to open its settings on the left, under the list of agents: what it is doing
+(**working**, **waiting for messages**, so it answers at once, or **idle**, so it sees messages when
+its user next types), its task and last message, its role and listening setting, and **Message**,
+**Stop** or **Reopen**, and **Remove**. Click its picture to change it. Its name is a field: click
+it, type, Enter. ✕ or Esc closes it. The side panel on the right is for the project: its rules,
+skills and machines, its roles (**⋯**), its tasks, and **Commands**.
+
+An agent whose last conversation crewchat did not record (one that joined before crewchat kept
+track of sessions) has **Start again** instead of **Reopen**: a new session opens in a Terminal
+window in its folder and checks in as the same agent, with its name, role, picture and tasks.
+
+**New agent** works in a project made on the page, too: under **Or connect one**, type a folder's
+path (`~/code/my-app`) and **Connect** runs `crewchat start` in it for you.
 
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 

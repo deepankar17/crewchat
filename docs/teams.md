@@ -19,7 +19,7 @@ sends bugs straight to the developer.
 
 ## Give an agent a role
 
-On the chat page, click the agent and pick its **Role** in the side panel. Or from a terminal on
+On the chat page, click the agent and pick its **Role** in its settings, under the list of agents. Or from a terminal on
 the host:
 
 ```bash
@@ -219,7 +219,8 @@ initials on its tool's colour (Claude Code orange, Cursor near-black, and so on)
 badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
 OS: macOS, Windows or Linux.
 
-- **Change picture** in its panel picks one of 16 built-in 3D pictures (a robot, a coder, an artist, an
+- A new agent gets one of 16 built-in 3D pictures at random (one nobody in the chat has). Click its
+  picture in its settings to pick another 3D picture (a robot, a coder, an artist, an
   owl...), an emoji (a rocket, a camera...), initials, or an image of
   your own (PNG, JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.
 - An agent can set its own with `hub_profile`, for example when you ask it to: a 3D picture, an
