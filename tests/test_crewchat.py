@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -3344,6 +3345,67 @@ class Lifecycle(Base):
         page = self.raw("/", opener=opener)[1].decode()
         self.assertIn('id="update"', page)
         self.assertIn("crewchat update", page)
+
+    def test_hooks_refresh_points_every_connected_folder_at_this_copy(self):
+        folder = Path(tempfile.mkdtemp(prefix="rehook-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "rehook")
+        hooks = lambda: (folder / ".claude" / "settings.local.json").read_text() + (folder / ".cursor" / "hooks.json").read_text()  # noqa: E731
+        self.assertIn(crewchat.self_command()[1], hooks())
+        # A reinstall moved crewchat (here: another Python's folder): the old hooks point nowhere.
+        moved = ["/tools/crewchat/bin/python", "/tools/crewchat/lib/python3.12/site-packages/crewchat.py"]
+        with mock.patch.object(crewchat, "self_command", return_value=moved):
+            out = cli("hooks", "refresh")
+        self.assertIn("Wrote the hooks again in", out)
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook claude stop", hooks())
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook cursor", hooks())
+        self.assertNotIn(crewchat.self_command()[1], hooks())
+        cli("hooks", "refresh")  # and back
+
+    def test_a_hook_gives_up_soon_on_a_server_that_is_off(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens there: crewchat stopped, the folder used on its own
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1):
+            with self.assertRaises((urllib.error.URLError, OSError)):
+                crewchat.hook_check("http://127.0.0.1:%d" % port, "token", "key", 1800, 0)  # listening 30 min
+        self.assertLess(time.time() - began, 10)  # not the 30 minutes it would have listened
+
+    def test_an_installed_crewchats_hooks_run_its_own_command(self):
+        bin_dir = Path(tempfile.mkdtemp(prefix="tool-bin-", dir=TMP))
+        (bin_dir / "python").write_text("")
+        launcher = bin_dir / ("crewchat.exe" if os.name == "nt" else "crewchat")
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat.sys, "executable", str(bin_dir / "python")):
+            self.assertIn("/python ", crewchat.hook_command("claude", "stop"))  # no launcher there: Python and the script
+            launcher.write_text("")
+            self.assertEqual(crewchat.hook_command("claude", "stop"), "%s hook claude stop" % launcher.as_posix())
+            self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "stop")))
+        # A checkout (no launcher of its own) runs its script with this Python, as before.
+        self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_update_runs_the_new_copy_not_this_one(self):
+        ran = []
+
+        def run(command, **kw):
+            ran.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat, "find_uv", return_value="/bin/uv"), \
+                mock.patch.object(crewchat, "latest_release", return_value="99.0.0"), \
+                mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(crewchat, "installed_command", return_value=["/new/bin/crewchat"]), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CREWCHAT_SOURCE", None)
+            if os.name == "nt":
+                self.skipTest("Windows updates in a window of its own")
+            crewchat.cmd_update(argparse.Namespace(version=None))
+        self.assertEqual(ran[0][:2], ["/bin/uv", "tool"])
+        # This process's script may be gone (uv rebuilt the tool, perhaps on another Python).
+        self.assertEqual(ran[1:], [["/new/bin/crewchat", "hooks", "refresh"], ["/new/bin/crewchat", "restart"]])
 
     def test_uninstall_takes_crewchat_out_of_a_folder_and_leaves_the_rest(self):
         mine = Path(tempfile.mkdtemp(dir=TMP))
