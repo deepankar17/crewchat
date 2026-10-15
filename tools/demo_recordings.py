@@ -122,8 +122,11 @@ class Recorder:
                 % json.dumps("/".join(url.split("/")[:3]))
             for _ in range(100):
                 time.sleep(0.1)
-                if self.js(loaded):
-                    break
+                try:
+                    if self.js(loaded):
+                        break
+                except RuntimeError:  # asked mid-navigation, as the old page went away: ask again
+                    pass
             else:
                 raise RuntimeError("the page did not load: %s" % url)
         time.sleep(wait)

@@ -58,7 +58,8 @@ class Chat:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def agent(self, place="macbook", client="claude", status="", activity="working", name=None):
-        """A new agent; name gives it that first name instead of one the hub picks at random."""
+        """A new agent; name gives it that first name instead of one the hub picks at random (by a
+        rename, whose line in the chat quiet() drops with the join lines)."""
         auto = self.hub.agent_for(self.hub.open_session(place, client))
         if name and name != auto:
             self.hub.rename(auto, name)
