@@ -3962,21 +3962,66 @@ def run_crewchat(argv, root=None):
     return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
 
 
-def connect_folder(path, chat, root=None):
-    """The owner connects a folder on this machine to a project from the chat page's New agent:
-    `crewchat start` in it, as in a terminal. Returns the folder as the launch options list it."""
+MAX_LISTED_FOLDERS = 500  # Browse on the page lists this many folders of one folder
+
+
+def typed_folder(path):
+    """A folder path the owner typed on the page, made absolute (~ is the home folder)."""
     raw = str(path or "").strip()
     if not raw:
         raise HubError("type the folder's path")
     folder = Path(os.path.expanduser(raw))
     if not folder.is_absolute():
         raise HubError("type the folder's full path, such as ~/code/my-app")
-    folder = folder.resolve()
+    return folder.resolve()
+
+
+def list_folders(path, root=None):
+    """The folders in a folder on this machine, for New agent's Browse: hidden ones (.git, .cache)
+    and crewchat's own folder left out."""
+    folder = typed_folder(path or "~")
     if not folder.is_dir():
         raise HubError("there is no folder at %s" % folder)
+    try:
+        names = sorted((e.name for e in os.scandir(folder) if not e.name.startswith(".") and e.is_dir()), key=str.lower)
+    except OSError as e:
+        raise HubError("cannot open %s (%s)" % (folder, e.strerror or e))
+    names = [n for n in names if not inside_any(folder / n, {Path(root or home())})]
+    return {"path": str(folder), "parent": str(folder.parent) if folder.parent != folder else "",
+            "home": str(Path.home()), "more": len(names) > MAX_LISTED_FOLDERS,
+            "folders": [{"name": n, "path": str(folder / n)} for n in names[:MAX_LISTED_FOLDERS]]}
+
+
+def make_folder(path, name, root=None):
+    """A new folder called name in a folder on this machine, made from New agent's Browse."""
+    parent = typed_folder(path)
+    name = str(name or "").strip()
+    if not name or name in (".", "..") or len(name) > 100 or re.search(r"[\\/:\x00-\x1f]", name):
+        raise HubError("a folder's name has no / \\ or :, and is 100 characters at most")
+    folder = parent / name
+    if inside_any(folder, {Path(root or home())}):
+        raise HubError("not in crewchat's own folder")
+    try:
+        folder.mkdir()
+    except FileExistsError:
+        raise HubError("there is already a %s in %s" % (name, parent))
+    except OSError as e:  # no such parent, no permission
+        raise HubError("could not make %s (%s)" % (folder, e.strerror or e))
+    return str(folder)
+
+
+def connect_folder(path, chat, root=None, create=False):
+    """The owner connects a folder on this machine to a project from the chat page's New agent:
+    `crewchat start` in it, as in a terminal (create: make the folder first if it is not there).
+    Returns the folder as the launch options list it."""
+    folder = typed_folder(path)
     # Not the disk, home or above it (a .claude folder there is every session's), nor crewchat's own folder.
     if folder == Path(folder.anchor) or inside_any(Path.home(), {folder}) or inside_any(folder, {Path(root or home())}):
         raise HubError("pick a project's own folder, not %s" % folder)
+    if not folder.is_dir():
+        if not create:
+            raise HubError("there is no folder at %s" % folder)
+        make_folder(folder.parent, folder.name, root)
     done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open"], root)
     if done["code"] != 0:
         lines = [line for line in done["output"].splitlines() if line.strip()]
@@ -4578,10 +4623,15 @@ class Handler(BaseHTTPRequestHandler):
         return answer
 
     def _folders(self, data):
-        """The owner connects a folder on this machine to this project, for New agent."""
-        if data.get("op") != "connect":
-            raise HubError("unknown op")
-        path = connect_folder(data.get("path"), self.project.id, self.projects.base)
+        """New agent's folders on this machine: list one (Browse), make one, or connect one to this project."""
+        op, base = data.get("op"), self.projects.base
+        if op == "list":
+            return list_folders(data.get("path"), base)
+        if op == "mkdir":
+            return {"path": make_folder(data.get("path"), data.get("name"), base)}
+        if op != "connect":
+            raise HubError("op is list, mkdir or connect")
+        path = connect_folder(data.get("path"), self.project.id, base, create=data.get("create") is True)
         self.projects.primary.roster.refresh()  # the machine's folders and the folder's token, just written
         return {"path": path, "folders": launch_folders(self.hub.machine_config(), self.roster.root, self.hub.chat_key)}
 
@@ -9524,6 +9574,17 @@ dialog select, dialog input[type=text], dialog textarea { width: 100%; }
 dialog textarea { min-height: 80px; resize: vertical; }
 dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
 dialog fieldset { border: 0; padding: 0; margin: 0; }
+.browser { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 8px;
+  display: flex; flex-direction: column; gap: 6px; }
+.browser .crumbs { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+.browser .crumbs code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.browser .crumbs button, .browser .make button { padding: 3px 10px; font-size: 12.5px; }
+.browser .dirs { display: flex; flex-direction: column; max-height: 200px; overflow-y: auto; }
+.browser .dirs button { background: none; color: var(--text); text-align: left; border-radius: 10px; padding: 5px 10px;
+  font-weight: 500; font-size: 14px; }
+.browser .dirs button:hover, .browser .dirs button:focus-visible { background: var(--tint); }
+.browser .make { display: flex; gap: 6px; }
+.browser .make input { flex: 1; min-width: 0; }
 .steps { display: flex; gap: 4px; list-style: none; padding: 0; margin: 10px 0 4px; counter-reset: step; }
 .steps li { flex: 1; font-size: 12px; color: var(--muted); text-align: center; padding: 6px 0; border-radius: 99px; background: var(--soft); counter-increment: step; }
 .steps li::before { content: counter(step) ". "; }
@@ -9729,7 +9790,9 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
         <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
         <label for="l-path">Or connect one</label>
         <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
+          <button type="button" class="secondary" id="l-browse" aria-expanded="false" aria-controls="l-browser">Browse…</button>
           <button type="button" class="secondary" id="l-connect">Connect</button></div>
+        <div id="l-browser" class="browser" hidden aria-label="Folders on this machine"></div>
         <label>Machine</label><p id="l-machine"></p>
       </fieldset>
       <fieldset class="step" hidden>
@@ -10401,7 +10464,8 @@ async function openLaunch(role) {
   $("plus").open = false;
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
-  for (const id of ["l-name", "l-task", "l-instructions"]) $(id).value = "";
+  for (const id of ["l-name", "l-task", "l-instructions", "l-path"]) $(id).value = "";
+  $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false");
   $("l-folder-label").textContent = word("folder");
   $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
   const roles = state.roles.map((r) => new Option(r.title, r.name));
@@ -10442,26 +10506,83 @@ function launchNote(folders) {
   const missing = launchTools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
   $("launch-note").textContent = !ready.length
     ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then come back."
-    : !folders.length ? "No folder on this machine is in this project yet: type one's path under Or connect one." : missing;
+    : !folders.length ? "No folder on this machine is in this project yet: Browse to one (or make one), or type its path." : missing;
   $("l-start").disabled = !ready.length || !folders.length;
 }
-// The owner connects a folder to this project (`crewchat start` in it, on this machine).
-async function connectFolder() {
-  const path = $("l-path").value.trim(), button = $("l-connect");
+// The owner connects a folder to this project (`crewchat start` in it, on this machine). One that
+// is not there yet can be made: create.
+async function connectFolder(create) {
+  const path = $("l-path").value.trim(), button = $("l-connect"), note = $("launch-note");
   if (!path || button.disabled) return;
   button.disabled = true;
-  $("launch-note").textContent = "Connecting " + path + "…";
+  note.textContent = (create ? "Making and connecting " : "Connecting ") + path + "…";
   try {
-    const out = await postJSON("/api/folders", { op: "connect", path });
+    const out = await postJSON("/api/folders", { op: "connect", path, create: create === true });
     showFolders(out.folders, out.path);
     launchNote(out.folders);
     $("l-path").value = "";
-    $("launch-note").textContent = ["Connected " + out.path + ".", $("launch-note").textContent].join(" ").trim();
+    $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false");
+    note.textContent = ["Connected " + out.path + ".", note.textContent].join(" ").trim();
   } catch (err) {
-    $("launch-note").textContent = "Not connected: " + err.message;
+    note.replaceChildren("Not connected: " + err.message);
+    if (/^there is no folder at /.test(err.message)) {
+      const make = el("button", "link", "Create it and connect");
+      make.type = "button";
+      make.addEventListener("click", () => connectFolder(true));
+      note.append(" ", make);
+    }
   } finally {
     button.disabled = false;
   }
+}
+// Browse: the folders on the machine that hosts the page, to pick one or make one (a browser's own
+// file picker cannot say where a folder is).
+function tilde(path, home) { return home && (path === home || path.startsWith(home + "/")) ? "~" + path.slice(home.length) : path; }
+async function browse(path) {
+  const box = $("l-browser");
+  box.hidden = false;
+  $("l-browse").setAttribute("aria-expanded", "true");
+  let out;
+  try { out = await postJSON("/api/folders", { op: "list", path: path || "~" }); }
+  catch (err) { box.replaceChildren(el("p", "meta", "Cannot open it: " + err.message)); return; }
+  $("l-path").value = tilde(out.path, out.home);
+  const crumbs = el("div", "crumbs");
+  const go = (label, title, to) => {
+    const b = el("button", "secondary", label);
+    b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
+    b.addEventListener("click", () => browse(to));
+    crumbs.append(b);
+  };
+  if (out.parent) go("↑", "Up to " + tilde(out.parent, out.home), out.parent);
+  go("~", "The home folder", "~");
+  crumbs.append(el("code", "", tilde(out.path, out.home)));
+  const dirs = el("div", "dirs");
+  for (const f of out.folders) {
+    const b = el("button", "", "📁 " + f.name);
+    b.type = "button";
+    b.addEventListener("click", () => browse(f.path));
+    dirs.append(b);
+  }
+  if (!out.folders.length) dirs.append(el("p", "meta", "No folders in here."));
+  if (out.more) dirs.append(el("p", "meta", "More folders than shown: type the path instead."));
+  const make = el("div", "make");
+  const name = el("input");
+  name.type = "text"; name.placeholder = "New folder in here"; name.maxLength = 100; name.setAttribute("aria-label", "New folder name");
+  const add = el("button", "secondary", "New folder");
+  add.type = "button";
+  const mkdir = async () => {
+    if (!name.value.trim() || add.disabled) return;
+    add.disabled = true;
+    try { await browse((await postJSON("/api/folders", { op: "mkdir", path: out.path, name: name.value.trim() })).path); }
+    catch (err) { $("launch-note").textContent = "Not made: " + err.message; add.disabled = false; }
+  };
+  add.addEventListener("click", mkdir);
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); mkdir(); } });
+  const use = el("button", "", "Connect this folder");
+  use.type = "button";
+  use.addEventListener("click", () => { $("l-path").value = out.path; connectFolder(); });
+  make.append(name, add, use);
+  box.replaceChildren(crumbs, dirs, make);
 }
 // The chosen tool: its colour, its models, and what it may do without asking.
 function showTool() {
@@ -10526,7 +10647,11 @@ $("l-dice").addEventListener("click", () => {
   if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
   else $("l-dice").disabled = true;  // every first name is in use
 });
-$("l-connect").addEventListener("click", connectFolder);
+$("l-connect").addEventListener("click", () => connectFolder());
+$("l-browse").addEventListener("click", () => {
+  if (!$("l-browser").hidden) { $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false"); return; }
+  browse($("l-path").value.trim() || "~");
+});
 $("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connectFolder(); } });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
+  chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
+  and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
+  `connect`).
 - **crewchat under any name.** Registered as something other than `crewchat` (MCP directories
   publish `claude mcp add --scope user crewchat-mcp -- uvx crewchat stdio`), its tools now skip the
   permission prompt too: crewchat finds every name it is registered under for a folder (the

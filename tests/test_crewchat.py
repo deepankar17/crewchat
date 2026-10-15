@@ -1492,6 +1492,42 @@ class Launching(Base):
         cli("start", str(elsewhere), "--no-open", "--no-service", "--chat", "connect-other")
         self.assertIn("is in the project \"connect-other\"", connect(str(elsewhere))["error"])  # one project per folder
 
+    def test_browse_and_make_folders_from_the_page(self):
+        def op(**body):
+            try:
+                return crewchat.post_json(self.base + "/api/folders", self.owner, body)
+            except urllib.error.HTTPError as e:
+                return {"status": e.code, "error": json.loads(e.read())["error"]}
+        top = Path(tempfile.mkdtemp(prefix="browse-", dir=TMP)).resolve()
+        for name in ("beta", "Alpha", ".git"):
+            (top / name).mkdir()
+        (top / "notes.txt").write_text("a file, not a folder")
+        out = op(op="list", path=str(top))
+        self.assertEqual(out["path"], str(top))
+        self.assertEqual([f["name"] for f in out["folders"]], ["Alpha", "beta"])  # no hidden ones, no files
+        self.assertEqual(out["folders"][0]["path"], str(top / "Alpha"))
+        self.assertEqual(out["parent"], str(top.parent))
+        self.assertEqual(op(op="list")["path"], str(Path.home().resolve()))  # home to begin with
+        self.assertIn("there is no folder", op(op="list", path=str(top / "nope"))["error"])
+        # crewchat's own folder is not offered, nor can a folder be made in it.
+        self.assertNotIn(str(crewchat.home().resolve()), [f["path"] for f in op(op="list", path=str(crewchat.home().parent))["folders"]])
+        self.assertIn("crewchat's own folder", op(op="mkdir", path=str(crewchat.home()), name="x")["error"])
+        made = op(op="mkdir", path=str(top), name="my app")
+        self.assertEqual(made, {"path": str(top / "my app")})
+        self.assertTrue((top / "my app").is_dir())
+        self.assertIn("already", op(op="mkdir", path=str(top), name="my app")["error"])
+        for bad in ("", "..", "a/b", "a\\b", "c:d"):
+            self.assertIn("folder's name", op(op="mkdir", path=str(top), name=bad)["error"], bad)
+        self.assertEqual(op(op="rename")["status"], 400)
+        # Connect makes a missing folder when asked to (not its missing parents).
+        self.assertIn("there is no folder", op(op="connect", path=str(top / "new-app"))["error"])
+        self.assertIn("could not make", op(op="connect", path=str(top / "a" / "b"), create=True)["error"])
+        out = op(op="connect", path=str(top / "new-app"), create=True)
+        self.assertEqual(out["path"], str(top / "new-app"))
+        self.assertIn(str(top / "new-app"), [f["path"] for f in out["folders"]])
+        self.assertTrue((top / "new-app" / ".mcp.json").is_file())  # connected: crewchat start ran in it
+        self.assertEqual(self.raw("/api/folders", data=b'{"op": "list"}')[0], 401)  # the owner's only
+
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
         self.assertEqual(self.launch(tool="vim")["status"], 400)

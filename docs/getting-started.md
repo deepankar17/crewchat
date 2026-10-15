@@ -150,7 +150,8 @@ track of sessions) has **Start again** instead of **Reopen**: a new session open
 window in its folder and checks in as the same agent, with its name, role, picture and tasks.
 
 **New agent** works in a project made on the page, too: under **Or connect one**, type a folder's
-path (`~/code/my-app`) and **Connect** runs `crewchat start` in it for you.
+path (`~/code/my-app`), or **Browse…** the folders on the host and make a **New folder** there, and
+**Connect** runs `crewchat start` in it for you (a folder that is not there yet: **Create it and connect**).
 
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 

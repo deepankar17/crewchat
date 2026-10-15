@@ -529,6 +529,35 @@ class NewPage(Signed):
         c.until("$('panel').hidden && $('view-commands').getAttribute('aria-pressed') === 'false'", what="Commands to close")
         self.assertEqual(c.errors, [])
 
+    def test_new_agent_browses_makes_and_connects_a_folder(self):
+        c = self.chrome
+        top = H.TMP / "browse-here"
+        (top / "apps" / "web").mkdir(parents=True, exist_ok=True)
+        try:
+            c.js("openLaunch(); showStep(1)")
+            c.js("$('l-path').value = %s" % json.dumps(str(top)))
+            c.click("#l-browse")
+            c.until("[...document.querySelectorAll('#l-browser .dirs button')].some(b => b.textContent.includes('apps'))",
+                    what="the folder list")
+            c.js("[...document.querySelectorAll('#l-browser .dirs button')].find(b => b.textContent.includes('apps')).click()")
+            c.until("$('l-path').value.endsWith('/apps') && $('l-browser').innerText.includes('web')", what="into apps")
+            c.js("document.querySelector('#l-browser .make input').value = 'mobile'")
+            c.js("[...document.querySelectorAll('#l-browser .make button')].find(b => b.textContent === 'New folder').click()")
+            c.until("$('l-path').value.endsWith('/apps/mobile')", what="into the new folder")
+            self.assertTrue((top / "apps" / "mobile").is_dir())
+            c.js("[...document.querySelectorAll('#l-browser .make button')].find(b => b.textContent === 'Connect this folder').click()")
+            c.until("$('l-folder').value.endsWith('/apps/mobile') && $('l-browser').hidden", timeout=60, what="connected")
+            self.assertTrue((top / "apps" / "mobile" / ".mcp.json").is_file())
+            # A path that is not there: Connect offers to make it.
+            c.js("$('l-path').value = %s" % json.dumps(str(top / "apps" / "desktop")))
+            c.click("#l-connect")
+            c.until("$('launch-note').innerText.includes('Create it and connect')", what="the offer to make it")
+            c.js("[...$('launch-note').querySelectorAll('button')].find(b => b.textContent === 'Create it and connect').click()")
+            c.until("$('l-folder').value.endsWith('/apps/desktop')", timeout=60, what="made and connected")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("$('launch').close()")
+
     def test_errors_on_the_task_board_are_shown_there_and_keep_the_task(self):
         c = self.chrome
         c.click("#view-tasks")
