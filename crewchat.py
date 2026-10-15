@@ -4913,8 +4913,24 @@ def owner_tool(name, **arguments):
 
 
 def self_command():
-    """How to run this same program again, for hooks and services: [python, script]."""
+    """How to run this same program again: [python, script]."""
     return [Path(sys.executable).as_posix(), Path(__file__).resolve().as_posix()]
+
+
+def launcher():
+    """An installed crewchat's own command (the uv tool's bin/crewchat), or None for a checkout. It
+    stays put when uv rebuilds the tool, perhaps on another Python, unlike this file's path; and if
+    crewchat is gone, running it fails in the shell (not with Python's exit 2, which Claude Code's
+    hooks take as "block")."""
+    folder = tool_folder()
+    exe = folder / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat") if folder else None
+    return exe if exe and exe.is_file() else None
+
+
+def run_command():
+    """How hooks and the login service run crewchat: its launcher, else Python and this script."""
+    exe = launcher()
+    return [exe.as_posix()] if exe else self_command()
 
 
 # --------------------------------------------------------------------------------------------
@@ -5944,15 +5960,10 @@ def git_exclude(project, paths):
 
 def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
-    # cmd and PowerShell, whichever shell the agent's tool uses for hooks. An installed crewchat
-    # runs by its own command: it stays put when uv rebuilds the tool on another Python, and if
-    # crewchat is gone the shell says so (not Python's exit 2, which Claude Code takes as "block").
+    # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
+    # installed crewchat runs by its own launcher.
     quote = lambda p: p if " " not in p else '"%s"' % p  # noqa: E731
-    exe = Path(sys.executable).parent / ("crewchat.exe" if os.name == "nt" else "crewchat")
-    if installed_by_installer() and exe.is_file():
-        return "%s hook %s %s" % (quote(exe.as_posix()), client, event)
-    python, script = (quote(p) for p in self_command())
-    return "%s %s hook %s %s" % (python, script, client, event)
+    return "%s hook %s %s" % (" ".join(quote(p) for p in run_command()), client, event)
 
 
 def is_our_hook(command):
@@ -6326,7 +6337,7 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
-SERVER_GONE_SECS = 15  # a hook gives up on a server it cannot reach for this long (a restart takes less)
+SERVER_GONE_SECS = 15  # a hook gives up on a server unreachable this long in a row (a restart takes less)
 
 
 def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None):
@@ -6342,7 +6353,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
     """
     begun = time.time()
     deadline = begun + wait_total
-    reached = False  # the server answered this hook at least once
+    failing = None  # since when the server has not answered
     while True:
         # Round up, so the last call waits out the remainder instead of asking again and again.
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
@@ -6350,7 +6361,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         try:
             out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
                                                         "chain": chain}, timeout=MAX_WAIT + 30)
-            reached = True
+            failing = None
             if out.get("session") == "want" and report:
                 found, report = report(), None
                 if found:  # a quick call of its own, so a long wait above is not held up
@@ -6359,9 +6370,10 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
             raise
         except (urllib.error.URLError, OSError):
             # The server is restarting or briefly unreachable: while listening, keep trying. One that
-            # has not answered since this hook began is off (crewchat stopped, or the folder used
-            # without it): give up soon, so the agent's session is not held up waiting for it.
-            if time.time() + 5 >= deadline or (not reached and time.time() - begun >= SERVER_GONE_SECS):
+            # stays unreachable is off (crewchat stopped, or the folder used without it): give up
+            # soon, so the agent's session is not held up waiting for it.
+            failing = failing or time.time()
+            if time.time() + 5 >= deadline or time.time() - failing >= SERVER_GONE_SECS:
                 raise
             time.sleep(3)
             continue
@@ -6871,21 +6883,18 @@ def serve_unconnected(start, stdin=None, stdout=None):
             stdout.flush()
 
 
-def refresh_hooks(config=None):
-    """Write the hooks of every folder connected on this machine again, so they run this copy of
-    crewchat: an update or a reinstall can move it (another Python, another folder), and hooks
-    still pointing at the old one fail. Returns the folders done."""
-    config = config or load_config()
+def refresh_hooks():
+    """Bring the hooks of every folder connected on this machine up to this copy of crewchat now, as
+    the server does when it starts (upgrade_folders): an update or a reinstall can move crewchat
+    (another Python, another folder), and hooks still pointing at the old one fail, even with the
+    server off. Returns the folders whose hooks changed."""
     done = []
-    for path in sorted(config.get("folders") or {}):
-        folder = Path(path)
-        if not folder.is_dir():
-            continue
-        place, token, clients, _ = connected_project(folder, config)
-        for client in clients:
-            {"claude": install_claude, "cursor": install_cursor}[client](folder, local_url(config), token)
-        if clients:
-            done.append(folder)
+    for path in sorted(load_config().get("folders") or {}):
+        try:
+            if Path(path).is_dir() and update_hooks(path):
+                done.append(path)
+        except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
+            print("- Could not update crewchat's hooks in %s: %s" % (path, e))
     return done
 
 
@@ -6895,7 +6904,7 @@ def cmd_hooks(args):
             print("No folder is connected on this machine yet.")
             return
         done = refresh_hooks()
-        print("Wrote the hooks again in %d connected folder%s, for crewchat %s." % (
+        print("Updated the hooks in %d connected folder%s for crewchat %s; the others were up to date." % (
             len(done), "" if len(done) == 1 else "s", __version__))
         return
     project = Path(args.project or ".").resolve()
@@ -6950,8 +6959,7 @@ def cmd_listen(args):
 # Start at login
 # --------------------------------------------------------------------------------------------
 def launchd_plist(keep_awake):
-    python, script = self_command()
-    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + [python, script, "serve"]
+    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + run_command() + ["serve"]
     log = (home() / "hub.log").as_posix()
     env = ""
     if os.environ.get("CREWCHAT_HOME"):
@@ -6977,11 +6985,10 @@ def launchd_plist(keep_awake):
 
 
 def systemd_unit():
-    python, script = self_command()
     env = "Environment=CREWCHAT_HOME=%s\n" % home().as_posix() if os.environ.get("CREWCHAT_HOME") else ""
     return ("[Unit]\nDescription=crewchat: group chat for AI coding agents\n\n[Service]\n"
-            "ExecStart=\"%s\" \"%s\" serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
-            % (python, script, env))
+            "ExecStart=%s serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+            % (" ".join('"%s"' % p for p in run_command()), env))
 
 
 def run(command):
@@ -7376,13 +7383,6 @@ def find_uv():
     return None
 
 
-def installed_command(uv, env=None):
-    """The crewchat command uv installed ([path]), or None: after `uv tool install` it runs the new code."""
-    out = subprocess.run([uv, "tool", "dir", "--bin"], capture_output=True, text=True, env=env)
-    exe = Path(out.stdout.strip() or ".") / ("crewchat.exe" if os.name == "nt" else "crewchat")
-    return [str(exe)] if out.returncode == 0 and exe.is_file() else None
-
-
 def tool_folder():
     """The folder uv installed this crewchat into (the one holding uv-receipt.toml), or None."""
     return next((f for f in list(Path(__file__).resolve().parents)[:5] if (f / "uv-receipt.toml").exists()), None)
@@ -7481,8 +7481,9 @@ def cmd_update(args):
                 die("the update did not install; crewchat %s is still in place." % __version__)
         # The new copy, not this one: uv rebuilt the tool, perhaps on another Python, so this
         # process's script may be gone. It writes the folders' hooks for itself, then restarts.
-        new = installed_command(uv, env) or self_command()
-        subprocess.run(new + ["hooks", "refresh"], env=env)
+        new = run_command()
+        subprocess.run(new + ["hooks", "refresh"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)  # quietly: an older release has no `hooks refresh`
         if running:
             subprocess.run(new + ["restart"], env=env)
         return

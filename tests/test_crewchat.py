@@ -3355,7 +3355,7 @@ class Lifecycle(Base):
         moved = ["/tools/crewchat/bin/python", "/tools/crewchat/lib/python3.12/site-packages/crewchat.py"]
         with mock.patch.object(crewchat, "self_command", return_value=moved):
             out = cli("hooks", "refresh")
-        self.assertIn("Wrote the hooks again in", out)
+        self.assertIn("Updated the hooks in 1 connected folder", out)
         self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook claude stop", hooks())
         self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook cursor", hooks())
         self.assertNotIn(crewchat.self_command()[1], hooks())
@@ -3372,17 +3372,25 @@ class Lifecycle(Base):
                 crewchat.hook_check("http://127.0.0.1:%d" % port, "token", "key", 1800, 0)  # listening 30 min
         self.assertLess(time.time() - began, 10)  # not the 30 minutes it would have listened
 
-    def test_an_installed_crewchats_hooks_run_its_own_command(self):
-        bin_dir = Path(tempfile.mkdtemp(prefix="tool-bin-", dir=TMP))
-        (bin_dir / "python").write_text("")
-        launcher = bin_dir / ("crewchat.exe" if os.name == "nt" else "crewchat")
-        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
-                mock.patch.object(crewchat.sys, "executable", str(bin_dir / "python")):
-            self.assertIn("/python ", crewchat.hook_command("claude", "stop"))  # no launcher there: Python and the script
-            launcher.write_text("")
-            self.assertEqual(crewchat.hook_command("claude", "stop"), "%s hook claude stop" % launcher.as_posix())
+    def test_an_installed_crewchat_runs_by_its_own_launcher(self):
+        tool = Path(tempfile.mkdtemp(prefix="uv-tool-", dir=TMP)).resolve()
+        (tool / "uv-receipt.toml").write_text("")
+        site = tool / "lib" / "python3.12" / "site-packages"
+        site.mkdir(parents=True)
+        exe = tool / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat")
+        with mock.patch.object(crewchat, "__file__", str(site / "crewchat.py")):
+            self.assertIsNone(crewchat.launcher())  # not there (yet): Python and the script, as before
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+            self.assertEqual(crewchat.launcher(), exe)
+            launched = exe.as_posix()
+            # Hooks and the login service run it: its path stays put when uv rebuilds the tool on another
+            # Python, and a crewchat that is gone fails in the shell, not with Python's exit 2 ("block").
+            self.assertEqual(crewchat.hook_command("claude", "stop"), "%s hook claude stop" % launched)
             self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "stop")))
-        # A checkout (no launcher of its own) runs its script with this Python, as before.
+            self.assertIn('ExecStart="%s" serve' % launched, crewchat.systemd_unit())
+            self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
+        # A checkout runs its script with this Python, as before.
         self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
 
     def test_update_runs_the_new_copy_not_this_one(self):
@@ -3396,7 +3404,7 @@ class Lifecycle(Base):
                 mock.patch.object(crewchat, "find_uv", return_value="/bin/uv"), \
                 mock.patch.object(crewchat, "latest_release", return_value="99.0.0"), \
                 mock.patch.object(crewchat, "server_up", return_value=True), \
-                mock.patch.object(crewchat, "installed_command", return_value=["/new/bin/crewchat"]), \
+                mock.patch.object(crewchat, "launcher", return_value=Path("/new/bin/crewchat")), \
                 mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
                 mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
             os.environ.pop("CREWCHAT_SOURCE", None)
