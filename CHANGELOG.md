@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **An advisor for a new Claude Code agent** (#31). **New agent** has an **Advisor** choice next to
+  the model: Fable, Opus or Sonnet becomes Claude Code's own `--advisor`, a stronger model the agent
+  consults at decision points. Reopen, Switch model and Start again keep it. Other tools have no
+  such option. `/api/launch` takes `advisor`.
 - **The page's layout: the crew on the left, the project on the right.** crewchat's name sits next to
   its logo and the project tabs line up over the chat. Clicking an agent opens its settings in the
   left column, under the list; the side panel on the right is for the project (rules, skills and

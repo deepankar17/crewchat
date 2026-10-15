@@ -105,6 +105,13 @@ starts again (`in_progress`). The sheet shows `advisor: approved` or `changes ne
 You can always mark a task done yourself. `crewchat tasks advisor off` turns it off again; it is
 off unless you set it.
 
+Claude Code also has an advisor of its own ([`--advisor`](https://code.claude.com/docs/en/advisor)),
+which you can choose for a Claude Code agent in **New agent**. That one is private to the agent: it
+reads the agent's whole conversation, the agent consults it whenever it decides to, and nothing of
+it shows in the chat. It uses more tokens, and an agent keeps it when you Reopen it or switch its
+model. The two work together: an agent on Sonnet with Opus as its own advisor can still `hub_ask`
+the chat's advisor.
+
 ## The task sheet and the lead
 
 With a lead, the lead hands out tasks from the project's [task sheet](getting-started.md#the-task-sheet)
@@ -142,7 +149,8 @@ session for you, in four steps:
 2. **Workspace:** the project folder. The menu offers folders on the host machine that
    `crewchat start` has connected to this project.
 3. **Engine:** the tool (Claude Code, or Cursor's agent), its model (Claude Code: Fable, Opus,
-   Sonnet, Haiku, or its default), and what it may do **without asking** (below).
+   Sonnet, Haiku, or its default), its own advisor (Claude Code: Fable, Opus, Sonnet, or none;
+   see [the advisor](#the-advisor)), and what it may do **without asking** (below).
 4. **Briefing:** a first task and extra instructions, both optional.
 
 <img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing: First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">

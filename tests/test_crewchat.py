@@ -1307,9 +1307,10 @@ class Launching(Base):
         self.launched = []
         self.saved = crewchat.launch_agent, crewchat.find_tool
         self.real_launch_agent = crewchat.launch_agent
-        self.models = []
-        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="": (
-            self.launched.append((tool, folder, key, permissions)), self.models.append(model))
+        self.models, self.advisors = [], []
+        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="", advisor="": (
+            self.launched.append((tool, folder, key, permissions)), self.models.append(model),
+            self.advisors.append(advisor))
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
@@ -1392,6 +1393,23 @@ class Launching(Base):
         self.assertIn("no picture preset", self.launch(picture="preset:nope")["error"])
         self.assertIn("#rrggbb", self.launch(colour="red")["error"])
         self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="opus")[-3:-1], ["--model", "opus"])
+
+    def test_new_agent_with_claude_codes_own_advisor(self):
+        out = self.launch(name="advised", model="sonnet", advisor="opus")
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(self.advisors[-1], "opus")
+        Session(self.base, crewchat.read_token(self.place)).call("hub_link", key=self.launched[-1][2])
+        self.assertEqual(self.hub.agents["advised"]["advisor"], "opus")  # Reopen starts it with the same advisor
+        self.assertEqual(self.launch(name="unadvised"), {"ok": True})
+        self.assertEqual(self.advisors[-1], "")  # none unless chosen
+        for bad in ("haiku", "opus; rm -rf ~", "gpt"):
+            self.assertIn("no advisor called", self.launch(advisor=bad)["error"])
+        self.assertIn("no advisor called opus", self.launch(tool="cursor", advisor="opus")["error"])
+        self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="sonnet", advisor="opus")[-5:-1],
+                         ["--model", "sonnet", "--advisor", "opus"])
+        self.assertNotIn("--advisor", crewchat.launch_command("claude", "claude", "start-x"))
+        self.assertEqual([m[0] for m in crewchat.tool_advisors("claude")], ["fable", "opus", "sonnet"])
+        self.assertEqual(crewchat.tool_advisors("cursor"), [])
 
     def agent_op(self, **body):
         try:
@@ -1633,6 +1651,22 @@ class Launching(Base):
                 crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertIn("no longer connected", json.loads(caught.exception.read())["error"])
         self.assertEqual(stopped, [])  # still running, as it was
+
+    def test_reopen_and_switch_model_keep_its_advisor(self):
+        name = self.closed_session()
+        self.hub.agents[name]["advisor"] = "fable"
+        _, opened = self.reopened(agent=name)
+        self.assertEqual(opened[0][1][-4:-2], ["--advisor", "fable"])
+        self.hub.agents[name]["session"].pop("reopening", None)
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                                  opened.append((folder, command, key, title))):
+            crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
+        self.assertEqual(opened[-1][1][-6:-2], ["--model", "sonnet", "--advisor", "fable"])
+        self.hub.agents[name]["advisor"] = "haiku"  # one this copy does not offer (an older or edited state)
+        self.hub.agents[name]["session"].pop("reopening", None)
+        _, opened = self.reopened(agent=name)
+        self.assertNotIn("--advisor", opened[0][1])
 
     def test_reopen_keeps_the_permissions_it_was_started_with(self):
         crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),

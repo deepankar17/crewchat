@@ -1824,7 +1824,8 @@ class Hub:
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
-    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model=""):
+    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model="",
+                  advisor=""):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
@@ -1846,25 +1847,29 @@ class Hub:
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
                                 "picture": picture, "colour": colour,
-                                "instructions": instructions, "model": model, "expires": now + START_TTL}
+                                "instructions": instructions, "model": model, "advisor": advisor,
+                                "expires": now + START_TTL}
             return key
 
     def launch(self, tool, folder, name="", role="", task="", permissions="ask", model="", picture="",
-               colour="", instructions=""):
+               colour="", instructions="", advisor=""):
         """Open a new agent session in a connected folder on this machine; it checks in with a
         start key and gets this name, role, picture, instructions and first task, and may do what
-        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool)."""
+        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool),
+        advisor one of tool_advisors(tool)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
         if model:
             check_model(tool, model)
+        if advisor:
+            check_advisor(tool, advisor)
         if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model)
+        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model, advisor)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model)
+            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
         except (HubError, OSError) as e:
             with self.lock:
                 self.starts.pop(key, None)
@@ -1910,6 +1915,8 @@ class Hub:
                 self.agents[name]["permissions"] = spec.get("permissions") or "ask"
                 if spec.get("model"):
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
+                if spec.get("advisor"):
+                    self.agents[name]["advisor"] = spec["advisor"]  # and with the same advisor
                 self._save()
         if spec.get("picture") is not None or spec.get("colour"):
             try:
@@ -2706,6 +2713,7 @@ class Hub:
                 "art": ART_PICTURES,
                 "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
+                "advisors": {tool: tool_advisors(tool) for tool in LAUNCH_TOOLS},
                 "names": AGENT_NAMES,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
@@ -2844,11 +2852,14 @@ class Hub:
         with self.lock:
             permissions = (self.agents.get(name) or {}).get("permissions", "ask")
             model = model or (self.agents.get(name) or {}).get("model") or None
+            advisor = (self.agents.get(name) or {}).get("advisor") or ""
         permissions = permissions if permissions in LAUNCH_PERMISSIONS[tool] else "ask"
         if model and model not in [m for m, _ in tool_models(tool)]:
             model = None
+        if advisor not in [m for m, _ in tool_advisors(tool)]:
+            advisor = ""
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor)
 
     def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
@@ -2887,6 +2898,7 @@ class Hub:
                 raise HubError("%s is running or starting already" % name)
             tool = agent["client"]
             permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
+            advisor = agent.get("advisor") or ""
         connected = {f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)}
         folder = next((str(f) for f in self.agent_folders(name) if str(f) in connected), None)
         if folder is None:
@@ -2895,10 +2907,12 @@ class Hub:
             permissions = "ask"
         if model not in [m for m, _ in tool_models(tool)]:
             model = ""
+        if advisor not in [m for m, _ in tool_advisors(tool)]:
+            advisor = ""
         with self.lock:
             key = self._link_key(name)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model)
+            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
         except (HubError, OSError) as e:
             raise HubError(str(e))
         with self.lock:
@@ -4589,7 +4603,7 @@ class Handler(BaseHTTPRequestHandler):
         permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
         self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
                         data.get("task"), permissions, str(data.get("model") or ""), data.get("picture") or "",
-                        data.get("colour") or "", data.get("instructions") or "")
+                        data.get("colour") or "", data.get("instructions") or "", str(data.get("advisor") or ""))
         return {"ok": True}
 
     def _admin(self, raw):
@@ -5152,16 +5166,17 @@ def launch_options(config, root=None, chat=""):
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t) if exe else []},
+                           "models": tool_models(t) if exe else [], "advisors": tool_advisors(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
-def tool_options(tool, permissions="ask", base=None, model=""):
+def tool_options(tool, permissions="ask", base=None, model="", advisor=""):
     """The options an agent tool starts with: its base options (as this copy knows them), the
-    chosen permissions, and a model from tool_models. The same for a new agent and a reopened one."""
+    chosen permissions, a model from tool_models and an advisor from tool_advisors. The same for a
+    new agent and a reopened one."""
     return ((LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-            + (["--model", model] if model else []))
+            + (["--model", model] if model else []) + (["--advisor", advisor] if advisor else []))
 
 
 def check_model(tool, model):
@@ -5170,10 +5185,17 @@ def check_model(tool, model):
         raise HubError("%s has no model called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], model))
 
 
-def launch_command(exe, tool, key, permissions="ask", base=None, model=""):
-    """The agent's command line. Only the fixed prompt, the key, fixed options and a model from
-    tool_models reach it: no text typed on the chat page is ever passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base, model) + [LAUNCH_PROMPT % key]
+def check_advisor(tool, advisor):
+    """An advisor model the owner chose for an agent tool, checked (tool_advisors)."""
+    if advisor not in [m for m, _ in tool_advisors(tool)]:
+        raise HubError("%s has no advisor called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], advisor))
+
+
+def launch_command(exe, tool, key, permissions="ask", base=None, model="", advisor=""):
+    """The agent's command line. Only the fixed prompt, the key, fixed options and a model and an
+    advisor from tool_models and tool_advisors reach it: no text typed on the chat page is ever
+    passed to a shell."""
+    return [exe] + tool_options(tool, permissions, base, model, advisor) + [LAUNCH_PROMPT % key]
 
 
 def macos_script(folder, command, key, title=""):
@@ -5235,6 +5257,9 @@ REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_i
 REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
+# The models Claude Code's own advisor (--advisor) can be: its aliases that can act as one (Haiku 4.5
+# cannot, so the haiku alias is left out). One ranked below the agent's model only gets a warning.
+CLAUDE_ADVISORS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]
 
 
 def tool_models(tool):
@@ -5243,18 +5268,25 @@ def tool_models(tool):
     return CLAUDE_MODELS if tool == "claude" else []
 
 
-def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
+def tool_advisors(tool):
+    """The models an agent tool's own advisor can be: [[id, label], ...]. Only Claude Code has one
+    (--advisor: it consults that model at decision points, reading its whole conversation)."""
+    return CLAUDE_ADVISORS if tool == "claude" else []
+
+
+def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor=""):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
     if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
     # One argument, so an id can never be taken for an option of its own.
-    return [exe] + tool_options(tool, permissions, base, model or "") + ["--resume=" + session, REOPEN_PROMPT]
+    return ([exe] + tool_options(tool, permissions, base, model or "", advisor or "")
+            + ["--resume=" + session, REOPEN_PROMPT])
 
 
-def launch_agent(tool, folder, key, permissions="ask", root=None, model=""):
+def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
     """Open a terminal window on this machine with a new agent session in folder."""
     exe, base = agent_tool(tool, folder, permissions, root)
-    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model), key, root=root)
+    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, advisor), key, root=root)
 
 
 def open_terminal(folder, command, key, title="", root=None):
@@ -9565,6 +9597,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <fieldset class="step" hidden>
         <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
         <label for="l-model">Model</label><select id="l-model"></select>
+        <label for="l-advisor">Advisor</label><select id="l-advisor"></select>
+        <p class="meta" id="l-advisor-note" hidden>A stronger model it consults on its own at decision points; it reads the whole conversation and uses more tokens. For a chat-wide advisor everyone sees, give an agent the advisor role.</p>
         <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
         <p class="meta" id="l-perms-note"></p>
       </fieldset>
@@ -10301,6 +10335,10 @@ function showTool() {
   const models = own(state.models, $("l-tool").value) || [];
   $("l-model").replaceChildren(new Option("Its default", ""), ...models.map(([id, label]) => new Option(label, id)));
   $("l-model").disabled = !models.length;
+  const advisors = own(state.advisors, $("l-tool").value) || [];
+  $("l-advisor").replaceChildren(new Option("None", ""), ...advisors.map(([id, label]) => new Option(label, id)));
+  $("l-advisor").disabled = !advisors.length;
+  $("l-advisor-note").hidden = true;
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
   showPermissions();
@@ -10328,6 +10366,7 @@ async function startAgent(event) {
     await postJSON("/api/launch", {
       tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(), role: $("l-role").value,
       task: $("l-task").value.trim(), permissions: $("l-perms").value, model: $("l-model").value,
+      advisor: $("l-advisor").value,
       picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
       instructions: $("l-instructions").value.trim() });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
@@ -10361,6 +10400,7 @@ $("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.prev
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
+$("l-advisor").addEventListener("change", () => { $("l-advisor-note").hidden = !$("l-advisor").value; });
 $("l-perms").addEventListener("change", showPermissions);
 
 function roleTitle(name) {
@@ -11473,7 +11513,7 @@ async function loop() {
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       state.tools = data.tools || {}; state.presets = data.presets || {}; state.art = data.art || {};
-      state.models = data.models || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
+      state.models = data.models || {}; state.advisors = data.advisors || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
       state.held = {};
