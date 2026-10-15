@@ -142,6 +142,10 @@ settings for other tools instead of writing files.
 `crewchat stdio [--project FOLDER]` speaks MCP over stdin and stdout and relays it to the chat that
 folder (or one above it) is connected to, for clients that only start local servers, such as
 Claude Desktop. `--url URL --token TOKEN` (or `CREWCHAT_TOKEN`) names the chat directly instead.
+In a folder that is not connected to a chat it still starts, with no tools and a note on running
+`crewchat start` there, so a registration for every folder (`claude mcp add --scope user ... --
+uvx crewchat stdio`, as MCP directories publish it) does not show as a failed server elsewhere.
+Registered under another name than `crewchat`, its tools are allowed without asking all the same.
 
 ## Several machines
 

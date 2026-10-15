@@ -106,6 +106,8 @@ INSTALLED="$("$BIN/crewchat" --version)"
 logo "${INSTALLED#crewchat }"
 say ""
 say "Installed $INSTALLED."
+# Hooks in connected folders run crewchat by its path, which a reinstall can move: write them again.
+"$BIN/crewchat" hooks refresh >/dev/null 2>&1 || true
 if [ -n "$WAS_RUNNING" ]; then
   if "$BIN/crewchat" restart >/dev/null 2>&1; then
     say "Restarted the crewchat server on the new version."

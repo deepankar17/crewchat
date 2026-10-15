@@ -71,6 +71,9 @@ if (-not $Bin) { $Bin = Join-Path $env:USERPROFILE ".local\bin" }
 $Exe = Join-Path $Bin "crewchat.exe"
 $Installed = & $Exe --version
 if ($LASTEXITCODE -ne 0 -or -not $Installed) { throw "crewchat installed but does not run; try: $Exe --version" }
+# Hooks in connected folders run crewchat by its path, which a reinstall can move: write them again
+# (an older release has no `hooks refresh`; that is fine).
+& $Exe hooks refresh *> $null
 if ($Restart) {
     # The new crewchat starts its server again: through its login service, or by setting that up
     # (unless the owner turned it off), or else in the background. A release before 0.9.10 has no

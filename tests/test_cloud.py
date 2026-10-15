@@ -28,6 +28,8 @@ except ImportError:
     HAVE_CRYPTO = False
 
 crewchat.Handler.log_message = lambda *args: None
+crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 cloud.STATE_DEBOUNCE = 0.2  # publish roster changes quickly in tests
 
 

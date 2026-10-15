@@ -24,10 +24,14 @@ class Install(unittest.TestCase):
     def setUp(self):
         self.home = H.TMP / ("install-home-%d" % id(self))
         self.home.mkdir()
+        # uv alone, not the folder it is in: that may hold the owner's own crewchat, which the
+        # installer would then take for the one it updates.
+        (self.home / "uv-only").mkdir()
+        os.symlink(UV, str(self.home / "uv-only" / "uv"))
         self.env = dict(os.environ, HOME=str(self.home), UV_TOOL_DIR=str(self.home / "uv-tools"),
                         UV_TOOL_BIN_DIR=str(self.home / "bin"), UV_CACHE_DIR=uv_dir("cache", "dir"),
                         UV_PYTHON_INSTALL_DIR=uv_dir("python", "dir"), CREWCHAT_HOME=str(self.home / ".crewchat"),
-                        PATH=os.path.dirname(UV) + ":/usr/bin:/bin")
+                        PATH=":".join([str(self.home / "bin"), str(self.home / "uv-only"), "/usr/bin", "/bin"]))
         self.exe = self.home / "bin" / "crewchat"
 
     def install(self, source, lean=False):

@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -29,6 +30,8 @@ os.environ["CREWCHAT_HOME"] = str(Path(TMP) / "home")
 import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 
 crewchat.Handler.log_message = lambda *args: None  # keep the request log out of the test output
+crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
 
 def cli(*argv):
@@ -2336,7 +2339,10 @@ class Joining(Base):
         self.assertIn('- Added %s to the project "notes-app", as "site".' % site, out)
         self.assertIn("notes-app  [--chat notes-app]", cli("projects"))
         # Agents in different projects do not see or reach each other.
-        here, here_name = self.agent()
+        here, _ = self.agent()
+        # Names are random per project, so both could get the same one: give this one its own.
+        here_name = "first-project-agent"
+        self.assertIn("You are now %s." % here_name, here.text("hub_rename", name=here_name))
         token = crewchat.read_token(place, entry["root"])
         there = Session(self.base, token)
         there_name = there.me
@@ -2366,6 +2372,125 @@ class Joining(Base):
             cli(*args)
         with self.assertRaises(SystemExit):
             cli("join", "--url", self.base, "--code", "AAAA-AAAA", "--client", "generic")
+
+
+class OtherNames(Base):
+    """crewchat registered under a name of the user's or a directory's (`claude mcp add --scope user
+    crewchat-mcp -- uvx crewchat stdio`): its tools are still allowed without asking, and in a folder
+    with no chat it is a server with no tools, not a failed one."""
+
+    def setUp(self):
+        self.user = crewchat.user_home()
+        shutil.rmtree(self.user, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.user, True)
+
+    def project(self):
+        folder = Path(tempfile.mkdtemp(prefix="project-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        return folder
+
+    def register(self, folder=None, **servers):
+        """User-scope servers for Claude Code, or local-scope ones for folder."""
+        path = self.user / ".claude.json"
+        data = json.loads(path.read_text()) if path.exists() else {}
+        target = data.setdefault("projects", {}).setdefault(str(folder), {}) if folder else data
+        target.setdefault("mcpServers", {}).update(servers)
+        self.user.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def stdio(self, folder, lines=b"", home=None):
+        env = dict(os.environ, HOME=str(home or self.user), USERPROFILE=str(home or self.user))  # Windows: USERPROFILE
+        return subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--project", str(folder)],
+                              input=lines, capture_output=True, env=env, timeout=60)
+
+    def test_what_counts_as_crewchat(self):
+        yes = crewchat.is_crewchat_server
+        self.assertTrue(yes({"command": "uvx", "args": ["crewchat", "stdio"]}))
+        self.assertTrue(yes({"command": "uvx", "args": ["crewchat@latest", "stdio"]}))
+        self.assertTrue(yes({"command": "crewchat", "args": ["stdio", "--project", "/x"]}))
+        self.assertTrue(yes({"command": "/usr/bin/python3", "args": ["/opt/crewchat/crewchat.py", "stdio"]}))
+        self.assertTrue(yes({"command": "C:\\Tools\\crewchat.exe", "args": ["stdio"]}))
+        self.assertTrue(yes({"type": "http", "url": self.mcp}, urls=(self.mcp,)))
+        self.assertTrue(yes({"url": "https://elsewhere/mcp", "headers": {"Authorization": "Bearer t0k"}}, tokens={"t0k"}))
+        self.assertFalse(yes({"command": "uvx", "args": ["crewchat", "serve"]}))
+        self.assertFalse(yes({"command": "npx", "args": ["crewchat-lookalike", "stdio"]}))
+        self.assertFalse(yes({"url": "https://elsewhere/mcp", "headers": {"Authorization": "Bearer other"}},
+                             urls=(self.mcp,), tokens={"t0k"}))
+        self.assertFalse(yes("crewchat"))
+
+    def test_a_server_named_otherwise_is_allowed_and_the_double_is_noted(self):
+        folder = self.project()
+        self.register(**{"crewchat-mcp": {"type": "stdio", "command": "uvx", "args": ["crewchat", "stdio"]},
+                         "other": {"command": "npx", "args": ["other-mcp", "stdio"]}})
+        self.register(folder, chat={"type": "http", "url": self.mcp, "headers": {}},
+                      **{"bad name!": {"command": "crewchat", "args": ["stdio"]}})
+        (self.user / ".cursor").mkdir()
+        (self.user / ".cursor" / "mcp.json").write_text(json.dumps(
+            {"mcpServers": {"crew": {"command": "/usr/local/bin/crewchat", "args": ["stdio"]}}}))
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Named", "--chat", "Demo")
+        allow = json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"]["allow"]
+        for name in ("crewchat", "crewchat-mcp", "chat"):
+            self.assertIn("mcp__%s__hub_send" % name, allow)
+            self.assertIn("mcp__%s__hub_inbox" % name, allow)
+        self.assertFalse([r for r in allow if r.startswith(("mcp__other__", "mcp__bad"))])
+        cursor = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        self.assertIn("Mcp(crew:hub_send)", cursor)
+        self.assertIn("Mcp(crewchat:hub_send)", cursor)
+        # crewchat twice for one client: start says so, and how to keep one.
+        self.assertIn("Claude Code sees crewchat 3 times: crewchat (.mcp.json), chat (~/.claude.json (local scope)), "
+                      "crewchat-mcp (~/.claude.json (user scope))", out)
+        self.assertIn("`claude mcp remove --scope local chat`", out)
+        self.assertIn("Cursor sees crewchat 2 times", out)
+        # Taking crewchat out of the folder takes every name's rules with it.
+        crewchat.disconnect_folder(folder)
+        settings = folder / ".claude" / "settings.local.json"
+        left = json.loads(settings.read_text()).get("permissions", {}).get("allow", []) if settings.exists() else []
+        self.assertFalse([r for r in left if "__hub_" in r])
+
+    def test_one_registration_says_nothing(self):
+        folder = self.project()
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Single", "--chat", "Demo")
+        self.assertNotIn("sees crewchat", out)
+        self.assertIsNone(crewchat.duplicate_note(folder, "claude"))
+
+    def test_a_name_given_later_is_allowed_when_its_server_starts(self):
+        folder = self.project()
+        cli("start", str(folder), "--no-open", "--no-service", "--place", "Later", "--chat", "Demo")
+        settings = folder / ".claude" / "settings.local.json"
+        self.assertNotIn("mcp__crewchat-mcp__hub_send", settings.read_text())
+        self.register(**{"crewchat-mcp": {"command": "uvx", "args": ["crewchat", "stdio"]}})
+        done = self.stdio(folder)  # the client starts it: no input, so it relays nothing and ends
+        self.assertEqual(done.returncode, 0, done.stderr)
+        allow = json.loads(settings.read_text())["permissions"]["allow"]
+        self.assertIn("mcp__crewchat-mcp__hub_send", allow)
+        self.assertEqual(allow.count("mcp__crewchat__hub_send"), 1)
+        self.assertEqual(crewchat.allow_registered(folder), [])  # nothing left to add
+
+    def test_stdio_in_a_folder_with_no_chat_is_a_server_with_no_tools(self):
+        folder = Path(tempfile.mkdtemp(prefix="elsewhere-", dir=TMP)).resolve()
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                    {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+                    [{"jsonrpc": "2.0", "id": 4, "method": "prompts/list"}, {"jsonrpc": "2.0", "id": 5, "method": "x"}]]
+        done = self.stdio(folder, ("\n".join(json.dumps(r) for r in requests) + "\nnot json\n").encode())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b"is not connected to a crewchat", done.stderr)
+        answers = [json.loads(line) for line in done.stdout.decode().splitlines()]
+        hello = answers[0]["result"]
+        self.assertEqual((hello["protocolVersion"], hello["serverInfo"]["name"]), ("2025-06-18", "crewchat"))
+        self.assertIn("run `crewchat start` in this folder", hello["instructions"])
+        self.assertEqual(answers[1], {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}})
+        self.assertEqual(answers[2]["result"], {})
+        self.assertEqual([a.get("result") for a in answers[3]], [{"prompts": []}, None])
+        self.assertEqual(answers[3][1]["error"]["code"], -32601)
+        self.assertEqual(answers[4]["error"]["code"], -32700)
+        self.assertEqual(len(answers), 5)  # nothing for the notification
+
+    def test_the_chat_tools_are_not_shown_as_activity_by_any_name(self):
+        for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_update)"):
+            self.assertEqual(crewchat.tool_summary("claude", {"tool_name": name}), "", name)
 
 
 class Hooks(Base):
@@ -3254,6 +3379,127 @@ class Lifecycle(Base):
         page = self.raw("/", opener=opener)[1].decode()
         self.assertIn('id="update"', page)
         self.assertIn("crewchat update", page)
+
+    def test_hooks_refresh_points_every_connected_folder_at_this_copy(self):
+        folder = Path(tempfile.mkdtemp(prefix="rehook-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "rehook")
+        hooks = lambda: (folder / ".claude" / "settings.local.json").read_text() + (folder / ".cursor" / "hooks.json").read_text()  # noqa: E731
+        self.assertIn(crewchat.self_command()[1], hooks())
+        # A reinstall moved crewchat (here: another Python's folder): the old hooks point nowhere.
+        moved = ["/tools/crewchat/bin/python", "/tools/crewchat/lib/python3.12/site-packages/crewchat.py"]
+        with mock.patch.object(crewchat, "self_command", return_value=moved):
+            out = cli("hooks", "refresh")
+        self.assertIn("Updated the hooks in 1 connected folder", out)
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook claude stop", hooks())
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook cursor", hooks())
+        self.assertNotIn(crewchat.self_command()[1], hooks())
+        cli("hooks", "refresh")  # and back
+        # With the server off no restart follows (update, install.sh), so the login service is
+        # brought up to this copy too; with it running, the restart that follows does that.
+        with mock.patch.object(crewchat, "refresh_service") as service:
+            with mock.patch.object(crewchat, "server_up", return_value=False):
+                cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
+            cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
+
+    def test_a_hook_gives_up_soon_on_a_server_that_is_off(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens there: crewchat stopped, the folder used on its own
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1):
+            with self.assertRaises((urllib.error.URLError, OSError)):
+                crewchat.hook_check("http://127.0.0.1:%d" % port, "token", "key", 1800, 0)  # listening 30 min
+        self.assertLess(time.time() - began, 10)  # not the 30 minutes it would have listened
+
+    def test_an_installed_crewchat_runs_by_its_own_launcher(self):
+        tool = Path(tempfile.mkdtemp(prefix="uv-tool-", dir=TMP)).resolve()
+        (tool / "uv-receipt.toml").write_text("")
+        site = tool / "lib" / "python3.12" / "site-packages"
+        site.mkdir(parents=True)
+        exe = tool / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat")
+        with mock.patch.object(crewchat, "__file__", str(site / "crewchat.py")):
+            self.assertIsNone(crewchat.launcher())  # not there (yet): Python and the script, as before
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+            self.assertEqual(crewchat.launcher(), exe)
+            launched = exe.as_posix()
+            # Hooks and the login service run it: its path stays put when uv rebuilds the tool on another
+            # Python, and a crewchat that is gone fails in the shell, not with Python's exit 2 ("block").
+            self.assertEqual(crewchat.hook_command("claude", "stop"), "%s hook claude stop" % launched)
+            self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "stop")))
+            self.assertIn('ExecStart="%s" serve' % launched, crewchat.systemd_unit())
+            self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
+        # A checkout runs its script with this Python, as before.
+        self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_a_hook_gives_up_on_a_server_stopped_while_it_listened(self):
+        answers = iter([{"text": ""}])
+
+        def post(url, token, body, timeout=10):
+            try:
+                return next(answers)  # it answered once, then crewchat was stopped
+            except StopIteration:
+                raise urllib.error.URLError("connection refused")
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1), mock.patch.object(crewchat, "post_json", side_effect=post):
+            with self.assertRaises(urllib.error.URLError):
+                crewchat.hook_check("http://127.0.0.1:1", "token", "key", 1800, 0)
+        self.assertLess(time.time() - began, 10)
+
+    @unittest.skipIf(os.name == "nt", "Windows' logon task is not rewritten")
+    def test_restart_rewrites_a_login_service_another_copy_wrote(self):
+        user = Path(tempfile.mkdtemp(prefix="user-home-", dir=TMP))
+        mac = sys.platform == "darwin"
+        path = (user / "Library" / "LaunchAgents" / (crewchat.SERVICE_LABEL + ".plist") if mac
+                else user / ".config" / "systemd" / "user" / "crewchat.service")
+        path.parent.mkdir(parents=True)
+        ran = []
+        with mock.patch.object(crewchat.Path, "home", return_value=user), \
+                mock.patch.object(crewchat, "run", side_effect=lambda c: ran.append(c) or subprocess.CompletedProcess(c, 0, "", "")):
+            with mock.patch.object(crewchat, "run_command", return_value=["/gone/python3.14/crewchat.py"]):
+                path.write_text(crewchat.launchd_plist(True) if mac else crewchat.systemd_unit())  # before the update
+            with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+                with mock.patch.object(crewchat, "launcher", return_value=None):  # a checkout: leaves it alone
+                    crewchat.refresh_service()
+                self.assertIn("/gone/", path.read_text())
+                self.assertEqual(ran, [])
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()
+                text = path.read_text()
+                self.assertIn("/tools/crewchat/bin/crewchat", text)
+                self.assertNotIn("/gone/", text)
+                if mac:
+                    self.assertIn("/usr/bin/caffeinate", text)  # --keep-awake kept
+                    self.assertTrue(any("bootout" in c for c in ran))
+                ran.clear()
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()  # up to date: left alone
+                self.assertEqual(ran, [])
+
+    def test_update_runs_the_new_copy_not_this_one(self):
+        ran = []
+
+        def run(command, **kw):
+            ran.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat, "find_uv", return_value="/bin/uv"), \
+                mock.patch.object(crewchat, "latest_release", return_value="99.0.0"), \
+                mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(crewchat, "launcher", return_value=Path("/new/bin/crewchat")), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CREWCHAT_SOURCE", None)
+            if os.name == "nt":
+                self.skipTest("Windows updates in a window of its own")
+            crewchat.cmd_update(argparse.Namespace(version=None))
+        self.assertEqual(ran[0][:2], ["/bin/uv", "tool"])
+        # This process's script may be gone (uv rebuilt the tool, perhaps on another Python).
+        self.assertEqual(ran[1:], [["/new/bin/crewchat", "hooks", "refresh"], ["/new/bin/crewchat", "restart"]])
 
     def test_uninstall_takes_crewchat_out_of_a_folder_and_leaves_the_rest(self):
         mine = Path(tempfile.mkdtemp(dir=TMP))
