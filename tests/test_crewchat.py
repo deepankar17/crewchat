@@ -3360,6 +3360,14 @@ class Lifecycle(Base):
         self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook cursor", hooks())
         self.assertNotIn(crewchat.self_command()[1], hooks())
         cli("hooks", "refresh")  # and back
+        # With the server off no restart follows (update, install.sh), so the login service is
+        # brought up to this copy too; with it running, the restart that follows does that.
+        with mock.patch.object(crewchat, "refresh_service") as service:
+            with mock.patch.object(crewchat, "server_up", return_value=False):
+                cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
+            cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
 
     def test_a_hook_gives_up_soon_on_a_server_that_is_off(self):
         probe = socket.socket()
@@ -3420,7 +3428,12 @@ class Lifecycle(Base):
             with mock.patch.object(crewchat, "run_command", return_value=["/gone/python3.14/crewchat.py"]):
                 path.write_text(crewchat.launchd_plist(True) if mac else crewchat.systemd_unit())  # before the update
             with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
-                crewchat.refresh_service()
+                with mock.patch.object(crewchat, "launcher", return_value=None):  # a checkout: leaves it alone
+                    crewchat.refresh_service()
+                self.assertIn("/gone/", path.read_text())
+                self.assertEqual(ran, [])
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()
                 text = path.read_text()
                 self.assertIn("/tools/crewchat/bin/crewchat", text)
                 self.assertNotIn("/gone/", text)
@@ -3428,7 +3441,8 @@ class Lifecycle(Base):
                     self.assertIn("/usr/bin/caffeinate", text)  # --keep-awake kept
                     self.assertTrue(any("bootout" in c for c in ran))
                 ran.clear()
-                crewchat.refresh_service()  # up to date: left alone
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()  # up to date: left alone
                 self.assertEqual(ran, [])
 
     def test_update_runs_the_new_copy_not_this_one(self):

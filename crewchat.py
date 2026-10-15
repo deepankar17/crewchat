@@ -6903,6 +6903,8 @@ def cmd_hooks(args):
             print("No folder is connected on this machine yet.")
             return
         done = refresh_hooks()
+        if not server_up(load_config()):  # no restart follows to do it (update, install.sh): the service too
+            refresh_service()
         print("Updated the hooks in %d connected folder%s for crewchat %s; the others were up to date." % (
             len(done), "" if len(done) == 1 else "s", __version__))
         return
@@ -7366,8 +7368,9 @@ def cmd_stop(_args):
 def refresh_service():
     """A login service written by another copy of crewchat (before an update or a reinstall moved it)
     still runs that copy, which may be gone: write this copy's in its place, keeping --keep-awake.
-    macOS and Linux (Windows' task keeps pythonw, which has no console); the server is stopped."""
-    if os.name == "nt" or not service_installed():
+    macOS and Linux (Windows' task keeps pythonw, which has no console); the server is stopped. Only an
+    installed crewchat does it: a checkout or a uvx copy restarting must not take the service over."""
+    if os.name == "nt" or launcher() is None or not service_installed():
         return
     mac = sys.platform == "darwin"
     path = service_file()
