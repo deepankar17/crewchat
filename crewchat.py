@@ -1487,6 +1487,7 @@ class Hub:
                 if mine:
                     self._forget(mine, "is %s (session resumed)" % owner)
                 self.agents[owner]["checked"] = time.time()
+                self.agents[owner].pop("starting", None)  # a session it was started again in is here
                 self._save()
                 self._changed()
                 return owner, "Linked. This session is %s again, in the project %s.%s%s" % (
@@ -2877,6 +2878,11 @@ class Hub:
         running = bool(session) and process_running(session)  # a process lookup: not under the lock
         with self.lock:
             agent = self._local_agent(name, "start")
+            state = self._session_state(agent)
+            if agent.get("client") not in LAUNCH_TOOLS:
+                raise HubError("only Claude Code and Cursor agents can be started from the page")
+            if state and state["reopen"] and not running:
+                raise HubError("%s has a conversation to reopen: use Reopen" % name)
             if running or not self.startable(name):  # waiting for messages, or started a moment ago
                 raise HubError("%s is running or starting already" % name)
             tool = agent["client"]
@@ -3933,7 +3939,7 @@ def run_listed_command(usage, values=None, chat=""):
 def run_crewchat(argv, root=None):
     """`crewchat ...` in a separate process, for the page; returns {code, output}. root: the machine's
     crewchat folder (CREWCHAT_HOME) when it is not the default."""
-    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
+    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1", CREWCHAT_FROM_SERVER="1")
     if root is not None:
         env["CREWCHAT_HOME"] = str(root)
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
@@ -3967,10 +3973,10 @@ def connect_folder(path, chat, root=None):
     folder = folder.resolve()
     if not folder.is_dir():
         raise HubError("there is no folder at %s" % folder)
-    # Not the whole disk or home: a folder's .claude settings in the home folder are every session's.
-    if folder == Path(folder.anchor) or folder == Path.home().resolve() or inside_any(folder, {Path(root or home())}):
+    # Not the disk, home or above it (a .claude folder there is every session's), nor crewchat's own folder.
+    if folder == Path(folder.anchor) or inside_any(Path.home(), {folder}) or inside_any(folder, {Path(root or home())}):
         raise HubError("pick a project's own folder, not %s" % folder)
-    done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open", "--no-service"], root)
+    done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open"], root)
     if done["code"] != 0:
         lines = [line for line in done["output"].splitlines() if line.strip()]
         raise HubError(re.sub(r"^(- |crewchat: )", "", lines[-1]) if lines else "crewchat start failed")
@@ -5282,6 +5288,8 @@ def ensure_server(config, args):
     if server_up(config):
         print("- The server is running at %s." % local_url(config))
         return
+    if os.environ.get("CREWCHAT_FROM_SERVER"):  # run by the server for the page: it is the server
+        die("the server did not answer at %s; try again" % local_url(config))
     supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
     if args.no_service and config.get("service") is not False:
         # A choice like `crewchat service uninstall`: an upgrade's `crewchat resume` keeps to it.
@@ -10574,7 +10582,7 @@ function pictureMenu(a, agentOp) {
   menu.hidden = true;
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
-    .then(() => { menu.hidden = true; });
+    .then(() => { menu.hidden = true; menu.dispatchEvent(new Event("close")); });
   for (const [id, label] of Object.entries(state.art || {})) {
     const b = actButton(picks, "", "Picture: " + label, (b) => set({ picture: "art:" + id }, b));
     const img = el("img"); img.alt = ""; img.src = "/pictures/" + id + ".webp"; b.append(img);
@@ -10754,6 +10762,7 @@ function pictureButton(a, menu) {
     menu.hidden = !menu.hidden;
     b.setAttribute("aria-expanded", String(!menu.hidden));
   });
+  menu.addEventListener("close", () => { b.setAttribute("aria-expanded", "false"); b.focus(); });
   return b;
 }
 

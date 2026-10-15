@@ -1430,8 +1430,8 @@ class Launching(Base):
         self.assertIn("This session is %s again" % name, session.text("hub_link", key=again))
         self.assertEqual(session.me, name)
         self.assertEqual(self.hub.agents[name]["role"], "docs")
+        self.assertNotIn("starting", self.hub.agents[name])  # it checked in: no more waiting for it
         with self.hub.lock:
-            self.hub.agents[name]["starting"] = 0
             self.hub.waiting[name] = 1  # its stop hook is waiting for messages: it is open
         try:
             self.assertFalse(row()["startable"])
@@ -1440,6 +1440,31 @@ class Launching(Base):
             with self.hub.lock:
                 self.hub.waiting.pop(name, None)
         self.assertEqual(self.agent_op(op="start", agent="nobody")["status"], 400)
+        with self.hub.lock:  # a recorded conversation, closed: Reopen is the way back
+            self.hub.agents[name]["session"] = {"id": "0" * 8 + "-0000-0000-0000-" + "0" * 12, "pid": 999999,
+                                                "started": "x", "app": "terminal", "tool": "claude", "since": 0}
+        try:
+            self.assertIn("use Reopen", self.agent_op(op="start", agent=name)["error"])
+        finally:
+            with self.hub.lock:
+                self.hub.agents[name].pop("session", None)
+
+    def test_a_start_the_server_runs_never_starts_or_registers_a_server(self):
+        saved, up = os.environ.get("CREWCHAT_FROM_SERVER"), crewchat.server_up
+        os.environ["CREWCHAT_FROM_SERVER"] = "1"
+        crewchat.server_up = lambda config: False  # the server did not answer the child in time
+        before = crewchat.load_config()
+        try:
+            with self.assertRaises(SystemExit) as e, contextlib.redirect_stdout(io.StringIO()):
+                crewchat.ensure_server(dict(before), argparse.Namespace(no_service=True, keep_awake=False))
+            self.assertIn("did not answer", str(e.exception))
+            self.assertEqual(crewchat.load_config().get("service"), before.get("service"))  # not turned off
+        finally:
+            crewchat.server_up = up
+            if saved is None:
+                os.environ.pop("CREWCHAT_FROM_SERVER", None)
+            else:
+                os.environ["CREWCHAT_FROM_SERVER"] = saved
 
     def test_a_folder_is_connected_from_the_page(self):
         def connect(path):
@@ -1451,6 +1476,7 @@ class Launching(Base):
         self.assertIn("full path", connect("code/app")["error"])
         self.assertIn("there is no folder", connect(str(self.folder / "missing"))["error"])
         self.assertIn("a project's own folder", connect("~")["error"])
+        self.assertIn("a project's own folder", connect(str(Path.home().parent))["error"])  # above home too
         self.assertIn("a project's own folder", connect(str(crewchat.home()))["error"])
         self.assertIn("a project's own folder", connect(str(crewchat.home() / "tokens"))["error"])
         folder = Path(tempfile.mkdtemp(prefix="connect-", dir=TMP)).resolve()
