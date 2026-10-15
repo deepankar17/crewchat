@@ -3393,6 +3393,44 @@ class Lifecycle(Base):
         # A checkout runs its script with this Python, as before.
         self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
 
+    def test_a_hook_gives_up_on_a_server_stopped_while_it_listened(self):
+        answers = iter([{"text": ""}])
+
+        def post(url, token, body, timeout=10):
+            try:
+                return next(answers)  # it answered once, then crewchat was stopped
+            except StopIteration:
+                raise urllib.error.URLError("connection refused")
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1), mock.patch.object(crewchat, "post_json", side_effect=post):
+            with self.assertRaises(urllib.error.URLError):
+                crewchat.hook_check("http://127.0.0.1:1", "token", "key", 1800, 0)
+        self.assertLess(time.time() - began, 10)
+
+    @unittest.skipIf(os.name == "nt", "Windows' logon task is not rewritten")
+    def test_restart_rewrites_a_login_service_another_copy_wrote(self):
+        user = Path(tempfile.mkdtemp(prefix="user-home-", dir=TMP))
+        mac = sys.platform == "darwin"
+        path = (user / "Library" / "LaunchAgents" / (crewchat.SERVICE_LABEL + ".plist") if mac
+                else user / ".config" / "systemd" / "user" / "crewchat.service")
+        path.parent.mkdir(parents=True)
+        ran = []
+        with mock.patch.object(crewchat.Path, "home", return_value=user), \
+                mock.patch.object(crewchat, "run", side_effect=lambda c: ran.append(c) or subprocess.CompletedProcess(c, 0, "", "")):
+            with mock.patch.object(crewchat, "run_command", return_value=["/gone/python3.14/crewchat.py"]):
+                path.write_text(crewchat.launchd_plist(True) if mac else crewchat.systemd_unit())  # before the update
+            with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+                crewchat.refresh_service()
+                text = path.read_text()
+                self.assertIn("/tools/crewchat/bin/crewchat", text)
+                self.assertNotIn("/gone/", text)
+                if mac:
+                    self.assertIn("/usr/bin/caffeinate", text)  # --keep-awake kept
+                    self.assertTrue(any("bootout" in c for c in ran))
+                ran.clear()
+                crewchat.refresh_service()  # up to date: left alone
+                self.assertEqual(ran, [])
+
     def test_update_runs_the_new_copy_not_this_one(self):
         ran = []
 

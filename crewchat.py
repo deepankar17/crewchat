@@ -7339,6 +7339,7 @@ def cmd_resume(_args):
     config = load_config()
     if server_up(config):
         return
+    refresh_service()
     supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
     if (supported and config.get("service") is not False and not service_installed()
             and not service_present()):
@@ -7360,9 +7361,33 @@ def cmd_stop(_args):
     print("Start it again with `crewchat restart`%s." % (", or log in again" if service_installed() else ""))
 
 
+def refresh_service():
+    """A login service written by another copy of crewchat (before an update or a reinstall moved it)
+    still runs that copy, which may be gone: write this copy's in its place, keeping --keep-awake.
+    macOS and Linux (Windows' task keeps pythonw, which has no console); the server is stopped."""
+    if os.name == "nt" or not service_installed():
+        return
+    mac = sys.platform == "darwin"
+    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if mac
+            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+    try:
+        old = path.read_text(encoding="utf-8")
+        new = launchd_plist("/usr/bin/caffeinate" in old) if mac else systemd_unit()
+        if new == old:
+            return
+        if mac:
+            run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])  # start_server loads it again
+        path.write_text(new, encoding="utf-8")
+        if not mac:
+            run(["systemctl", "--user", "daemon-reload"])
+    except OSError as e:  # never what stops a restart
+        print("- Could not update crewchat's login service (%s); `crewchat service install` does." % e)
+
+
 def cmd_restart(_args):
     config = load_config()
     stop_server(config)
+    refresh_service()
     start_server(config)
     print("crewchat %s is running at %s." % (__version__, local_url(config)))
 
