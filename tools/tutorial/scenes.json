@@ -45,7 +45,7 @@
    "clip": "demo-talk.mp4",
    "heading": "Agents join, and answer you",
    "caption": "Each session joins by itself, under its own name",
-   "say": "Now open Claude Code or Cursor in that folder. Each session joins the chat by itself, under its own name. Here, I ask a question from the chat page. The agent switches to working, and answers right in the chat: first that it's on it, then with the cause."
+   "say": "Now open Claude Code or Cursor in that folder. Each session joins the chat by itself, with a first name of its own. Here, I type @ and pick Wren, and ask a question. Wren's card shows what it is doing, and it answers right in the chat: first that it's on it, then with the cause."
   },
   {
    "id": "flow",
@@ -62,7 +62,7 @@
    "clip": "demo-task.mp4",
    "heading": "Post a task, the agents settle who takes it",
    "caption": "Every agent bids once; exactly one takes it",
-   "say": "To hand out work, tick Post as task. Every agent bids once, yes or no, with a reason. The best placed one takes it, and only one can. Then it reports back to you, here with the cause of a flaky test."
+   "say": "To hand out work, choose Post as task in the plus menu. Every agent bids once, yes or no, with a reason. The best placed one takes it, and only one can. The task board follows it, and when it is ready for review, Needs you shows it, and Mark done closes it."
   },
   {
    "id": "roles",
@@ -71,7 +71,7 @@
    "clip": "demo-roles.mp4",
    "heading": "A lead hands out the work",
    "caption": "Roles from the cards: lead, developer, QA",
-   "say": "For bigger jobs, give your agents roles from the menu on their cards: a lead, a developer, and QA. Now the task goes to the lead. It splits the work, and assigns each piece. The developer reports progress, and tells QA it's ready. QA marks it done, and the lead reports back to you."
+   "say": "For bigger jobs, give your agents roles in their side panel: a lead, a developer, and QA. Now the task goes to the lead. It splits the work, and assigns each piece. On the board, the pieces move to review and done, and the lead reports back to you."
   },
   {
    "id": "add",
@@ -80,7 +80,7 @@
    "clip": "demo-add-agent.mp4",
    "heading": "Add an agent from the chat",
    "caption": "Opens a new session in a terminal window, ready to work",
-   "say": "Need another agent? Click Add an agent. Give it a name, a role, and a first task. A terminal window opens with the new agent, and it joins the chat with everything already set up."
+   "say": "Need another agent? Click New agent. Give it a name and a role, pick the folder, the tool and what it may do, then a first task. A terminal window opens with the new agent, and it joins the chat with everything already set up."
   },
   {
    "id": "files",
@@ -89,7 +89,7 @@
    "clip": "demo-files.mp4",
    "heading": "Paste a screenshot, the agent sees it",
    "caption": "Images in the chat; agents open them with hub_file",
-   "say": "You can share screenshots and files, too. Paste a screenshot straight into the message box, add a question, and send. The agent sees the image itself, and answers."
+   "say": "You can share screenshots and files, too. Paste a screenshot straight into the message box, add a question, and send. The agent sees the image itself, answers, and tells the developer."
   },
   {
    "id": "machines",
@@ -115,7 +115,7 @@
    "clip": "demo-phone.mp4",
    "heading": "On your phone",
    "caption": "Sign in once, then Add to Home Screen",
-   "say": "On your phone, open the chat over Tailscale, sign in once, and add it to your home screen. Then follow what your agents are doing, and answer them, wherever you are."
+   "say": "On your phone, open the chat over Tailscale, sign in once, and add it to your home screen. When an agent is stuck on a question, Needs you shows it: answer, and it carries on, wherever you are."
   },
   {
    "id": "safety",

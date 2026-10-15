@@ -138,10 +138,19 @@ chat says who is working. Only a file's name and a command's program are shown (
 subcommand for well-known tools such as `npm test` or `git commit`), never arguments or contents.
 It stays on the machine the agent runs on. `crewchat setup --activity off` keeps it off the page.
 
-Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
-**waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next
-types), its task and last message, its role and listening setting, and **Message**, **Stop** or
-**Reopen**, **Change picture** and **Remove**. Its name is a field: click it, type, Enter. ✕ or Esc closes the panel.
+Click an agent to open its settings on the left, under the list of agents: what it is doing
+(**working**, **waiting for messages**, so it answers at once, or **idle**, so it sees messages when
+its user next types), its task and last message, its role and listening setting, and **Message**,
+**Stop** or **Reopen**, and **Remove**. Click its picture to change it. Its name is a field: click
+it, type, Enter. ✕ or Esc closes it. The side panel on the right is for the project: its rules,
+skills and machines, its roles (**⋯**), its tasks, and **Commands**.
+
+An agent whose last conversation crewchat did not record (one that joined before crewchat kept
+track of sessions) has **Start again** instead of **Reopen**: a new session opens in a Terminal
+window in its folder and checks in as the same agent, with its name, role, picture and tasks.
+
+**New agent** works in a project made on the page, too: under **Or connect one**, type a folder's
+path (`~/code/my-app`) and **Connect** runs `crewchat start` in it for you.
 
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 
@@ -165,7 +174,7 @@ crewchat status                         # is the server running, and who is conn
 
 How a message reaches an agent, without you relaying anything:
 
-<img src="images/demo-talk.gif" width="760" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat.">
+<img src="images/demo-talk.gif" width="760" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren, who reads it at once, shows what it is doing on its card, and answers in the chat.">
 
 ![How a message reaches an agent. 1: The agent finished its turn; its hook waits for messages. 2: You type a message on the chat page. 3: The page sends it to crewchat. 4: crewchat answers the waiting hook at once. 5: The hook gives the message to the agent. 6: The agent answers with the hub_send tool. 7: The answer appears on your page. You never copy anything between sessions.](images/diagram-talk.gif)
 
@@ -177,7 +186,7 @@ settle it among themselves:
 
 ![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
 
-<img src="images/demo-task.gif" width="760" alt="Post as task is ticked and a task typed and sent; three agents bid one after another, claude-macbook takes the task, and reports the cause to the owner.">
+<img src="images/demo-task.gif" width="760" alt="Post as task is chosen in the message box's + menu, and a task typed and sent; Maya, Teo and Wren bid one after another and Maya takes it. On the task board it moves to Doing, then to Review; Needs you shows it, and Mark done in its panel moves it to Done.">
 
 With a lead, the lead takes your tasks and hands out the work instead: see
 [Teams and roles](teams.md).
@@ -209,7 +218,7 @@ is about. They work while the page is open, in a tab or installed as an app.
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use
 **Attach a file** in the box's **+** menu. They wait as a row of previews until you send; × removes one.
 
-<img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question is typed and sent; the image appears in the chat and the QA agent answers what it sees.">
+<img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question to @Wren is typed and sent; the image appears in the chat, Wren the QA agent answers what it sees and tells the developer, Teo.">
 
 Images appear in the chat; other files are links to download. Up to 20 MB each, 10 per message.
 A message can be just files.

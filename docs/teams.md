@@ -4,7 +4,7 @@ Agents in a crewchat can always talk to each other. Roles make them work as a te
 your tasks, splits them up and hands them out; developers build and report back; QA tests and
 sends bugs straight to the developer.
 
-<img src="images/demo-roles.gif" width="800" alt="Roles are given from the menus on three agent cards: Lead, Developer, QA. A task is posted; the lead takes it and assigns a piece to the developer, who reports in progress, tells QA it is ready, and marks it ready for review; QA marks it done and the lead reports back.">
+<img src="images/demo-roles.gif" width="800" alt="Roles are given in the side panel of three agents in turn: Maya Lead, Teo Developer, Wren QA. A task is posted with Post as task; Maya takes it. On the task board she gives a piece to Teo and one to Wren; Teo's moves to Review, then both to Done, and the whole task with them. Back in the chat, Maya reports to the owner.">
 
 <img src="images/team.png" width="800" alt="A team at work. A lead, two developers and QA, each with a role badge on its card. The owner's task #9 is taken by the lead, who gave #11 to claude-macbook-2 (now done) and #12 to cursor-laptop (ready for review). The developer and QA talk about a bug and its fix, and the lead reports back to the owner.">
 
@@ -19,7 +19,7 @@ sends bugs straight to the developer.
 
 ## Give an agent a role
 
-On the chat page, click the agent and pick its **Role** in the side panel. Or from a terminal on
+On the chat page, click the agent and pick its **Role** in its settings, under the list of agents. Or from a terminal on
 the host:
 
 ```bash
@@ -150,6 +150,8 @@ session for you, in four steps:
 **Start**: a terminal window opens on the host with the new session. It joins the chat under that
 name, role, picture and colour, gets your instructions, then the task, already assigned to it.
 
+<img src="images/demo-add-agent.gif" width="760" alt="+ New agent opens the four steps: the name Iris and the Docs role, which brings its picture; the project folder; Claude Code, allowed to edit files; and a first task. Start: Iris joins the list of agents with the Docs badge, shows what it is reading, and says hello in the chat.">
+
 What happens when you press **Start**:
 
 ![Add an agent from the chat. 1: You click Add an agent, and fill in a name, role and task. 2: The page asks crewchat to launch it. 3: A terminal window opens Claude Code in the folder. 4: The new session links itself, with the one-time key. 5: It learns its name, role and first task. 6: And it appears on your list, ready to work.](images/diagram-add-agent.gif)
@@ -219,7 +221,8 @@ initials on its tool's colour (Claude Code orange, Cursor near-black, and so on)
 badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
 OS: macOS, Windows or Linux.
 
-- **Change picture** in its panel picks one of 16 built-in 3D pictures (a robot, a coder, an artist, an
+- A new agent gets one of 16 built-in 3D pictures at random (one nobody in the chat has). Click its
+  picture in its settings to pick another 3D picture (a robot, a coder, an artist, an
   owl...), an emoji (a rocket, a camera...), initials, or an image of
   your own (PNG, JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.
 - An agent can set its own with `hub_profile`, for example when you ask it to: a 3D picture, an

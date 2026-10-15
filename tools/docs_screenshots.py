@@ -57,19 +57,33 @@ class Chat:
         self.url = "http://127.0.0.1:%d" % self.port
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
-    def agent(self, place="macbook", client="claude", status="", activity="working"):
-        name = self.hub.agent_for(self.hub.open_session(place, client))
+    def agent(self, place="macbook", client="claude", status="", activity="working", name=None):
+        """A new agent; name gives it that first name instead of one the hub picks at random (by a
+        rename, whose line in the chat quiet() drops with the join lines)."""
+        auto = self.hub.agent_for(self.hub.open_session(place, client))
+        if name and name != auto:
+            self.hub.rename(auto, name)
+        name = name or auto
         if status:
             self.hub.set_status(name, status)
         self.doing(name, activity)
         return name
 
-    def doing(self, name, activity):
+    def doing(self, name, activity, what=""):
+        """What an agent is up to; what is the tool call its card shows (as its hooks report it)."""
         with self.hub.lock:
             self.hub.waiting.pop(name, None)
             if activity == "listening":
                 self.hub.waiting[name] = 1
             self.hub.activity[name] = (activity, time.time())
+            if what:
+                self.hub.agents[name].update(doing=what, doing_at=time.time(), seen=time.time())
+            self.hub._changed()
+
+    def heard(self, name):
+        """One agent has read everything so far (the receipt under the owner's message)."""
+        with self.hub.lock:
+            self.hub.agents[name]["cursor"] = self.hub.next_seq - 1
             self.hub._changed()
 
     def say(self, sender, to, text, kind="msg", files=None):
@@ -253,7 +267,7 @@ def scene_team(b):
     b.open(chat.sign_in())
     b.shoot("team")
     b.shoot("role-cards", "#agents", pad=8)
-    # The side panel: an agent, then the project's roles.
+    # An agent's settings (in the rail, under the crew), then the project's roles (the side panel).
     b.size(1280, 900)
     b.open(chat.sign_in())
     b.js("openPanel('agent', state.agents[0].agent)")

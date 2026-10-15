@@ -10,6 +10,18 @@
   starts. `crewchat start` notes a server registered twice. `crewchat stdio` in a folder with no
   chat now runs as a server with no tools instead of failing, so a user-scope registration does
   not show as broken in every other project.
+- **The page's layout: the crew on the left, the project on the right.** crewchat's name sits next to
+  its logo and the project tabs line up over the chat. Clicking an agent opens its settings in the
+  left column, under the list; the side panel on the right is for the project (rules, skills and
+  machines, roles, tasks) and now **Commands**, which open beside the chat instead of in its place.
+  Click an agent's picture to change it.
+- **Every new agent gets a random 3D picture**, one nobody in the chat has; **New agent** can still
+  ask for initials.
+- **Connect a folder from New agent.** A project made on the page has no folder yet: type one's path
+  and **Connect** runs `crewchat start` in it (`/api/folders`). Not the home folder, anything above
+  it, or crewchat's own folder.
+- **Start again** for an agent whose conversation crewchat did not record: a new session in its
+  folder that checks in as the same agent (name, role, picture, tasks). `/api/agent` op `start`.
 - **What each agent is doing, live.** An agent's tool calls show in its line of the list and its
   panel while it works ("Editing LoginViewModel.kt", "Running npm test", "Searching the code"): a
   file's name and a command's program only, never arguments or contents. A line under the chat says

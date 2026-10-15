@@ -364,8 +364,8 @@ def check_profile(hub, picture=None, colour=None):
 
 
 def check_picture(hub, value):
-    """A picture the owner or the agent chose, checked; returns it as stored."""
-    value = str(value or "")
+    """A picture the owner or the agent chose, checked; returns it as stored ("initials" is "")."""
+    value = "" if value == "initials" else str(value or "")
     kind, _, rest = value.partition(":")
     if kind == "preset" and rest not in PICTURE_PRESETS:
         raise HubError("no picture preset called %s" % rest)
@@ -814,9 +814,10 @@ class Roster:
             paths.append(home() / "config.json")  # the machine's saved packs
         for path in paths:
             try:
-                out.append(path.stat().st_mtime_ns)
+                st = path.stat()
+                out.append((st.st_mtime_ns, st.st_ino, st.st_size))  # a file written in place of it is a new inode
             except OSError:
-                out.append(0)
+                out.append(None)
         return tuple(out)
 
     def refresh(self, force=False):
@@ -1365,13 +1366,21 @@ class Hub:
                 return secrets.choice(free)
         return self._free_name("%s-%s" % (client, place))
 
+    def _random_picture(self):
+        """A 3D picture for a new agent, one nobody here or on a linked machine has while any is free.
+        Caller holds the lock."""
+        used = {a.get("picture") for a in self.agents.values()}
+        used.update(row.get("picture") for dev in self.remote.values() for row in dev["agents"])
+        pictures = ["art:" + p for p in ART_PICTURES]
+        return secrets.choice([p for p in pictures if p not in used] or pictures)
+
     def _new_agent(self, place, client):
         now = time.time()
         name = self._agent_name(place, client)
         self.agents[name] = {
             "place": place, "client": client, "created": now, "seen": now, "active": now,
             "cursor": self.next_seq - 1,  # a newcomer does not inherit the backlog as unread
-            "status": "", "checked": now, "role": "",
+            "status": "", "checked": now, "role": "", "picture": self._random_picture(),
         }
         self._event("%s joined (%s on %s)" % (name, client, place))
         return name
@@ -1478,6 +1487,7 @@ class Hub:
                 if mine:
                     self._forget(mine, "is %s (session resumed)" % owner)
                 self.agents[owner]["checked"] = time.time()
+                self.agents[owner].pop("starting", None)  # a session it was started again in is here
                 self._save()
                 self._changed()
                 return owner, "Linked. This session is %s again, in the project %s.%s%s" % (
@@ -1601,7 +1611,8 @@ class Hub:
              "online": now - a["seen"] < ONLINE_SECS, "status": a["status"], "cursor": a["cursor"],
              "unread": len(self._unread(n)), "device": self.device, "remote": False,
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
-             "session": self._session_state(a), "picture": a.get("picture", ""), "colour": a.get("colour", ""),
+             "session": self._session_state(a), "startable": self.startable(n),
+             "picture": a.get("picture", ""), "colour": a.get("colour", ""),
              "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now)}
             for n, a in self.agents.items()
         ]
@@ -1817,7 +1828,8 @@ class Hub:
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
-        picture, colour = check_profile(self, picture or "", colour or "")
+        # No picture keeps the random one every new agent gets; "initials" asks for initials instead.
+        picture, colour = check_profile(self, picture or None, colour or "")
         if len(instructions) > MAX_TEXT:
             raise HubError("the instructions are too long")
         with self.lock:
@@ -1899,9 +1911,9 @@ class Hub:
                 if spec.get("model"):
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
                 self._save()
-        if spec.get("picture") or spec.get("colour"):
+        if spec.get("picture") is not None or spec.get("colour"):
             try:
-                self.set_profile(name, spec.get("picture") or None, spec.get("colour") or None)
+                self.set_profile(name, spec.get("picture"), spec.get("colour") or None)
             except HubError as e:  # its picture went away in the meantime
                 notes.append("Your picture was not set (%s)." % e)
         if spec["role"]:
@@ -2847,13 +2859,68 @@ class Hub:
             raise HubError("%s is still running: stop it first" % name)
         self._open_again(name, None, session, folder, command)
 
+    def startable(self, name):
+        """Can the owner start a new session for this local agent (Start again)? Its tool can be
+        started from the page, it has no conversation to reopen, it is not waiting for messages, and
+        it was not just started. Caller holds the lock."""
+        agent, session = self.agents[name], self._session_state(self.agents[name])
+        return (agent.get("client") in LAUNCH_TOOLS and not self.waiting.get(name)
+                and not (session and (session["running"] or session["reopen"]))
+                and time.time() - float(agent.get("starting") or 0) >= REOPEN_WAIT)
+
+    def start_again(self, name):
+        """The owner starts a new session for a local agent whose own one cannot be reopened (crewchat
+        recorded none): in the agent's folder, with its link key, so it checks in as the same agent,
+        with its name, role, picture and tasks. The old conversation's memory is gone; the chat is not."""
+        with self.lock:
+            agent = self._local_agent(name, "start")
+            session = dict(agent.get("session") or {})
+        running = bool(session) and process_running(session)  # a process lookup: not under the lock
+        with self.lock:
+            agent = self._local_agent(name, "start")
+            state = self._session_state(agent)
+            if agent.get("client") not in LAUNCH_TOOLS:
+                raise HubError("only Claude Code and Cursor agents can be started from the page")
+            if state and state["reopen"] and not running:
+                raise HubError("%s has a conversation to reopen: use Reopen" % name)
+            if running or not self.startable(name):  # waiting for messages, or started a moment ago
+                raise HubError("%s is running or starting already" % name)
+            tool = agent["client"]
+            permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
+        connected = {f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)}
+        folder = next((str(f) for f in self.agent_folders(name) if str(f) in connected), None)
+        if folder is None:
+            raise HubError("%s's folder is not connected to this project on this machine any more" % name)
+        if permissions not in LAUNCH_PERMISSIONS[tool]:
+            permissions = "ask"
+        if model not in [m for m, _ in tool_models(tool)]:
+            model = ""
+        with self.lock:
+            key = self._link_key(name)
+        try:
+            launch_agent(tool, folder, key, permissions, self.home, model)
+        except (HubError, OSError) as e:
+            raise HubError(str(e))
+        with self.lock:
+            if name in self.agents:
+                self.agents[name]["starting"] = time.time()  # until it checks in, Start again waits
+            self._event("Owner started a new session for %s in %s" % (name, Path(folder).name))
+            self._save()
+            self._changed()
+
+    def _link_key(self, name):
+        """The link key an agent's hooks use, made anew if it was lost. Not a start key: those
+        are spent ten minutes after the launch. Caller holds the lock."""
+        key = next((k for k, v in self.links.items() if v == name and not k.startswith("start-")), None)
+        if key is None:
+            key = secrets.token_urlsafe(12)
+            self.links[key] = name
+            self._save()
+        return key
+
     def _open_again(self, name, model, session, folder, command):
         with self.lock:
-            key = next((k for k, v in self.links.items() if v == name), None)
-            if key is None:  # its link was lost: a new one, tied to the same name
-                key = secrets.token_urlsafe(12)
-                self.links[key] = name
-                self._save()
+            key = self._link_key(name)
         open_terminal(folder, command, key, title=name, root=self.home)
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
@@ -3430,7 +3497,7 @@ def call_tool(hub, sid, name, args, owner=False):
         return "Sent #%s to %s%s." % (msg["id"], to, " with %d file(s)" % len(files) if files else "")
     if name == "hub_profile":
         picture = args.get("picture")
-        picture = None if picture is None else "" if picture == "initials" else (
+        picture = picture if picture in (None, "initials") else (
             "art:%s" if picture in ART_PICTURES else "preset:%s") % picture
         if args.get("file"):
             folders = hub.agent_folders(me)
@@ -3867,14 +3934,22 @@ def run_listed_command(usage, values=None, chat=""):
             argv.append(part)
     if spec.get("chat") and chat:
         argv += ["--chat", chat]
-    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1")
+    return run_crewchat(argv)
+
+
+def run_crewchat(argv, root=None):
+    """`crewchat ...` in a separate process, for the page; returns {code, output}. root: the machine's
+    crewchat folder (CREWCHAT_HOME) when it is not the default."""
+    env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1", CREWCHAT_FROM_SERVER="1")
+    if root is not None:
+        env["CREWCHAT_HOME"] = str(root)
     flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
     if not RUN_SLOTS.acquire(blocking=False):
         raise HubError("two commands are still running; wait for one to finish")
     try:
         done = subprocess.run([sys.executable, os.path.abspath(__file__)] + argv, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env, cwd=str(home()),
-                              creationflags=flags, encoding="utf-8", errors="replace")
+                              capture_output=True, text=True, timeout=RUN_TIMEOUT, env=env,
+                              cwd=str(root or home()), creationflags=flags, encoding="utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         return {"code": -1, "output": "Still running after %d seconds, so it was stopped." % RUN_TIMEOUT}
     except OSError as e:
@@ -3887,13 +3962,35 @@ def run_listed_command(usage, values=None, chat=""):
     return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
 
 
+def connect_folder(path, chat, root=None):
+    """The owner connects a folder on this machine to a project from the chat page's New agent:
+    `crewchat start` in it, as in a terminal. Returns the folder as the launch options list it."""
+    raw = str(path or "").strip()
+    if not raw:
+        raise HubError("type the folder's path")
+    folder = Path(os.path.expanduser(raw))
+    if not folder.is_absolute():
+        raise HubError("type the folder's full path, such as ~/code/my-app")
+    folder = folder.resolve()
+    if not folder.is_dir():
+        raise HubError("there is no folder at %s" % folder)
+    # Not the disk, home or above it (a .claude folder there is every session's), nor crewchat's own folder.
+    if folder == Path(folder.anchor) or inside_any(Path.home(), {folder}) or inside_any(folder, {Path(root or home())}):
+        raise HubError("pick a project's own folder, not %s" % folder)
+    done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open"], root)
+    if done["code"] != 0:
+        lines = [line for line in done["output"].splitlines() if line.strip()]
+        raise HubError(re.sub(r"^(- |crewchat: )", "", lines[-1]) if lines else "crewchat start failed")
+    return str(folder)
+
+
 def link_info(hub, shared=True):
     """How this machine reaches the others, for the page: the link says (over Tailscale, with cloud
     sync through Firestore), or not at all."""
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4431,12 +4528,14 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.stop_agent(name)
         elif op == "reopen":
             self.hub.reopen_agent(name)
+        elif op == "start":
+            self.hub.start_again(name)
         elif op == "model":
             self.hub.switch_model(name, data.get("model"))
         elif op == "profile":
             self.hub.set_profile(name, data.get("picture"), data.get("colour"))
         else:
-            raise HubError("op is rename, remove, listen, stop, reopen, model or profile")
+            raise HubError("op is rename, remove, listen, stop, reopen, start, model or profile")
         return {"ok": True}
 
     def _role(self, data):
@@ -4477,6 +4576,14 @@ class Handler(BaseHTTPRequestHandler):
             with self.hub.lock:
                 self.hub._changed()  # every page shows the new roles
         return answer
+
+    def _folders(self, data):
+        """The owner connects a folder on this machine to this project, for New agent."""
+        if data.get("op") != "connect":
+            raise HubError("unknown op")
+        path = connect_folder(data.get("path"), self.project.id, self.projects.base)
+        self.projects.primary.roster.refresh()  # the machine's folders and the folder's token, just written
+        return {"path": path, "folders": launch_folders(self.hub.machine_config(), self.roster.root, self.hub.chat_key)}
 
     def _launch(self, data):
         """Add an agent: a new agent session on this machine."""
@@ -4677,7 +4784,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         owner_actions = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
-                         "/api/read": self._read,
+                         "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}
         if path in owner_actions:
             if not self._owner_request():
@@ -5183,6 +5290,8 @@ def ensure_server(config, args):
     if server_up(config):
         print("- The server is running at %s." % local_url(config))
         return
+    if os.environ.get("CREWCHAT_FROM_SERVER"):  # run by the server for the page: it is the server
+        die("the server did not answer at %s; try again" % local_url(config))
     supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
     if args.no_service and config.get("service") is not False:
         # A choice like `crewchat service uninstall`: an upgrade's `crewchat resume` keeps to it.
@@ -9059,9 +9168,10 @@ body {
   font: 15px/1.5 ui-rounded, "SF Pro Rounded", "Nunito", "Quicksand", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   display: grid; height: 100dvh;
   grid-template-areas: "top top top" "rail space panel";
-  grid-template-columns: 260px minmax(0, 1fr) 0; grid-template-rows: auto minmax(0, 1fr);
+  --rail-width: 260px;
+  grid-template-columns: var(--rail-width) minmax(0, 1fr) 0; grid-template-rows: auto minmax(0, 1fr);
 }
-body.panel-open { grid-template-columns: 260px minmax(0, 1fr) 320px; }
+body.panel-open { grid-template-columns: var(--rail-width) minmax(0, 1fr) 320px; }
 select, textarea, button, input { font: inherit; color: inherit; }
 button { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 999px; padding: 8px 16px; font-weight: 600; cursor: pointer; }
 button:disabled { opacity: 0.5; cursor: default; }
@@ -9076,9 +9186,12 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .phone-only { display: none !important; }
 .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 
-/* Top bar: one Chrome-style tab per project. */
+/* Top bar: the name over the rail, then one Chrome-style tab per project over the chat. */
 #topbar { grid-area: top; display: flex; align-items: flex-end; gap: 6px; padding: 8px 12px 0; min-width: 0; }
-.brand { display: flex; align-items: center; align-self: center; padding: 0 6px 6px 2px; }
+.brand { display: flex; align-items: center; align-self: center; gap: 10px; padding: 0 6px 6px 2px; flex: none;
+  width: calc(var(--rail-width) - 18px); color: var(--ink); text-decoration: none; }  /* 18px: the bar's padding and gap */
+.wordmark { font-size: 20px; font-weight: 600; letter-spacing: -0.02em; }
+.wordmark b { color: var(--accent); font-weight: 800; }
 .logo { width: 28px; height: 28px; flex: none; }
 #tabs { display: flex; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .tab { display: flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 14px 14px 0 0; max-width: 220px;
@@ -9184,11 +9297,15 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
-.picmenu > summary { cursor: pointer; list-style: none; display: inline-block; border-radius: 999px; padding: 3px 10px; font-size: 12.5px; }
+.picbutton { position: relative; padding: 0; background: none; border-radius: 50%; flex: none; }
+.picbutton .picedit { position: absolute; right: -2px; bottom: -2px; width: 22px; height: 22px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 12px; background: var(--panel); color: var(--ink);
+  border: 1px solid var(--line); box-shadow: var(--shadow); opacity: 0.85; transition: opacity 0.15s, transform 0.15s; }
+.picbutton:hover .picedit, .picbutton:focus-visible .picedit, .picbutton[aria-expanded="true"] .picedit { opacity: 1; transform: scale(1.08); }
 .picmenu .picks button.art { padding: 2px; border-radius: 50%; min-width: 0; }
 .picmenu .picks button.art img { width: 34px; height: 34px; display: block; }
 .avatar img.art { border-radius: 0; object-fit: contain; width: 92%; height: 92%; }
-.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; align-items: center; }
+.picmenu .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; align-items: center; }
 .picmenu .picks button { min-width: 34px; padding: 4px 8px; background: var(--soft); color: var(--text); border: 1px solid var(--line); }
 
 /* The space: header, thread, composer. */
@@ -9291,7 +9408,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 /* Tasks and Commands, in the space in place of the thread. */
 .view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
-#tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
+#tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
 #tasks.board-on { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
@@ -9356,6 +9473,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 
 /* The side panel: an agent, a role, a task, or the project. */
 #panel { grid-area: panel; overflow-y: auto; padding: 12px 14px 20px; min-width: 0; }
+#agent-pane { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
+#agent-pane .card { padding: 10px 12px; }
+#agent-pane .field { grid-template-columns: 82px minmax(0, 1fr); }
 .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .panel-head h2 { font-size: 15px; margin: 0; flex: 1; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 10px; }
@@ -9443,7 +9563,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 </head>
 <body>
 <header id="topbar">
-  <a class="brand wide-only" href="/" title="crewchat">__LOGO__</a>
+  <a class="brand wide-only" href="/" title="crewchat">__LOGO__<span class="wordmark">crew<b>chat</b></span></a>
   <nav id="tabs" aria-label="Projects"></nav>
   <details id="tab-add" class="menu">
     <summary title="Switch to a project, or make one" aria-label="Switch to a project, or make one">+</summary>
@@ -9469,6 +9589,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   <h2 class="rail-head">Agents</h2>
   <div id="agents"></div>
   <button type="button" id="add-agent" class="add-agent">+ New agent</button>
+  <section id="agent-pane" hidden aria-labelledby="agent-pane-title">
+    <header class="panel-head">
+      <h2 id="agent-pane-title" tabindex="-1"></h2>
+      <button type="button" class="icon" id="agent-pane-close" aria-label="Close the agent's settings" title="Close (Esc)">✕</button>
+    </header>
+    <div id="agent-pane-body"></div>
+  </section>
 </aside>
 <div id="scrim"></div>
 <main id="space">
@@ -9530,15 +9657,6 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
     <table id="sheet" hidden><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
-  <section id="commands" hidden aria-label="Commands">
-    <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Commands</h2></div>
-    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
-      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
-      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
-      than the one of the folder you are in.</p>
-    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
-    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
-  </section>
   <p id="working" aria-live="off" hidden></p>
   <form id="form">
     <div id="pending" aria-label="Files to send"></div>
@@ -9566,6 +9684,14 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <button type="button" class="icon" id="panel-close" aria-label="Close the panel" title="Close (Esc)">✕</button>
   </header>
   <div id="panel-body"></div>
+  <div id="commands" hidden>
+    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
+      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
+      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
+      than the one of the folder you are in.</p>
+    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
+    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
+  </div>
   <div id="pane-project" hidden>
     <section class="card"><h3>Machines</h3><p id="link" class="linkline"></p></section>
     <section class="card" id="setup" aria-label="What this project's agents learn">
@@ -9599,6 +9725,9 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       </fieldset>
       <fieldset class="step" hidden>
         <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
+        <label for="l-path">Or connect one</label>
+        <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
+          <button type="button" class="secondary" id="l-connect">Connect</button></div>
         <label>Machine</label><p id="l-machine"></p>
       </fieldset>
       <fieldset class="step" hidden>
@@ -9794,23 +9923,32 @@ function postJSON(path, body) {
   return request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-// The space shows the chat, the task board or the commands; the rail's buttons and the back arrows switch.
+// The chat is at its newest message (or near enough).
+function atBottom() {
+  const log = $("log");
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+}
+
+// The space shows the chat or the task board (the commands open in the side panel); the rail's Tasks
+// button and the back arrow switch.
+// A hidden chat can't scroll, so whether it was at its newest message is kept, and on the way back it
+// shows what came in meanwhile.
 function showView(view) {
-  $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
-  $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
-  for (const name of ["tasks", "commands"]) {
-    $("view-" + name).classList.toggle("on", view === name);
-    $("view-" + name).setAttribute("aria-pressed", String(view === name));
-  }
-  if (view === "commands") loadCommands();
+  const log = $("log"), back = log.hidden && view === "chat";
+  if (!log.hidden && view !== "chat") state.pinned = atBottom();
+  log.hidden = view !== "chat"; $("form").hidden = view !== "chat";
+  $("tasks").hidden = view !== "tasks";
+  $("view-tasks").classList.toggle("on", view === "tasks");
+  $("view-tasks").setAttribute("aria-pressed", String(view === "tasks"));
   renderWorking();
+  if (back && state.pinned !== false) log.scrollTop = log.scrollHeight;
   if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
 $("view-tasks").addEventListener("click", () => showView($("tasks").hidden ? "tasks" : "chat"));
-$("view-commands").addEventListener("click", () => showView($("commands").hidden ? "commands" : "chat"));
+$("view-commands").addEventListener("click", () => (state.panel && state.panel.kind === "commands" ? closePanel() : openPanel("commands")));
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
 // A phone: the rail is a drawer.
@@ -9944,7 +10082,7 @@ function taskOp(body) {
 }
 // Where an action's error is shown: the panel, the task board, or under the message box.
 function showError(text) {
-  if (state.panel && $("panel-body").querySelector(".panel-note")) return panelNote(text);
+  if ((state.panel || state.agentPane) && paneNote()) return panelNote(text);
   ($("tasks").hidden ? $("error") : $("tasks-note")).textContent = text;
 }
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
@@ -10171,7 +10309,7 @@ $("task-form").addEventListener("submit", async (event) => {
   if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
     fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
-try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
+try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 function renderSetup(rules, skills) {
@@ -10267,7 +10405,7 @@ async function openLaunch(role) {
   const roles = state.roles.map((r) => new Option(r.title, r.name));
   $("l-role").replaceChildren(new Option("No role", ""), ...roles.map((o) => new Option(o.text, o.value)));
   $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option("A " + o.text.toLowerCase() + " (" + o.text + " role)", o.value)));
-  $("l-picture").replaceChildren(...pictureOptions());
+  $("l-picture").replaceChildren(...pictureOptions(), new Option("Initials", "initials"));
   $("l-colour-tool").checked = true;
   showStep(0);
   dialog.showModal();
@@ -10283,20 +10421,44 @@ async function openLaunch(role) {
     const firstReady = opts.tools.find((t) => !t.missing);
     if (firstReady) $("l-tool").value = firstReady.id;
     if ($("l-role").value) applyRole($("l-role").value); else showTool();  // a role picked meanwhile
-    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
-    const ready = opts.tools.filter((t) => !t.missing);
-    $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
+    showFolders(opts.folders);
     if (role) { $("l-template").value = role; $("l-role").value = role; applyRole(role); showStep(1); }
-    if (!ready.length || !opts.folders.length) {
-      note.textContent = !ready.length
-        ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
-        : "No folder on this machine is connected to this project yet. Run `crewchat start --chat " + (CHAT || "PROJECT") + "` in one first.";
-      $("l-start").disabled = true;
-    } else if (missing) {
-      note.textContent = missing;
-    }
+    launchNote(opts.folders);
   } catch (err) {
     note.textContent = "Could not load the options: " + err.message;
+  }
+}
+function showFolders(folders, pick) {
+  $("l-folder").replaceChildren(...(folders.length ? folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path))
+    : [new Option("None connected yet: type one below", "")]));
+  $("l-folder").disabled = !folders.length;
+  if (pick) $("l-folder").value = pick;
+}
+// What stops a start (no tool, no folder), or the tools that are missing.
+function launchNote(folders) {
+  const ready = launchTools.filter((t) => !t.missing);
+  const missing = launchTools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
+  $("launch-note").textContent = !ready.length
+    ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then come back."
+    : !folders.length ? "No folder on this machine is in this project yet: type one's path under Or connect one." : missing;
+  $("l-start").disabled = !ready.length || !folders.length;
+}
+// The owner connects a folder to this project (`crewchat start` in it, on this machine).
+async function connectFolder() {
+  const path = $("l-path").value.trim(), button = $("l-connect");
+  if (!path || button.disabled) return;
+  button.disabled = true;
+  $("launch-note").textContent = "Connecting " + path + "…";
+  try {
+    const out = await postJSON("/api/folders", { op: "connect", path });
+    showFolders(out.folders, out.path);
+    launchNote(out.folders);
+    $("l-path").value = "";
+    $("launch-note").textContent = ["Connected " + out.path + ".", $("launch-note").textContent].join(" ").trim();
+  } catch (err) {
+    $("launch-note").textContent = "Not connected: " + err.message;
+  } finally {
+    button.disabled = false;
   }
 }
 // The chosen tool: its colour, its models, and what it may do without asking.
@@ -10362,6 +10524,8 @@ $("l-dice").addEventListener("click", () => {
   if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
   else $("l-dice").disabled = true;  // every first name is in use
 });
+$("l-connect").addEventListener("click", connectFolder);
+$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connectFolder(); } });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
@@ -10386,8 +10550,15 @@ async function postAction(path, body, what, control) {
     if (control) control.disabled = false;
   }
 }
+// The note line of the pane the owner is in: the agent's (in the rail) or the side panel's.
+function paneNote() {
+  const agent = $("agent-pane-body"), side = $("panel-body");
+  const box = agent.contains(document.activeElement) ? agent : side.contains(document.activeElement) ? side
+    : state.agentPane ? agent : side;
+  return box.querySelector(".panel-note");
+}
 function panelNote(text) {
-  const note = $("panel-body").querySelector(".panel-note");
+  const note = paneNote();
   if (note) note.textContent = text; else $("error").textContent = text;
 }
 
@@ -10408,7 +10579,17 @@ function sessionLine(a) {
 
 function sessionControls(a, acts, agentOp) {
   const s = a.session;
-  if (!s || a.remote) return;
+  if (a.remote) return;
+  if (!s || (!s.running && !s.reopen)) {
+    // No conversation to reopen (crewchat recorded none): a new session that checks in as this agent.
+    if (a.startable && !isWorking(a))
+      actButton(acts, "Start again", "Start a new session as " + a.agent, (b) => {
+        if (confirm("Start a new session as " + a.agent + "? Its last conversation was not recorded, so a new one opens in a "
+                    + "Terminal window in its folder, with the same name, role and tasks. If it is still open somewhere, close it first."))
+          agentOp({ op: "start", agent: a.agent }, "Not started", b);
+      });
+    return;
+  }
   if (s.running) {
     actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {
       if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
@@ -10457,9 +10638,11 @@ function doing(a) {
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
 // The agent open in the panel is marked in the rail, without drawing the rail again.
 function markOpen() {
-  const p = state.panel;
+  const commands = !!state.panel && state.panel.kind === "commands";
+  $("view-commands").classList.toggle("on", commands);
+  $("view-commands").setAttribute("aria-pressed", String(commands));
   for (const card of $("agents").querySelectorAll(".agent")) {
-    const on = !!p && p.kind === "agent" && p.id === card.dataset.agent;
+    const on = state.agentPane === card.dataset.agent;
     card.classList.toggle("on", on);
     if (on) card.setAttribute("aria-current", "true"); else card.removeAttribute("aria-current");
   }
@@ -10579,20 +10762,22 @@ function manyMachines() {
   return state.many;
 }
 
-// The pictures to choose from in a menu: initials, the 3D pictures, the emoji presets.
+// The pictures to choose from in a menu: a random one ("", what every new agent gets), the 3D
+// pictures, the emoji presets.
 function pictureOptions() {
-  return [new Option("Initials", ""),
+  return [new Option("A random 3D picture", ""),
           ...Object.entries(state.art || {}).map(([id, label]) => new Option(label + " (3D)", "art:" + id)),
           ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id))];
 }
 
-// The Picture menu: a 3D picture, an emoji, initials, an image of your own, and a colour.
+// The Picture menu: a 3D picture, an emoji, initials, an image of your own, and a colour. The
+// picture itself opens it (pictureButton).
 function pictureMenu(a, agentOp) {
-  const menu = el("details", "picmenu");
-  menu.append(el("summary", "ghost", "Change picture"));
+  const menu = el("div", "picmenu");
+  menu.hidden = true;
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
-    .then(() => { menu.open = false; });
+    .then(() => { menu.hidden = true; menu.dispatchEvent(new Event("close")); });
   for (const [id, label] of Object.entries(state.art || {})) {
     const b = actButton(picks, "", "Picture: " + label, (b) => set({ picture: "art:" + id }, b));
     const img = el("img"); img.alt = ""; img.src = "/pictures/" + id + ".webp"; b.append(img);
@@ -10624,9 +10809,12 @@ function pictureMenu(a, agentOp) {
   return menu;
 }
 
-// The side panel: an agent, a task, a role, the roles, or the project. Esc or ✕ closes it; it is
-// drawn again as the chat changes, unless the owner is choosing or typing in it.
+// The side panel: a task, a role, the roles, the project or the commands (an agent opens in the rail,
+// under the crew). Esc or ✕ closes it; it is drawn again as the chat changes, unless the owner is
+// choosing or typing in it.
 function openPanel(kind, id) {
+  if (kind === "agent") return openAgent(id);
+  if (kind === "commands") loadCommands();
   const from = document.activeElement;
   if (!state.panel) state.panelFrom = from && from !== document.body ? from : null;  // focus goes back there
   state.panel = { kind, id };
@@ -10646,6 +10834,39 @@ function closePanel() {
   state.panelFrom = null;
   if (back) back.focus();
 }
+// An agent's settings, in the rail under the crew: its card again opens and closes them.
+function openAgent(name) {
+  if (state.agentPane === name && $("agents").contains(document.activeElement)) return closeAgent();
+  state.agentPane = name;
+  if (matchMedia("(max-width: 760px)").matches) document.body.classList.add("rail-open");  // the rail is a drawer
+  renderAgentPane(true);
+  markOpen();
+  $("agent-pane").scrollIntoView({ block: "nearest" });
+  $("agent-pane-title").focus({ preventScroll: true });
+}
+function closeAgent() {
+  const name = state.agentPane;
+  state.agentPane = null;
+  $("agent-pane").hidden = true;
+  markOpen();
+  $("agents").querySelector('[data-agent="' + CSS.escape(name || "") + '"]')?.focus();
+}
+function agentPaneBusy() {
+  const body = $("agent-pane-body");
+  return body.querySelector(".picmenu:not([hidden])") || body.contains(document.activeElement);
+}
+function renderAgentPane(force) {
+  const name = state.agentPane;
+  if (!name) return;
+  const key = JSON.stringify([name, state.version, Math.floor(state.now / 60)]);
+  if (!force && (key === state.agentPaneKey || agentPaneBusy())) return;
+  state.agentPaneKey = key;
+  $("agent-pane").hidden = false;
+  const [title, ...cards] = panelAgent(name);
+  $("agent-pane-title").textContent = title;
+  $("agent-pane-body").replaceChildren(...cards, el("p", "panel-note meta"));
+}
+$("agent-pane-close").addEventListener("click", closeAgent);
 // The roles panels' data: loaded, or the error and a way to try again.
 function loadRolesInto() {
   state.rolesError = "";
@@ -10656,12 +10877,13 @@ document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
   const menu = document.querySelector("details.menu[open]");
   if (menu) { menu.open = false; menu.querySelector("summary").focus(); return; }
-  if (state.panel) closePanel();
+  if (state.agentPane && ($("agent-pane").contains(document.activeElement) || !state.panel)) closeAgent();
+  else if (state.panel) closePanel();
   else document.body.classList.remove("rail-open");
 });
 // Not drawn again while the owner is in it: choosing, typing, or on one of its buttons.
 function panelBusy() {
-  return $("panel-body").querySelector(".picmenu[open], form.editing") || $("panel-body").contains(document.activeElement);
+  return $("panel-body").querySelector(".picmenu:not([hidden]), form.editing") || $("panel-body").contains(document.activeElement);
 }
 function renderPanel(force) {
   const p = state.panel;
@@ -10673,8 +10895,9 @@ function renderPanel(force) {
   document.body.classList.add("panel-open");
   const body = $("panel-body");
   $("pane-project").hidden = p.kind !== "project";
-  const draw = { agent: panelAgent, task: panelTask, roles: panelRoles, role: panelRole,
-                 project: () => ["Rules, skills and machines"] }[p.kind];
+  $("commands").hidden = p.kind !== "commands";
+  const draw = { task: panelTask, roles: panelRoles, role: panelRole, project: () => ["Rules, skills and machines"],
+                 commands: () => ["Commands"] }[p.kind];
   const [title, ...cards] = draw(p.id);
   $("panel-title").textContent = title;
   body.replaceChildren(...cards, el("p", "panel-note meta"));
@@ -10705,7 +10928,8 @@ function panelAgent(name) {
   names.append(remote ? el("div", "nm", a.agent) : nameField(a, agentOp));
   if (a.role) names.append(el("span", "badge " + a.role, roleTitle(a.role)));
   names.append(el("div", "meta", [tool.label || a.client, a.place + (a.remote ? " on " + a.device : "")].join(" · ")));
-  head.append(avatar(a, "big"), names);
+  const menu = remote ? null : pictureMenu(a, agentOp);
+  head.append(menu ? pictureButton(a, menu) : avatar(a, "big"), names);
 
   const now = [];
   now.push(field("Status", a.status || "No status set"));
@@ -10742,7 +10966,7 @@ function panelAgent(name) {
     const m = leadingMention(text.value);
     text.value = "@" + a.agent + " " + (m ? text.value.slice(m[0].length).replace(/^[,:]?\s*/, "") : text.value);
     fit(); text.focus();
-    if (matchMedia("(max-width: 760px)").matches) closePanel();
+    if (matchMedia("(max-width: 760px)").matches) document.body.classList.remove("rail-open");
   });
   sessionControls(a, acts, agentOp);
   const button = (label, title, run, cls) => {
@@ -10750,15 +10974,29 @@ function panelAgent(name) {
     if (cls) b.classList.add(cls);
     if (remote) { b.title = remote; b.disabled = true; }
   };
-  if (!remote) acts.append(pictureMenu(a, agentOp));
   button("Remove", "Remove " + a.agent + " from the chat", (b) => {
     if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
                 "still open, it joins again the next time it uses crewchat."))
-      agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closePanel(); });
+      agentOp({ op: "remove", agent: a.agent }, "Not removed", b).then((ok) => { if (ok) closeAgent(); });
   }, "danger");
-  const cards = [card("", head), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
+  const cards = [card("", ...[head, menu].filter(Boolean)), card("Now", ...now), card("Settings", ...settings), card("Actions", acts)];
   if (remote) cards.push(card("", el("p", "meta", remote + ": its picture, name and session.")));
   return [a.agent, ...cards];
+}
+
+// The agent's picture, as a button that opens and closes its Picture menu.
+function pictureButton(a, menu) {
+  const b = el("button", "picbutton");
+  b.type = "button"; b.title = "Change picture";
+  b.setAttribute("aria-label", "Change " + a.agent + "'s picture");
+  b.setAttribute("aria-expanded", "false");
+  b.append(avatar(a, "big"), el("span", "picedit", "✎"));
+  b.addEventListener("click", () => {
+    menu.hidden = !menu.hidden;
+    b.setAttribute("aria-expanded", String(!menu.hidden));
+  });
+  menu.addEventListener("close", () => { b.setAttribute("aria-expanded", "false"); b.focus(); });
+  return b;
 }
 
 // The agent's name, editable where it stands (as in a bot builder): Enter or leaving the field saves,
@@ -10782,9 +11020,8 @@ function nameField(a, agentOp) {
     const ok = await agentOp({ op: "rename", agent: a.agent, new: name }, "Not renamed", input);
     busy = false;
     done = !!ok;
-    const p = state.panel;
     if (ok) a.agent = name;  // the row as the next poll will have it
-    if (ok && p && p.kind === "agent" && p.id !== name) openPanel("agent", name);
+    if (ok && state.agentPane && state.agentPane !== name) { state.agentPane = name; renderAgentPane(true); }
     else if (!ok) input.value = a.agent;
   };
   input.addEventListener("keydown", (e) => {
@@ -11295,7 +11532,7 @@ function renderNeeds(needs) {
 // (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
 function markRead(upto) {
   const log = $("log");
-  const seen = !document.hidden && document.hasFocus() && !log.hidden && log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const seen = !document.hidden && document.hasFocus() && !log.hidden && atBottom();
   const seq = upto || (seen ? state.after : 0);
   if (!seq || seq <= (state.readPosted || 0)) return;
   if (!upto && !state.needs.some((n) => n.kind === "message" && n.seq <= seq)) return;
@@ -11427,7 +11664,7 @@ async function loop() {
       try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();
       const log = $("log");
-      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      const pinned = atBottom();
       const mine = data.messages.some((m) => m.from === "Owner");
       renderAgents();
       renderWorking();
@@ -11436,6 +11673,7 @@ async function loop() {
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
         loadRoles().then(() => renderPanel()).catch(() => {});
       renderPanel();
+      renderAgentPane();
       if (first && $("empty")) $("empty").replaceWith(welcome());
       refreshDynamic();
       // Scroll last: the cards and read receipts above change the list's height.
@@ -11621,7 +11859,7 @@ $("form").addEventListener("submit", async (e) => {
 
 setInterval(() => {
   state.now += 30;
-  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); }  // "N min ago" moves on
+  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); renderAgentPane(); }  // "N min ago" moves on
 }, 30000);
 loop();
 </script>
