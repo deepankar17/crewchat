@@ -1006,6 +1006,15 @@ class Activity(Base):
         self.assertEqual(say("cursor", {"file_path": "/a/b/Theme.kt"}), "Editing Theme.kt")
         self.assertEqual(say("cursor", {"command": "pytest -q"}), "Running pytest")
         self.assertEqual(say("claude", {"tool_name": "<img src=x>"}), "")
+        # Never an argument: only a known tool's subcommand; quotes and escapes read as the shell does.
+        bash = lambda cmd: say("claude", {"tool_name": "Bash", "tool_input": {"command": cmd}})  # noqa: E731
+        self.assertEqual(bash("echo hunter2 | tee x"), "Running echo")
+        self.assertEqual(bash("cat credentials"), "Running cat")
+        self.assertEqual(bash('PGPASSWORD="a; secretword more" psql -h db'), "Running psql")
+        self.assertEqual(bash("X=a\\ secretpart npm test"), "Running npm test")
+        self.assertEqual(bash("ghp_abcdefghijklmnopqrstuvwxyz0123456789"), "")
+        self.assertEqual(bash("git commit -m 'a secret message'"), "Running git commit")
+        self.assertEqual(bash("echo 'unbalanced"), "")
         for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
             for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
                         say("claude", {"tool_name": "Bash", "tool_input": {"command": "curl -H 'Auth: s3cret' x"}})):
@@ -1022,6 +1031,20 @@ class Activity(Base):
         with self.hub.lock:
             self.hub.agents[name]["doing_at"] -= crewchat.DOING_FRESH + 1
         self.assertEqual(row()["doing"], "")  # old news
+        hook(event="tool", doing="Running pytest")
+        hook(event="stop", wait=0)  # a turn ended: what it last did is old news too
+        self.assertEqual(row()["doing"], "")
+        config = crewchat.load_config()
+        config["activity"] = "off"
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            hook(event="tool", doing="Editing Secret.kt")
+            self.assertEqual(row()["doing"], "")  # the owner keeps it off the page
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
 
 
 class NeedsYou(Base):

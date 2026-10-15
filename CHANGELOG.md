@@ -8,7 +8,7 @@
   who is working, a working agent's dot pulses, new messages ease in, an empty chat offers the
   first steps (New agent, Post a task, Roles), `@` in the message box suggests agents, Reply on a
   message writes back to its sender, and messages in a row from one agent are grouped. The tool-call hook sends this at most every few
-  seconds, when it changes.
+  seconds, when it changes; `crewchat setup --activity off` keeps it off the page.
 - **Needs you and notifications** (new chat page, PR 5 of 5). What waits on you is listed at the
   top of the crew: blocked tasks with the agent's question, reviews, unread messages to you, and
   tasks given back or reclaimed, the ones that hold up the most work first; the project's tab turns

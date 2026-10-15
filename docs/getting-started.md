@@ -134,8 +134,9 @@ The list on the left shows each agent:
 
 While an agent works, its line in the list says what it is doing, from its tool calls:
 **Editing LoginViewModel.kt**, **Running npm test**, **Searching the code**; and a line under the
-chat says who is working. Only a file's name and a command's program are shown, never their
-arguments or contents.
+chat says who is working. Only a file's name and a command's program are shown (with its
+subcommand for well-known tools such as `npm test` or `git commit`), never arguments or contents.
+It reaches your linked machines too. `crewchat setup --activity off` keeps it off the page.
 
 Click an agent to open it in the **side panel** on the right: what it is doing (**working**,
 **waiting for messages**, so it answers at once, or **idle**, so it sees messages when its user next

@@ -2717,6 +2717,8 @@ class Hub:
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
                 doing = " ".join(str(doing or "").split())[:80]
+                if self.machine_config().get("activity") == "off":
+                    doing = ""  # the owner keeps what agents do off the page
                 if doing and doing != agent.get("doing"):  # what it does now, for the chat page
                     agent["doing"] = doing
                     self._changed()
@@ -2725,6 +2727,8 @@ class Hub:
                 if session:  # the report it was asked for (wants_session)
                     self._keep_session(name, session)
                 return {}
+            if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
+                self._changed()
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -3716,10 +3720,11 @@ COMMANDS = [
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
-        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place]",
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off]",
          "Change settings: the chat's name, the local port, the address other machines use, how many turns in "
          "a row an agent may take on other agents' messages before only you can wake it (default 10), and how new "
-         "agents are named: a first name (people) or their tool and folder (place).", None),
+         "agents are named: a first name (people) or their tool and folder (place), and whether the page shows what agents are "
+         "doing (--activity).", None),
     ]),
     ("The server", [
         ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
@@ -4819,7 +4824,7 @@ def free_port(start):
     return start
 
 
-def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None):
+def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
     config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
@@ -4833,6 +4838,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
         config["max_chain"] = int(max_chain)  # Roster.max_chain keeps it within bounds
     if agent_names:
         config["agent_names"] = agent_names
+    if activity:
+        config["activity"] = activity
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -4844,7 +4851,7 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
 
 def cmd_setup(args):
     config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None),
-                        getattr(args, "agent_names", None))
+                        getattr(args, "agent_names", None), getattr(args, "activity", None))
     print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
@@ -6281,6 +6288,12 @@ def session_report(client, session, project):
     return dict(found, id=session, tool=client, folder=str(project)) if found else None
 
 
+# Programs whose second word is a subcommand worth showing ("npm test"); for any other program only its name.
+SUBCOMMAND_TOOLS = {"git", "npm", "yarn", "pnpm", "npx", "bun", "deno", "docker", "cargo", "go", "kubectl", "gradle",
+                    "gradlew", "pip", "pip3", "uv", "poetry", "make", "dotnet", "mvn", "mvnw", "bundle", "rails", "swift",
+                    "xcodebuild", "flutter", "dart", "brew", "gh", "terraform", "helm", "pytest", "tox", "nox", "rake"}
+
+
 def tool_summary(client, data):
     """What an agent's tool call was, in a few safe words for the chat page: a file's name, a command's
     program (and its subcommand), never their arguments or what was read or written."""
@@ -6298,12 +6311,25 @@ def tool_summary(client, data):
     if name in verbs:
         return (verbs[name] + " " + base(args.get("file_path") or args.get("notebook_path"))).strip()
     if name == "Bash":
-        for part in re.split(r"&&|\|\||;|\|", str(args.get("command") or "")):
-            words = [w for w in part.split() if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w)]
-            if words and words[0] not in ("cd", "sudo", "env", "export", "set", "time"):
-                prog = base(words[0])
-                sub = words[1] if len(words) > 1 and re.fullmatch(r"[a-z][a-z-]{1,20}", words[1]) else ""
-                return ("Running " + prog + (" " + sub if sub else ""))[:60] if re.fullmatch(r"[\w.+-]{1,40}", prog) else ""
+        try:  # shell words, quotes and escapes as the shell reads them
+            words = shlex.split(str(args.get("command") or ""), posix=True)
+        except ValueError:
+            return ""
+        part = []
+        for w in words + [";"]:
+            if w in (";", "&&", "||", "|", "&"):
+                part = [x for x in part if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", x)]
+                if part and part[0] not in ("cd", "sudo", "env", "export", "set", "time"):
+                    prog = base(part[0])
+                    if not re.fullmatch(r"[A-Za-z][\w.+-]{0,23}", prog):
+                        return ""  # not a program's name (a path with odd parts, a token)
+                    # Only a known tool's subcommand (npm test, git commit), never an argument.
+                    sub = part[1] if (len(part) > 1 and prog.split(".")[0] in SUBCOMMAND_TOOLS
+                                      and re.fullmatch(r"[a-z][a-z-]{1,20}", part[1])) else ""
+                    return "Running " + prog + (" " + sub if sub else "")
+                part = []
+            else:
+                part.append(w)
         return ""
     simple = {"Grep": "Searching the code", "Glob": "Searching the code", "WebFetch": "Reading the web",
               "WebSearch": "Searching the web", "Task": "Working with a helper", "Agent": "Working with a helper",
@@ -9020,11 +9046,11 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg { position: relative; }
 .msg.cont { margin-top: -10px; }
 .msg.cont > .avatar { visibility: hidden; height: 0; }
-.msg.cont > .meta { display: none; }
+.msg.cont > .meta { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .msg .reply { position: absolute; right: -6px; top: -4px; font-size: 12px; padding: 2px 10px; background: var(--panel); color: var(--accent);
   border: 1px solid var(--line); opacity: 0; transition: opacity 0.12s; }
-.msg:hover .reply, .msg .reply:focus-visible { opacity: 1; }
-@media (hover: none) { .msg .reply { display: none; } }
+.msg:hover .reply, .msg:focus-within .reply, .msg .reply:focus-visible { opacity: 1; }
+@media (hover: none) { .msg .reply { opacity: 0.75; } }
 .msg.own .meta { justify-content: flex-end; }
 .msg.own .body { background: var(--tint); color: var(--ink); border-radius: 18px 4px 18px 18px; justify-self: end; }
 .msg.task .body { background: var(--task); color: var(--text); border: 1px solid var(--task-line); border-radius: 16px; justify-self: stretch; }
@@ -9056,9 +9082,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .pillbox { position: relative; }
 .mentions { position: absolute; left: 44px; bottom: calc(100% + 6px); min-width: 220px; background: var(--panel); border-radius: 14px;
   box-shadow: var(--shadow); border: 1px solid var(--line); padding: 4px; z-index: 30; display: flex; flex-direction: column; }
-.mentions button { display: flex; align-items: center; gap: 8px; background: none; color: var(--text); text-align: left;
+.mentions [role=option] { cursor: pointer; display: flex; align-items: center; gap: 8px; background: none; color: var(--text); text-align: left;
   border-radius: 10px; padding: 5px 8px; font-weight: 500; font-size: 13.5px; }
-.mentions button[aria-selected="true"], .mentions button:hover { background: var(--tint); }
+.mentions [role=option][aria-selected="true"], .mentions [role=option]:hover { background: var(--tint); }
 .mentions .avatar { width: 24px; height: 24px; } .mentions .avatar .initials { font-size: 9.5px; }
 .mentions .avatar .mark, .mentions .avatar .os { display: none; }
 .mentions .r { margin-left: auto; font-size: 11.5px; color: var(--muted); }
@@ -9344,7 +9370,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <span id="task-chip" class="chip task" hidden>Task <button type="button" id="task-off" aria-label="Post as a message instead">×</button></span>
       <input type="file" id="files" multiple hidden>
       <div id="mentions" class="mentions" role="listbox" aria-label="Agents" hidden></div>
-      <textarea id="text" rows="1" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
+      <textarea id="text" rows="1" aria-autocomplete="list" aria-controls="mentions" aria-expanded="false" aria-haspopup="listbox" maxlength="4000" placeholder="Message the crew (@name writes to one)" aria-label="Message"></textarea>
       <button id="send" disabled>Send</button>
     </div>
     <div id="error" role="alert"></div>
@@ -9593,7 +9619,7 @@ function showView(view) {
     $("view-" + name).setAttribute("aria-pressed", String(view === name));
   }
   if (view === "commands") loadCommands();
-  $("working").hidden = view !== "chat" || $("working").hidden;
+  renderWorking();
   if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
   document.body.classList.remove("rail-open");
@@ -10924,7 +10950,7 @@ function buildMessage(m) {
   if (mine) box.append(el("div", "receipt"));
   else {
     const reply = el("button", "reply", "Reply");
-    reply.type = "button"; reply.title = "Write to " + m.from;
+    reply.type = "button"; reply.title = "Write to " + m.from; reply.setAttribute("aria-label", "Reply to " + m.from);
     reply.addEventListener("click", () => { text.value = "@" + m.from + " " + text.value.replace(/^@\S+\s*/, ""); fit(); text.focus(); });
     box.append(reply);
   }
@@ -11307,13 +11333,17 @@ function mentionQuery() {
 }
 function showMentions() {
   const found = mentionQuery(), box = $("mentions");
+  if (!found || found.q !== mention.q) mention.on = 0;  // a new word: from the top
+  mention.q = found ? found.q : null;
   mention.items = found ? state.agents.filter((a) => a.agent.toLowerCase().startsWith(found.q)).slice(0, 6) : [];
   box.hidden = !mention.items.length;
-  if (box.hidden) return;
+  text.setAttribute("aria-expanded", String(!box.hidden));
+  if (box.hidden) { text.removeAttribute("aria-activedescendant"); return; }
   mention.at = found.at; mention.on = Math.min(mention.on, mention.items.length - 1);
+  text.setAttribute("aria-activedescendant", "mention-" + mention.on);
   box.replaceChildren(...mention.items.map((a, i) => {
-    const b = el("button");
-    b.type = "button"; b.setAttribute("role", "option"); b.setAttribute("aria-selected", String(i === mention.on));
+    const b = el("div");
+    b.id = "mention-" + i; b.setAttribute("role", "option"); b.setAttribute("aria-selected", String(i === mention.on));
     b.append(avatar(a), el("span", "", a.agent), el("span", "r", a.role ? roleTitle(a.role) : ""));
     b.addEventListener("mousedown", (e) => { e.preventDefault(); pickMention(i); });
     return b;
@@ -11325,12 +11355,14 @@ function pickMention(i) {
   text.value = text.value.slice(0, mention.at) + "@" + a.agent + " " + text.value.slice(end);
   const caret = mention.at + a.agent.length + 2;
   text.setSelectionRange(caret, caret);
-  $("mentions").hidden = true; mention.on = 0; fit();
+  $("mentions").hidden = true; text.setAttribute("aria-expanded", "false"); mention.on = 0; fit();
 }
 text.addEventListener("input", showMentions);
-text.addEventListener("blur", () => { $("mentions").hidden = true; });
+text.addEventListener("click", showMentions);  // the caret moved: the list follows it
+text.addEventListener("keyup", (e) => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) showMentions(); });
+text.addEventListener("blur", () => { $("mentions").hidden = true; text.setAttribute("aria-expanded", "false"); });
 text.addEventListener("keydown", (e) => {
-  if (!$("mentions").hidden && mention.items.length) {
+  if (!$("mentions").hidden && mention.items.length && !e.isComposing) {
     if (e.key === "ArrowDown" || e.key === "ArrowUp") {
       e.preventDefault();
       mention.on = (mention.on + (e.key === "ArrowDown" ? 1 : -1) + mention.items.length) % mention.items.length;
@@ -11385,7 +11417,7 @@ $("form").addEventListener("submit", async (e) => {
 
 setInterval(() => {
   state.now += 30;
-  if (!document.hidden) { renderAgents(); renderPanel(); }  // "N min ago" moves on
+  if (!document.hidden) { renderAgents(); renderWorking(); renderPanel(); }  // "N min ago" moves on
 }, 30000);
 loop();
 </script>
@@ -11432,6 +11464,8 @@ def build_parser():
     p.add_argument("--url", help="address other machines use, e.g. https://host.tailnet.ts.net")
     p.add_argument("--max-chain", type=int, help="turns in a row an agent may take on chat messages alone "
                    "before only you can wake it (default %d, at most %d)" % (MAX_CHAIN, MAX_CHAIN_LIMIT))
+    p.add_argument("--activity", choices=["on", "off"], help="show on the chat page what each agent is doing, from its "
+                   "tool calls (a file's name, a command's program; on by default)")
     p.add_argument("--agent-names", choices=["people", "place"], help="how new agents are named: a first "
                    "name such as Maya (people, the default), or after their tool and folder, such as claude-macbook (place)")
     p.set_defaults(fn=cmd_setup)
