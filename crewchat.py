@@ -3978,17 +3978,23 @@ def typed_folder(path):
 
 def list_folders(path, root=None):
     """The folders in a folder on this machine, for New agent's Browse: hidden ones (.git, .cache)
-    and crewchat's own folder left out."""
-    folder = typed_folder(path or "~")
-    if not folder.is_dir():
-        raise HubError("there is no folder at %s" % folder)
+    and crewchat's own folder left out. A path that is not there yet lists the nearest folder above
+    it that is (missing: the path asked for)."""
+    asked = folder = typed_folder(path or "~")
+    while not folder.is_dir() and folder.parent != folder:
+        folder = folder.parent
     try:
-        names = sorted((e.name for e in os.scandir(folder) if not e.name.startswith(".") and e.is_dir()), key=str.lower)
-    except OSError as e:
+        mine = os.stat(str(root or home()))
+    except OSError:
+        mine = None
+    try:
+        names = sorted((e.name for e in os.scandir(folder) if not e.name.startswith(".") and e.is_dir()
+                        and not (mine and os.path.samestat(e.stat(), mine))), key=str.lower)
+    except OSError as e:  # no permission (on a Mac: Desktop, Documents)
         raise HubError("cannot open %s (%s)" % (folder, e.strerror or e))
-    names = [n for n in names if not inside_any(folder / n, {Path(root or home())})]
     return {"path": str(folder), "parent": str(folder.parent) if folder.parent != folder else "",
-            "home": str(Path.home()), "more": len(names) > MAX_LISTED_FOLDERS,
+            "home": str(Path.home().resolve()), "more": len(names) > MAX_LISTED_FOLDERS,
+            "missing": str(asked) if asked != folder else "",
             "folders": [{"name": n, "path": str(folder / n)} for n in names[:MAX_LISTED_FOLDERS]]}
 
 
@@ -3996,8 +4002,11 @@ def make_folder(path, name, root=None):
     """A new folder called name in a folder on this machine, made from New agent's Browse."""
     parent = typed_folder(path)
     name = str(name or "").strip()
-    if not name or name in (".", "..") or len(name) > 100 or re.search(r"[\\/:\x00-\x1f]", name):
-        raise HubError("a folder's name has no / \\ or :, and is 100 characters at most")
+    # Not hidden (Browse would not show it), and nothing Windows refuses or quietly changes.
+    if (not name or name.startswith(".") or name.endswith((".", " ")) or len(name) > 100
+            or re.search(r'[\\/:*?"<>|\x00-\x1f]', name)):
+        raise HubError('a folder\'s name has no / \\ : * ? " < > |, does not start or end with a dot, '
+                       'and is 100 characters at most')
     folder = parent / name
     if inside_any(folder, {Path(root or home())}):
         raise HubError("not in crewchat's own folder")
@@ -9792,7 +9801,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
         <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
           <button type="button" class="secondary" id="l-browse" aria-expanded="false" aria-controls="l-browser">Browse…</button>
           <button type="button" class="secondary" id="l-connect">Connect</button></div>
-        <div id="l-browser" class="browser" hidden aria-label="Folders on this machine"></div>
+        <div id="l-browser" class="browser" role="group" hidden aria-label="Folders on this machine"></div>
         <label>Machine</label><p id="l-machine"></p>
       </fieldset>
       <fieldset class="step" hidden>
@@ -10465,7 +10474,7 @@ async function openLaunch(role) {
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
   for (const id of ["l-name", "l-task", "l-instructions", "l-path"]) $(id).value = "";
-  $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false");
+  showBrowser(false);
   $("l-folder-label").textContent = word("folder");
   $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
   const roles = state.roles.map((r) => new Option(r.title, r.name));
@@ -10510,9 +10519,9 @@ function launchNote(folders) {
   $("l-start").disabled = !ready.length || !folders.length;
 }
 // The owner connects a folder to this project (`crewchat start` in it, on this machine). One that
-// is not there yet can be made: create.
-async function connectFolder(create) {
-  const path = $("l-path").value.trim(), button = $("l-connect"), note = $("launch-note");
+// is not there yet can be made: create, for the path that was refused.
+async function connectFolder(create, typed) {
+  const path = typed || $("l-path").value.trim(), button = $("l-connect"), note = $("launch-note");
   if (!path || button.disabled) return;
   button.disabled = true;
   note.textContent = (create ? "Making and connecting " : "Connecting ") + path + "…";
@@ -10521,14 +10530,14 @@ async function connectFolder(create) {
     showFolders(out.folders, out.path);
     launchNote(out.folders);
     $("l-path").value = "";
-    $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false");
+    showBrowser(false);
     note.textContent = ["Connected " + out.path + ".", note.textContent].join(" ").trim();
   } catch (err) {
     note.replaceChildren("Not connected: " + err.message);
     if (/^there is no folder at /.test(err.message)) {
       const make = el("button", "link", "Create it and connect");
       make.type = "button";
-      make.addEventListener("click", () => connectFolder(true));
+      make.addEventListener("click", () => connectFolder(true, path));
       note.append(" ", make);
     }
   } finally {
@@ -10537,52 +10546,59 @@ async function connectFolder(create) {
 }
 // Browse: the folders on the machine that hosts the page, to pick one or make one (a browser's own
 // file picker cannot say where a folder is).
-function tilde(path, home) { return home && (path === home || path.startsWith(home + "/")) ? "~" + path.slice(home.length) : path; }
+function showBrowser(open) {
+  $("l-browser").hidden = !open;
+  $("l-browse").setAttribute("aria-expanded", String(open));
+  if (!open) state.browsing = (state.browsing || 0) + 1;  // a listing still on its way is not shown
+}
+function tilde(path, home) {
+  return home && (path === home || path.startsWith(home + "/") || path.startsWith(home + "\\")) ? "~" + path.slice(home.length) : path;
+}
 async function browse(path) {
-  const box = $("l-browser");
-  box.hidden = false;
-  $("l-browse").setAttribute("aria-expanded", "true");
-  let out;
+  const box = $("l-browser"), ticket = state.browsing = (state.browsing || 0) + 1;  // only the newest is shown
+  showBrowser(true);
+  let out, failed = "";
   try { out = await postJSON("/api/folders", { op: "list", path: path || "~" }); }
-  catch (err) { box.replaceChildren(el("p", "meta", "Cannot open it: " + err.message)); return; }
-  $("l-path").value = tilde(out.path, out.home);
+  catch (err) { failed = err.message; }
+  if (ticket !== state.browsing) return;  // another folder was opened since, or the browser closed
   const crumbs = el("div", "crumbs");
-  const go = (label, title, to) => {
-    const b = el("button", "secondary", label);
-    b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
-    b.addEventListener("click", () => browse(to));
-    crumbs.append(b);
-  };
-  if (out.parent) go("↑", "Up to " + tilde(out.parent, out.home), out.parent);
-  go("~", "The home folder", "~");
-  crumbs.append(el("code", "", tilde(out.path, out.home)));
+  if (out && out.parent) actButton(crumbs, "↑", "Up to " + tilde(out.parent, out.home), () => browse(out.parent));
+  actButton(crumbs, "~", "The home folder", () => browse("~"));
   const dirs = el("div", "dirs");
-  for (const f of out.folders) {
-    const b = el("button", "", "📁 " + f.name);
-    b.type = "button";
-    b.addEventListener("click", () => browse(f.path));
-    dirs.append(b);
+  dirs.setAttribute("role", "list");
+  if (failed) {
+    crumbs.append(el("code", "", path));
+    dirs.append(el("p", "meta", "Cannot open it: " + failed));
+    box.replaceChildren(crumbs, dirs);
+    return;
   }
+  $("l-path").value = tilde(out.missing || out.path, out.home);
+  crumbs.append(el("code", "", tilde(out.path, out.home)));
+  for (const f of out.folders) {
+    const b = actButton(dirs, "", "Open " + f.name, () => browse(f.path));
+    b.append(el("span", "", "📁 "), f.name);
+    b.firstChild.setAttribute("aria-hidden", "true");
+    b.setAttribute("role", "listitem");
+  }
+  if (out.missing) dirs.prepend(el("p", "meta", tilde(out.missing, out.home) + " is not there yet: Connect offers to make it."));
   if (!out.folders.length) dirs.append(el("p", "meta", "No folders in here."));
   if (out.more) dirs.append(el("p", "meta", "More folders than shown: type the path instead."));
   const make = el("div", "make");
   const name = el("input");
   name.type = "text"; name.placeholder = "New folder in here"; name.maxLength = 100; name.setAttribute("aria-label", "New folder name");
-  const add = el("button", "secondary", "New folder");
-  add.type = "button";
-  const mkdir = async () => {
+  make.append(name);
+  const add = actButton(make, "New folder", "Make a folder in " + tilde(out.path, out.home), async () => {
     if (!name.value.trim() || add.disabled) return;
     add.disabled = true;
     try { await browse((await postJSON("/api/folders", { op: "mkdir", path: out.path, name: name.value.trim() })).path); }
     catch (err) { $("launch-note").textContent = "Not made: " + err.message; add.disabled = false; }
-  };
-  add.addEventListener("click", mkdir);
-  name.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); mkdir(); } });
-  const use = el("button", "", "Connect this folder");
-  use.type = "button";
-  use.addEventListener("click", () => { $("l-path").value = out.path; connectFolder(); });
-  make.append(name, add, use);
+  });
+  add.className = "secondary";
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); add.click(); } });
+  actButton(make, "Connect this folder", "Connect " + tilde(out.path, out.home) + " to this project", () => connectFolder(false, out.path));
+  const keep = box.contains(document.activeElement);
   box.replaceChildren(crumbs, dirs, make);
+  if (keep) (dirs.querySelector("button") || crumbs.querySelector("button")).focus();  // focus stays in the list
 }
 // The chosen tool: its colour, its models, and what it may do without asking.
 function showTool() {
@@ -10648,11 +10664,8 @@ $("l-dice").addEventListener("click", () => {
   else $("l-dice").disabled = true;  // every first name is in use
 });
 $("l-connect").addEventListener("click", () => connectFolder());
-$("l-browse").addEventListener("click", () => {
-  if (!$("l-browser").hidden) { $("l-browser").hidden = true; $("l-browse").setAttribute("aria-expanded", "false"); return; }
-  browse($("l-path").value.trim() || "~");
-});
-$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connectFolder(); } });
+$("l-browse").addEventListener("click", () => ($("l-browser").hidden ? browse($("l-path").value.trim() || "~") : showBrowser(false)));
+$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); connectFolder(); } });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);

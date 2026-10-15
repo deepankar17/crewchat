@@ -1508,7 +1508,9 @@ class Launching(Base):
         self.assertEqual(out["folders"][0]["path"], str(top / "Alpha"))
         self.assertEqual(out["parent"], str(top.parent))
         self.assertEqual(op(op="list")["path"], str(Path.home().resolve()))  # home to begin with
-        self.assertIn("there is no folder", op(op="list", path=str(top / "nope"))["error"])
+        nearest = op(op="list", path=str(top / "nope" / "deeper"))  # not there yet: the nearest folder above it
+        self.assertEqual((nearest["path"], nearest["missing"]), (str(top), str(top / "nope" / "deeper")))
+        self.assertEqual(out["missing"], "")
         # crewchat's own folder is not offered, nor can a folder be made in it.
         self.assertNotIn(str(crewchat.home().resolve()), [f["path"] for f in op(op="list", path=str(crewchat.home().parent))["folders"]])
         self.assertIn("crewchat's own folder", op(op="mkdir", path=str(crewchat.home()), name="x")["error"])
@@ -1516,7 +1518,7 @@ class Launching(Base):
         self.assertEqual(made, {"path": str(top / "my app")})
         self.assertTrue((top / "my app").is_dir())
         self.assertIn("already", op(op="mkdir", path=str(top), name="my app")["error"])
-        for bad in ("", "..", "a/b", "a\\b", "c:d"):
+        for bad in ("", "..", "a/b", "a\\b", "c:d", ".hidden", "app.", "a*b", 'a"b', "a|b"):
             self.assertIn("folder's name", op(op="mkdir", path=str(top), name=bad)["error"], bad)
         self.assertEqual(op(op="rename")["status"], 400)
         # Connect makes a missing folder when asked to (not its missing parents).
