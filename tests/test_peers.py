@@ -21,6 +21,8 @@ import crewchat  # noqa: E402
 import crewchat_peers as peers  # noqa: E402
 
 crewchat.Handler.log_message = lambda *args: None
+crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 peers.PULL_WAIT = 2
 peers.BACKOFF = (0.2, 0.3, 0.5)
 peers.log = lambda text: None

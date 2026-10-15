@@ -29,6 +29,8 @@ os.environ["CREWCHAT_HOME"] = str(Path(TMP) / "home")
 import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 
 crewchat.Handler.log_message = lambda *args: None  # keep the request log out of the test output
+crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
+os.environ.pop("CLAUDE_CONFIG_DIR", None)
 
 
 def cli(*argv):
@@ -2234,6 +2236,125 @@ class Joining(Base):
             cli(*args)
         with self.assertRaises(SystemExit):
             cli("join", "--url", self.base, "--code", "AAAA-AAAA", "--client", "generic")
+
+
+class OtherNames(Base):
+    """crewchat registered under a name of the user's or a directory's (`claude mcp add --scope user
+    crewchat-mcp -- uvx crewchat stdio`): its tools are still allowed without asking, and in a folder
+    with no chat it is a server with no tools, not a failed one."""
+
+    def setUp(self):
+        self.user = crewchat.user_home()
+        shutil.rmtree(self.user, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.user, True)
+
+    def project(self):
+        folder = Path(tempfile.mkdtemp(prefix="project-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        return folder
+
+    def register(self, folder=None, **servers):
+        """User-scope servers for Claude Code, or local-scope ones for folder."""
+        path = self.user / ".claude.json"
+        data = json.loads(path.read_text()) if path.exists() else {}
+        target = data.setdefault("projects", {}).setdefault(str(folder), {}) if folder else data
+        target.setdefault("mcpServers", {}).update(servers)
+        self.user.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def stdio(self, folder, lines=b"", home=None):
+        env = dict(os.environ, HOME=str(home or self.user))
+        return subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--project", str(folder)],
+                              input=lines, capture_output=True, env=env, timeout=60)
+
+    def test_what_counts_as_crewchat(self):
+        yes = crewchat.is_crewchat_server
+        self.assertTrue(yes({"command": "uvx", "args": ["crewchat", "stdio"]}))
+        self.assertTrue(yes({"command": "uvx", "args": ["crewchat@latest", "stdio"]}))
+        self.assertTrue(yes({"command": "crewchat", "args": ["stdio", "--project", "/x"]}))
+        self.assertTrue(yes({"command": "/usr/bin/python3", "args": ["/opt/crewchat/crewchat.py", "stdio"]}))
+        self.assertTrue(yes({"command": "C:\\Tools\\crewchat.exe", "args": ["stdio"]}))
+        self.assertTrue(yes({"type": "http", "url": self.mcp}, urls=(self.mcp,)))
+        self.assertTrue(yes({"url": "https://elsewhere/mcp", "headers": {"Authorization": "Bearer t0k"}}, tokens={"t0k"}))
+        self.assertFalse(yes({"command": "uvx", "args": ["crewchat", "serve"]}))
+        self.assertFalse(yes({"command": "npx", "args": ["crewchat-lookalike", "stdio"]}))
+        self.assertFalse(yes({"url": "https://elsewhere/mcp", "headers": {"Authorization": "Bearer other"}},
+                             urls=(self.mcp,), tokens={"t0k"}))
+        self.assertFalse(yes("crewchat"))
+
+    def test_a_server_named_otherwise_is_allowed_and_the_double_is_noted(self):
+        folder = self.project()
+        self.register(**{"crewchat-mcp": {"type": "stdio", "command": "uvx", "args": ["crewchat", "stdio"]},
+                         "other": {"command": "npx", "args": ["other-mcp", "stdio"]}})
+        self.register(folder, chat={"type": "http", "url": self.mcp, "headers": {}},
+                      **{"bad name!": {"command": "crewchat", "args": ["stdio"]}})
+        (self.user / ".cursor").mkdir()
+        (self.user / ".cursor" / "mcp.json").write_text(json.dumps(
+            {"mcpServers": {"crew": {"command": "/usr/local/bin/crewchat", "args": ["stdio"]}}}))
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Named", "--chat", "Demo")
+        allow = json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"]["allow"]
+        for name in ("crewchat", "crewchat-mcp", "chat"):
+            self.assertIn("mcp__%s__hub_send" % name, allow)
+            self.assertIn("mcp__%s__hub_inbox" % name, allow)
+        self.assertFalse([r for r in allow if r.startswith(("mcp__other__", "mcp__bad"))])
+        cursor = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        self.assertIn("Mcp(crew:hub_send)", cursor)
+        self.assertIn("Mcp(crewchat:hub_send)", cursor)
+        # crewchat twice for one client: start says so, and how to keep one.
+        self.assertIn("Claude Code sees crewchat 3 times: crewchat (.mcp.json), chat (~/.claude.json (local scope)), "
+                      "crewchat-mcp (~/.claude.json (user scope))", out)
+        self.assertIn("`claude mcp remove chat`", out)
+        self.assertIn("Cursor sees crewchat 2 times", out)
+        # Taking crewchat out of the folder takes every name's rules with it.
+        crewchat.disconnect_folder(folder)
+        settings = folder / ".claude" / "settings.local.json"
+        left = json.loads(settings.read_text()).get("permissions", {}).get("allow", []) if settings.exists() else []
+        self.assertFalse([r for r in left if "__hub_" in r])
+
+    def test_one_registration_says_nothing(self):
+        folder = self.project()
+        out = cli("start", str(folder), "--no-open", "--no-service", "--place", "Single", "--chat", "Demo")
+        self.assertNotIn("sees crewchat", out)
+        self.assertIsNone(crewchat.duplicate_note(folder, "claude"))
+
+    def test_a_name_given_later_is_allowed_when_its_server_starts(self):
+        folder = self.project()
+        cli("start", str(folder), "--no-open", "--no-service", "--place", "Later", "--chat", "Demo")
+        settings = folder / ".claude" / "settings.local.json"
+        self.assertNotIn("mcp__crewchat-mcp__hub_send", settings.read_text())
+        self.register(**{"crewchat-mcp": {"command": "uvx", "args": ["crewchat", "stdio"]}})
+        done = self.stdio(folder)  # the client starts it: no input, so it relays nothing and ends
+        self.assertEqual(done.returncode, 0, done.stderr)
+        allow = json.loads(settings.read_text())["permissions"]["allow"]
+        self.assertIn("mcp__crewchat-mcp__hub_send", allow)
+        self.assertEqual(allow.count("mcp__crewchat__hub_send"), 1)
+        self.assertEqual(crewchat.allow_registered(folder), [])  # nothing left to add
+
+    def test_stdio_in_a_folder_with_no_chat_is_a_server_with_no_tools(self):
+        folder = Path(tempfile.mkdtemp(prefix="elsewhere-", dir=TMP)).resolve()
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                    {"jsonrpc": "2.0", "id": 3, "method": "ping"},
+                    [{"jsonrpc": "2.0", "id": 4, "method": "prompts/list"}, {"jsonrpc": "2.0", "id": 5, "method": "x"}]]
+        done = self.stdio(folder, ("\n".join(json.dumps(r) for r in requests) + "\nnot json\n").encode())
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn(b"is not connected to a crewchat", done.stderr)
+        answers = [json.loads(line) for line in done.stdout.decode().splitlines()]
+        hello = answers[0]["result"]
+        self.assertEqual((hello["protocolVersion"], hello["serverInfo"]["name"]), ("2025-06-18", "crewchat"))
+        self.assertIn("run `crewchat start` in this folder", hello["instructions"])
+        self.assertEqual(answers[1], {"jsonrpc": "2.0", "id": 2, "result": {"tools": []}})
+        self.assertEqual(answers[2]["result"], {})
+        self.assertEqual([a.get("result") for a in answers[3]], [{"prompts": []}, None])
+        self.assertEqual(answers[3][1]["error"]["code"], -32601)
+        self.assertEqual(answers[4]["error"]["code"], -32700)
+        self.assertEqual(len(answers), 5)  # nothing for the notification
+
+    def test_the_chat_tools_are_not_shown_as_activity_by_any_name(self):
+        for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_update)"):
+            self.assertEqual(crewchat.tool_summary("claude", {"tool_name": name}), "", name)
 
 
 class Hooks(Base):

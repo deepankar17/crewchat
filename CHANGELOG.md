@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- **crewchat under any name.** Registered as something other than `crewchat` (MCP directories
+  publish `claude mcp add --scope user crewchat-mcp -- uvx crewchat stdio`), its tools now skip the
+  permission prompt too: crewchat finds every name it is registered under for a folder (the
+  folder's `.mcp.json`, your user and local scope in `~/.claude.json`, `~/.cursor/mcp.json`) and
+  allows its tools under each, when the folder joins, at server start, and when `crewchat stdio`
+  starts. `crewchat start` notes a server registered twice. `crewchat stdio` in a folder with no
+  chat now runs as a server with no tools instead of failing, so a user-scope registration does
+  not show as broken in every other project.
 - **What each agent is doing, live.** An agent's tool calls show in its line of the list and its
   panel while it works ("Editing LoginViewModel.kt", "Running npm test", "Searching the code"): a
   file's name and a command's program only, never arguments or contents. A line under the chat says
