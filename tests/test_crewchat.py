@@ -1065,6 +1065,33 @@ class NeedsYou(Base):
         b.text("hub_take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
 
+    def test_a_note_is_credited_to_the_agent_that_wrote_it(self):
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        mid = self.add("Migrate the database")
+        a.text("hub_take", id=mid)
+        b.text("hub_update", id=mid, status="blocked", note="OK to drop the old tables?")  # not b's task
+        item = next(n for n in self.hub.needs_you() if n.get("task") == mid)
+        self.assertEqual((item["agent"], item["holder"], item["text"]), (b_name, a_name, "OK to drop the old tables?"))
+        a.text("hub_update", id=mid, status="in_progress", note="carrying on")
+
+    def test_what_the_owner_blocked_is_not_listed_back(self):
+        mid = self.add("Wait for the designer")
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "blocked"})
+        self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
+
+    def test_a_long_chain_of_tasks_is_counted_without_recursion(self):
+        first = prev = self.add("Step 0")
+        for i in range(1, 1200):
+            prev = self.add("Step %d" % i, depends=prev)
+        a, _ = self.agent()
+        a.text("hub_take", id=first)
+        a.text("hub_update", id=first, status="blocked", note="stuck")
+        item = next(n for n in self.hub.needs_you() if n.get("task") == first)
+        self.assertEqual(item["blocking"], 1199)
+        a.text("hub_update", id=first, status="done", note="unstuck")
+
     def test_the_poll_and_the_tabs_say_so(self):
         a, _ = self.agent()
         a.text("hub_send", to="Owner", text="Look at this")
@@ -3229,6 +3256,12 @@ class Lifecycle(Base):
         self.assertEqual(order()[0], crash)
         with self.assertRaises(urllib.error.HTTPError):
             move("before:nope")
+        before = order()
+        move("before:" + crash)  # its own place
+        move("before:" + order()[order().index(crash) + 1])  # just above the next one: where it is
+        self.assertEqual(order(), before)
+        move("end"); move("end")  # already last
+        self.assertEqual(order()[-1], crash)
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": sign})
         self.assertNotIn(sign, [r["id"] for r in hub.sheet_rows()])
         self.assertEqual(a.text("hub_inbox"), "No new messages.")

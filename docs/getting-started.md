@@ -318,9 +318,11 @@ side panel, with its history and the owner's actions.
 - **Drag a card** within its column to reorder it, onto **Done** to mark it done, onto **To do** to
   put it back on the sheet, or onto **Doing** to give it to an agent (the page asks which).
   **Blocked** and **Review** are set by the agents.
-- **Filters** show one agent's, one role's or one machine's tasks. **Done** shows the last 20.
+- **Filters** show one agent's, one role's or one machine's tasks. **Done** shows 20 tasks, and
+  **Show more** the rest. On the board you open a card to act on it with the keyboard, or use **List**.
 - **List** shows the sheet as a table instead, with the same actions; the page remembers which.
-- On a phone the board shows one column at a time: swipe between them. From a terminal:
+- On a phone the board shows one column at a time: swipe between them, and open a card to move it
+  (dragging is for a mouse). From a terminal:
 
 ```bash
 crewchat tasks                                         # the sheet

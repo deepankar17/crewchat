@@ -1670,7 +1670,12 @@ class Hub:
     def needs_you(self):
         """What waits on the owner, most pressing first: blocked tasks (with the agent's question),
         tasks ready for review, tasks given back or reclaimed and not taken again, and messages to
-        the owner not yet read. Each says how many open tasks wait on it ("blocking")."""
+        the owner not yet read. Each says how many open tasks wait on it ("blocking"). Worked out
+        again only when the chat changed (every page polls it, for every project)."""
+        cached = getattr(self, "_needs", None)
+        if cached and cached[0] == self.version:
+            return cached[1]
+        version = self.version
         rows = self.sheet_rows(view="open")
         open_ids = {r["id"] for r in rows}
         waiting_on = {}
@@ -1678,18 +1683,19 @@ class Hub:
             for d in r["depends"]:
                 waiting_on.setdefault(d, set()).add(r["id"])
 
-        def blocking(mid, seen=None):  # every open task that waits on mid, however far down
-            seen = set() if seen is None else seen
-            for child in waiting_on.get(mid, ()):
-                if child in open_ids and child not in seen:
-                    seen.add(child)
-                    blocking(child, seen)
+        def blocking(mid):  # every open task that waits on mid, however far down (no recursion: chains can be long)
+            seen, todo = set(), [mid]
+            while todo:
+                for child in waiting_on.get(todo.pop(), ()):
+                    if child in open_ids and child not in seen:
+                        seen.add(child)
+                        todo.append(child)
             return seen
 
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
-                if m["kind"] == "update" and m.get("task") and m["from"] != OWNER and m["task"] not in last_word:
+                if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
@@ -1699,15 +1705,22 @@ class Hub:
             kind = ("blocked" if r["status"] == "blocked" else "review" if r["status"] == "review"
                     else "reclaimed" if r["status"] in ("todo", "waiting") and r.get("reclaimed")
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
+            if kind in ("blocked", "review") and r.get("note") == OWNER:
+                continue  # the owner set it so: nothing waits on the owner
             if kind:
-                items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": r["holder"] or said.get("from", ""),
-                              "text": said.get("text", "") if said.get("status") == r["status"] or kind == "given_back" else "",
+                # Named after whoever wrote the note (any agent may update a task), so an answer goes back
+                # to the agent that asked; a reclaimed task, after the agent it was taken from.
+                fits = said.get("status") == r["status"] or kind == "given_back" and said.get("status") == "todo"
+                agent = (r.get("reclaimed") if kind == "reclaimed" else said.get("from") if fits else r["holder"]) or ""
+                items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": agent, "holder": r["holder"],
+                              "text": said.get("text", "") if fits else "",
                               "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
         order = {"blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
         items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
+        self._needs = (version, items)
         return items
 
     def owner_read(self, seq):
@@ -8815,7 +8828,7 @@ CHAT_PAGE = r"""<!doctype html>
   --bg: #eef3ff; --panel: #ffffff; --soft: #f6f8ff; --ink: #0b1f55; --text: #1b2440; --muted: #5d6a8f;
   --line: #dfe7ff; --accent: #2f5fd6; --accent-2: #5b8cff; --deep: #2148ad; --on-accent: #ffffff; --tint: #dfe7ff;
   --task: #fff6dd; --task-line: #e9cf86; --task-ink: #6b4e00;
-  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f;
+  --ok: #1f8a52; --ok-strong: #17703f; --warn: #b37400; --off: #7d87a3; --err: #c4321f; --err-ink: #ffffff;
   --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
   --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
   --radius: 18px; --shadow: 0 1px 2px rgba(11, 31, 85, 0.06), 0 6px 20px rgba(11, 31, 85, 0.07);
@@ -8825,7 +8838,7 @@ CHAT_PAGE = r"""<!doctype html>
     --bg: #0a1330; --panel: #111c40; --soft: #16234d; --ink: #e8eeff; --text: #dfe6ff; --muted: #9daad3;
     --line: #24346a; --accent: #5b8cff; --accent-2: #8fb0ff; --deep: #2f5fd6; --on-accent: #0b1f55; --tint: #1c2b5c;
     --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
-    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5;
+    --ok: #63c58c; --ok-strong: #1f7a45; --warn: #e0b055; --off: #5f6b91; --err: #f2b8b5; --err-ink: #3d0a07;
     --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
     --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 6px 20px rgba(0, 0, 0, 0.25);
@@ -8868,7 +8881,7 @@ input[type=text], input[type=search], textarea { background: var(--soft); border
 .tab .pname { overflow: hidden; text-overflow: ellipsis; }
 .tab .unread { min-width: 8px; height: 8px; border-radius: 99px; background: var(--accent); }
 .tab .unread:empty { width: 8px; }
-.tab .unread:not(:empty) { color: #fff; font-size: 10.5px; font-weight: 700; padding: 0 6px; line-height: 16px; height: 16px; }
+.tab .unread:not(:empty) { color: var(--err-ink); font-size: 10.5px; font-weight: 700; padding: 0 6px; line-height: 16px; height: 16px; }
 .tab.needs .unread, .tab.needs .pav { background: var(--err); }
 .pav { display: inline-flex; align-items: center; justify-content: center; flex: none; width: 22px; height: 22px;
   border-radius: 8px; background: var(--accent); color: var(--on-accent); font-size: 12px; font-weight: 700; }
@@ -8921,11 +8934,13 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .need { display: block; width: 100%; text-align: left; background: var(--soft); color: var(--text); border-radius: 14px; padding: 8px 10px;
   font-weight: 400; border-left: 4px solid var(--need, var(--err)); }
 .need:hover { background: var(--tint); }
-.need .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--need, var(--err)); }
+.need > span { display: block; }
+.need .k { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink); }
 .need .t { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .need .q { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
-.need .blk { font-size: 11px; font-weight: 650; color: var(--err); }
-#needs-count { background: var(--err); color: #fff; border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
+.need .blk { font-size: 11px; font-weight: 650; color: var(--ink); }
+#needs-list { max-height: 45vh; overflow-y: auto; }
+#needs-count { background: var(--err); color: var(--err-ink); border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
 #needs-count:empty { display: none; }
 .card.needs-card { border-left: 4px solid var(--err); }
 .needs-card textarea { width: 100%; min-height: 70px; resize: vertical; margin-top: 6px; }
@@ -9067,7 +9082,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
 .view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
 #tasks, #commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
-#tasks { padding: 16px 20px; }
+#tasks.board-on { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
 .task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
 .task-form input { flex: 1 1 120px; min-width: 0; font-size: 13.5px; }
@@ -9108,7 +9123,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .col { background: var(--soft); border-radius: var(--radius); padding: 10px; min-height: 140px; display: flex; flex-direction: column; gap: 8px;
   border: 2px solid transparent; transition: border-color 0.12s, background 0.12s; }
 .col.over { border-color: var(--accent-2); background: var(--tint); }
-.col.nodrop.dragging-on { opacity: 0.55; }
+#board.dragging .col.nodrop { opacity: 0.55; }
 .col-head { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; color: var(--ink); padding: 2px 4px; }
 .col-head .n { margin-left: auto; font-size: 12px; font-weight: 650; color: var(--muted); background: var(--panel); border-radius: 99px; padding: 0 8px; }
 .col-head .swatch { width: 10px; height: 10px; }
@@ -9238,7 +9253,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   </div>
   <section id="needs-you" hidden aria-label="Needs you">
     <h2 class="rail-head">Needs you <span id="needs-count"></span></h2>
-    <div id="needs-list"></div>
+    <div id="needs-list" role="list"></div>
+    <p id="needs-said" class="sr" role="status"></p>
   </section>
   <h2 class="rail-head">Agents</h2>
   <div id="agents"></div>
@@ -9258,7 +9274,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
         <button type="button" data-notify="all" aria-pressed="false">When something needs me</button>
         <button type="button" data-notify="mentions" aria-pressed="false">Only messages to me</button>
         <button type="button" data-notify="off" aria-pressed="true">Never</button>
-        <p class="meta" id="bell-note" style="margin:6px 10px 2px"></p>
+        <p class="meta" id="bell-note" role="status" style="margin:6px 10px 2px"></p>
       </div>
     </details>
     <details id="space-menu" class="menu">
@@ -9299,7 +9315,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     </form>
     <p id="tasks-note" class="meta" role="alert"></p>
     <div id="board" aria-label="Task board"></div>
-    <div id="give" class="give" hidden><label for="give-to">Give it to</label><select id="give-to"></select>
+    <div id="give" class="give" hidden role="group" aria-labelledby="give-label"><label for="give-to" id="give-label">Give it to</label>
+      <select id="give-to"></select><button type="button" id="give-ok">Give</button>
       <button type="button" class="secondary" id="give-cancel">Cancel</button></div>
     <table id="sheet" hidden><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
   </section>
@@ -9500,7 +9517,10 @@ function renderProjects(list, current) {
     if (p.id === current) a.setAttribute("aria-current", "page");
     a.title = p.name + (p.linked ? " (shared with your linked machines)" : "");
     a.append(el("span", "pav", letter(p.name)), el("span", "pname", p.name));
-    if (p.needs) { a.classList.add("needs"); a.append(el("span", "unread", String(p.needs)), el("span", "sr", " (" + p.needs + " need you)")); }
+    if (p.needs) {
+      const n = el("span", "unread", String(p.needs)); n.setAttribute("aria-hidden", "true");
+      a.classList.add("needs"); a.append(n, el("span", "sr", " (" + p.needs + " need you)"));
+    }
     if (p.fresh && !p.needs) {
       a.append(el("span", "unread"), el("span", "sr", " (new messages)"));
     }
@@ -9574,6 +9594,8 @@ function showView(view) {
   }
   if (view === "commands") loadCommands();
   $("working").hidden = view !== "chat" || $("working").hidden;
+  if (view === "chat") setTimeout(() => markRead(), 0);
+  $("give").hidden = true;
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
@@ -9745,14 +9767,15 @@ function taskMeta(r) {
 function renderSheet(all) {
   const open = all.filter((r) => r.status !== "done").length;
   $("tasks-count").textContent = open ? "(" + open + ")" : "";
-  renderBoard(all);
   const rows = boardFilters(all);
+  renderBoard(rows, all);
+  if ($("sheet").hidden) return;
   const body = $("sheet").tBodies[0];
   if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
   if (!rows.length) {
     const row = body.insertRow(); body.replaceChildren(row);
     const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
-    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
+    cell.textContent = all.length ? "No task matches the filters." : "No tasks yet. Add one above, or post a message as a task.";
     return;
   }
   body.replaceChildren(...rows.map((r) => {
@@ -9790,7 +9813,8 @@ function boardFilters(rows) {
     }
     return pick.value;
   };
-  const agentOf = (name) => state.agents.find((a) => a.agent === name);
+  const byName = new Map(state.agents.map((a) => [a.agent, a]));
+  const agentOf = (name) => byName.get(name);
   const agents = [...new Set(rows.map((r) => r.holder).filter(Boolean))].sort();
   const roles = [...new Set(agents.map((n) => (agentOf(n) || {}).role).filter(Boolean))];
   const machines = [...new Set(rows.map((r) => r.where || (agentOf(r.holder) || {}).device).filter(Boolean))].sort();
@@ -9798,8 +9822,10 @@ function boardFilters(rows) {
   const role = keep("f-role", "Every role", roles.map((r) => [r, roleTitle(r)]));
   const machine = keep("f-machine", "Every machine", machines.map((m) => [m, m]));
   $("f-machine").hidden = machines.length < 2;
+  const placeOf = (r) => r.where || (agentOf(r.holder) || {}).device;
+  if ($("f-machine").hidden) $("f-machine").value = "";  // a filter nobody can see does not filter
   return rows.filter((r) => (!agent || r.holder === agent) && (!role || (agentOf(r.holder) || {}).role === role) &&
-    (!machine || (r.where || (agentOf(r.holder) || {}).device) === machine));
+    (!$("f-machine").value || placeOf(r) === machine));
 }
 function taskCard(r) {
   const b = el("button", "tcard");
@@ -9816,45 +9842,68 @@ function taskCard(r) {
   b.addEventListener("dragstart", (e) => {
     boardDrag = r; b.classList.add("dragging"); e.dataTransfer.effectAllowed = "move";
     e.dataTransfer.setData("text/plain", r.id);
-    for (const c of document.querySelectorAll(".col.nodrop")) c.classList.add("dragging-on");
+    $("board").classList.add("dragging");
   });
   b.addEventListener("dragend", () => {
-    boardDrag = null; b.classList.remove("dragging");
-    for (const c of document.querySelectorAll(".col")) c.classList.remove("over", "dragging-on");
+    boardDrag = null;
+    $("board").classList.remove("dragging");
+    state.boardKey = "";  // what changed during the drag shows now
+    renderSheet(state.sheet);
   });
   return b;
 }
 // What dropping r on a column (before a card, or at its end) does; null when nothing.
+// What dropping r does: before the card `before` in a column (or at its end, with before ""), as the
+// owner may. null: nothing (its own place; Blocked and Review are the agents'; only a task to do can be
+// given to an agent).
 function dropAction(r, col, before) {
   const from = column(r);
-  if (col === "blocked" || col === "review") return null;
+  if (col === "blocked" || col === "review" || before === r.id) return null;
   if (col === from) return { op: "move", task: r.id, where: before ? "before:" + before : "end" };
   if (col === "done") return { op: "status", task: r.id, status: "done" };
   if (col === "todo") return { op: "status", task: r.id, status: "todo" };
-  if (col === "doing") return { give: r };
+  if (col === "doing") return from === "todo" ? { give: r } : null;
   return null;
 }
+// The card a drop lands before: the first whose middle is below the pointer ("" for the column's end).
+function dropBefore(col, y, dragged) {
+  for (const card of col.querySelectorAll(".tcard")) {
+    const box = card.getBoundingClientRect();
+    if (y < box.top + box.height / 2) return card.dataset.task === dragged ? dragged : card.dataset.task;
+  }
+  return "";
+}
+// Give a task to an agent: the board asks which, with a Give button.
 function askGive(r) {
-  $("give-to").replaceChildren(new Option("An agent…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
+  const agents = state.agents.map((a) => new Option(a.agent, a.agent));
+  $("give-to").replaceChildren(...(agents.length ? agents : [new Option("No agent here yet", "")]));
+  $("give-label").textContent = "Give #" + r.id + " to";
+  $("give-ok").disabled = !agents.length;
   $("give").hidden = false; $("give").dataset.task = r.id;
   $("give-to").focus();
 }
-$("give-to").addEventListener("change", async () => {
-  const agent = $("give-to").value;
-  if (!agent) return;
+function closeGive() {
+  const id = $("give").dataset.task;
   $("give").hidden = true;
-  await taskOp({ op: "assign", task: $("give").dataset.task, agent });
+  $("board").querySelector('[data-task="' + CSS.escape(id || "") + '"]')?.focus();
+}
+$("give-ok").addEventListener("click", async () => {
+  const agent = $("give-to").value, task = $("give").dataset.task;
+  if (!agent) return;
+  closeGive();
+  await taskOp({ op: "assign", task, agent });
 });
-$("give-cancel").addEventListener("click", () => { $("give").hidden = true; });
-function renderBoard(rows) {
+$("give-cancel").addEventListener("click", closeGive);
+$("give").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closeGive(); } });
+function renderBoard(shown, all) {
   const board = $("board");
-  if (boardDrag || board.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
-  const shown = boardFilters(rows);
-  const key = JSON.stringify([shown, state.showAllDone, state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
+  if (boardDrag || board.hidden) return;
+  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.where]), state.showAllDone,
+                              state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
   if (key === state.boardKey) return;
   state.boardKey = key;
   const focused = document.activeElement && board.contains(document.activeElement) ? document.activeElement.dataset.task : "";
-  $("board-count").textContent = shown.length === rows.length ? "" : shown.length + " of " + rows.length + " shown";
+  $("board-count").textContent = shown.length === all.length ? "" : shown.length + " of " + all.length + " shown";
   board.replaceChildren(...COLUMNS.map(([id, label, tint]) => {
     const col = el("section", "col" + (id === "blocked" || id === "review" ? " nodrop" : ""));
     col.dataset.col = id;
@@ -9867,7 +9916,7 @@ function renderBoard(rows) {
     if (id === "done" && mine.length > DONE_SHOWN && !state.showAllDone) {
       const hidden = mine.length - DONE_SHOWN;
       mine = mine.slice(-DONE_SHOWN);
-      const more = el("button", "more", "Show " + hidden + " older");
+      const more = el("button", "more", "Show " + hidden + " more");
       more.type = "button"; more.addEventListener("click", () => { state.showAllDone = true; renderBoard(state.sheet); });
       col.append(more);
     }
@@ -9880,8 +9929,8 @@ function renderBoard(rows) {
     col.addEventListener("dragleave", (e) => { if (!col.contains(e.relatedTarget)) col.classList.remove("over"); });
     col.addEventListener("drop", (e) => {
       e.preventDefault(); col.classList.remove("over");
-      const r = boardDrag, card = e.target.closest && e.target.closest(".tcard");
-      const act = r && dropAction(r, id, card && card.dataset.task !== r.id ? card.dataset.task : "");
+      const r = boardDrag;
+      const act = r && dropAction(r, id, dropBefore(col, e.clientY, r.id));
       if (!act) return;
       if (act.give) askGive(act.give); else taskOp(act);
     });
@@ -9890,14 +9939,19 @@ function renderBoard(rows) {
   if (focused) board.querySelector('[data-task="' + CSS.escape(focused) + '"]')?.focus();
 }
 function showBoard(on) {
-  $("board").hidden = !on; $("sheet").hidden = on;
+  $("board").hidden = !on; $("sheet").hidden = on; $("give").hidden = true;
+  $("tasks").classList.toggle("board-on", on);
+  state.boardKey = "";
+  renderSheet(state.sheet);
   $("as-board").setAttribute("aria-pressed", String(on)); $("as-list").setAttribute("aria-pressed", String(!on));
   try { localStorage.setItem("crewchat-tasks-as", on ? "board" : "list"); } catch (e) {}
 }
 $("as-board").addEventListener("click", () => showBoard(true));
 $("as-list").addEventListener("click", () => showBoard(false));
-for (const id of ["f-agent", "f-role", "f-machine"]) $(id).addEventListener("change", () => { state.boardKey = ""; renderSheet(state.sheet); });
-try { if (localStorage.getItem("crewchat-tasks-as") === "list") showBoard(false); } catch (e) {}
+for (const id of ["f-agent", "f-role", "f-machine"]) $(id).addEventListener("change", () => renderSheet(state.sheet));
+let asList = false;
+try { asList = localStorage.getItem("crewchat-tasks-as") === "list"; } catch (e) {}
+showBoard(!asList);
 
 $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -10562,20 +10616,27 @@ function needsCard(n, r) {
   const box = card(label + (n.agent ? " · " + n.agent : ""));
   box.classList.add("needs-card");
   if (n.text) box.append(el("p", "", n.text));
+  if (n.agent && n.holder && n.agent !== n.holder) box.append(el("p", "meta", "Written by " + n.agent + "; the task is " + n.holder + "'s."));
   if (n.blocking) box.append(el("p", "meta", "It holds up " + n.blocking + " other task" + (n.blocking > 1 ? "s" : "") + "."));
-  const to = r.holder || n.agent;
+  const to = n.agent || r.holder;
   if (to && n.kind !== "given_back" && n.kind !== "reclaimed") {
     const answer = el("textarea");
     answer.placeholder = n.kind === "review" ? "What to change, or leave empty and mark it done" : "Your answer to " + to;
     answer.setAttribute("aria-label", "Answer to " + to);
     const acts = el("div", "acts");
     actButton(acts, "Send", "Send your answer to " + to, async (b) => {
-      if (!answer.value.trim()) return;
+      if (!answer.value.trim()) { answer.focus(); return panelNote("Write your answer first."); }
       if (await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) {
         answer.value = ""; panelNote("Sent to " + to + ".");
       }
     });
-    if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", (b) => taskOp({ op: "status", task: r.id, status: "done" }));
+    if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", async (b) => {
+      if (answer.value.trim()) {  // what was typed goes too, first
+        if (!await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) return;
+        answer.value = "";
+      }
+      postAction("/api/task", { op: "status", task: r.id, status: "done" }, "Not marked done", b);
+    });
     box.append(answer, acts);
   }
   return box;
@@ -10980,68 +11041,95 @@ function renderNeeds(needs) {
   $("needs-count").textContent = needs.length ? String(needs.length) : "";
   if (key === state.needsKey) return;
   state.needsKey = key;
+  const known = state.needsShown || new Set(), added = needs.filter((n) => !known.has(needKey(n)));
+  if (state.needsShown && added.length)  // a new item is said, not the whole list
+    $("needs-said").textContent = added.length + " new: " + added.map((n) => (NEED_LOOK[n.kind] || [""])[0] + (n.task ? " #" + n.task : "") + (n.agent ? " from " + n.agent : "")).join("; ");
+  state.needsShown = new Set(needs.map(needKey));
   box.replaceChildren(...needs.map((n) => {
     const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
     const b = el("button", "need");
+    b.setAttribute("role", "listitem");
     b.type = "button"; b.style.setProperty("--need", tint);
     const who = n.agent ? (n.kind === "message" ? " from " : " · ") + n.agent : "";
-    b.append(el("div", "k", label + who),
-             el("div", "t", n.task ? "#" + n.task + " " + (n.title || "") : n.text));
-    if (n.kind !== "message" && n.text) b.append(el("div", "q", n.text));
-    if (n.blocking) b.append(el("div", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
+    b.append(el("span", "k", label + who),
+             el("span", "t", n.task ? "#" + n.task + " " + (n.title || "") : n.text));
+    if (n.kind !== "message" && n.text) b.append(el("span", "q", n.text));
+    if (n.blocking) b.append(el("span", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
     b.addEventListener("click", () => {
       if (n.kind === "message") {
         if (n.agent) openPanel("agent", n.agent);
         const node = [...$("log").querySelectorAll(".msg")].find((x) => x.dataset.id === n.id);
         if (node) { showView("chat"); node.scrollIntoView({ block: "center" }); }
-        markRead(true);
+        markRead(n.seq);
       } else openPanel("task", n.task);
     });
     return b;
   }));
 }
 // What you have seen of the chat: messages to you count as read while the page is in front.
-function markRead(force) {
-  if (document.hidden || state.after <= (state.readPosted || 0) && !force) return;
-  const mine = state.needs.some((n) => n.kind === "message");
-  if (!mine && !force) { state.readPosted = state.after; return; }
-  state.readPosted = state.after;
-  postJSON("/api/read", { seq: state.after }).catch(() => { state.readPosted = 0; });
+// (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
+function markRead(upto) {
+  const log = $("log");
+  const seen = !document.hidden && document.hasFocus() && !log.hidden && log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const seq = upto || (seen ? state.after : 0);
+  if (!seq || seq <= (state.readPosted || 0)) return;
+  if (!upto && !state.needs.some((n) => n.kind === "message" && n.seq <= seq)) return;
+  state.readPosted = seq;
+  postJSON("/api/read", { seq }).catch(() => { state.readPosted = 0; });
 }
 document.addEventListener("visibilitychange", () => markRead());
+window.addEventListener("focus", () => markRead());
 
 // Notifications, per project: all that needs you, only messages to you, or none. Only while the page
 // is in the background; a notification opens its item.
-const NOTIFY_KEY = "crewchat-notify-" + (CHAT || "first");
+// Kept by the project's id (the page at "/" learns it from the first poll), in this browser.
+const notifyKey = () => "crewchat-notify-" + (state.chat || CHAT || "first");
 function notifyMode() {
-  try { return localStorage.getItem(NOTIFY_KEY) || "off"; } catch (e) { return "off"; }
+  try { return localStorage.getItem(notifyKey()) || "off"; } catch (e) { return "off"; }
 }
 function showBell() {
   const mode = notifyMode();
   for (const b of document.querySelectorAll("[data-notify]")) b.setAttribute("aria-pressed", String(b.dataset.notify === mode));
   $("bell").classList.toggle("off", mode === "off");
+  $("bell").querySelector("summary").setAttribute("aria-label", "Notifications: " + { all: "when something needs you", mentions: "messages to you", off: "off" }[mode]);
   const denied = typeof Notification !== "undefined" && Notification.permission === "denied";
   $("bell-note").textContent = typeof Notification === "undefined" ? "This browser does not show notifications."
     : denied && mode !== "off" ? "The browser blocks notifications for this page: allow them in its site settings." : "";
 }
 for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("click", async () => {
-  try { localStorage.setItem(NOTIFY_KEY, b.dataset.notify); } catch (e) {}
+  try { localStorage.setItem(notifyKey(), b.dataset.notify); } catch (e) {}
   if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "default")
-    await Notification.requestPermission().catch(() => {});
+    await new Promise((done) => { const p = Notification.requestPermission(done); if (p && p.then) p.then(done, done); });
+  if (b.dataset.notify !== "off" && typeof Notification !== "undefined" && Notification.permission === "denied")
+    try { localStorage.setItem(notifyKey(), "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
   showBell();
+  if (typeof Notification !== "undefined" && Notification.permission === "denied") $("bell-note").textContent = "The browser blocks notifications for this page: allow them in its site settings, then turn them on here.";
 });
 showBell();
+function Notice(title, options) {
+  try { return new Notification(title, options); }
+  catch (e) {  // Android Chrome: only a service worker may show one
+    navigator.serviceWorker?.ready.then((reg) => reg.showNotification(title, options)).catch(() => {});
+    return {};
+  }
+}
 function notify(needs) {
   const fresh = needs.filter((n) => !state.notified.has(needKey(n)));
-  for (const n of needs) state.notified.add(needKey(n));
+  state.notified = new Set(needs.map(needKey));  // one that leaves and comes back notifies again
   if (state.notifyPrimed === undefined) { state.notifyPrimed = true; return; }  // not what was there on load
   const mode = notifyMode();
   if (mode === "off" || !document.hidden || typeof Notification === "undefined" || Notification.permission !== "granted") return;
-  for (const n of fresh.filter((x) => mode === "all" || x.kind === "message").slice(0, 3)) {
+  const wanted = fresh.filter((x) => mode === "all" || x.kind === "message");
+  for (const n of wanted.slice(0, 3)) {
     const [label] = NEED_LOOK[n.kind] || [""];
-    const note = new Notification((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
-                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text, tag: needKey(n) });
-    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close(); };
+    const note = Notice((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
+                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text,
+                                    tag: (state.chat || CHAT) + ":" + needKey(n) });
+    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close?.(); };
+  }
+  if (wanted.length > 3) {
+    const more = Notice((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (state.chat || CHAT) + ":more" });
+    more.onclick = () => { window.focus(); more.close?.(); };
   }
 }
 
@@ -11109,8 +11197,9 @@ async function loop() {
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
       state.needs = data.needs || [];
+      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); }
       renderNeeds(state.needs);
-      notify(state.needs);
+      try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();
       const log = $("log");
       const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
