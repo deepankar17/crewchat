@@ -3460,6 +3460,7 @@ TOOLS = [
         },
     },
 ]
+HUB_TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
 
 
 def int_arg(args, key, default, low, high):
@@ -5222,10 +5223,11 @@ def agent_tool(tool, folder, permissions, root=None):
         raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
             LAUNCH_TOOLS[tool][0], " ".join(missing)))
     if tool == "cursor":
-        try:  # approve crewchat's MCP server alone, not every server the folder lists (--approve-mcps)
-            subprocess.run([exe, "mcp", "enable", SERVER_NAME], cwd=str(folder), capture_output=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass  # it asks in its window instead
+        for name in registered_names(folder, "cursor", root):  # crewchat's MCP server alone (not
+            try:  # every server the folder lists, --approve-mcps), under each name it has
+                subprocess.run([exe, "mcp", "enable", name], cwd=str(folder), capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass  # it asks in its window instead
     return exe, base
 
 
@@ -5390,6 +5392,10 @@ def cmd_start(args):
                   "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
     except OSError as e:
         print("- Could not write the project's guide for its agents (%s)." % e)
+    for client in ("claude", "cursor") if args.client == "all" else (args.client,):
+        note = client in CLIENT_FILES and duplicate_note(project, client)
+        if note:
+            print("- Note: " + note)
 
     if newer_version():
         print("- crewchat %s is available (this is %s): run `crewchat update`." % (newer_version(), __version__))
@@ -5956,36 +5962,149 @@ def install_claude(project, url, token):
     enabled = settings.setdefault("enabledMcpjsonServers", [])
     if SERVER_NAME not in enabled:
         enabled.append(SERVER_NAME)
-    set_claude_hooks(settings)
+    set_claude_hooks(settings, registered_names(project, "claude"))
     write_json(settings_path, settings)
     return [".mcp.json", ".claude/settings.local.json"]
 
 
 # crewchat's tools an agent may use without asking: all of them (hub_send's files come only from the
-# agent's own project folder, see share_file). In Claude Code's permission rules, and in Cursor's.
-CLAUDE_ALLOW = "mcp__%s__" % SERVER_NAME
-CURSOR_ALLOW = "Mcp(%s:" % SERVER_NAME
+# agent's own project folder, see share_file). In Claude Code's permission rules, and in Cursor's. A rule
+# names the server as the client has it registered: crewchat, or another name a user or a directory
+# gave it (`claude mcp add crewchat-mcp -- uvx crewchat stdio`), see registered_names.
+CLAUDE_ALLOW = "mcp__%s__"
+CURSOR_ALLOW = "Mcp(%s:"
+ALLOW = {"claude": CLAUDE_ALLOW, "cursor": CURSOR_ALLOW}
+SERVER_NAME_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # a name a permission rule can name
 
 
-def crewchat_rules(prefix):
-    """The allow rules for crewchat's tools, with Claude Code's or Cursor's prefix."""
-    names = [t["name"] for t in TOOLS]
-    return [prefix + n + (")" if prefix == CURSOR_ALLOW else "") for n in names]
+def crewchat_rules(prefix, names=(SERVER_NAME,)):
+    """The allow rules for crewchat's tools under each of its names, with Claude Code's or Cursor's prefix."""
+    tools = [t["name"] for t in TOOLS]
+    return [prefix % name + tool + (")" if prefix == CURSOR_ALLOW else "") for name in names for tool in tools]
 
 
-def allow_rule(data, prefix):
+def allow_rule(data, prefix, names=(SERVER_NAME,)):
     """crewchat's rules in a settings file's permissions.allow list. Returns whether any was missing."""
     allow = data.setdefault("permissions", {}).setdefault("allow", [])
-    missing = [r for r in crewchat_rules(prefix) if r not in allow]
+    missing = [r for r in crewchat_rules(prefix, names) if r not in allow]
     allow.extend(missing)
     return bool(missing)
 
 
-def disallow_rule(data, prefix):
+def is_crewchat_server(entry, urls=(), tokens=()):
+    """Does this MCP server entry run crewchat: `crewchat stdio` (uvx crewchat stdio, python crewchat.py
+    stdio, ...), or this machine's chat by its address or one of its folder tokens?"""
+    if not isinstance(entry, dict):
+        return False
+    words = [str(w) for w in [entry.get("command") or ""] + list(entry.get("args") or []) if w]
+    for i, word in enumerate(words):
+        base = re.split(r"[@=<>~]", re.split(r"[\\/]", word)[-1], maxsplit=1)[0].lower()
+        if base in ("crewchat", "crewchat.py", "crewchat.exe") and "stdio" in words[i + 1:]:
+            return True
+    url = str(entry.get("url") or "").rstrip("/")
+    auth = str((entry.get("headers") or {}).get("Authorization") or "") if isinstance(entry.get("headers"), dict) else ""
+    return bool(url) and (url in urls or (auth.startswith("Bearer ") and auth[7:] in tokens))
+
+
+def client_registrations(project, client):
+    """Every MCP server the client sees in this folder, as (name, entry, where it is set): the folder's
+    connection file, and the user's own (user and local scope)."""
+    project = Path(project)
+    found = []
+
+    def servers(path, where, pick=lambda data: data):
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            servers = pick(data).get("mcpServers") or {}
+        except (OSError, ValueError, AttributeError):
+            return  # missing, or being written by the client right now
+        if isinstance(servers, dict):
+            found.extend((name, entry, where) for name, entry in servers.items())
+    servers(project / CLIENT_FILES[client], CLIENT_FILES[client])
+    if client == "claude":
+        user = Path(os.environ.get("CLAUDE_CONFIG_DIR") or user_home()).expanduser() / ".claude.json"
+        servers(user, "~/.claude.json (user scope)")
+        servers(user, "~/.claude.json (local scope)",  # keyed by the folder, on Windows maybe with forward slashes
+                lambda data: next((v for k, v in (data.get("projects") or {}).items()
+                                   if k in (str(project), project.as_posix())), None) or {})
+    else:
+        servers(user_home() / ".cursor" / "mcp.json", "~/.cursor/mcp.json")
+    return found
+
+
+def user_home():
+    """Where the clients keep the user's own settings (~/.claude.json, ~/.cursor)."""
+    return Path.home()
+
+
+def crewchat_registrations(project, client, root=None):
+    """The (name, where) crewchat is registered under for this folder's client, crewchat's own first."""
+    try:
+        urls = (local_url(load_config(root)) + "/mcp",)
+    except SystemExit:
+        urls = ()
+    try:
+        tokens = set(filter(None, (read_token(p, root) for p in list_places(root))))
+    except (OSError, SystemExit):
+        tokens = set()
+    found = [(name, where) for name, entry, where in client_registrations(project, client)
+             if SERVER_NAME_OK.match(str(name)) and (name == SERVER_NAME or is_crewchat_server(entry, urls, tokens))]
+    return sorted(set(found), key=lambda f: (f[0] != SERVER_NAME, f))
+
+
+def registered_names(project, client, root=None):
+    """The names crewchat's tools have for this folder's client: crewchat, and any other it is registered
+    under, so its permission rules match whatever a user or a directory named it."""
+    names = [SERVER_NAME]
+    for name, _ in crewchat_registrations(project, client, root):
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def duplicate_note(project, client, root=None):
+    """A line on crewchat being registered more than once for this folder's client (each agent then sees
+    every tool twice), or None."""
+    found = crewchat_registrations(project, client, root)
+    if len({name for name, _ in found}) < 2:
+        return None
+    where = ", ".join("%s (%s)" % (name, place) for name, place in found)
+    extra, place = next((name, place) for name, place in found if name != SERVER_NAME)
+    scope = next((s for s in ("user", "local") if "(%s scope)" % s in place), "project")
+    fix = ("`claude mcp remove --scope %s %s`" % (scope, extra) if client == "claude"
+           else "take %s out of %s" % (extra, place))
+    return ("%s sees crewchat %d times: %s. Its agents get every chat tool twice; one is enough. "
+            "Both work and both are allowed without asking. To keep one: %s."
+            % ({"claude": "Claude Code", "cursor": "Cursor"}[client], len(found), where, fix))
+
+
+def allow_registered(folder, root=None):
+    """crewchat's tools allowed under every name they are registered under, in a connected folder whose
+    settings crewchat wrote (not committed ones). Run by `crewchat stdio`, so a name a user gave it
+    later is allowed too. Returns what changed."""
+    folder = Path(folder)
+    changed = []
+    for client, rel in (("claude", ".claude/settings.local.json"), ("cursor", ".cursor/cli.json")):
+        connected = (folder / CLIENT_FILES[client]).is_file() and client_config(folder, client)
+        if not connected or tracked_by_git(folder, rel):
+            continue
+        names = registered_names(folder, client, root)
+        if names == [SERVER_NAME]:
+            continue  # nothing beyond what joining the folder wrote
+        try:
+            if edit_json(folder / rel, lambda data: allow_rule(data, ALLOW[client], names)):
+                changed.append(rel)
+        except (OSError, SystemExit):
+            pass
+    return changed
+
+
+def disallow_rule(data, prefix, names=(SERVER_NAME,)):
     """Take crewchat's rules out of permissions.allow (also one the user added, such as hub_send's),
     and the list (and permissions) if left empty."""
     permissions = data.get("permissions") if isinstance(data.get("permissions"), dict) else {}
-    allow = [r for r in permissions.get("allow") or [] if not str(r).startswith(prefix)]
+    prefixes = tuple(prefix % name for name in names)
+    allow = [r for r in permissions.get("allow") or [] if not str(r).startswith(prefixes)]
     if allow:
         permissions["allow"] = allow
     elif permissions:
@@ -5994,10 +6113,11 @@ def disallow_rule(data, prefix):
             del data["permissions"]
 
 
-def set_claude_hooks(settings):
+def set_claude_hooks(settings, names=(SERVER_NAME,)):
     """crewchat's hooks in Claude Code settings, replacing its own older ones and keeping the user's,
-    and its tools allowed without asking (an agent stuck on a permission prompt misses the chat)."""
-    allow_rule(settings, CLAUDE_ALLOW)
+    and its tools allowed without asking under each of its names (an agent stuck on a permission
+    prompt misses the chat)."""
+    allow_rule(settings, CLAUDE_ALLOW, names)
     hooks = settings.setdefault("hooks", {})
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
@@ -6027,7 +6147,7 @@ def allow_cursor_tools(project):
     """crewchat's tools allowed without asking in the folder's Cursor agent settings (.cursor/cli.json)."""
     path = Path(project) / ".cursor" / "cli.json"
     data = read_json(path)
-    if allow_rule(data, CURSOR_ALLOW):
+    if allow_rule(data, CURSOR_ALLOW, registered_names(project, "cursor")):
         write_json(path, data)
         return True
     return False
@@ -6057,7 +6177,9 @@ def update_hooks(folder):
                 ours.add(rel)
                 setter(data)
         return change
-    changed = [rel for rel, setter in ((".claude/settings.local.json", set_claude_hooks),
+    claude_names = registered_names(folder, "claude")
+    changed = [rel for rel, setter in ((".claude/settings.local.json",
+                                        lambda data: set_claude_hooks(data, claude_names)),
                                        (".cursor/hooks.json", set_cursor_hooks))
                if (folder / rel).is_file() and not tracked_by_git(folder, rel)
                and edit_json(folder / rel, ours_then(rel, setter))]
@@ -6422,8 +6544,8 @@ def tool_summary(client, data):
             name, args = "Edit", {"file_path": data["file_path"]}
         elif data.get("command"):
             name, args = "Bash", {"command": data["command"]}
-    if not name or "crewchat" in name or name.startswith("hub_"):
-        return ""  # the chat's own tools: what they do shows in the chat already
+    if not name or "crewchat" in name or re.split(r"__|:", name)[-1].rstrip(")") in HUB_TOOL_NAMES:
+        return ""  # the chat's own tools, by any server name: what they do shows in the chat already
 
     def base(path):  # a file's own name, from either kind of path
         return re.split(r"[\\/]", path)[-1][:60] if isinstance(path, str) else ""
@@ -6678,13 +6800,60 @@ def cmd_stdio(args):
             die("--url needs the folder's token too: --token, or CREWCHAT_TOKEN")
     else:
         start = Path(args.project or ".").resolve()
-        config = next((client_config(folder, client) for folder in [start] + list(start.parents)
-                       for client in CLIENT_FILES if client_config(folder, client)), None)
-        if config is None:
-            die("%s is not connected to a crewchat. Run `crewchat start` there first, or pass --url and "
-                "--token." % start)
-        base, token = config
+        found = next(((folder, client_config(folder, client)) for folder in [start] + list(start.parents)
+                      for client in CLIENT_FILES if client_config(folder, client)), None)
+        if found is None:
+            # Registered for every folder (user scope, as directories publish it), it starts in folders
+            # that never joined a chat too: there it is a server with no tools, not a failed one.
+            return serve_unconnected(start)
+        folder, (base, token) = found
+        try:  # the name this server was registered under is allowed too, as crewchat is
+            allow_registered(folder)
+        except OSError:
+            pass
     StdioRelay((base if base.endswith("/mcp") else base + "/mcp"), token).run()
+
+
+def serve_unconnected(start, stdin=None, stdout=None):
+    """An MCP server with no tools, for `crewchat stdio` in a folder that is not connected to a chat:
+    the client shows it as working (it is, there is just no chat here) and its instructions say how
+    to connect. No tool, so it adds nothing to each agent's tool list in every other project."""
+    stdin, stdout = stdin or sys.stdin.buffer, stdout or sys.stdout.buffer
+    note = ("%s is not connected to a crewchat, so crewchat has no tools here. To use it, run `crewchat start` "
+            "in this folder, then start a new session." % start)
+    sys.stderr.write("crewchat: %s\n" % note)
+    answers = {"ping": {}, "tools/list": {"tools": []}, "resources/list": {"resources": []},
+               "prompts/list": {"prompts": []}}
+    for line in iter(stdin.readline, b""):
+        try:
+            payload = json.loads(line.decode("utf-8")) if line.strip() else None
+        except (ValueError, UnicodeDecodeError):
+            payload = "bad"
+        if payload is None:
+            continue
+        out = []
+        for req in payload if isinstance(payload, list) else [payload]:
+            if not isinstance(req, dict) or "method" not in req:
+                if not isinstance(req, dict):
+                    out.append({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "Parse error"}})
+                continue
+            if "id" not in req:
+                continue  # a notification
+            method, params = req["method"], req.get("params") if isinstance(req.get("params"), dict) else {}
+            if method == "initialize":
+                wanted = params.get("protocolVersion")
+                result = {"protocolVersion": wanted if wanted in PROTOCOLS else PROTOCOLS[0],
+                          "capabilities": {"tools": {}}, "serverInfo": {"name": SERVER_NAME, "version": __version__},
+                          "instructions": note}
+            else:
+                result = answers.get(method)
+            out.append({"jsonrpc": "2.0", "id": req["id"], "result": result} if result is not None else
+                       {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "Method not found: %s"
+                                                                     % method}})
+        if out:
+            stdout.write((json.dumps(out if isinstance(payload, list) else out[0], separators=(",", ":"))
+                          + "\n").encode("utf-8"))
+            stdout.flush()
 
 
 def cmd_hooks(args):
@@ -7277,6 +7446,7 @@ def cmd_update(args):
 def disconnect_folder(project):
     """Take crewchat's connection and hooks out of a project folder, leaving everything else."""
     changed = []
+    names = {client: registered_names(project, client) for client in CLIENT_FILES}  # before .mcp.json goes
 
     def edit(rel, change):
         if edit_json(project / rel, change):
@@ -7288,7 +7458,7 @@ def disconnect_folder(project):
             del data["mcpServers"]
 
     def claude_settings(data):
-        disallow_rule(data, CLAUDE_ALLOW)
+        disallow_rule(data, CLAUDE_ALLOW, names["claude"])
         enabled = [n for n in data.get("enabledMcpjsonServers") or [] if n != SERVER_NAME]
         if enabled:
             data["enabledMcpjsonServers"] = enabled
@@ -7324,7 +7494,7 @@ def disconnect_folder(project):
     edit(".claude/settings.local.json", claude_settings)
     edit(".cursor/mcp.json", servers)
     edit(".cursor/hooks.json", cursor_hooks)
-    edit(".cursor/cli.json", lambda data: disallow_rule(data, CURSOR_ALLOW))
+    edit(".cursor/cli.json", lambda data: disallow_rule(data, CURSOR_ALLOW, names["cursor"]))
     for name in (".crewchat-listen", ".crewchat-hooks"):
         try:
             (project / name).unlink()
