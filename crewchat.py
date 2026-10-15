@@ -3983,13 +3983,22 @@ def list_folders(path, root=None):
     asked = folder = typed_folder(path or "~")
     while not folder.is_dir() and folder.parent != folder:
         folder = folder.parent
+    own = Path(root or home()).resolve()
     try:
-        mine = os.stat(str(root or home()))
+        mine = os.stat(str(own))
     except OSError:
         mine = None
+
+    def is_own(entry):
+        """crewchat's folder: by its path, or by file identity for another name of it (POSIX only:
+        on Windows, scandir's stat leaves st_ino at 0)."""
+        if os.path.normcase(entry.path) == os.path.normcase(str(own)):
+            return True
+        st = entry.stat()
+        return bool(mine and st.st_ino) and os.path.samestat(st, mine)
     try:
         names = sorted((e.name for e in os.scandir(folder) if not e.name.startswith(".") and e.is_dir()
-                        and not (mine and os.path.samestat(e.stat(), mine))), key=str.lower)
+                        and not is_own(e)), key=str.lower)
     except OSError as e:  # no permission (on a Mac: Desktop, Documents)
         raise HubError("cannot open %s (%s)" % (folder, e.strerror or e))
     return {"path": str(folder), "parent": str(folder.parent) if folder.parent != folder else "",
