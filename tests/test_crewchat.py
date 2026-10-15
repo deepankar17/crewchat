@@ -2266,7 +2266,9 @@ class Joining(Base):
         self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
         self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
         self.assertNotIn("mcp__crewchat", allow)
-        cursor_allow = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        cursor_permissions = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]
+        cursor_allow = cursor_permissions["allow"]
+        self.assertEqual(cursor_permissions["deny"], [])  # Cursor's agent refuses a cli.json without one
         self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
         self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
@@ -2664,6 +2666,14 @@ class Hooks(Base):
             "stop": [{"command": "python crewchat.py hook cursor stop"}]}}))
         self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json",
                                                         ".cursor/cli.json"])
+        self.assertEqual(json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["deny"], [])
+        # A cli.json written before Cursor wanted a deny list gets one, and nothing else changes.
+        (folder / ".cursor" / "cli.json").write_text(json.dumps({"permissions": {
+            "allow": crewchat.crewchat_rules(crewchat.CURSOR_ALLOW)}}))
+        self.assertTrue(crewchat.allow_cursor_tools(folder))
+        self.assertEqual(json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"],
+                         {"allow": crewchat.crewchat_rules(crewchat.CURSOR_ALLOW), "deny": []})
+        self.assertFalse(crewchat.allow_cursor_tools(folder))  # up to date
         self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
                          {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
