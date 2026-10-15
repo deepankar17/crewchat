@@ -6109,6 +6109,8 @@ def disallow_rule(data, prefix, names=(SERVER_NAME,)):
         permissions["allow"] = allow
     elif permissions:
         permissions.pop("allow", None)
+        if permissions.get("deny") == []:  # the empty list Cursor needs beside allow (allow_cursor_tools)
+            permissions.pop("deny")
         if not permissions:
             del data["permissions"]
 
@@ -6147,10 +6149,13 @@ def allow_cursor_tools(project):
     """crewchat's tools allowed without asking in the folder's Cursor agent settings (.cursor/cli.json)."""
     path = Path(project) / ".cursor" / "cli.json"
     data = read_json(path)
-    if allow_rule(data, CURSOR_ALLOW, registered_names(project, "cursor")):
+    changed = allow_rule(data, CURSOR_ALLOW, registered_names(project, "cursor"))
+    if not isinstance(data["permissions"].get("deny"), list):  # Cursor's agent refuses a cli.json without one
+        data["permissions"]["deny"] = []
+        changed = True
+    if changed:
         write_json(path, data)
-        return True
-    return False
+    return changed
 
 
 def set_cursor_hooks(hooks):
