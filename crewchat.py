@@ -9755,13 +9755,25 @@ function postJSON(path, body) {
   return request(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
 }
 
-// The space shows the chat, the task board or the commands; the rail's buttons and the back arrows switch.
+// The chat is at its newest message (or near enough).
+function atBottom() {
+  const log = $("log");
+  return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+}
+
+// The space shows the chat or the task board (the commands open in the side panel); the rail's Tasks
+// button and the back arrow switch.
+// A hidden chat can't scroll, so whether it was at its newest message is kept, and on the way back it
+// shows what came in meanwhile.
 function showView(view) {
-  $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
+  const log = $("log"), back = log.hidden && view === "chat";
+  if (!log.hidden && view !== "chat") state.pinned = atBottom();
+  log.hidden = view !== "chat"; $("form").hidden = view !== "chat";
   $("tasks").hidden = view !== "tasks";
   $("view-tasks").classList.toggle("on", view === "tasks");
   $("view-tasks").setAttribute("aria-pressed", String(view === "tasks"));
   renderWorking();
+  if (back && state.pinned !== false) log.scrollTop = log.scrollHeight;
   if (view === "chat") setTimeout(() => markRead(), 0);
   $("give").hidden = true;
   document.body.classList.remove("rail-open");
@@ -11352,7 +11364,7 @@ function renderNeeds(needs) {
 // (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
 function markRead(upto) {
   const log = $("log");
-  const seen = !document.hidden && document.hasFocus() && !log.hidden && log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+  const seen = !document.hidden && document.hasFocus() && !log.hidden && atBottom();
   const seq = upto || (seen ? state.after : 0);
   if (!seq || seq <= (state.readPosted || 0)) return;
   if (!upto && !state.needs.some((n) => n.kind === "message" && n.seq <= seq)) return;
@@ -11484,7 +11496,7 @@ async function loop() {
       try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();
       const log = $("log");
-      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      const pinned = atBottom();
       const mine = data.messages.some((m) => m.from === "Owner");
       renderAgents();
       renderWorking();

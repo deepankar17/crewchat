@@ -404,9 +404,6 @@ def scene_roles(r):
     chat.hub.update(maya, task, "done", "Switch built by Teo, tested by Wren.")
     time.sleep(1.2)
     r.click("#view-tasks", 600)  # back to the chat
-    # The page leaves the chat where it was before the board, not at the messages that came in
-    # meanwhile (the log is hidden, so it cannot scroll), so scroll down as a person would.
-    r.js("$('log').scrollTo({top: $('log').scrollHeight, behavior: 'smooth'})")
     time.sleep(0.8)
     chat.say(maya, O, "The dark theme is done and tested. Should the default follow the system setting?")
     frames = r.stop(2.4)

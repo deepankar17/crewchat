@@ -644,6 +644,32 @@ class NewPage(Signed):
         self.assertFalse(c.js("$('log').hidden"))
         self.assertEqual(c.errors, [])
 
+    def test_back_from_the_board_shows_what_came_in_meanwhile(self):
+        c = self.chrome
+        last_in_view = """(() => { const log = $('log'), r = log.getBoundingClientRect();
+            const b = log.lastElementChild.getBoundingClientRect();
+            return b.bottom > r.top && b.top < r.bottom; })()"""
+        for i in range(12):
+            self.agent.call("hub_send", to="all", text="Earlier note %d. " % i + "Some words to fill the chat. " * 8)
+        c.until("$('log').innerText.includes('Earlier note 11')", what="the earlier notes")
+        c.until("$('log').scrollHeight > $('log').clientHeight + 200", what="a chat taller than the page")
+        c.until(last_in_view, what="the chat at its newest message")
+        # At the bottom, then the board: what agents post meanwhile is shown on the way back.
+        c.click("#view-tasks")
+        for i in range(4):
+            self.agent.call("hub_send", to="all", text="While on the board %d. " % i + "More words. " * 10)
+        c.until("$('log').textContent.includes('While on the board 3')", what="the new messages")
+        c.click("#tasks .back")
+        self.assertTrue(c.js(last_in_view), "the newest message is out of view")
+        # Scrolled up to read, then the board: the chat stays where the owner left it.
+        c.js("$('log').scrollTop = 0")
+        c.click("#view-tasks")
+        self.agent.call("hub_send", to="all", text="While reading back")
+        c.until("$('log').textContent.includes('While reading back')", what="the message")
+        c.click("#tasks .back")
+        self.assertEqual(c.js("$('log').scrollTop"), 0)
+        self.assertEqual(c.errors, [])
+
     def test_the_task_board(self):
         c = self.chrome
         c.click("#view-tasks")
