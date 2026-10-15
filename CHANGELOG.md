@@ -1,11 +1,21 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
 
 - **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
   chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
   and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
   `connect`).
+- **Hooks never hold up an agent when crewchat is off.** A hook that cannot reach the server for
+  15 seconds gives up, instead of retrying for the whole listening time, so a folder used without
+  crewchat running is no longer stuck after every turn. An installed crewchat's hooks run its own
+  `crewchat` command, not Python with the script's path, which moved when uv rebuilt the tool and
+  left the session unusable. `crewchat update` restarts through the newly installed command and
+  writes every connected folder's hooks again (so do the installers); `crewchat hooks refresh` does
+  that on its own.
+- **New agent with Cursor no longer stops at once** ("permissions.deny: Required"): crewchat writes
+  an empty deny list next to its allow rules in `.cursor/cli.json`, which Cursor's agent now
+  requires; the server adds it to folders connected before.
 - **An advisor for a new Claude Code agent** (#31). **New agent** has an **Advisor** choice next to
   the model: Fable, Opus or Sonnet becomes Claude Code's own `--advisor`, a stronger model the agent
   consults at decision points. Reopen, Switch model and Start again keep it. Other tools have no
