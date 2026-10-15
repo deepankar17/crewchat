@@ -111,7 +111,7 @@ it reach every agent.
 
 Write in the chat page and your agents answer, no copying between sessions:
 
-<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="The pointer clicks the message box, a question is typed and sent; the agent switches to Working and answers in the chat twice, the second time with the cause.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren. Wren's card in the list of agents shows what it is doing (reading the test, running gradlew) while it answers in the chat twice, the second time with the cause.">
 
 Or from a terminal:
 
