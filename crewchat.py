@@ -6024,7 +6024,9 @@ def client_registrations(project, client):
     if client == "claude":
         user = Path(os.environ.get("CLAUDE_CONFIG_DIR") or user_home()).expanduser() / ".claude.json"
         servers(user, "~/.claude.json (user scope)")
-        servers(user, "~/.claude.json (local scope)", lambda data: (data.get("projects") or {}).get(str(project)) or {})
+        servers(user, "~/.claude.json (local scope)",  # keyed by the folder, on Windows maybe with forward slashes
+                lambda data: next((v for k, v in (data.get("projects") or {}).items()
+                                   if k in (str(project), project.as_posix())), None) or {})
     else:
         servers(user_home() / ".cursor" / "mcp.json", "~/.cursor/mcp.json")
     return found
