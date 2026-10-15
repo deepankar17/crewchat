@@ -5962,8 +5962,7 @@ def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
     # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
     # installed crewchat runs by its own launcher.
-    quote = lambda p: p if " " not in p else '"%s"' % p  # noqa: E731
-    return "%s hook %s %s" % (" ".join(quote(p) for p in run_command()), client, event)
+    return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
 def is_our_hook(command):
@@ -7107,8 +7106,7 @@ def cmd_service(args):
     if not (mac or linux):
         die("starting at login is automated on macOS, Linux and Windows only. Run `crewchat serve` instead.")
     uid = os.getuid()
-    plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-    unit = Path.home() / ".config" / "systemd" / "user" / "crewchat.service"
+    plist, unit = service_file(mac=True), service_file(mac=False)
     if args.action == "install":
         if mac:
             run(["launchctl", "bootout", "gui/%d/%s" % (uid, SERVICE_LABEL)])
@@ -7252,15 +7250,21 @@ def reclaim_checks(projects):
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
 
 
+def service_file(mac=None):
+    """The login service's file: launchd's plist on macOS, the systemd user unit elsewhere."""
+    if mac is None:
+        mac = sys.platform == "darwin"
+    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if mac
+            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+
+
 def service_installed():
     """Is crewchat's login service set up, and for this chat? A machine has one such service; it
     belongs to another chat when it was set up with another CREWCHAT_HOME, and is then left alone."""
     if os.name == "nt":
         return windows_service() is not None
-    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
-            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
     try:
-        text = path.read_text(encoding="utf-8")
+        text = service_file().read_text(encoding="utf-8")
     except OSError:
         return False
     return service_home_is_ours(re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)",
@@ -7310,8 +7314,7 @@ def start_server(config):
             else:
                 start_background()
         elif sys.platform == "darwin":
-            plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)]).returncode != 0:
+            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(service_file())]).returncode != 0:
                 run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
         else:
             run(["systemctl", "--user", "start", "crewchat.service"])
@@ -7328,8 +7331,7 @@ def service_present():
     """Does this machine have crewchat's login service at all, for this chat or another one?"""
     if os.name == "nt":
         return run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0 or run_entry() is not None
-    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")).exists() or \
-        (Path.home() / ".config" / "systemd" / "user" / "crewchat.service").exists()
+    return service_file(mac=True).exists() or service_file(mac=False).exists()
 
 
 def cmd_resume(_args):
@@ -7368,8 +7370,7 @@ def refresh_service():
     if os.name == "nt" or not service_installed():
         return
     mac = sys.platform == "darwin"
-    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if mac
-            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+    path = service_file()
     try:
         old = path.read_text(encoding="utf-8")
         new = launchd_plist("/usr/bin/caffeinate" in old) if mac else systemd_unit()
@@ -7485,7 +7486,7 @@ def cmd_update(args):
     uv = find_uv()
     local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
     if os.name == "nt" and uv and not local:
-        exe = Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
+        exe = launcher() or Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
         script = windows_update_script(uv, update_specs(version), exe, tool_folder() or Path(__file__).parent,
                                        os.getpid())
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", script],
