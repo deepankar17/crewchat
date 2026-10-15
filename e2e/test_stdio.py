@@ -143,11 +143,18 @@ class Stdio(unittest.TestCase):
             relay.stop()
 
     def test_a_folder_that_is_not_connected(self):
-        out = subprocess.run(H.crewchat_command() + ["stdio"], cwd=str(H.TMP), env=self.m.env, input=b"",
+        # Registered for every folder (user scope), it is a server with no tools here, not a failed one.
+        hello = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "e2e"}}}
+        tools = {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}
+        out = subprocess.run(H.crewchat_command() + ["stdio"], cwd=str(H.TMP), env=self.m.env,
+                             input=(json.dumps(hello) + "\n" + json.dumps(tools) + "\n").encode(),
                              capture_output=True, timeout=30)
-        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn(b"not connected to a crewchat", out.stderr)
-        self.assertEqual(out.stdout, b"")  # nothing a client could mistake for MCP
+        answers = [json.loads(line) for line in out.stdout.decode().splitlines()]
+        self.assertIn("crewchat start", answers[0]["result"]["instructions"])
+        self.assertEqual(answers[1]["result"], {"tools": []})
 
     def test_bad_lines_and_notifications(self):
         relay = Relay(self.m, "--project", self.m.folder)

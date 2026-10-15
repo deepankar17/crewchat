@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -1309,9 +1310,10 @@ class Launching(Base):
         self.launched = []
         self.saved = crewchat.launch_agent, crewchat.find_tool
         self.real_launch_agent = crewchat.launch_agent
-        self.models = []
-        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="": (
-            self.launched.append((tool, folder, key, permissions)), self.models.append(model))
+        self.models, self.advisors = [], []
+        crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="", advisor="": (
+            self.launched.append((tool, folder, key, permissions)), self.models.append(model),
+            self.advisors.append(advisor))
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/" + tool
         self.folder = Path(tempfile.mkdtemp(prefix="launch-", dir=TMP)).resolve()
         subprocess.run(["git", "init", "-q", str(self.folder)], check=False)
@@ -1394,6 +1396,23 @@ class Launching(Base):
         self.assertIn("no picture preset", self.launch(picture="preset:nope")["error"])
         self.assertIn("#rrggbb", self.launch(colour="red")["error"])
         self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="opus")[-3:-1], ["--model", "opus"])
+
+    def test_new_agent_with_claude_codes_own_advisor(self):
+        out = self.launch(name="advised", model="sonnet", advisor="opus")
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(self.advisors[-1], "opus")
+        Session(self.base, crewchat.read_token(self.place)).call("hub_link", key=self.launched[-1][2])
+        self.assertEqual(self.hub.agents["advised"]["advisor"], "opus")  # Reopen starts it with the same advisor
+        self.assertEqual(self.launch(name="unadvised"), {"ok": True})
+        self.assertEqual(self.advisors[-1], "")  # none unless chosen
+        for bad in ("haiku", "opus; rm -rf ~", "gpt"):
+            self.assertIn("no advisor called", self.launch(advisor=bad)["error"])
+        self.assertIn("no advisor called opus", self.launch(tool="cursor", advisor="opus")["error"])
+        self.assertEqual(crewchat.launch_command("claude", "claude", "start-x", model="sonnet", advisor="opus")[-5:-1],
+                         ["--model", "sonnet", "--advisor", "opus"])
+        self.assertNotIn("--advisor", crewchat.launch_command("claude", "claude", "start-x"))
+        self.assertEqual([m[0] for m in crewchat.tool_advisors("claude")], ["fable", "opus", "sonnet"])
+        self.assertEqual(crewchat.tool_advisors("cursor"), [])
 
     def agent_op(self, **body):
         try:
@@ -1673,6 +1692,22 @@ class Launching(Base):
                 crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertIn("no longer connected", json.loads(caught.exception.read())["error"])
         self.assertEqual(stopped, [])  # still running, as it was
+
+    def test_reopen_and_switch_model_keep_its_advisor(self):
+        name = self.closed_session()
+        self.hub.agents[name]["advisor"] = "fable"
+        _, opened = self.reopened(agent=name)
+        self.assertEqual(opened[0][1][-4:-2], ["--advisor", "fable"])
+        self.hub.agents[name]["session"].pop("reopening", None)
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                                  opened.append((folder, command, key, title))):
+            crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
+        self.assertEqual(opened[-1][1][-6:-2], ["--model", "sonnet", "--advisor", "fable"])
+        self.hub.agents[name]["advisor"] = "haiku"  # one this copy does not offer (an older or edited state)
+        self.hub.agents[name]["session"].pop("reopening", None)
+        _, opened = self.reopened(agent=name)
+        self.assertNotIn("--advisor", opened[0][1])
 
     def test_reopen_keeps_the_permissions_it_was_started_with(self):
         crewchat.post_json(self.base + "/api/launch", self.owner, {"tool": "claude", "folder": str(self.folder),
@@ -2269,7 +2304,9 @@ class Joining(Base):
         self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
         self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
         self.assertNotIn("mcp__crewchat", allow)
-        cursor_allow = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["allow"]
+        cursor_permissions = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]
+        cursor_allow = cursor_permissions["allow"]
+        self.assertEqual(cursor_permissions["deny"], [])  # Cursor's agent refuses a cli.json without one
         self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
         self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
@@ -2667,6 +2704,14 @@ class Hooks(Base):
             "stop": [{"command": "python crewchat.py hook cursor stop"}]}}))
         self.assertEqual(crewchat.update_hooks(folder), [".claude/settings.local.json", ".cursor/hooks.json",
                                                         ".cursor/cli.json"])
+        self.assertEqual(json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]["deny"], [])
+        # A cli.json written before Cursor wanted a deny list gets one, and nothing else changes.
+        (folder / ".cursor" / "cli.json").write_text(json.dumps({"permissions": {
+            "allow": crewchat.crewchat_rules(crewchat.CURSOR_ALLOW)}}))
+        self.assertTrue(crewchat.allow_cursor_tools(folder))
+        self.assertEqual(json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"],
+                         {"allow": crewchat.crewchat_rules(crewchat.CURSOR_ALLOW), "deny": []})
+        self.assertFalse(crewchat.allow_cursor_tools(folder))  # up to date
         self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
                          {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
@@ -3382,6 +3427,127 @@ class Lifecycle(Base):
         page = self.raw("/", opener=opener)[1].decode()
         self.assertIn('id="update"', page)
         self.assertIn("crewchat update", page)
+
+    def test_hooks_refresh_points_every_connected_folder_at_this_copy(self):
+        folder = Path(tempfile.mkdtemp(prefix="rehook-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "rehook")
+        hooks = lambda: (folder / ".claude" / "settings.local.json").read_text() + (folder / ".cursor" / "hooks.json").read_text()  # noqa: E731
+        self.assertIn(crewchat.self_command()[1], hooks())
+        # A reinstall moved crewchat (here: another Python's folder): the old hooks point nowhere.
+        moved = ["/tools/crewchat/bin/python", "/tools/crewchat/lib/python3.12/site-packages/crewchat.py"]
+        with mock.patch.object(crewchat, "self_command", return_value=moved):
+            out = cli("hooks", "refresh")
+        self.assertIn("Updated the hooks in 1 connected folder", out)
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook claude stop", hooks())
+        self.assertIn("/tools/crewchat/lib/python3.12/site-packages/crewchat.py hook cursor", hooks())
+        self.assertNotIn(crewchat.self_command()[1], hooks())
+        cli("hooks", "refresh")  # and back
+        # With the server off no restart follows (update, install.sh), so the login service is
+        # brought up to this copy too; with it running, the restart that follows does that.
+        with mock.patch.object(crewchat, "refresh_service") as service:
+            with mock.patch.object(crewchat, "server_up", return_value=False):
+                cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
+            cli("hooks", "refresh")
+            self.assertEqual(service.call_count, 1)
+
+    def test_a_hook_gives_up_soon_on_a_server_that_is_off(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()  # nothing listens there: crewchat stopped, the folder used on its own
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1):
+            with self.assertRaises((urllib.error.URLError, OSError)):
+                crewchat.hook_check("http://127.0.0.1:%d" % port, "token", "key", 1800, 0)  # listening 30 min
+        self.assertLess(time.time() - began, 10)  # not the 30 minutes it would have listened
+
+    def test_an_installed_crewchat_runs_by_its_own_launcher(self):
+        tool = Path(tempfile.mkdtemp(prefix="uv-tool-", dir=TMP)).resolve()
+        (tool / "uv-receipt.toml").write_text("")
+        site = tool / "lib" / "python3.12" / "site-packages"
+        site.mkdir(parents=True)
+        exe = tool / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat")
+        with mock.patch.object(crewchat, "__file__", str(site / "crewchat.py")):
+            self.assertIsNone(crewchat.launcher())  # not there (yet): Python and the script, as before
+            exe.parent.mkdir(parents=True)
+            exe.write_text("")
+            self.assertEqual(crewchat.launcher(), exe)
+            launched = exe.as_posix()
+            # Hooks and the login service run it: its path stays put when uv rebuilds the tool on another
+            # Python, and a crewchat that is gone fails in the shell, not with Python's exit 2 ("block").
+            self.assertEqual(crewchat.hook_command("claude", "stop"), "%s hook claude stop" % launched)
+            self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "stop")))
+            self.assertIn('ExecStart="%s" serve' % launched, crewchat.systemd_unit())
+            self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
+        # A checkout runs its script with this Python, as before.
+        self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_a_hook_gives_up_on_a_server_stopped_while_it_listened(self):
+        answers = iter([{"text": ""}])
+
+        def post(url, token, body, timeout=10):
+            try:
+                return next(answers)  # it answered once, then crewchat was stopped
+            except StopIteration:
+                raise urllib.error.URLError("connection refused")
+        began = time.time()
+        with mock.patch.object(crewchat, "SERVER_GONE_SECS", 1), mock.patch.object(crewchat, "post_json", side_effect=post):
+            with self.assertRaises(urllib.error.URLError):
+                crewchat.hook_check("http://127.0.0.1:1", "token", "key", 1800, 0)
+        self.assertLess(time.time() - began, 10)
+
+    @unittest.skipIf(os.name == "nt", "Windows' logon task is not rewritten")
+    def test_restart_rewrites_a_login_service_another_copy_wrote(self):
+        user = Path(tempfile.mkdtemp(prefix="user-home-", dir=TMP))
+        mac = sys.platform == "darwin"
+        path = (user / "Library" / "LaunchAgents" / (crewchat.SERVICE_LABEL + ".plist") if mac
+                else user / ".config" / "systemd" / "user" / "crewchat.service")
+        path.parent.mkdir(parents=True)
+        ran = []
+        with mock.patch.object(crewchat.Path, "home", return_value=user), \
+                mock.patch.object(crewchat, "run", side_effect=lambda c: ran.append(c) or subprocess.CompletedProcess(c, 0, "", "")):
+            with mock.patch.object(crewchat, "run_command", return_value=["/gone/python3.14/crewchat.py"]):
+                path.write_text(crewchat.launchd_plist(True) if mac else crewchat.systemd_unit())  # before the update
+            with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+                with mock.patch.object(crewchat, "launcher", return_value=None):  # a checkout: leaves it alone
+                    crewchat.refresh_service()
+                self.assertIn("/gone/", path.read_text())
+                self.assertEqual(ran, [])
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()
+                text = path.read_text()
+                self.assertIn("/tools/crewchat/bin/crewchat", text)
+                self.assertNotIn("/gone/", text)
+                if mac:
+                    self.assertIn("/usr/bin/caffeinate", text)  # --keep-awake kept
+                    self.assertTrue(any("bootout" in c for c in ran))
+                ran.clear()
+                with mock.patch.object(crewchat, "launcher", return_value=Path("/tools/crewchat/bin/crewchat")):
+                    crewchat.refresh_service()  # up to date: left alone
+                self.assertEqual(ran, [])
+
+    def test_update_runs_the_new_copy_not_this_one(self):
+        ran = []
+
+        def run(command, **kw):
+            ran.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat, "find_uv", return_value="/bin/uv"), \
+                mock.patch.object(crewchat, "latest_release", return_value="99.0.0"), \
+                mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(crewchat, "launcher", return_value=Path("/new/bin/crewchat")), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CREWCHAT_SOURCE", None)
+            if os.name == "nt":
+                self.skipTest("Windows updates in a window of its own")
+            crewchat.cmd_update(argparse.Namespace(version=None))
+        self.assertEqual(ran[0][:2], ["/bin/uv", "tool"])
+        # This process's script may be gone (uv rebuilt the tool, perhaps on another Python).
+        self.assertEqual(ran[1:], [["/new/bin/crewchat", "hooks", "refresh"], ["/new/bin/crewchat", "restart"]])
 
     def test_uninstall_takes_crewchat_out_of_a_folder_and_leaves_the_rest(self):
         mine = Path(tempfile.mkdtemp(dir=TMP))

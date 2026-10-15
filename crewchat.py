@@ -1824,7 +1824,8 @@ class Hub:
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
-    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model=""):
+    def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model="",
+                  advisor=""):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
@@ -1846,25 +1847,29 @@ class Hub:
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
                                 "picture": picture, "colour": colour,
-                                "instructions": instructions, "model": model, "expires": now + START_TTL}
+                                "instructions": instructions, "model": model, "advisor": advisor,
+                                "expires": now + START_TTL}
             return key
 
     def launch(self, tool, folder, name="", role="", task="", permissions="ask", model="", picture="",
-               colour="", instructions=""):
+               colour="", instructions="", advisor=""):
         """Open a new agent session in a connected folder on this machine; it checks in with a
         start key and gets this name, role, picture, instructions and first task, and may do what
-        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool)."""
+        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool),
+        advisor one of tool_advisors(tool)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
         if model:
             check_model(tool, model)
+        if advisor:
+            check_advisor(tool, advisor)
         if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model)
+        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model, advisor)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model)
+            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
         except (HubError, OSError) as e:
             with self.lock:
                 self.starts.pop(key, None)
@@ -1910,6 +1915,8 @@ class Hub:
                 self.agents[name]["permissions"] = spec.get("permissions") or "ask"
                 if spec.get("model"):
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
+                if spec.get("advisor"):
+                    self.agents[name]["advisor"] = spec["advisor"]  # and with the same advisor
                 self._save()
         if spec.get("picture") is not None or spec.get("colour"):
             try:
@@ -2706,6 +2713,7 @@ class Hub:
                 "art": ART_PICTURES,
                 "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
+                "advisors": {tool: tool_advisors(tool) for tool in LAUNCH_TOOLS},
                 "names": AGENT_NAMES,
                 "images": INLINE_IMAGES,
                 "max_upload": MAX_UPLOAD,
@@ -2844,11 +2852,14 @@ class Hub:
         with self.lock:
             permissions = (self.agents.get(name) or {}).get("permissions", "ask")
             model = model or (self.agents.get(name) or {}).get("model") or None
+            advisor = (self.agents.get(name) or {}).get("advisor") or ""
         permissions = permissions if permissions in LAUNCH_PERMISSIONS[tool] else "ask"
         if model and model not in [m for m, _ in tool_models(tool)]:
             model = None
+        if advisor not in [m for m, _ in tool_advisors(tool)]:
+            advisor = ""
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model)
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor)
 
     def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
@@ -2887,6 +2898,7 @@ class Hub:
                 raise HubError("%s is running or starting already" % name)
             tool = agent["client"]
             permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
+            advisor = agent.get("advisor") or ""
         connected = {f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)}
         folder = next((str(f) for f in self.agent_folders(name) if str(f) in connected), None)
         if folder is None:
@@ -2895,10 +2907,12 @@ class Hub:
             permissions = "ask"
         if model not in [m for m, _ in tool_models(tool)]:
             model = ""
+        if advisor not in [m for m, _ in tool_advisors(tool)]:
+            advisor = ""
         with self.lock:
             key = self._link_key(name)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model)
+            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
         except (HubError, OSError) as e:
             raise HubError(str(e))
         with self.lock:
@@ -3865,6 +3879,8 @@ COMMANDS = [
         ("hooks off [--project FOLDER]", "Keep a folder's sessions out of the chat: no request to join, no messages handed over.", None),
         ("hooks on [--project FOLDER]", "Let them back in.", None),
         ("hooks status [--project FOLDER]", "Show the setting.", None),
+        ("hooks refresh", "Write every connected folder's hooks again for this crewchat (after a reinstall moved it).",
+         {"argv": ["hooks", "refresh"]}),
         ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
         ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
         ("invite [--local] [--place NAME] [--client all|claude|cursor|generic] [--url URL]",
@@ -4658,7 +4674,7 @@ class Handler(BaseHTTPRequestHandler):
         permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
         self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
                         data.get("task"), permissions, str(data.get("model") or ""), data.get("picture") or "",
-                        data.get("colour") or "", data.get("instructions") or "")
+                        data.get("colour") or "", data.get("instructions") or "", str(data.get("advisor") or ""))
         return {"ok": True}
 
     def _admin(self, raw):
@@ -4979,8 +4995,24 @@ def owner_tool(name, **arguments):
 
 
 def self_command():
-    """How to run this same program again, for hooks and services: [python, script]."""
+    """How to run this same program again: [python, script]."""
     return [Path(sys.executable).as_posix(), Path(__file__).resolve().as_posix()]
+
+
+def launcher():
+    """An installed crewchat's own command (the uv tool's bin/crewchat), or None for a checkout. It
+    stays put when uv rebuilds the tool, perhaps on another Python, unlike this file's path; and if
+    crewchat is gone, running it fails in the shell (not with Python's exit 2, which Claude Code's
+    hooks take as "block")."""
+    folder = tool_folder()
+    exe = folder / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat") if folder else None
+    return exe if exe and exe.is_file() else None
+
+
+def run_command():
+    """How hooks and the login service run crewchat: its launcher, else Python and this script."""
+    exe = launcher()
+    return [exe.as_posix()] if exe else self_command()
 
 
 # --------------------------------------------------------------------------------------------
@@ -5221,16 +5253,17 @@ def launch_options(config, root=None, chat=""):
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t) if exe else []},
+                           "models": tool_models(t) if exe else [], "advisors": tool_advisors(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
-def tool_options(tool, permissions="ask", base=None, model=""):
+def tool_options(tool, permissions="ask", base=None, model="", advisor=""):
     """The options an agent tool starts with: its base options (as this copy knows them), the
-    chosen permissions, and a model from tool_models. The same for a new agent and a reopened one."""
+    chosen permissions, a model from tool_models and an advisor from tool_advisors. The same for a
+    new agent and a reopened one."""
     return ((LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-            + (["--model", model] if model else []))
+            + (["--model", model] if model else []) + (["--advisor", advisor] if advisor else []))
 
 
 def check_model(tool, model):
@@ -5239,10 +5272,17 @@ def check_model(tool, model):
         raise HubError("%s has no model called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], model))
 
 
-def launch_command(exe, tool, key, permissions="ask", base=None, model=""):
-    """The agent's command line. Only the fixed prompt, the key, fixed options and a model from
-    tool_models reach it: no text typed on the chat page is ever passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base, model) + [LAUNCH_PROMPT % key]
+def check_advisor(tool, advisor):
+    """An advisor model the owner chose for an agent tool, checked (tool_advisors)."""
+    if advisor not in [m for m, _ in tool_advisors(tool)]:
+        raise HubError("%s has no advisor called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], advisor))
+
+
+def launch_command(exe, tool, key, permissions="ask", base=None, model="", advisor=""):
+    """The agent's command line. Only the fixed prompt, the key, fixed options and a model and an
+    advisor from tool_models and tool_advisors reach it: no text typed on the chat page is ever
+    passed to a shell."""
+    return [exe] + tool_options(tool, permissions, base, model, advisor) + [LAUNCH_PROMPT % key]
 
 
 def macos_script(folder, command, key, title=""):
@@ -5305,6 +5345,9 @@ REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_i
 REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
+# The models Claude Code's own advisor (--advisor) can be: its aliases that can act as one (Haiku 4.5
+# cannot, so the haiku alias is left out). One ranked below the agent's model only gets a warning.
+CLAUDE_ADVISORS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]
 
 
 def tool_models(tool):
@@ -5313,18 +5356,25 @@ def tool_models(tool):
     return CLAUDE_MODELS if tool == "claude" else []
 
 
-def resume_command(exe, tool, session, permissions="ask", base=None, model=None):
+def tool_advisors(tool):
+    """The models an agent tool's own advisor can be: [[id, label], ...]. Only Claude Code has one
+    (--advisor: it consults that model at decision points, reading its whole conversation)."""
+    return CLAUDE_ADVISORS if tool == "claude" else []
+
+
+def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor=""):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
     if not SESSION_RE.fullmatch(str(session)):
         raise HubError("that session cannot be reopened")
     # One argument, so an id can never be taken for an option of its own.
-    return [exe] + tool_options(tool, permissions, base, model or "") + ["--resume=" + session, REOPEN_PROMPT]
+    return ([exe] + tool_options(tool, permissions, base, model or "", advisor or "")
+            + ["--resume=" + session, REOPEN_PROMPT])
 
 
-def launch_agent(tool, folder, key, permissions="ask", root=None, model=""):
+def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
     """Open a terminal window on this machine with a new agent session in folder."""
     exe, base = agent_tool(tool, folder, permissions, root)
-    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model), key, root=root)
+    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, advisor), key, root=root)
 
 
 def open_terminal(folder, command, key, title="", root=None):
@@ -6010,9 +6060,9 @@ def git_exclude(project, paths):
 
 def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
-    # cmd and PowerShell, whichever shell the agent's tool uses for hooks.
-    python, script = (p if " " not in p else '"%s"' % p for p in self_command())
-    return "%s %s hook %s %s" % (python, script, client, event)
+    # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
+    # installed crewchat runs by its own launcher.
+    return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
 def is_our_hook(command):
@@ -6177,6 +6227,8 @@ def disallow_rule(data, prefix, names=(SERVER_NAME,)):
         permissions["allow"] = allow
     elif permissions:
         permissions.pop("allow", None)
+        if permissions.get("deny") == []:  # the empty list Cursor needs beside allow (allow_cursor_tools)
+            permissions.pop("deny")
         if not permissions:
             del data["permissions"]
 
@@ -6215,10 +6267,13 @@ def allow_cursor_tools(project):
     """crewchat's tools allowed without asking in the folder's Cursor agent settings (.cursor/cli.json)."""
     path = Path(project) / ".cursor" / "cli.json"
     data = read_json(path)
-    if allow_rule(data, CURSOR_ALLOW, registered_names(project, "cursor")):
+    changed = allow_rule(data, CURSOR_ALLOW, registered_names(project, "cursor"))
+    if not isinstance(data["permissions"].get("deny"), list):  # Cursor's agent refuses a cli.json without one
+        data["permissions"]["deny"] = []
+        changed = True
+    if changed:
         write_json(path, data)
-        return True
-    return False
+    return changed
 
 
 def set_cursor_hooks(hooks):
@@ -6386,6 +6441,9 @@ def listen_seconds(project, client="claude"):
         return 0
 
 
+SERVER_GONE_SECS = 15  # a hook gives up on a server unreachable this long in a row (a restart takes less)
+
+
 def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None):
     """Ask the server for this session's messages without marking them read.
 
@@ -6399,6 +6457,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
     """
     begun = time.time()
     deadline = begun + wait_total
+    failing = None  # since when the server has not answered
     while True:
         # Round up, so the last call waits out the remainder instead of asking again and again.
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
@@ -6406,6 +6465,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         try:
             out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
                                                         "chain": chain}, timeout=MAX_WAIT + 30)
+            failing = None
             if out.get("session") == "want" and report:
                 found, report = report(), None
                 if found:  # a quick call of its own, so a long wait above is not held up
@@ -6413,8 +6473,11 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
-            # The server is restarting or briefly unreachable. While listening, keep trying.
-            if time.time() + 5 >= deadline:
+            # The server is restarting or briefly unreachable: while listening, keep trying. One that
+            # stays unreachable is off (crewchat stopped, or the folder used without it): give up
+            # soon, so the agent's session is not held up waiting for it.
+            failing = failing or time.time()
+            if time.time() + 5 >= deadline or time.time() - failing >= SERVER_GONE_SECS:
                 raise
             time.sleep(3)
             continue
@@ -6924,7 +6987,32 @@ def serve_unconnected(start, stdin=None, stdout=None):
             stdout.flush()
 
 
+def refresh_hooks():
+    """Bring the hooks of every folder connected on this machine up to this copy of crewchat now, as
+    the server does when it starts (upgrade_folders): an update or a reinstall can move crewchat
+    (another Python, another folder), and hooks still pointing at the old one fail, even with the
+    server off. Returns the folders whose hooks changed."""
+    done = []
+    for path in sorted(load_config().get("folders") or {}):
+        try:
+            if Path(path).is_dir() and update_hooks(path):
+                done.append(path)
+        except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
+            print("- Could not update crewchat's hooks in %s: %s" % (path, e))
+    return done
+
+
 def cmd_hooks(args):
+    if args.mode == "refresh":
+        if not (home() / "config.json").exists():
+            print("No folder is connected on this machine yet.")
+            return
+        done = refresh_hooks()
+        if not server_up(load_config()):  # no restart follows to do it (update, install.sh): the service too
+            refresh_service()
+        print("Updated the hooks in %d connected folder%s for crewchat %s; the others were up to date." % (
+            len(done), "" if len(done) == 1 else "s", __version__))
+        return
     project = Path(args.project or ".").resolve()
     path = project / ".crewchat-hooks"
     if args.mode == "off":
@@ -6977,8 +7065,7 @@ def cmd_listen(args):
 # Start at login
 # --------------------------------------------------------------------------------------------
 def launchd_plist(keep_awake):
-    python, script = self_command()
-    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + [python, script, "serve"]
+    program = (["/usr/bin/caffeinate", "-is"] if keep_awake else []) + run_command() + ["serve"]
     log = (home() / "hub.log").as_posix()
     env = ""
     if os.environ.get("CREWCHAT_HOME"):
@@ -7004,11 +7091,10 @@ def launchd_plist(keep_awake):
 
 
 def systemd_unit():
-    python, script = self_command()
     env = "Environment=CREWCHAT_HOME=%s\n" % home().as_posix() if os.environ.get("CREWCHAT_HOME") else ""
     return ("[Unit]\nDescription=crewchat: group chat for AI coding agents\n\n[Service]\n"
-            "ExecStart=\"%s\" \"%s\" serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
-            % (python, script, env))
+            "ExecStart=%s serve\n%sRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+            % (" ".join('"%s"' % p for p in run_command()), env))
 
 
 def run(command):
@@ -7127,8 +7213,7 @@ def cmd_service(args):
     if not (mac or linux):
         die("starting at login is automated on macOS, Linux and Windows only. Run `crewchat serve` instead.")
     uid = os.getuid()
-    plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-    unit = Path.home() / ".config" / "systemd" / "user" / "crewchat.service"
+    plist, unit = service_file(mac=True), service_file(mac=False)
     if args.action == "install":
         if mac:
             run(["launchctl", "bootout", "gui/%d/%s" % (uid, SERVICE_LABEL)])
@@ -7272,15 +7357,21 @@ def reclaim_checks(projects):
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
 
 
+def service_file(mac=None):
+    """The login service's file: launchd's plist on macOS, the systemd user unit elsewhere."""
+    if mac is None:
+        mac = sys.platform == "darwin"
+    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if mac
+            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
+
+
 def service_installed():
     """Is crewchat's login service set up, and for this chat? A machine has one such service; it
     belongs to another chat when it was set up with another CREWCHAT_HOME, and is then left alone."""
     if os.name == "nt":
         return windows_service() is not None
-    path = (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist") if sys.platform == "darwin"
-            else Path.home() / ".config" / "systemd" / "user" / "crewchat.service")
     try:
-        text = path.read_text(encoding="utf-8")
+        text = service_file().read_text(encoding="utf-8")
     except OSError:
         return False
     return service_home_is_ours(re.search(r"<key>CREWCHAT_HOME</key><string>(.*?)</string>|Environment=CREWCHAT_HOME=(.*)",
@@ -7330,8 +7421,7 @@ def start_server(config):
             else:
                 start_background()
         elif sys.platform == "darwin":
-            plist = Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
-            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(plist)]).returncode != 0:
+            if run(["launchctl", "bootstrap", "gui/%d" % os.getuid(), str(service_file())]).returncode != 0:
                 run(["launchctl", "kickstart", "-k", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])
         else:
             run(["systemctl", "--user", "start", "crewchat.service"])
@@ -7348,8 +7438,7 @@ def service_present():
     """Does this machine have crewchat's login service at all, for this chat or another one?"""
     if os.name == "nt":
         return run(["schtasks", "/Query", "/TN", "crewchat"]).returncode == 0 or run_entry() is not None
-    return (Path.home() / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")).exists() or \
-        (Path.home() / ".config" / "systemd" / "user" / "crewchat.service").exists()
+    return service_file(mac=True).exists() or service_file(mac=False).exists()
 
 
 def cmd_resume(_args):
@@ -7359,6 +7448,7 @@ def cmd_resume(_args):
     config = load_config()
     if server_up(config):
         return
+    refresh_service()
     supported = os.name == "nt" or sys.platform == "darwin" or sys.platform.startswith("linux")
     if (supported and config.get("service") is not False and not service_installed()
             and not service_present()):
@@ -7380,9 +7470,33 @@ def cmd_stop(_args):
     print("Start it again with `crewchat restart`%s." % (", or log in again" if service_installed() else ""))
 
 
+def refresh_service():
+    """A login service written by another copy of crewchat (before an update or a reinstall moved it)
+    still runs that copy, which may be gone: write this copy's in its place, keeping --keep-awake.
+    macOS and Linux (Windows' task keeps pythonw, which has no console); the server is stopped. Only an
+    installed crewchat does it: a checkout or a uvx copy restarting must not take the service over."""
+    if os.name == "nt" or launcher() is None or not service_installed():
+        return
+    mac = sys.platform == "darwin"
+    path = service_file()
+    try:
+        old = path.read_text(encoding="utf-8")
+        new = launchd_plist("/usr/bin/caffeinate" in old) if mac else systemd_unit()
+        if new == old:
+            return
+        if mac:
+            run(["launchctl", "bootout", "gui/%d/%s" % (os.getuid(), SERVICE_LABEL)])  # start_server loads it again
+        path.write_text(new, encoding="utf-8")
+        if not mac:
+            run(["systemctl", "--user", "daemon-reload"])
+    except OSError as e:  # never what stops a restart
+        print("- Could not update crewchat's login service (%s); `crewchat service install` does." % e)
+
+
 def cmd_restart(_args):
     config = load_config()
     stop_server(config)
+    refresh_service()
     start_server(config)
     print("crewchat %s is running at %s." % (__version__, local_url(config)))
 
@@ -7460,7 +7574,8 @@ def windows_update_script(uv, specs, crewchat_exe, folder, pid):
                      "'Not on PyPI yet; installing it from its GitHub release.' } }" % install(spec))
     lines.append("if (-not $done) { & %s; $done = $LASTEXITCODE -eq 0 }" % install(specs[-1]))
     lines += [
-        "if ($done) { & %s resume; Write-Host ''; & %s --version }" % (quote(crewchat_exe), quote(crewchat_exe)),
+        "if ($done) { & %s hooks refresh; & %s resume; Write-Host ''; & %s --version }"
+        % (quote(crewchat_exe), quote(crewchat_exe), quote(crewchat_exe)),
         "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
         "Write-Host ''",
         "Read-Host 'Press Enter to close'",
@@ -7479,7 +7594,7 @@ def cmd_update(args):
     uv = find_uv()
     local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
     if os.name == "nt" and uv and not local:
-        exe = Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
+        exe = launcher() or Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
         script = windows_update_script(uv, update_specs(version), exe, tool_folder() or Path(__file__).parent,
                                        os.getpid())
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", script],
@@ -7498,8 +7613,13 @@ def cmd_update(args):
         else:
             if subprocess.run([uv] + UV_INSTALL + [specs[-1]], env=env).returncode != 0:
                 die("the update did not install; crewchat %s is still in place." % __version__)
+        # The new copy, not this one: uv rebuilt the tool, perhaps on another Python, so this
+        # process's script may be gone. It writes the folders' hooks for itself, then restarts.
+        new = run_command()
+        subprocess.run(new + ["hooks", "refresh"], env=env, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)  # quietly: an older release has no `hooks refresh`
         if running:
-            subprocess.run(self_command() + ["restart"], env=env)  # a fresh process runs the new code
+            subprocess.run(new + ["restart"], env=env)
         return
     fetch = ("cat %s" % shlex.quote(str(Path(local) / "install.sh")) if local and Path(local).is_dir() else
              "curl -LsSf %s" % INSTALL_SH if shutil.which("curl") else
@@ -9816,6 +9936,8 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <fieldset class="step" hidden>
         <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
         <label for="l-model">Model</label><select id="l-model"></select>
+        <label for="l-advisor">Advisor</label><select id="l-advisor"></select>
+        <p class="meta" id="l-advisor-note" hidden>A stronger model it consults on its own at decision points; it reads the whole conversation and uses more tokens. For a chat-wide advisor everyone sees, give an agent the advisor role.</p>
         <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
         <p class="meta" id="l-perms-note"></p>
       </fieldset>
@@ -10617,6 +10739,10 @@ function showTool() {
   const models = own(state.models, $("l-tool").value) || [];
   $("l-model").replaceChildren(new Option("Its default", ""), ...models.map(([id, label]) => new Option(label, id)));
   $("l-model").disabled = !models.length;
+  const advisors = own(state.advisors, $("l-tool").value) || [];
+  $("l-advisor").replaceChildren(new Option("None", ""), ...advisors.map(([id, label]) => new Option(label, id)));
+  $("l-advisor").disabled = !advisors.length;
+  $("l-advisor-note").hidden = true;
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
   showPermissions();
@@ -10644,6 +10770,7 @@ async function startAgent(event) {
     await postJSON("/api/launch", {
       tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(), role: $("l-role").value,
       task: $("l-task").value.trim(), permissions: $("l-perms").value, model: $("l-model").value,
+      advisor: $("l-advisor").value,
       picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
       instructions: $("l-instructions").value.trim() });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
@@ -10678,6 +10805,7 @@ $("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isC
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
+$("l-advisor").addEventListener("change", () => { $("l-advisor-note").hidden = !$("l-advisor").value; });
 $("l-perms").addEventListener("change", showPermissions);
 
 function roleTitle(name) {
@@ -11790,7 +11918,7 @@ async function loop() {
       state.more = !!data.more;
       state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
       state.tools = data.tools || {}; state.presets = data.presets || {}; state.art = data.art || {};
-      state.models = data.models || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
+      state.models = data.models || {}; state.advisors = data.advisors || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
       state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
       state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
       state.held = {};
@@ -12180,7 +12308,8 @@ def build_parser():
     p.set_defaults(fn=cmd_listen)
 
     p = sub.add_parser("hooks", help="switch this project's hooks off (its sessions stay out of the chat) or on")
-    p.add_argument("mode", choices=["on", "off", "status"])
+    p.add_argument("mode", choices=["on", "off", "status", "refresh"],
+                   help="refresh: write every connected folder's hooks again for this crewchat (after a reinstall)")
     p.add_argument("--project")
     p.set_defaults(fn=cmd_hooks)
 

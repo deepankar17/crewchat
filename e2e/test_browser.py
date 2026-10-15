@@ -842,6 +842,11 @@ class NewPage(Signed):
         self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Briefing")
         c.click("#l-back")
         self.assertEqual(c.js(step), 2)
+        c.js("$('l-tool').value = 'claude'; $('l-tool').dispatchEvent(new Event('change'))")
+        self.assertEqual(c.js("[...$('l-advisor').options].map(o => o.value)"), ["", "fable", "opus", "sonnet"])
+        self.assertTrue(c.js("$('l-advisor-note').hidden"))
+        c.js("$('l-advisor').value = 'opus'; $('l-advisor').dispatchEvent(new Event('change'))")
+        self.assertFalse(c.js("$('l-advisor-note').hidden"))  # what Claude Code's own advisor is
         self.assertEqual(self.shown_though_hidden(), [])
         c.click("#l-cancel")
         self.assertEqual(c.errors, [])

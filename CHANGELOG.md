@@ -6,6 +6,10 @@
   chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
   and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
   `connect`).
+- **An advisor for a new Claude Code agent** (#31). **New agent** has an **Advisor** choice next to
+  the model: Fable, Opus or Sonnet becomes Claude Code's own `--advisor`, a stronger model the agent
+  consults at decision points. Reopen, Switch model and Start again keep it. Other tools have no
+  such option. `/api/launch` takes `advisor`.
 - **crewchat under any name.** Registered as something other than `crewchat` (MCP directories
   publish `claude mcp add --scope user crewchat-mcp -- uvx crewchat stdio`), its tools now skip the
   permission prompt too: crewchat finds every name it is registered under for a folder (the
