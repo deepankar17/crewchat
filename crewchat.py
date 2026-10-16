@@ -276,7 +276,7 @@ or clash before it does."""),
     }),
     "blank": {"label": "Blank", "crew": "general", "roles": {}},
 }
-KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
+KNOWN_CLIENTS = ("claude", "cursor", "codex", "qwen", "opencode", "windsurf", "copilot", "gemini", "cline", "zed")
 # First names a new agent is given, unless the machine names agents after their tool and folder
 # (config "agent_names": "place"). Short, easy to type after @, and from many places.
 AGENT_NAMES = (
@@ -292,6 +292,7 @@ TOOLS_INFO = {
     for tool, label, colour, mark in (
         ("claude", "Claude Code", "#d97757", "C"), ("cursor", "Cursor", "#1a1a1a", "Cu"),
         ("codex", "Codex", "#000000", "Cx"), ("gemini", "Gemini CLI", "#4285f4", "G"),
+        ("qwen", "Qwen Code", "#615ced", "Q"), ("opencode", "OpenCode", "#211e1e", "Oc"),
         ("antigravity", "Antigravity", "#3186ff", "Ag"), ("grok", "Grok", "#000000", "Gk"),
         ("windsurf", "Windsurf", "#09b6a2", "W"), ("copilot", "Copilot", "#8957e5", "Cp"),
         ("cline", "Cline", "#2b2b2b", "Cn"), ("zed", "Zed", "#084ccf", "Z"), ("agent", "Agent", "#6b7280", "•"),
@@ -2891,7 +2892,8 @@ class Hub:
             agent = self._local_agent(name, "start")
             state = self._session_state(agent)
             if agent.get("client") not in LAUNCH_TOOLS:
-                raise HubError("only Claude Code and Cursor agents can be started from the page")
+                raise HubError("only %s agents can be started from the page"
+                               % ", ".join(label for label, _ in LAUNCH_TOOLS.values()))
             if state and state["reopen"] and not running:
                 raise HubError("%s has a conversation to reopen: use Reopen" % name)
             if running or not self.startable(name):  # waiting for messages, or started a moment ago
@@ -3791,7 +3793,7 @@ PAGE_HEADERS = {
 # uninstall are never run from the page: a stray tap on a phone must not undo a setup.
 COMMANDS = [
     ("Getting going", [
-        ("start [FOLDER] [--place NAME] [--client all|claude|cursor] [--chat PROJECT]",
+        ("start [FOLDER] [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode] [--chat PROJECT]",
          "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to "
          "run again. --place labels the folder in agent names; --chat puts it in that project (made if there is none).", None),
         ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open] [--pack ID]",
@@ -3883,9 +3885,9 @@ COMMANDS = [
          {"argv": ["hooks", "refresh"]}),
         ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
         ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
-        ("invite [--local] [--place NAME] [--client all|claude|cursor|generic] [--url URL]",
+        ("invite [--local] [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode|generic] [--url URL]",
          "A join command for another folder, with a single-use code (10 minutes).", {"argv": ["invite"], "chat": True, "ask": True}),
-        ("join --url URL --code CODE [--place NAME] [--client all|claude|cursor|generic] [--project FOLDER]",
+        ("join --url URL --code CODE [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode|generic] [--project FOLDER]",
          "Connect a folder to a chat, with the command from an invite (run it in that folder).", None),
     ]),
     ("Several machines over Tailscale", [
@@ -3911,7 +3913,7 @@ COMMANDS = [
     ]),
     ("One host, and other tools", [
         ("url [ADDRESS]", "Show (or set) the address other machines use to reach this host.", {"argv": ["url"]}),
-        ("stdio [--project FOLDER] [--url URL] [--token TOKEN]",
+        ("stdio [--project FOLDER] [--url URL] [--token TOKEN] [--local-only]",
          "crewchat's tools over standard input and output, for MCP clients that only start local programs.", None),
     ]),
 ]
@@ -5152,20 +5154,22 @@ def joined_place(project, config=None, root=None):
     want = local_url(config or load_config(root)) + "/mcp"
     tokens = {read_token(p, root): p for p in list_places(root)}
     found, token, clients = None, None, []
-    for client, rel in CLIENT_FILES.items():
-        entry = (read_json(project / rel).get("mcpServers") or {}).get(SERVER_NAME) or {}
-        auth = (entry.get("headers") or {}).get("Authorization", "")
-        if entry.get("url") == want and auth[7:] in tokens:
-            found, token = tokens[auth[7:]], auth[7:]
+    for client in ALL_CLIENTS:
+        entry = connection_entry(project, client)
+        if entry and entry[0] == want and entry[1] in tokens:
+            found, token = tokens[entry[1]], entry[1]
             clients.append(client)
     return found, token, clients
 
 
 # Agents launched from the chat page ---------------------------------------------------------
-LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent")}
+LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent"), "codex": ("Codex CLI", "codex"),
+                "gemini": ("Gemini CLI", "gemini"), "qwen": ("Qwen Code", "qwen"), "opencode": ("OpenCode", "opencode")}
+MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings alone, no hooks
+PROMPT_OPTION = {"gemini": ["-i"], "qwen": ["-i"], "opencode": ["--prompt"]}  # else the prompt is the last argument
 # Options every agent started from the chat page gets: Cursor's agent is not stopped by the folder's
 # trust prompt (crewchat's MCP server alone is approved before it starts, see launch_agent).
-LAUNCH_BASE = {"claude": [], "cursor": ["--trust"]}
+LAUNCH_BASE = {"claude": [], "cursor": ["--trust"], "codex": [], "gemini": [], "qwen": [], "opencode": []}
 # What it may do without asking, per tool: id -> (what the page says, its command-line options).
 # crewchat's own tools are always allowed, by the folder's settings (CLAUDE_ALLOW, CURSOR_ALLOW).
 LAUNCH_PERMISSIONS = {
@@ -5176,6 +5180,16 @@ LAUNCH_PERMISSIONS = {
     "cursor": {"ask": ("Use crewchat; ask before sending a message or anything else", []),
                "auto": ("Also run what Cursor judges safe (auto-review)", ["--auto-review"]),
                "all": ("Run any command (--force)", ["--force"])},
+    "codex": {"ask": ("As Codex's own settings say", []),
+              "edits": ("Edit and run commands in the folder without asking (--full-auto)", ["--full-auto"]),
+              "all": ("Do anything, outside its sandbox too (no prompts at all)", ["--dangerously-bypass-approvals-and-sandbox"])},
+    "gemini": {"ask": ("Ask before each change (its default)", []),
+               "edits": ("Also edit files without asking", ["--approval-mode", "auto_edit"]),
+               "all": ("Do anything (--yolo: no prompts at all)", ["--yolo"])},
+    "qwen": {"ask": ("Ask before each change (its default)", []),
+             "edits": ("Also edit files without asking", ["--approval-mode", "auto-edit"]),
+             "all": ("Do anything (--yolo: no prompts at all)", ["--yolo"])},
+    "opencode": {"ask": ("As OpenCode's own settings say", [])},
 }
 # Where these tools usually live: the server may run with a short PATH (started at login).
 TOOL_DIRS = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
@@ -5243,7 +5257,11 @@ def launch_folders(config, root=None, chat=""):
 
 
 TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
-              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash"}
+              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash",
+              "codex": "Needs Codex CLI: npm install -g @openai/codex",
+              "gemini": "Needs Gemini CLI: npm install -g @google/gemini-cli",
+              "qwen": "Needs Qwen Code: npm install -g @qwen-code/qwen-code",
+              "opencode": "Needs OpenCode: curl -fsSL https://opencode.ai/install | bash"}
 
 
 def launch_options(config, root=None, chat=""):
@@ -5282,7 +5300,7 @@ def launch_command(exe, tool, key, permissions="ask", base=None, model="", advis
     """The agent's command line. Only the fixed prompt, the key, fixed options and a model and an
     advisor from tool_models and tool_advisors reach it: no text typed on the chat page is ever
     passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base, model, advisor) + [LAUNCH_PROMPT % key]
+    return [exe] + tool_options(tool, permissions, base, model, advisor) + PROMPT_OPTION.get(tool, []) + [LAUNCH_PROMPT % key]
 
 
 def macos_script(folder, command, key, title=""):
@@ -5316,6 +5334,7 @@ def fit_options(help_text, tool, permissions):
     chosen = LAUNCH_PERMISSIONS[tool][permissions][1]
     missing = [o for o in chosen if o.startswith("--") and o not in help_text]
     missing += [v for o, v in zip(chosen, chosen[1:]) if o == "--permission-mode" and '"%s"' % v not in help_text]
+    missing += [v for o, v in zip(chosen, chosen[1:]) if o == "--approval-mode" and v not in help_text]
     return [o for o in LAUNCH_BASE[tool] if o in help_text], missing
 
 
@@ -5330,6 +5349,17 @@ def agent_tool(tool, folder, permissions, root=None):
     if missing:
         raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
             LAUNCH_TOOLS[tool][0], " ".join(missing)))
+    if tool in MORE_TOOLS and not connection_entry(folder, "claude" if tool == "codex" else tool):
+        # Connected before this tool was installed: its settings get crewchat now.
+        config = load_config(root)
+        _, token, _ = joined_place(Path(folder), config, root)
+        written = install_client(tool, Path(folder), local_url(config), token) if token else []
+        if not written:
+            raise HubError("crewchat could not add itself to %s's settings in this folder (see the server log); "
+                           "run `crewchat start --client %s` there" % (LAUNCH_TOOLS[tool][0], tool))
+        git_exclude(Path(folder), written)
+    elif tool == "codex":
+        install_codex()  # Codex's settings have crewchat (`crewchat stdio` finds this folder's chat)
     if tool == "cursor":
         for name in registered_names(folder, "cursor", root):  # crewchat's MCP server alone (not
             try:  # every server the folder lists, --approve-mcps), under each name it has
@@ -5462,9 +5492,13 @@ def cmd_start(args):
 
     place, token, clients, chosen = connected_project(project, config)
     if place and (not args.chat or find_chat(args.chat) == chosen):
-        # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
-        for client in clients:
-            {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
+        # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since; and add the tool
+        # asked for, or (all) the other tools installed since.
+        asked = [c for c in clients_for(args.client, config) if args.client != "all" or c in MORE_TOOLS]
+        written = []
+        for client in clients + [c for c in asked if c not in clients]:
+            written += install_client(client, project, local_url(config), token)
+        git_exclude(project, written)
         remember(project, place, chat=chosen["chat"])
         print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
         if args.pack:
@@ -5510,8 +5544,8 @@ def cmd_start(args):
                   "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
     except OSError as e:
         print("- Could not write the project's guide for its agents (%s)." % e)
-    for client in ("claude", "cursor") if args.client == "all" else (args.client,):
-        note = client in CLIENT_FILES and duplicate_note(project, client)
+    for client in [c for c in clients_for(args.client, config) if c in CLIENT_FILES]:
+        note = duplicate_note(project, client)
         if note:
             print("- Note: " + note)
 
@@ -5520,12 +5554,13 @@ def cmd_start(args):
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))
     print()
-    kinds = {"all": ("claude", "cursor"), "claude": ("claude",), "cursor": ("cursor",)}[args.client]
+    kinds = clients_for(args.client, config)
     where = "this folder" if project == Path.cwd().resolve() else str(project)
     named = ("named %s-%s, %s-%s-2, ..." % (kinds[0], place, kinds[0], place) if config.get("agent_names") == "place"
              else "with a first name of its own (Maya, Teo, ...)")
     print("Now open %s in %s. Each new session joins the chat by itself, %s"
-          % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where, named))
+          % (", ".join(LAUNCH_TOOLS[k][0] for k in kinds[:-1]) + (" or " if len(kinds) > 1 else "")
+             + LAUNCH_TOOLS[kinds[-1]][0], where, named))
     print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
     print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
     if not (config.get("peers") or config.get("cloud")):
@@ -5702,7 +5737,7 @@ def cmd_invite(args):
     print("  crewchat join --url %s --code %s-%s%s" % (
         url, code[:4], code[4:], "" if args.client == "all" else " --client " + args.client))
     print()
-    print("Every Claude Code and Cursor session opened in that folder then joins the chat by itself.")
+    print("Every agent session (Claude Code, Cursor, Codex, Gemini CLI, ...) opened in that folder then joins the chat.")
     if url.startswith("http://127.0.0.1"):
         print("That address only works on this machine. For another machine, set the shared address")
         print("first (`crewchat url`), or pass --url.")
@@ -5994,7 +6029,30 @@ def cmd_status(_args):
 # --------------------------------------------------------------------------------------------
 # Agent-side commands: join a chat, and the hooks that check it
 # --------------------------------------------------------------------------------------------
-CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}
+CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}  # the tools crewchat's hooks run in
+# Tools that join by their MCP settings alone (no hooks: their agents check hub_inbox, as crewchat's
+# instructions say): the folder's file and the key of the server's address in it. Codex keeps its
+# servers in the user's own config instead (install_codex), so a Codex folder's chat is its .mcp.json.
+# For each: the file, the key its servers are under, the key of a server's address, and what else
+# crewchat's entry says (Gemini CLI and Qwen Code trust its tools, as Claude Code and Cursor do).
+MCP_FILES = {"gemini": (".gemini/settings.json", "mcpServers", "httpUrl", {"trust": True}),
+             "qwen": (".qwen/settings.json", "mcpServers", "httpUrl", {"trust": True}),
+             "opencode": ("opencode.json", "mcp", "url", {"type": "remote", "enabled": True})}
+ALL_CLIENTS = list(CLIENT_FILES) + list(MCP_FILES)  # every tool whose folder file can hold crewchat's entry
+
+
+def connection_entry(project, client):
+    """(server address, place token) of crewchat's server in a folder's settings for a tool, or None."""
+    rel, servers, key = (CLIENT_FILES[client], "mcpServers", "url") if client in CLIENT_FILES else MCP_FILES[client][:3]
+    try:
+        data = json.loads((Path(project) / rel).read_text(encoding="utf-8"))
+        entry = data[servers][SERVER_NAME]
+        url, auth = entry[key], entry["headers"]["Authorization"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not (isinstance(url, str) and isinstance(auth, str) and auth.startswith("Bearer ")):
+        return None
+    return url, auth[len("Bearer "):]
 HOOK_REASON = (
     "New messages on the crewchat:\n\n%s\n\n"
     "Handle what is for you, as the crewchat rules say: answer anything Owner wrote with hub_send, "
@@ -6069,12 +6127,17 @@ def is_our_hook(command):
     return " hook claude " in command or " hook cursor " in command
 
 
-def install_claude(project, url, token):
+def write_mcp_json(project, url, token):
+    """crewchat in the folder's .mcp.json: Claude Code's, and where `crewchat stdio` finds the chat."""
     config = read_json(project / ".mcp.json")
     config.setdefault("mcpServers", {})[SERVER_NAME] = {
         "type": "http", "url": url + "/mcp", "headers": {"Authorization": "Bearer %s" % token},
     }
     write_json(project / ".mcp.json", config, private=True)
+
+
+def install_claude(project, url, token):
+    write_mcp_json(project, url, token)
     settings_path = project / ".claude" / "settings.local.json"
     settings = read_json(settings_path)
     enabled = settings.setdefault("enabledMcpjsonServers", [])
@@ -6263,6 +6326,110 @@ def install_cursor(project, url, token):
     return [".cursor/mcp.json", ".cursor/hooks.json", ".cursor/cli.json"]
 
 
+def install_mcp_settings(project, url, token, client):
+    """crewchat in a folder's settings for a tool that joins by them alone (MCP_FILES): Gemini CLI's and
+    Qwen Code's (its tools trusted, as crewchat's are in Claude Code and Cursor), OpenCode's. Not into
+    a file the folder's repository has: it would carry the token into a commit."""
+    rel, servers, key, extra = MCP_FILES[client]
+    path = Path(project) / rel
+    if tracked_by_git(project, rel):
+        print("- %s is committed in this folder, so crewchat did not add itself there (the token would go "
+              "into a commit). Add an MCP server that runs `crewchat stdio` in %s instead." % (rel, LAUNCH_TOOLS[client][0]))
+        return []
+    try:
+        data = read_json(path)
+    except SystemExit:  # not plain JSON (OpenCode's may have comments): left alone
+        print("- Could not add crewchat to %s: it is not plain JSON." % rel)
+        return []
+    data.setdefault(servers, {})[SERVER_NAME] = dict({key: url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}},
+                                                     **extra)
+    write_json(path, data, private=True)
+    return [rel]
+
+
+def codex_config():
+    """Codex's own settings, where it keeps its MCP servers (it has none per folder)."""
+    return Path(os.environ.get("CODEX_HOME") or (user_home() / ".codex")).expanduser() / "config.toml"
+
+
+CODEX_BEGIN, CODEX_END = "# crewchat: begin (`crewchat uninstall` takes this out)", "# crewchat: end"
+CODEX_BLOCK = re.compile(r"\n?%s\n.*?%s\n?" % (re.escape(CODEX_BEGIN), re.escape(CODEX_END)), re.S)
+# A crewchat server the user set up themselves, in any of TOML's ways ([mcp_servers.crewchat],
+# [mcp_servers."crewchat"], mcp_servers.crewchat.command = ..., crewchat = {...} under [mcp_servers]),
+# or servers given inline (mcp_servers = {...}), where a table of ours cannot be added.
+CODEX_THEIRS = re.compile(r'mcp_servers[^\n]*\bcrewchat\b|^\s*"?crewchat"?\s*=|^\s*mcp_servers\s*=', re.M)
+
+
+def install_codex():
+    """crewchat in Codex's settings, once for every folder: `crewchat stdio`, which finds the chat of the
+    folder Codex runs in (its .mcp.json). Our own block is brought up to this copy's command; a crewchat
+    server the user set up, or settings written another way, are left alone. Returns whether it changed."""
+    path = codex_config()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    string = lambda v: json.dumps(v, ensure_ascii=False)  # noqa: E731  (a TOML basic string, as JSON writes one)
+    command = run_command()
+    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s\n" % (
+        CODEX_BEGIN, SERVER_NAME, string(command[0]),
+        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), CODEX_END)
+    if CODEX_THEIRS.search(CODEX_BLOCK.sub("\n", text)):
+        return False  # the user's own crewchat, or servers written inline: not ours to change
+    if CODEX_BLOCK.search(text):
+        new = CODEX_BLOCK.sub(lambda m: ("\n" if m.group(0).startswith("\n") else "") + block, text, count=1)
+    else:
+        new = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
+    if new == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
+    return True
+
+
+def uninstall_codex():
+    """Take crewchat's block out of Codex's settings. Returns whether it was there."""
+    path = codex_config()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    new = CODEX_BLOCK.sub("\n", text, count=1)
+    if new == text:
+        return False
+    path.write_text(new.strip("\n") + ("\n" if new.strip() else ""), encoding="utf-8")
+    return True
+
+
+def refresh_codex():
+    """At server start (so after every upgrade): crewchat's block in Codex's settings runs this copy."""
+    try:
+        if CODEX_BEGIN in codex_config().read_text(encoding="utf-8"):
+            install_codex()
+    except OSError:
+        pass
+
+
+def install_client(client, project, url, token):
+    """Connect a folder for one agent tool. Returns the files written in it (to keep out of git)."""
+    if client == "claude":
+        return install_claude(project, url, token)
+    if client == "cursor":
+        return install_cursor(project, url, token)
+    if client == "codex":  # its chat is the folder's .mcp.json, which `crewchat stdio` reads
+        write_mcp_json(project, url, token)
+        install_codex()
+        return [".mcp.json"]
+    return install_mcp_settings(project, url, token, client)
+
+
+def clients_for(choice, config=None):
+    """The tools `--client` asks for: one, or all (Claude Code and Cursor, and the others found here)."""
+    if choice != "all":
+        return [choice]
+    return ["claude", "cursor"] + [t for t in MORE_TOOLS if find_tool(t, config or {})]
+
+
 def allow_cursor_tools(project):
     """crewchat's tools allowed without asking in the folder's Cursor agent settings (.cursor/cli.json)."""
     path = Path(project) / ".cursor" / "cli.json"
@@ -6372,10 +6539,8 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
         print("agents in their instructions to check hub_inbox.")
         return place
     written = []
-    if client in ("all", "claude"):
-        written += install_claude(project, url, token)
-    if client in ("all", "cursor"):
-        written += install_cursor(project, url, token)
+    for tool in clients_for(client):
+        written += install_client(tool, project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
     if (home() / "config.json").exists() and url == local_url():
         remember(project, place, chat=answer.get("chat", ""))
@@ -6387,9 +6552,10 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
     print("Wrote: %s" % ", ".join(written))
     if not ignored:
         print("These files hold a secret token or machine paths: do not commit them.")
-    print("Every new Claude Code or Cursor session in this folder now joins the chat under its own")
-    print("name (%s-%s, %s-%s-2, ...). Sessions that are already open need a restart." % (
-        "claude" if client != "cursor" else "cursor", place, "claude" if client != "cursor" else "cursor", place))
+    tools = clients_for(client)
+    print("Every new %s session in this folder now joins the chat under a name of its own." % " or ".join(
+        LAUNCH_TOOLS[t][0] for t in tools))
+    print("Sessions that are already open need a restart.")
     return place
 
 
@@ -6409,12 +6575,8 @@ def find_project(client):
 
 def client_config(project, client):
     """(server address, place token) from the project's connection file, or None."""
-    try:
-        entry = json.loads((project / CLIENT_FILES[client]).read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
-        url = entry["url"]
-        return (url[:-4] if url.endswith("/mcp") else url), entry["headers"]["Authorization"][len("Bearer "):]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    entry = connection_entry(project, client)
+    return entry and ((entry[0][:-4] if entry[0].endswith("/mcp") else entry[0]), entry[1])
 
 
 def hooks_off(project):
@@ -6932,17 +7094,29 @@ def cmd_stdio(args):
     else:
         start = Path(args.project or ".").resolve()
         found = next(((folder, client_config(folder, client)) for folder in [start] + list(start.parents)
-                      for client in CLIENT_FILES if client_config(folder, client)), None)
+                      for client in ALL_CLIENTS if client_config(folder, client)), None)
         if found is None:
             # Registered for every folder (user scope, as directories publish it), it starts in folders
             # that never joined a chat too: there it is a server with no tools, not a failed one.
             return serve_unconnected(start)
         folder, (base, token) = found
+        if getattr(args, "local_only", False) and not local_folder(folder):
+            # Registered for every folder (Codex's settings): a .mcp.json naming a crewchat elsewhere, as
+            # a repository could commit, is not followed; only this machine's chat is.
+            return serve_unconnected(start)
         try:  # the name this server was registered under is allowed too, as crewchat is
             allow_registered(folder)
         except OSError:
             pass
     StdioRelay((base if base.endswith("/mcp") else base + "/mcp"), token).run()
+
+
+def local_folder(folder):
+    """Is this folder connected to this machine's own chat (its address, a place token it gave)?"""
+    try:
+        return any(joined_place(Path(folder), load_config(), entry["root"])[0] for entry in list_projects())
+    except SystemExit:  # no chat set up on this machine
+        return False
 
 
 def serve_unconnected(start, stdin=None, stdout=None):
@@ -7333,7 +7507,8 @@ def update_checks(projects):
 
 def upgrade_folders(projects):
     """At server start (so after every upgrade): each connected folder gets this version's guide and
-    crewchat hooks. Only what changed is written."""
+    crewchat hooks, and Codex's settings this copy's command. Only what changed is written."""
+    refresh_codex()
     for project in projects.all():
         for folder in project.hub.project_folders():
             try:
@@ -7683,6 +7858,15 @@ def disconnect_folder(project):
     edit(".cursor/mcp.json", servers)
     edit(".cursor/hooks.json", cursor_hooks)
     edit(".cursor/cli.json", lambda data: disallow_rule(data, CURSOR_ALLOW, names["cursor"]))
+    for rel, key, _, _ in MCP_FILES.values():
+        def drop(data, key=key):
+            (data.get(key) or {}).pop(SERVER_NAME, None)
+            if data.get(key) == {}:
+                del data[key]
+        try:
+            edit(rel, drop)
+        except SystemExit:  # not plain JSON: left as it is
+            pass
     for name in (".crewchat-listen", ".crewchat-hooks"):
         try:
             (project / name).unlink()
@@ -7729,6 +7913,8 @@ def cmd_uninstall(args):
             changed = disconnect_folder(Path(folder))
             if changed:
                 print("- Took crewchat out of %s (%s)." % (folder, ", ".join(changed)))
+    if uninstall_codex():
+        print("- Took crewchat out of Codex's settings (%s)." % codex_config())
     data = home()
     if data.exists():
         if args.purge or (not args.yes and ask("Also delete your chats, files and settings in %s?" % data)):
@@ -12166,7 +12352,7 @@ def build_parser():
                        "run again.")
     p.add_argument("folder", nargs="?", help="project folder (default: the current folder)")
     p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
-    p.add_argument("--client", choices=["all", "claude", "cursor"], default="all")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS), default="all")
     p.add_argument("--project", help="chat name on first setup (default: the folder's name)")
     p.add_argument("--port", type=int, help="local port on first setup (default: %d or the next free one)"
                    % DEFAULT_PORT)
@@ -12205,8 +12391,9 @@ def build_parser():
 
     p = sub.add_parser("invite", help="print the command that connects a project folder")
     p.add_argument("--place", help="label for that folder, used in agent names (default: its machine's name)")
-    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all",
-                   help="all = Claude Code and Cursor (default), generic = print the MCP settings")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS) + ["generic"], default="all",
+                   help="all = Claude Code, Cursor and the other tools installed here (default), "
+                        "generic = print the MCP settings")
     p.add_argument("--url", help="address that machine should use")
     p.add_argument("--local", action="store_true", help="the folder is on this machine")
     p.set_defaults(fn=cmd_invite)
@@ -12296,7 +12483,7 @@ def build_parser():
     p = sub.add_parser("join", help="connect this project folder to a chat")
     p.add_argument("--url", required=True)
     p.add_argument("--code", required=True, help="single-use code from `crewchat invite`")
-    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS) + ["generic"], default="all")
     p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
     p.add_argument("--project", help="project folder (default: the current folder)")
     p.set_defaults(fn=cmd_join)
@@ -12364,6 +12551,8 @@ def build_parser():
     p.add_argument("--project", help="a folder connected with `crewchat start` (default: this folder)")
     p.add_argument("--url", help="the chat's address instead, with --token")
     p.add_argument("--token", help="with --url: the folder's token (or set CREWCHAT_TOKEN)")
+    p.add_argument("--local-only", action="store_true",
+                   help="only a folder connected to this machine's own chat (registered for every folder)")
     p.set_defaults(fn=cmd_stdio)
 
     p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")

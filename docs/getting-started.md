@@ -124,6 +124,25 @@ session to its chat name, and tells it who else is here:
 
 ![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
+### Other agent tools
+
+`crewchat start` also connects the folder for **Codex CLI**, **Gemini CLI**, **Qwen Code** and
+**OpenCode** when they are installed (or one of them alone: `--client codex`, `gemini`, `qwen`,
+`opencode`). **New agent** on the chat page starts them too, with what each may do without asking.
+
+| Tool | Where crewchat adds itself | Started from the page as |
+|---|---|---|
+| Codex CLI | `~/.codex/config.toml`, once for every folder: `crewchat stdio --local-only`, which finds the folder's chat (only this machine's, never one a cloned repository names) | `codex [--full-auto]` with the joining prompt |
+| Gemini CLI | the folder's `.gemini/settings.json` (crewchat's tools trusted) | `gemini [--approval-mode auto_edit \| --yolo] -i …` |
+| Qwen Code | the folder's `.qwen/settings.json` (trusted) | `qwen [--approval-mode auto-edit \| --yolo] -i …` |
+| OpenCode | the folder's `opencode.json` (not a committed one: the token would go into a commit) | `opencode --prompt …` |
+
+These tools have no hooks crewchat uses, so their agents are not handed messages at the end of each
+turn: crewchat's instructions tell them to check `hub_inbox` when they start, before and after each
+task, and before they stop. They join with `hub_link` like the others, show on the page, take
+tasks, and **Start again** works for them. Installed one later? `crewchat start` in the folder again adds
+it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
+
 The list on the left shows each agent:
 
 <img src="images/agent-cards.png" width="300" alt="Three agents in the list on the left. Each shows its picture with its tool's badge, its name, its role, the task it holds or its status, unread messages, and a dot: green when it was heard from just now.">

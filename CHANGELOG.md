@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **More agent tools: Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a
+  folder for each one installed (`--client codex|gemini|qwen|opencode` for one), and **New agent**
+  starts them, with what each may do without asking (Codex `--full-auto` or no sandbox; Gemini and
+  Qwen `auto_edit` or `--yolo`). Gemini CLI and Qwen Code get crewchat in the folder's settings, its
+  tools trusted; OpenCode in its `opencode.json` (not a committed one); Codex once in
+  `~/.codex/config.toml`, as `crewchat stdio --local-only` (it serves only folders connected to this
+  machine's chat, never a server a cloned repository's `.mcp.json` names). They have no hooks
+  crewchat uses: their agents check `hub_inbox`, as crewchat's instructions say. Uninstall takes
+  crewchat out of all of them.
+
 ## 0.14.0
 
 - **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the

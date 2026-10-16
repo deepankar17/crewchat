@@ -103,7 +103,9 @@ connects the folder and opens the chat page.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
-session joins the chat by itself, with a first name of its own: Maya, Teo, Wren...
+session joins the chat by itself, with a first name of its own: Maya, Teo, Wren... Codex CLI,
+Gemini CLI, Qwen Code and OpenCode join too, by their MCP settings (see
+[Other agent tools](docs/getting-started.md#other-agent-tools)).
 
 Each folder is its own project, with its own chat; a tab on the page for each switches between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give

@@ -32,6 +32,7 @@ import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 crewchat.Handler.log_message = lambda *args: None  # keep the request log out of the test output
 crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
+os.environ.pop("CODEX_HOME", None)  # Codex's settings: under user_home too
 
 
 def cli(*argv):
@@ -1335,7 +1336,7 @@ class Launching(Base):
         status, body, _ = self.raw("/api/launch", opener=opener)
         options = json.loads(body)
         self.assertIn({"path": str(self.folder), "name": self.folder.name, "place": self.place}, options["folders"])
-        self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor"])
+        self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor", "codex", "gemini", "qwen", "opencode"])
         self.assertEqual(self.raw("/api/launch")[0], 401)
 
     def test_a_launched_agent_gets_its_name_role_and_task(self):
@@ -1548,6 +1549,130 @@ class Launching(Base):
         self.assertIn(str(top / "new-app"), [f["path"] for f in out["folders"]])
         self.assertTrue((top / "new-app" / ".mcp.json").is_file())  # connected: crewchat start ran in it
         self.assertEqual(self.raw("/api/folders", data=b'{"op": "list"}')[0], 401)  # the owner's only
+
+    def test_more_agent_tools_join_by_their_mcp_settings(self):
+        folder = Path(tempfile.mkdtemp(prefix="more-tools-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        (folder / "opencode.json").write_text(json.dumps({"theme": "mine"}))  # the user's own settings stay
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo")  # every tool is "installed" here
+        place, token, clients = crewchat.joined_place(folder)
+        self.assertEqual(clients, ["claude", "cursor", "gemini", "qwen", "opencode"])  # Codex's chat is the .mcp.json
+        gemini = json.loads((folder / ".gemini" / "settings.json").read_text())["mcpServers"]["crewchat"]
+        self.assertEqual(gemini, {"httpUrl": self.base + "/mcp", "headers": {"Authorization": "Bearer " + token}, "trust": True})
+        self.assertEqual(json.loads((folder / ".qwen" / "settings.json").read_text())["mcpServers"]["crewchat"]["trust"], True)
+        opencode = json.loads((folder / "opencode.json").read_text())
+        self.assertEqual(opencode["theme"], "mine")
+        self.assertEqual(opencode["mcp"]["crewchat"], {"url": self.base + "/mcp", "type": "remote", "enabled": True,
+                                                      "headers": {"Authorization": "Bearer " + token}})
+        self.assertEqual(crewchat.client_config(folder, "gemini"), (self.base, token))
+        excluded = (folder / ".git" / "info" / "exclude").read_text()
+        for rel in (".gemini/settings.json", ".qwen/settings.json", "opencode.json"):  # the token stays out of git
+            self.assertIn(rel, excluded)
+        # Codex: once, in its own settings, `crewchat stdio` (which reads this folder's .mcp.json).
+        codex = crewchat.codex_config().read_text()
+        self.assertIn("[mcp_servers.crewchat]", codex)
+        self.assertIn('"stdio", "--local-only"]', codex)
+        self.assertEqual(codex.count("[mcp_servers.crewchat]"), 1)
+        # Run again with a tool asked for (or installed since), a connected folder gets it too.
+        shutil.rmtree(folder / ".qwen")
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "qwen")
+        self.assertEqual(crewchat.connection_entry(folder, "qwen")[1], token)
+        # Taken out again, leaving the user's own.
+        crewchat.disconnect_folder(folder)
+        self.assertFalse((folder / ".gemini" / "settings.json").exists())
+        self.assertEqual(json.loads((folder / "opencode.json").read_text()), {"theme": "mine"})
+
+    def test_a_committed_settings_file_gets_no_token(self):
+        folder = Path(tempfile.mkdtemp(prefix="committed-", dir=TMP)).resolve()
+        git = lambda *a: subprocess.run(["git", "-C", str(folder)] + list(a), capture_output=True, check=True)  # noqa: E731
+        git("init", "-q")
+        (folder / "opencode.json").write_text('{"theme": "team"}')
+        git("add", "opencode.json")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "team settings")
+        out = cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "opencode")
+        self.assertIn("opencode.json is committed", out)
+        self.assertEqual((folder / "opencode.json").read_text(), '{"theme": "team"}')
+
+    def test_a_tool_connected_later_is_added_at_launch_or_refused(self):
+        tool = lambda t, c: "/bin/" + t  # noqa: E731  (every tool installed)
+        shutil.rmtree(self.folder / ".gemini")  # as if Gemini CLI was installed after the folder joined
+        self.assertNotIn("gemini", crewchat.joined_place(self.folder)[2])
+        with mock.patch.object(crewchat, "find_tool", side_effect=tool), \
+                mock.patch.object(crewchat, "tool_help", return_value=""):
+            crewchat.agent_tool("gemini", str(self.folder), "ask", self.hub.home)
+            self.assertIn("gemini", crewchat.joined_place(self.folder)[2])  # its settings got crewchat
+            with mock.patch.object(crewchat, "install_client", return_value=[]):
+                shutil.rmtree(self.folder / ".qwen", ignore_errors=True)
+                with self.assertRaises(crewchat.HubError) as e:
+                    crewchat.agent_tool("qwen", str(self.folder), "ask", self.hub.home)
+                self.assertIn("could not add itself to Qwen Code's settings", str(e.exception))
+
+    def test_stdio_finds_the_chat_in_any_tools_settings(self):
+        folder = Path(tempfile.mkdtemp(prefix="gemini-only-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "gemini")
+        self.assertFalse((folder / ".mcp.json").exists())
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+        env = dict(os.environ, HOME=str(crewchat.user_home()), USERPROFILE=str(crewchat.user_home()))
+        done = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--local-only", "--project", str(folder)],
+                              input=("\n".join(json.dumps(r) for r in requests) + "\n").encode(), capture_output=True,
+                              env=env, timeout=60)
+        answers = [json.loads(line) for line in done.stdout.decode().splitlines() if line.strip()]
+        tools = next(a for a in answers if a.get("id") == 2)["result"]["tools"]
+        self.assertIn("hub_link", [t["name"] for t in tools], done.stderr)
+
+    def test_codex_settings_get_one_block_of_crewchats_own(self):
+        path = crewchat.codex_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n')
+        self.assertTrue(crewchat.install_codex())
+        self.assertFalse(crewchat.install_codex())  # already there
+        text = path.read_text()
+        self.assertTrue(text.startswith('model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n\n# crewchat: begin'))
+        with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+            self.assertTrue(crewchat.install_codex())  # brought up to this copy's command
+        self.assertIn('command = "/tools/crewchat/bin/crewchat"\nargs = ["stdio", "--local-only"]', path.read_text())
+        self.assertEqual(path.read_text().count("[mcp_servers.crewchat]"), 1)
+        try:
+            import tomllib  # Python 3.11+: Codex must still be able to read its settings
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            with mock.patch.object(crewchat, "run_command", return_value=['C:\\Users\\Ünï "q"\\crewchat.exe']):
+                crewchat.install_codex()
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["mcp_servers"]["crewchat"], {"command": 'C:\\Users\\Ünï "q"\\crewchat.exe',
+                                                                 "args": ["stdio", "--local-only"]})
+            self.assertEqual(parsed["mcp_servers"]["other"], {"command": "other"})
+        self.assertTrue(crewchat.uninstall_codex())
+        self.assertEqual(path.read_text(), 'model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n')
+        self.assertFalse(crewchat.uninstall_codex())
+        for theirs in ('[mcp_servers.crewchat]\ncommand = "uvx"\n', 'mcp_servers = { crewchat = { command = "x" } }\n',
+                       '[mcp_servers."crewchat"]\ncommand = "x"\n', 'mcp_servers.crewchat.command = "x"\n',
+                       '[mcp_servers]\ncrewchat = { command = "x" }\n', '[mcp_servers.crewchat.env]\nA = "b"\n',
+                       'mcp_servers = { other = { command = "x" } }\n'):
+            path.write_text(theirs)
+            self.assertFalse(crewchat.install_codex())  # a server the user set up is theirs
+            self.assertEqual(path.read_text(), theirs)
+        path.unlink()
+
+    def test_how_the_other_tools_are_started(self):
+        prompt = crewchat.LAUNCH_PROMPT % "start-k"
+        self.assertEqual(crewchat.launch_command("gemini", "gemini", "start-k", "edits"),
+                         ["gemini", "--approval-mode", "auto_edit", "-i", prompt])
+        self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "all"), ["qwen", "--yolo", "-i", prompt])
+        self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "edits")[1:3], ["--approval-mode", "auto-edit"])
+        self.assertEqual(crewchat.launch_command("opencode", "opencode", "start-k"), ["opencode", "--prompt", prompt])
+        self.assertEqual(crewchat.launch_command("codex", "codex", "start-k", "edits"), ["codex", "--full-auto", prompt])
+        # A copy that does not know the option is refused rather than started wrongly.
+        self.assertEqual(crewchat.fit_options("--yolo --approval-mode <default|yolo>", "gemini", "edits")[1], ["auto_edit"])
+        self.assertEqual(crewchat.fit_options("--approval-mode default|auto_edit|yolo", "gemini", "edits")[1], [])
+        self.assertEqual(self.launch(tool="opencode", permissions="all")["status"], 400)  # OpenCode: its own settings
+        with mock.patch.object(crewchat, "find_tool", side_effect=lambda t, c: "/bin/" + t if t in ("claude", "codex") else None):
+            self.assertEqual(crewchat.clients_for("all"), ["claude", "cursor", "codex"])  # the others: when installed
+        self.assertEqual(crewchat.clients_for("qwen"), ["qwen"])
 
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
@@ -2527,6 +2652,19 @@ class OtherNames(Base):
         self.assertEqual(answers[3][1]["error"]["code"], -32601)
         self.assertEqual(answers[4]["error"]["code"], -32700)
         self.assertEqual(len(answers), 5)  # nothing for the notification
+
+    def test_stdio_registered_for_every_folder_follows_only_this_machines_chat(self):
+        repo = Path(tempfile.mkdtemp(prefix="cloned-", dir=TMP)).resolve()  # a repository with its own .mcp.json
+        (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"crewchat": {
+            "url": "https://chat.example/mcp", "headers": {"Authorization": "Bearer theirs"}}}}))
+        self.assertFalse(crewchat.local_folder(repo))
+        env = dict(os.environ, HOME=str(self.user), USERPROFILE=str(self.user))
+        done = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--local-only", "--project", str(repo)],
+                              input=b"", capture_output=True, env=env, timeout=60)
+        self.assertIn(b"is not connected to a crewchat", done.stderr)  # not relayed to chat.example
+        mine = Path(tempfile.mkdtemp(prefix="mine-", dir=TMP)).resolve()
+        cli("start", str(mine), "--no-open", "--no-service", "--chat", "demo", "--client", "claude")
+        self.assertTrue(crewchat.local_folder(mine))
 
     def test_the_chat_tools_are_not_shown_as_activity_by_any_name(self):
         for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_update)"):
