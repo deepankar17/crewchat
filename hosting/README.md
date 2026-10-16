@@ -12,6 +12,7 @@ The domain is registered with Cloudflare, whose DNS points it at Firebase as Pho
 | TXT | `crewchat.dev` | `hosting-site=crewchat-chat` (Firebase's ownership check) |
 | CNAME | `www` | `crewchat-chat.web.app` (Firebase redirects `www.crewchat.dev` to `crewchat.dev`) |
 | MX, SPF, DKIM | | Cloudflare Email Routing, managed by Cloudflare |
+| TXT | `_dmarc` | `v=DMARC1; p=quarantine; rua=mailto:support@crewchat.dev` |
 
 ## Pages
 
