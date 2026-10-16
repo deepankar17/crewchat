@@ -2943,7 +2943,10 @@ class Hub:
     def _open_again(self, name, model, session, folder, command):
         with self.lock:
             key = self._link_key(name)
-        open_terminal(folder, command, key, title=name, root=self.home)
+        # OpenCode does not send a prompt given with the session it continues: crewchat's plugin does,
+        # once (the nonce), to that session.
+        env = {"CREWCHAT_REOPEN": "%s:%s" % (session["id"], secrets.token_hex(8))} if session.get("tool") == "opencode" else {}
+        open_terminal(folder, command, key, title=name, root=self.home, env=env)
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
                 self.agents[name]["session"]["reopening"] = time.time()  # until its hooks report the new process
@@ -5187,7 +5190,9 @@ LAUNCH_PERMISSIONS = {
                "auto": ("Also run what Cursor judges safe (auto-review)", ["--auto-review"]),
                "all": ("Run any command (--force)", ["--force"])},
     "codex": {"ask": ("As Codex's own settings say", []),
-              "edits": ("Edit and run commands in the folder without asking (--full-auto)", ["--full-auto"]),
+              # What --full-auto was (Codex no longer has it): its workspace sandbox, asking when it decides to.
+              "edits": ("Edit and run commands in the folder without asking (its workspace sandbox)",
+                        ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]),
               "all": ("Do anything, outside its sandbox too (no prompts at all)", ["--dangerously-bypass-approvals-and-sandbox"])},
     "gemini": {"ask": ("Ask before each change (its default)", []),
                "edits": ("Also edit files without asking", ["--approval-mode", "auto_edit"]),
@@ -5309,7 +5314,7 @@ def launch_command(exe, tool, key, permissions="ask", base=None, model="", advis
     return [exe] + tool_options(tool, permissions, base, model, advisor) + PROMPT_OPTION.get(tool, []) + [LAUNCH_PROMPT % key]
 
 
-def macos_script(folder, command, key, title=""):
+def macos_script(folder, command, key, title="", env=None):
     return "\n".join([
         "#!/bin/sh",
         "# Opened by crewchat to start an agent. It deletes itself.",
@@ -5317,7 +5322,8 @@ def macos_script(folder, command, key, title=""):
     ] + (["printf '\\033]0;%%s\\007' %s" % shlex.quote(title)] if title else []) + [  # the window's title
         "cd %s || exit 1" % shlex.quote(str(folder)),
         'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
-        "export CREWCHAT_LINK_KEY=%s" % shlex.quote(key),  # its hooks link with the same key
+    ] + ["export %s=%s" % (name, shlex.quote(value))  # its hooks link with the same key
+         for name, value in sorted(dict(env or {}, CREWCHAT_LINK_KEY=key).items())] + [
         "exec " + " ".join(shlex.quote(part) for part in command),
     ]) + "\n"
 
@@ -5378,7 +5384,11 @@ def agent_tool(tool, folder, permissions, root=None):
 REOPEN_WAIT = 120  # seconds a reopened session has to report before Reopen may be clicked again
 REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_inbox, then carry on with "
                  "your task.")
-REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
+# How each tool resumes a conversation by the id its hooks report (checked with each tool: Codex's is
+# a subcommand). Cursor's agent: resuming a chat by id is not checked yet, so Stop only.
+RESUME_ARGS = {"claude": lambda session: ["--resume=" + session], "gemini": lambda session: ["--resume=" + session],
+               "qwen": lambda session: ["--resume=" + session], "opencode": lambda session: ["--session=" + session]}
+REOPEN_TOOLS = ("claude", "codex", "gemini", "qwen", "opencode")
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
 # The models Claude Code's own advisor (--advisor) can be: its aliases that can act as one (Haiku 4.5
@@ -5400,11 +5410,15 @@ def tool_advisors(tool):
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor=""):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
-    if not SESSION_RE.fullmatch(str(session)):
+    if not SESSION_RE.fullmatch(str(session)) or tool not in REOPEN_TOOLS:
         raise HubError("that session cannot be reopened")
-    # One argument, so an id can never be taken for an option of its own.
-    return ([exe] + tool_options(tool, permissions, base, model or "", advisor or "")
-            + ["--resume=" + session, REOPEN_PROMPT])
+    options = tool_options(tool, permissions, base, model or "", advisor or "")
+    if tool == "codex":  # codex resume [options] <id> <prompt>; an id never starts with "-" (SESSION_RE)
+        return [exe, "resume"] + options + [session, REOPEN_PROMPT]
+    # The id in one argument with its option, so it can never be taken for an option of its own.
+    if tool == "opencode":  # its plugin sends REOPEN_PROMPT (see _open_again)
+        return [exe] + options + RESUME_ARGS[tool](session)
+    return [exe] + options + RESUME_ARGS[tool](session) + PROMPT_OPTION.get(tool, []) + [REOPEN_PROMPT]
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
@@ -5413,24 +5427,25 @@ def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advi
     open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, advisor), key, root=root)
 
 
-def open_terminal(folder, command, key, title="", root=None):
+def open_terminal(folder, command, key, title="", root=None, env=None):
     """Run an agent's command in a new terminal window on this machine, in folder, its hooks given
-    key (CREWCHAT_LINK_KEY); title names the window where the terminal allows."""
+    key (CREWCHAT_LINK_KEY) and env; title names the window where the terminal allows."""
+    env = dict(env or {}, CREWCHAT_LINK_KEY=key)
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(macos_script(folder, command, key, title), encoding="utf-8")
+        script.write_text(macos_script(folder, command, key, title, env), encoding="utf-8")
         os.chmod(script, 0o700)
         out = run(["open", str(script)])
         if out.returncode != 0:
             raise HubError("could not open a Terminal window: %s" % (out.stderr.strip() or out.stdout.strip()))
     elif os.name == "nt":
-        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, CREWCHAT_LINK_KEY=key),
+        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, **env),
                          creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
     else:
         # Some terminals start the window from a server process that does not get this one's
         # environment, so the key goes on the command line, through env.
-        command = ["env", "CREWCHAT_LINK_KEY=%s" % key] + command
+        command = ["env"] + ["%s=%s" % item for item in sorted(env.items())] + command
         for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
             if shutil.which(term[0]):
                 subprocess.Popen(term + command, cwd=str(folder), start_new_session=True)
@@ -6370,7 +6385,12 @@ OPENCODE_PLUGIN_MARK = "// crewchat's plugin"
 # sent as the session's next prompt. Never waited for: OpenCode goes on while the hook listens.
 OPENCODE_PLUGIN = OPENCODE_PLUGIN_MARK + r""": hands the chat's messages to OpenCode's agents at the end of each turn.
 // `crewchat uninstall` (or `crewchat hooks refresh`) takes care of this file; edits to it are not kept.
-const HOOK = %s;
+import {closeSync, mkdirSync, openSync} from "fs";
+import {tmpdir} from "os";
+import {join} from "path";
+
+const HOOK = %(hook)s;
+const REOPEN_PROMPT = %(reopen)s;
 
 async function hook(event, data, directory) {
   try {
@@ -6388,7 +6408,28 @@ async function hook(event, data, directory) {
   }
 }
 
-export const CrewchatPlugin = async ({client, directory}) => ({
+// Reopened from the chat page (CREWCHAT_REOPEN: the session and a nonce): OpenCode does not send a prompt
+// given with the session it continues, so this does, once. A command the agent runs inherits the
+// variable: the nonce, claimed by making a file of its name, keeps it from sending it again.
+function reopened() {
+  const [session, nonce] = (process.env.CREWCHAT_REOPEN || "").split(":");
+  delete process.env.CREWCHAT_REOPEN;
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(session || "") || !/^[0-9a-f]{16}$/.test(nonce || "")) return "";
+  try {
+    const dir = join(tmpdir(), "crewchat-hooks");
+    mkdirSync(dir, {recursive: true});
+    closeSync(openSync(join(dir, "opencode-reopen-" + nonce), "wx"));
+    return session;
+  } catch (e) {
+    return "";
+  }
+}
+
+export const CrewchatPlugin = async ({client, directory}) => {
+  const session = reopened();
+  if (session) setTimeout(() => client.session.promptAsync(
+    {path: {id: session}, body: {parts: [{type: "text", text: REOPEN_PROMPT}]}}).catch(() => {}), 1000);
+  return {
   "chat.message": async (input, output) => {
     const text = await hook("prompt", {session_id: input.sessionID}, directory);
     const part = text && (output.parts || []).find((p) => p.type === "text" && !p.synthetic);
@@ -6403,14 +6444,15 @@ export const CrewchatPlugin = async ({client, directory}) => ({
     hook("stop", {session_id: sessionID}, directory).then((text) => text && client.session.promptAsync(
       {path: {id: sessionID}, body: {parts: [{type: "text", text}]}})).catch(() => {});
   },
-});
+  };
+};
 """
 
 
 def write_opencode_plugin(project):
     """crewchat's plugin in the folder (OPENCODE_PLUGIN), running this copy. Returns whether it changed."""
     path = Path(project) / OPENCODE_PLUGIN_FILE
-    text = OPENCODE_PLUGIN % json.dumps(run_command() + ["hook", "opencode"])
+    text = OPENCODE_PLUGIN % {"hook": json.dumps(run_command() + ["hook", "opencode"]), "reopen": json.dumps(REOPEN_PROMPT)}
     try:
         if path.read_text(encoding="utf-8") == text:
             return False
@@ -6809,7 +6851,7 @@ def claim_launch_key(folder, key, session):
     return True
 
 
-SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
+SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
 AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a quoted path, or npm's node + cli.js)
     "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
     "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)'),

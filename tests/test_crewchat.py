@@ -1343,7 +1343,7 @@ class Launching(Base):
     """Add an agent from the chat page: the launcher is replaced, so no window opens."""
 
     def setUp(self):
-        self.launched = []
+        self.launched, self.opened_env = [], []
         self.saved = crewchat.launch_agent, crewchat.find_tool
         self.real_launch_agent = crewchat.launch_agent
         self.models, self.advisors = [], []
@@ -1765,6 +1765,7 @@ class Launching(Base):
         text = plugin.read_text()
         self.assertTrue(text.startswith(crewchat.OPENCODE_PLUGIN_MARK))
         self.assertIn(json.dumps(crewchat.run_command() + ["hook", "opencode"]), text)
+        self.assertIn("const REOPEN_PROMPT = %s;" % json.dumps(crewchat.REOPEN_PROMPT), text)  # what Reopen asks
         self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, (folder / ".git" / "info" / "exclude").read_text())  # never committed
         if shutil.which("node"):  # the plugin is a module OpenCode can load
             check = subprocess.run(["node", "--check", "--input-type=module"], input=text, capture_output=True, text=True)
@@ -1789,7 +1790,9 @@ class Launching(Base):
         self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "all"), ["qwen", "--yolo", "-i", prompt])
         self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "edits")[1:3], ["--approval-mode", "auto-edit"])
         self.assertEqual(crewchat.launch_command("opencode", "opencode", "start-k"), ["opencode", "--prompt", prompt])
-        self.assertEqual(crewchat.launch_command("codex", "codex", "start-k", "edits"), ["codex", "--full-auto", prompt])
+        # What --full-auto was: Codex no longer has that option, but has its workspace sandbox and approvals.
+        self.assertEqual(crewchat.launch_command("codex", "codex", "start-k", "edits"),
+                         ["codex", "--sandbox", "workspace-write", "--ask-for-approval", "on-request", prompt])
         # A copy that does not know the option is refused rather than started wrongly.
         self.assertEqual(crewchat.fit_options("--yolo --approval-mode <default|yolo>", "gemini", "edits")[1], ["auto_edit"])
         self.assertEqual(crewchat.fit_options("--approval-mode default|auto_edit|yolo", "gemini", "edits")[1], [])
@@ -1864,8 +1867,8 @@ class Launching(Base):
 
     def reopened(self, **body):
         opened = []
-        with mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
-                               opened.append((folder, command, key, title))):
+        with mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                               opened.append((folder, command, key, title)) or self.opened_env.append(env)):
             out = crewchat.post_json(self.base + "/api/agent", self.owner, dict({"op": "reopen"}, **body))
         return out, opened
 
@@ -1888,6 +1891,31 @@ class Launching(Base):
         self.hub.links = {k: v for k, v in self.hub.links.items() if v != name}
         _, opened = self.reopened(agent=name)
         self.assertEqual(self.hub.links[opened[0][2]], name)
+
+    def test_the_other_tools_reopen_their_own_conversations(self):
+        for tool, resume in (("codex", ["resume", "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
+                                        "sess-0003-abc", crewchat.REOPEN_PROMPT]),
+                             ("gemini", ["--approval-mode", "auto_edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
+                             ("qwen", ["--approval-mode", "auto-edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
+                             ("opencode", ["--session=sess-0003-abc"])):
+            name = self.closed_session(tool=tool)
+            if tool == "opencode":
+                self.hub.agents[name]["permissions"] = "ask"  # all it has
+            self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["reopen"], tool)
+            out, opened = self.reopened(agent=name)
+            self.assertEqual(out, {"ok": True})
+            self.assertEqual(opened[0][1], ["/usr/local/bin/" + tool] + resume, tool)
+            env = self.opened_env[-1] or {}
+            if tool == "opencode":  # OpenCode does not send a prompt with the session it continues: its plugin does
+                self.assertRegex(env.get("CREWCHAT_REOPEN", ""), r"^sess-0003-abc:[0-9a-f]{16}$")
+            else:
+                self.assertNotIn("CREWCHAT_REOPEN", env)
+        # OpenCode's session ids have an underscore; never an option, nor a line of its own.
+        self.assertTrue(crewchat.SESSION_RE.fullmatch("ses_ebba941c8ffecgoR55RwC2KYIa"))
+        for bad in ("_ses_ebba941c8ffe", "-ses_ebba941c8ffe", "ses ebba941c8ffe", "ses_ebba941c8ffe\n"):
+            self.assertFalse(crewchat.SESSION_RE.fullmatch(bad), bad)
+        script = crewchat.macos_script("/tmp/x", ["/x/opencode"], "link-0123456789", env={"CREWCHAT_REOPEN": "s:n"})
+        self.assertIn("export CREWCHAT_LINK_KEY=link-0123456789\nexport CREWCHAT_REOPEN=s:n", script)
 
     def test_cursor_sessions_can_be_stopped_but_not_reopened_yet(self):
         name = self.closed_session(tool="cursor")
@@ -1922,7 +1950,7 @@ class Launching(Base):
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
                 mock.patch.object(crewchat, "stop_process", stop), \
                 mock.patch.object(crewchat, "tool_models", lambda tool: [["opus", "Opus"], ["sonnet", "Sonnet"]]), \
-                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(steps[0], "stop")
@@ -1949,7 +1977,7 @@ class Launching(Base):
         self.assertEqual(opened[0][1][-4:-2], ["--advisor", "fable"])
         self.hub.agents[name]["session"].pop("reopening", None)
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
-                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
                                   opened.append((folder, command, key, title))):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(opened[-1][1][-6:-2], ["--model", "sonnet", "--advisor", "fable"])

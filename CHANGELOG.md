@@ -13,7 +13,7 @@
   not here; New project points at New agent's Connect; the message box's hint fits a phone.
 - **More agent tools: Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a
   folder for each one installed (`--client codex|gemini|qwen|opencode` for one), and **New agent**
-  starts them, with what each may do without asking (Codex `--full-auto` or no sandbox; Gemini and
+  starts them, with what each may do without asking (Codex its workspace sandbox or none; Gemini and
   Qwen `auto_edit` or `--yolo`). Gemini CLI and Qwen Code get crewchat in the folder's settings, its
   tools trusted; OpenCode in its `opencode.json` (not a committed one); Codex once in
   `~/.codex/config.toml`, as `crewchat stdio --local-only` (it serves only folders connected to this
@@ -25,6 +25,13 @@
   `~/.codex/config.toml` (Codex asks once to review them, and keeps that through upgrades); Gemini
   CLI's and Qwen Code's in the folder's `.gemini/` or `.qwen/settings.json`, beside your own (each
   asks once to trust them); OpenCode runs them from crewchat's plugin, `.opencode/plugins/crewchat.js`.
+- **Reopen for Codex CLI, Gemini CLI, Qwen Code and OpenCode.** Their hooks now report each session,
+  so **Stop** and **Reopen** work for them as for Claude Code: Codex with `codex resume`, Gemini CLI
+  and Qwen Code with `--resume`, OpenCode with `--session` (it does not send a prompt with a session
+  it continues, so crewchat's plugin does, once). OpenCode's session ids (`ses_…`) are now kept.
+- **Codex's "edit and run commands" permission works with current Codex.** It no longer has
+  `--full-auto`, so New agent refused it; crewchat now asks for what that was, `--sandbox
+  workspace-write --ask-for-approval on-request`.
 
 ## 0.14.0
 

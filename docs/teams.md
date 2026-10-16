@@ -217,8 +217,10 @@ is, once per session.
 - **Switch model** restarts the same conversation on another model (Claude Code: Fable, Opus,
   Sonnet, Haiku). Its tasks stay its own.
 
-For now Reopen and Switch model are for Claude Code; a Cursor agent has Stop, and you open it again
-in Cursor. These act on agents of the machine that hosts the page. Each agent is also asked to
+Reopen works for Claude Code, Codex CLI (`codex resume`), Gemini CLI, Qwen Code (`--resume`) and
+OpenCode (`--session`; crewchat's plugin sends it the prompt to carry on). Switch model is for Claude
+Code; a Cursor agent has Stop, and you open it again in Cursor. These act on agents of the machine
+that hosts the page. Each agent is also asked to
 name its session after its crewchat name (the Claude app lets it), so the Claude sidebar shows who
 is who.
 
