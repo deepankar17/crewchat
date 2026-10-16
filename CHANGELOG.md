@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
+  chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
+  and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
+  `connect`).
+- **Fixes from a UI test of every page element.** An answered question in Needs you waits on the agent,
+  not you; a message there takes you to it and starts a reply; a search with no match says so; an
+  agent silent for long no longer shows Working; the Roles list says what each role does; New
+  agent's templates are named after their role and it no longer lists install notes for every tool
+  not here; New project points at New agent's Connect; the message box's hint fits a phone.
 - **More agent tools: Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a
   folder for each one installed (`--client codex|gemini|qwen|opencode` for one), and **New agent**
   starts them, with what each may do without asking (Codex `--full-auto` or no sandbox; Gemini and
@@ -14,10 +23,6 @@
 
 ## 0.14.0
 
-- **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
-  chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
-  and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
-  `connect`).
 - **Hooks never hold up an agent when crewchat is off.** A hook that cannot reach the server for
   15 seconds gives up, instead of retrying for the whole listening time, so a folder used without
   crewchat running is no longer stuck after every turn. An installed crewchat's hooks run its own
