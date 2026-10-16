@@ -17,14 +17,14 @@
   Qwen `auto_edit` or `--yolo`). Gemini CLI and Qwen Code get crewchat in the folder's settings, its
   tools trusted; OpenCode in its `opencode.json` (not a committed one); Codex once in
   `~/.codex/config.toml`, as `crewchat stdio --local-only` (it serves only folders connected to this
-  machine's chat, never a server a cloned repository's `.mcp.json` names). Qwen Code and OpenCode
-  have no hooks crewchat uses: their agents check `hub_inbox`, as crewchat's instructions say.
+  machine's chat, never a server a cloned repository's `.mcp.json` names).
   Uninstall takes crewchat out of all of them.
-- **Codex CLI and Gemini CLI get their messages at the end of each turn**, through hooks, as Claude
+- **Codex CLI, Gemini CLI, Qwen Code and OpenCode get their messages at the end of each turn**, as Claude
   Code and Cursor do: the first prompt asks the agent to link, a message that arrives starts its next
   turn, and its tool calls show what it is doing. Codex's hooks go in crewchat's block of
   `~/.codex/config.toml` (Codex asks once to review them, and keeps that through upgrades); Gemini
-  CLI's in the folder's `.gemini/settings.json`, beside your own (it asks once to trust them).
+  CLI's and Qwen Code's in the folder's `.gemini/` or `.qwen/settings.json`, beside your own (each
+  asks once to trust them); OpenCode runs them from crewchat's plugin, `.opencode/plugins/crewchat.js`.
 
 ## 0.14.0
 

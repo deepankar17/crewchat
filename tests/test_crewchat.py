@@ -1033,6 +1033,9 @@ class Activity(Base):
         self.assertEqual(say("gemini", {"tool_name": "read_file", "tool_input": {"absolute_path": "/x/.env"}}), "Reading .env")
         self.assertEqual(say("gemini", {"tool_name": "run_shell_command", "tool_input": {"command": "npm test --x=1"}}),
                          "Running npm test")
+        self.assertEqual(say("qwen", {"tool_name": "edit", "tool_input": {"file_path": "/x/App.kt"}}), "Editing App.kt")
+        self.assertEqual(say("opencode", {"tool_name": "read", "tool_input": {"filePath": "/x/main.py"}}), "Reading main.py")
+        self.assertEqual(say("opencode", {"tool_name": "bash", "tool_input": {"command": "npm test"}}), "Running npm test")
         self.assertEqual(say("codex", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "pytest -q x"]}}),
                          "Running pytest")
         self.assertEqual(say("codex", {"tool_name": "exec_command", "tool_input": {"command": ["git", "status"]}}),
@@ -1726,23 +1729,58 @@ class Launching(Base):
         self.assertIn("[mcp_servers.crewchat]", path.read_text())
         path.unlink()
 
-    def test_gemini_settings_get_crewchats_hooks_beside_the_users(self):
-        folder = Path(tempfile.mkdtemp(prefix="gemini-hooks-", dir=TMP)).resolve()
-        mine = {"matcher": "write_file", "hooks": [{"type": "command", "command": "echo mine"}]}
-        (folder / ".gemini").mkdir()
-        (folder / ".gemini" / "settings.json").write_text(json.dumps({"hooks": {"AfterTool": [mine]}}))
-        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "gemini")
-        settings = json.loads((folder / ".gemini" / "settings.json").read_text())
+    def test_gemini_and_qwen_settings_get_crewchats_hooks_beside_the_users(self):
         ours = lambda s: {event: [h for g in groups for h in g["hooks"] if crewchat.is_our_hook(h["command"])]  # noqa: E731
                           for event, groups in s["hooks"].items()}
-        self.assertEqual({e: [h["name"] for h in hs] for e, hs in ours(settings).items()},
-                         {"BeforeAgent": ["crewchat-prompt"], "AfterAgent": ["crewchat-stop"], "AfterTool": ["crewchat-tool"]})
-        self.assertEqual(ours(settings)["AfterAgent"][0]["timeout"], (crewchat.MAX_LISTEN + 100) * 1000)  # milliseconds
-        self.assertEqual(settings["hooks"]["AfterTool"][0], mine)
-        crewchat.set_gemini_hooks(settings)  # again: replaced, not added
-        self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 3)
+        for client, rel, (prompt, stop, tool) in (
+                ("gemini", ".gemini/settings.json", ("BeforeAgent", "AfterAgent", "AfterTool")),
+                ("qwen", ".qwen/settings.json", ("UserPromptSubmit", "Stop", "PostToolUse"))):
+            folder = Path(tempfile.mkdtemp(prefix=client + "-hooks-", dir=TMP)).resolve()
+            mine = {"matcher": "write_file", "hooks": [{"type": "command", "command": "echo mine"}]}
+            (folder / rel).parent.mkdir()
+            (folder / rel).write_text(json.dumps({"hooks": {tool: [mine]}}))
+            cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", client)
+            settings = json.loads((folder / rel).read_text())
+            self.assertEqual({e: [h["name"] for h in hs] for e, hs in ours(settings).items()},
+                             {prompt: ["crewchat-prompt"], stop: ["crewchat-stop"], tool: ["crewchat-tool"]}, client)
+            self.assertIn(" hook %s stop" % client, ours(settings)[stop][0]["command"])
+            # Milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds.
+            self.assertEqual(ours(settings)[stop][0]["timeout"], (crewchat.MAX_LISTEN + 100) * 1000)
+            self.assertGreaterEqual(min(h["timeout"] for hs in ours(settings).values() for h in hs), 1000)
+            self.assertEqual(settings["hooks"][tool][0], mine)
+            crewchat.set_settings_hooks(settings, client)  # again: replaced, not added
+            self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 3)
+            del settings["hooks"][stop]  # a folder connected before crewchat had them: hooks refresh adds them
+            (folder / rel).write_text(json.dumps(settings))
+            self.assertIn(rel, crewchat.update_hooks(folder))
+            self.assertIn(stop, json.loads((folder / rel).read_text())["hooks"])
+            crewchat.disconnect_folder(folder)
+            self.assertEqual(json.loads((folder / rel).read_text()), {"hooks": {tool: [mine]}})
+
+    def test_opencode_gets_crewchats_plugin(self):
+        folder = Path(tempfile.mkdtemp(prefix="opencode-plugin-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=True)
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "opencode")
+        plugin = folder / crewchat.OPENCODE_PLUGIN_FILE
+        text = plugin.read_text()
+        self.assertTrue(text.startswith(crewchat.OPENCODE_PLUGIN_MARK))
+        self.assertIn(json.dumps(crewchat.run_command() + ["hook", "opencode"]), text)
+        self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, (folder / ".git" / "info" / "exclude").read_text())  # never committed
+        if shutil.which("node"):  # the plugin is a module OpenCode can load
+            check = subprocess.run(["node", "--check", "--input-type=module"], input=text, capture_output=True, text=True)
+            self.assertEqual(check.returncode, 0, check.stderr)
+        plugin.write_text(text.replace(json.dumps(crewchat.run_command() + ["hook", "opencode"]),
+                                       '["/old/crewchat", "hook", "opencode"]'))
+        self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, crewchat.update_hooks(folder))  # brought up to this copy
+        self.assertEqual(plugin.read_text(), text)
+        self.assertEqual(crewchat.update_hooks(folder), [])
         crewchat.disconnect_folder(folder)
-        self.assertEqual(json.loads((folder / ".gemini" / "settings.json").read_text()), {"hooks": {"AfterTool": [mine]}})
+        self.assertFalse((folder / ".opencode").exists())  # its folders too, once empty
+        mine = folder / ".opencode" / "plugins" / "crewchat.js"  # a file of the same name the user wrote: theirs
+        mine.parent.mkdir(parents=True)
+        mine.write_text("export const Mine = async () => ({})\n")
+        crewchat.disconnect_folder(folder)
+        self.assertTrue(mine.exists())
 
     def test_how_the_other_tools_are_started(self):
         prompt = crewchat.LAUNCH_PROMPT % "start-k"
@@ -2890,11 +2928,14 @@ class Hooks(Base):
             for client, command in (("codex", "/usr/local/lib/node_modules/@openai/codex/vendor/x/codex/codex resume"),
                                     ("codex", "node /usr/local/bin/codex"),
                                     ("gemini", "node /usr/local/bin/gemini -i hello"),
-                                    ("gemini", "node /opt/homebrew/lib/node_modules/@google/gemini-cli/dist/index.js")):
+                                    ("gemini", "node /opt/homebrew/lib/node_modules/@google/gemini-cli/dist/index.js"),
+                                    ("qwen", "node /usr/local/bin/qwen"),
+                                    ("qwen", "node /usr/lib/node_modules/@qwen-code/qwen-code/cli.js -i hi"),
+                                    ("opencode", "/Users/x/.opencode/bin/opencode --prompt hi")):
                 table = {10: (9, "a", "sh -c hook"), 9: (1, "b", command)}
                 self.assertEqual(crewchat.agent_process(client, table)["pid"], 9, command)
                 self.assertIsNone(crewchat.agent_process("cursor" if client == "codex" else "codex", table))
-            self.assertIsNone(crewchat.agent_process("opencode", table))  # a tool it cannot tell: no report
+            self.assertIsNone(crewchat.agent_process("zed", table))  # a tool it cannot tell: no report
 
     def test_listening_set_on_the_chat_page_wins_over_the_folder(self):
         session, name = self.linked("page-listen")
@@ -2924,15 +2965,21 @@ class Hooks(Base):
         self.hook("cursor", "tool", {"conversation_id": "first-turn"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)  # no stop hook ran yet
 
-    def test_codex_and_gemini_get_messages_as_their_hooks_expect(self):
+    def test_codex_gemini_qwen_and_opencode_get_messages_as_their_hooks_expect(self):
         folder = Path(tempfile.mkdtemp(prefix="other-hooks-", dir=TMP))
         crewchat.install_claude(folder, self.base, self.token)  # Codex's chat: the folder's .mcp.json
         crewchat.install_mcp_settings(folder, self.base, self.token, "gemini")
-        for client, prompt_event in (("codex", "UserPromptSubmit"), ("gemini", "BeforeAgent")):
+        crewchat.install_mcp_settings(folder, self.base, self.token, "qwen")
+        crewchat.install_mcp_settings(folder, self.base, self.token, "opencode")
+        for client, prompt_event in (("codex", "UserPromptSubmit"), ("gemini", "BeforeAgent"), ("qwen", "UserPromptSubmit"),
+                                     ("opencode", None)):
             conversation = "other-%s-0001" % client
-            asked = json.loads(self.hook(client, "prompt", {"session_id": conversation}, project=folder))
-            self.assertEqual(asked["hookSpecificOutput"]["hookEventName"], prompt_event)  # strict JSON, or ignored
-            key = re.search(r'key "([^"]+)"', asked["hookSpecificOutput"]["additionalContext"]).group(1)
+            asked = self.hook(client, "prompt", {"session_id": conversation}, project=folder)
+            if prompt_event:
+                asked = json.loads(asked)
+                self.assertEqual(asked["hookSpecificOutput"]["hookEventName"], prompt_event)  # strict JSON, or ignored
+                asked = asked["hookSpecificOutput"]["additionalContext"]
+            key = re.search(r'key "([^"]+)"', asked).group(1)  # OpenCode's plugin adds the text to the message
             session = Session(self.base, self.token, client)
             session.call("hub_link", key=key)
             self.say(session.me, "hello %s" % client)

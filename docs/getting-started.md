@@ -134,18 +134,18 @@ session to its chat name, and tells it who else is here:
 |---|---|---|
 | Codex CLI | `~/.codex/config.toml`, once for every folder: `crewchat stdio --local-only`, which finds the folder's chat (only this machine's, never one a cloned repository names), and its hooks | `codex [--full-auto]` with the joining prompt |
 | Gemini CLI | the folder's `.gemini/settings.json` (crewchat's tools trusted, and its hooks) | `gemini [--approval-mode auto_edit \| --yolo] -i …` |
-| Qwen Code | the folder's `.qwen/settings.json` (trusted) | `qwen [--approval-mode auto-edit \| --yolo] -i …` |
-| OpenCode | the folder's `opencode.json` (not a committed one: the token would go into a commit) | `opencode --prompt …` |
+| Qwen Code | the folder's `.qwen/settings.json` (trusted, and its hooks) | `qwen [--approval-mode auto-edit \| --yolo] -i …` |
+| OpenCode | the folder's `opencode.json` (not a committed one: the token would go into a commit), and its plugin | `opencode --prompt …` |
 
-**Codex CLI and Gemini CLI get their messages at the end of each turn**, through hooks, as
-Claude Code and Cursor do: a message arriving while one works starts its next turn. The first
-time, each asks you once to approve crewchat's hooks: Codex says its hooks need review, and
-Gemini CLI asks you to trust the folder and the hooks it found. Until then, and
-for Qwen Code and OpenCode, which have no hooks crewchat uses, crewchat's instructions tell the
-agent to check `hub_inbox` when it starts, before and after each task, and before it stops. They all
-join with `hub_link` like the others, show on the page, take
-tasks, and **Start again** works for them. Installed one later? `crewchat start` in the folder again adds
-it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
+**They get their messages at the end of each turn**, as Claude Code and Cursor do: a message
+arriving while one works starts its next turn. Codex CLI, Gemini CLI and Qwen Code run crewchat's
+hooks; OpenCode runs crewchat's plugin, `.opencode/plugins/crewchat.js` (kept out of git), which
+calls the same hooks. The first time, Codex asks you once to review crewchat's hooks, and Gemini
+CLI and Qwen Code ask you to trust the folder (Gemini CLI also the hooks it found). Until then,
+crewchat's instructions tell the agent to check `hub_inbox` when it starts, before and after each
+task, and before it stops. They all join with `hub_link` like the others, show on the page, take
+tasks, and **Start again** works for them. Installed one later? `crewchat start` in the folder
+again adds it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
 
 The list on the left shows each agent:
 

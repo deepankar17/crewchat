@@ -5171,7 +5171,7 @@ def joined_place(project, config=None, root=None):
 # Agents launched from the chat page ---------------------------------------------------------
 LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent"), "codex": ("Codex CLI", "codex"),
                 "gemini": ("Gemini CLI", "gemini"), "qwen": ("Qwen Code", "qwen"), "opencode": ("OpenCode", "opencode")}
-MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings (Codex and Gemini: hooks too)
+MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings (and their hooks)
 PROMPT_OPTION = {"gemini": ["-i"], "qwen": ["-i"], "opencode": ["--prompt"]}  # else the prompt is the last argument
 # Options every agent started from the chat page gets: Cursor's agent is not stopped by the folder's
 # trust prompt (crewchat's MCP server alone is approved before it starts, see launch_agent).
@@ -6036,9 +6036,9 @@ def cmd_status(_args):
 # Agent-side commands: join a chat, and the hooks that check it
 # --------------------------------------------------------------------------------------------
 CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}  # the tools crewchat's hooks run in
-# Tools that join by their MCP settings (Gemini CLI's hooks are in them too; Qwen Code and OpenCode have
-# none: their agents check hub_inbox, as crewchat's instructions say): the folder's file and the key of the server's address in it. Codex keeps its
-# servers in the user's own config instead (install_codex), so a Codex folder's chat is its .mcp.json.
+# Tools that join by their MCP settings (Gemini CLI's and Qwen Code's hooks are in them too; OpenCode's are
+# a plugin, OPENCODE_PLUGIN): the folder's file and the key of the server's address in it. Codex keeps its servers in the user's own config instead (install_codex), so a
+# Codex folder's chat is its .mcp.json.
 # For each: the file, the key its servers are under, the key of a server's address, and what else
 # crewchat's entry says (Gemini CLI and Qwen Code trust its tools, as Claude Code and Cursor do).
 MCP_FILES = {"gemini": (".gemini/settings.json", "mcpServers", "httpUrl", {"trust": True}),
@@ -6129,14 +6129,20 @@ def hook_command(client, event):
     return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
-HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini")  # the tools whose hooks hand the chat's messages over
+HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini", "qwen", "opencode")  # the tools whose hooks hand messages over
 # The file whose presence marks a connected folder, for a tool's hooks (Codex's chat is its .mcp.json).
 HOOK_MARKERS = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json", "codex": ".mcp.json",
-                "gemini": ".gemini/settings.json"}
+                "gemini": ".gemini/settings.json", "qwen": ".qwen/settings.json", "opencode": "opencode.json"}
 # Tools whose hooks work as Claude Code's: a prompt hook adds context, a stop hook answers
 # {"decision": "block", "reason": ...} to go on with the chat's messages (Cursor: followup_message).
-BLOCK_CLIENTS = ("claude", "codex", "gemini")
-PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent"}  # their prompt hooks answer in JSON
+# OpenCode's are crewchat's plugin (OPENCODE_PLUGIN), which reads them the same way.
+BLOCK_CLIENTS = ("claude", "codex", "gemini", "qwen", "opencode")
+PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent", "qwen": "UserPromptSubmit"}  # answered in JSON
+# The hooks of the tools that keep them beside crewchat's server, in the folder's settings (MCP_FILES):
+# each event, the hook it runs, and its timeout in seconds.
+SETTINGS_HOOKS = {
+    "gemini": (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100), ("AfterTool", "tool", 10)),
+    "qwen": (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100), ("PostToolUse", "tool", 10))}
 
 
 def is_our_hook(command):
@@ -6328,17 +6334,17 @@ def set_claude_hooks(settings, names=(SERVER_NAME,)):
         hooks[event] = groups
 
 
-def set_gemini_hooks(settings):
-    """crewchat's hooks in Gemini CLI's settings (the folder's .gemini/settings.json), replacing its own
-    older ones and keeping the user's. Timeouts in milliseconds. Gemini CLI asks once to trust them."""
+def set_settings_hooks(settings, client):
+    """crewchat's hooks in Gemini CLI's or Qwen Code's settings (the folder's .gemini/ or .qwen/settings.json),
+    replacing its own older ones and keeping the user's. Each tool asks once to trust them. Timeouts in
+    milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds."""
     hooks = settings.setdefault("hooks", {})
-    for event, name, timeout in (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100),
-                                 ("AfterTool", "tool", 10)):
+    for event, name, timeout in SETTINGS_HOOKS[client]:
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
-        group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command("gemini", name),
+        group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command(client, name),
                             "timeout": timeout * 1000}]}
-        if event == "AfterTool":
+        if name == "tool":
             group["matcher"] = ".*"
         hooks[event] = groups + [group]
 
@@ -6355,6 +6361,64 @@ def install_cursor(project, url, token):
     write_json(hooks_path, hooks)
     allow_cursor_tools(project)
     return [".cursor/mcp.json", ".cursor/hooks.json", ".cursor/cli.json"]
+
+
+OPENCODE_PLUGIN_FILE = ".opencode/plugins/crewchat.js"
+OPENCODE_PLUGIN_MARK = "// crewchat's plugin"
+# OpenCode has no hooks of its own to run a command: this plugin runs crewchat's. Its prompt hook's text
+# joins the user's message; at the end of a turn (the session goes idle), the stop hook's messages are
+# sent as the session's next prompt. Never waited for: OpenCode goes on while the hook listens.
+OPENCODE_PLUGIN = OPENCODE_PLUGIN_MARK + r""": hands the chat's messages to OpenCode's agents at the end of each turn.
+// `crewchat uninstall` (or `crewchat hooks refresh`) takes care of this file; edits to it are not kept.
+const HOOK = %s;
+
+async function hook(event, data, directory) {
+  try {
+    const run = Bun.spawn([...HOOK, event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
+                                             env: {...process.env, CREWCHAT_PROJECT: directory}});
+    run.stdin.write(JSON.stringify(data));
+    run.stdin.end();
+    const out = (await new Response(run.stdout).text()).trim();
+    await run.exited;
+    if (!out.startsWith("{")) return out;
+    const said = JSON.parse(out);
+    return said.reason || said.followup_message || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+export const CrewchatPlugin = async ({client, directory}) => ({
+  "chat.message": async (input, output) => {
+    const text = await hook("prompt", {session_id: input.sessionID}, directory);
+    const part = text && (output.parts || []).find((p) => p.type === "text" && !p.synthetic);
+    if (part) part.text += "\n\n" + text;
+  },
+  "tool.execute.after": async (input) => {
+    hook("tool", {session_id: input.sessionID, tool_name: input.tool, tool_input: input.args || {}}, directory);
+  },
+  event: async ({event}) => {
+    const sessionID = event.type === "session.idle" && event.properties && event.properties.sessionID;
+    if (!sessionID) return;
+    hook("stop", {session_id: sessionID}, directory).then((text) => text && client.session.promptAsync(
+      {path: {id: sessionID}, body: {parts: [{type: "text", text}]}})).catch(() => {});
+  },
+});
+"""
+
+
+def write_opencode_plugin(project):
+    """crewchat's plugin in the folder (OPENCODE_PLUGIN), running this copy. Returns whether it changed."""
+    path = Path(project) / OPENCODE_PLUGIN_FILE
+    text = OPENCODE_PLUGIN % json.dumps(run_command() + ["hook", "opencode"])
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
 
 
 def install_mcp_settings(project, url, token, client):
@@ -6374,9 +6438,12 @@ def install_mcp_settings(project, url, token, client):
         return []
     data.setdefault(servers, {})[SERVER_NAME] = dict({key: url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}},
                                                      **extra)
-    if client == "gemini":
-        set_gemini_hooks(data)  # messages at the end of each turn, as Claude Code gets them
+    if client in SETTINGS_HOOKS:
+        set_settings_hooks(data, client)  # messages at the end of each turn, as Claude Code gets them
     write_json(path, data, private=True)
+    if client == "opencode" and not tracked_by_git(project, OPENCODE_PLUGIN_FILE):
+        write_opencode_plugin(project)  # OpenCode's hooks
+        return [rel, OPENCODE_PLUGIN_FILE]
     return [rel]
 
 
@@ -6524,11 +6591,17 @@ def update_hooks(folder):
     if ".cursor/hooks.json" in ours and not tracked_by_git(folder, ".cursor/cli.json") and allow_cursor_tools(folder):
         git_exclude(folder, [".cursor/cli.json"])  # as when the folder joined
         changed.append(".cursor/cli.json")
-    # Gemini CLI: its settings hold crewchat's server, so its hooks belong there too (also for a folder
-    # connected before crewchat had them).
-    rel = ".gemini/settings.json"
-    if connection_entry(folder, "gemini") and not tracked_by_git(folder, rel) and edit_json(folder / rel, set_gemini_hooks):
-        changed.append(rel)
+    # Gemini CLI and Qwen Code: their settings hold crewchat's server, so its hooks belong there too (also
+    # for a folder connected before crewchat had them).
+    for client in SETTINGS_HOOKS:
+        rel = MCP_FILES[client][0]
+        if connection_entry(folder, client) and not tracked_by_git(folder, rel) and \
+                edit_json(folder / rel, lambda data, client=client: set_settings_hooks(data, client)):
+            changed.append(rel)
+    if connection_entry(folder, "opencode") and not tracked_by_git(folder, OPENCODE_PLUGIN_FILE) and \
+            write_opencode_plugin(folder):
+        git_exclude(folder, [OPENCODE_PLUGIN_FILE])
+        changed.append(OPENCODE_PLUGIN_FILE)
     return changed
 
 
@@ -6616,7 +6689,7 @@ def find_project(client):
     """The project folder a hook runs for: the one holding this client's connection file."""
     marker = HOOK_MARKERS[client]
     starts = [os.environ.get("CREWCHAT_PROJECT"), os.environ.get("CLAUDE_PROJECT_DIR"),
-              os.environ.get("GEMINI_PROJECT_DIR"), os.getcwd()]
+              os.environ.get("GEMINI_PROJECT_DIR"), os.environ.get("QWEN_PROJECT_DIR"), os.getcwd()]
     for start in starts:
         if not start:
             continue
@@ -6741,7 +6814,9 @@ AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a qu
     "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
     "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)'),
     "codex": re.compile(r'(^|[/\\])codex(\.exe|\.js)?"?(\s|$)'),  # its native program, or npm's codex.js
-    "gemini": re.compile(r'(^|[/\\])gemini(\.exe|\.js)?"?(\s|$)|[/\\]gemini-cli[/\\]')}
+    "gemini": re.compile(r'(^|[/\\])gemini(\.exe|\.js)?"?(\s|$)|[/\\]gemini-cli[/\\]'),
+    "qwen": re.compile(r'(^|[/\\])qwen(\.exe|\.js)?"?(\s|$)|[/\\]@qwen-code[/\\]'),
+    "opencode": re.compile(r'(^|[/\\])opencode(\.exe)?"?(\s|$)')}
 
 
 def process_table(pids=None):
@@ -6885,6 +6960,9 @@ TOOL_WORDS = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Wri
 OTHER_TOOL_NAMES = {"read_file": "Read", "read_many_files": "Read", "write_file": "Write", "replace": "Edit",
                     "run_shell_command": "Bash", "glob": "Glob", "search_file_content": "Grep", "grep": "Grep",
                     "web_fetch": "WebFetch", "google_web_search": "WebSearch",  # Gemini CLI
+                    "edit": "Edit", "grep_search": "Grep", "web_search": "WebSearch", "todo_write": "TodoWrite",  # Qwen Code
+                    "bash": "Bash", "read": "Read", "write": "Write", "webfetch": "WebFetch", "todowrite": "TodoWrite",
+                    "patch": "Edit",  # OpenCode
                     "shell": "Bash", "exec_command": "Bash", "local_shell": "Bash", "apply_patch": "Edit"}  # Codex
 
 
@@ -6897,12 +6975,12 @@ def tool_summary(client, data):
     program (and a well-known tool's subcommand), never their arguments or what was read or written."""
     name = str(data.get("tool_name") or "")
     args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
-    if name in OTHER_TOOL_NAMES:  # Gemini CLI's and Codex's own names for the same tools
+    if name in OTHER_TOOL_NAMES:  # Gemini CLI's, Qwen Code's, OpenCode's and Codex's own names for the same tools
         name = OTHER_TOOL_NAMES[name]
         command = args.get("command")
         if isinstance(command, list):  # Codex's ["bash", "-lc", "npm test"]: the script the shell runs
             command = command[2] if len(command) == 3 and command[1] in ("-c", "-lc") else " ".join(map(str, command))
-        args = dict(args, file_path=args.get("file_path") or args.get("absolute_path") or args.get("path"),
+        args = dict(args, file_path=args.get("file_path") or args.get("filePath") or args.get("absolute_path") or args.get("path"),
                     command=command)
     if client == "cursor" and not name:  # afterFileEdit sends a file, afterShellExecution a command
         if data.get("file_path"):
@@ -7953,6 +8031,15 @@ def disconnect_folder(project):
             edit(rel, drop)
         except SystemExit:  # not plain JSON: left as it is
             pass
+    plugin = project / OPENCODE_PLUGIN_FILE
+    try:
+        if plugin.read_text(encoding="utf-8").startswith(OPENCODE_PLUGIN_MARK):
+            plugin.unlink()
+            changed.append(OPENCODE_PLUGIN_FILE)
+            for folder in (plugin.parent, plugin.parent.parent):  # .opencode/plugins and .opencode, if now empty
+                folder.rmdir()
+    except OSError:
+        pass
     for name in (".crewchat-listen", ".crewchat-hooks"):
         try:
             (project / name).unlink()
