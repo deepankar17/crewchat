@@ -78,7 +78,7 @@ class Website(unittest.TestCase):
 
     def test_external_links_go_only_where_expected(self):
         hosts = {"github.com", "raw.githubusercontent.com", "pypi.org", "www.youtube.com", "docs.astral.sh",
-                 "crewchat-chat.web.app"}
+                 "crewchat.dev"}
         for path, page in self.pages.items():
             for link in page.links:
                 host = urlparse(link).hostname
