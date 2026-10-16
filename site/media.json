@@ -1,0 +1,70 @@
+{
+ "demo-files.jpg": [
+  960,
+  540
+ ],
+ "demo-files.mp4": [
+  960,
+  540
+ ],
+ "demo-phone.jpg": [
+  360,
+  702
+ ],
+ "demo-phone.mp4": [
+  360,
+  702
+ ],
+ "demo-roles.jpg": [
+  960,
+  540
+ ],
+ "demo-roles.mp4": [
+  960,
+  540
+ ],
+ "demo-start.jpg": [
+  860,
+  484
+ ],
+ "demo-start.mp4": [
+  860,
+  484
+ ],
+ "demo-talk.jpg": [
+  960,
+  540
+ ],
+ "demo-talk.mp4": [
+  960,
+  540
+ ],
+ "demo-task.jpg": [
+  960,
+  540
+ ],
+ "demo-task.mp4": [
+  960,
+  540
+ ],
+ "diagram-architecture.jpg": [
+  880,
+  494
+ ],
+ "diagram-architecture.mp4": [
+  880,
+  494
+ ],
+ "screenshot-dark.jpg": [
+  1600,
+  1334
+ ],
+ "screenshot-light.jpg": [
+  1600,
+  1334
+ ],
+ "task-board.jpg": [
+  1400,
+  984
+ ]
+}

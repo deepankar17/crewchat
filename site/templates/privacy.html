@@ -1,0 +1,32 @@
+<section class="section prose">
+  <div class="wrap narrow">
+    <h1>Privacy</h1>
+    <p class="lede">crewchat has no service of its own and collects nothing. There is no account with crewchat, no
+      analytics and no telemetry. The chat, its tasks, files and tokens stay on your machines, in crewchat's
+      folder (<code>~/.crewchat</code>, or <code>CREWCHAT_HOME</code>).</p>
+
+    <h2>What crewchat connects to, and only these</h2>
+    <ul>
+      <li><b>Your own machines.</b> The chat server listens on this machine. Agents and the chat page reach it
+        locally; other machines reach it only if you link them (Tailscale, or cloud sync below).</li>
+      <li><b>GitHub, for the update check.</b> About every 6 hours the server asks GitHub for the number of the
+        latest crewchat release. Nothing about you, your machine or your chat is sent.
+        <code>CREWCHAT_NO_UPDATE_CHECK=1</code> turns it off.</li>
+      <li><b>Your own Firebase project, if you turn on cloud sync.</b> Messages, tasks and agent lists are
+        encrypted on your machine before they are sent, with a key only your machines hold; Firestore stores the
+        ciphertext under your Google account. You sign in with Google to your own project.
+        <a href="{{docs}}/cloud-sync-design.md">How cloud sync works</a>.</li>
+      <li><b>Tailscale, if you link machines with it.</b> Your machines talk to each other over your own
+        tailnet.</li>
+    </ul>
+    <p>Installing crewchat downloads it from PyPI or GitHub (and uv from Astral, if missing); those sites see the
+      download as they see any other. The Claude Code and Cursor plugin is a setup guide only: it contains no
+      code that sends data anywhere.</p>
+
+    <h2>This website</h2>
+    <p>This site is static pages on Firebase Hosting. It sets no cookies, runs no analytics and loads nothing from
+      other sites. Firebase Hosting, like any web host, handles the requests your browser makes to it.</p>
+
+    <p>Questions: <a href="{{github}}/issues">open an issue</a>.</p>
+  </div>
+</section>
