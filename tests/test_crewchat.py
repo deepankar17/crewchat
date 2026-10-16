@@ -1374,6 +1374,86 @@ class Launching(Base):
         self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor", "codex", "gemini", "qwen", "opencode"])
         self.assertEqual(self.raw("/api/launch")[0], 401)
 
+    def test_new_agent_says_what_a_tool_still_needs(self):
+        home = Path(tempfile.mkdtemp(prefix="tool-home-", dir=TMP)).resolve()
+        folder = str(self.folder)
+        answers = {}  # what each tool's own status command says: (exit code, output)
+        ready = lambda tool, folder="": [(i["state"], i["text"], i["fix"]) for i in  # noqa: E731
+                                         crewchat.tool_readiness(tool, folder, fresh=True)]
+        with mock.patch.object(crewchat, "user_home", lambda: home), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(home / ".codex")}), \
+                mock.patch.object(crewchat, "status_of", lambda command: answers.get(command[1], (None, ""))):
+            for key in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
+                        "CLAUDE_CONFIG_DIR"):
+                os.environ.pop(key, None)
+            # Signed in, or not, as each tool's own status command says.
+            answers["auth"] = (0, '{"loggedIn": false, "authMethod": "none"}')
+            self.assertEqual(ready("claude")[0], ("todo", "Claude Code is not signed in", "claude, then /login"))
+            answers["auth"] = (0, 'warning\n{"loggedIn": true, "authMethod": "claude.ai"}')
+            self.assertEqual(ready("claude")[0][:2], ("ok", "Signed in"))
+            answers["status"] = (0, "Not logged in")
+            self.assertEqual(ready("cursor")[0], ("todo", "Cursor is not signed in", "cursor-agent login"))
+            answers["status"] = (0, "\u2713 Logged in as someone")
+            self.assertEqual(ready("cursor")[0][:2], ("ok", "Signed in"))
+            answers["login"] = (1, "Not logged in")
+            self.assertEqual(ready("codex")[0], ("todo", "Codex CLI is not signed in", "codex login"))
+            (home / ".codex").mkdir()
+            (home / ".codex" / "config.toml").write_text('model_provider = "ollama"\n')
+            self.assertEqual(ready("codex")[0][:2], ("ok", "Uses its own model provider (ollama)"))
+            answers["login"] = (0, "Logged in using an API key - ***")
+            self.assertEqual(ready("codex")[0][:2], ("ok", "Signed in with an API key"))
+            # Gemini CLI and Qwen Code: by their settings and credentials.
+            self.assertEqual(ready("gemini")[0][0], "todo")
+            (home / ".gemini").mkdir()
+            (home / ".gemini" / "settings.json").write_text('{"security": {"auth": {"selectedType": "oauth-personal"}}}')
+            self.assertEqual(ready("gemini")[0][:2], ("todo", "Gemini CLI is set to sign in, but has not yet"))
+            (home / ".gemini" / "oauth_creds.json").write_text("{}")
+            self.assertEqual(ready("gemini")[0][:2], ("ok", "Signed in with Google"))
+            (home / ".qwen").mkdir()
+            (home / ".qwen" / "settings.json").write_text('{"security": {"auth": {"selectedType": "openai"}}}')
+            self.assertEqual(ready("qwen")[0][0], "note")  # a key crewchat cannot see from here
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "x"}):
+                self.assertEqual(ready("qwen")[0][:2], ("ok", "Set up (openai)"))
+            answers["auth"] = (0, "\u2514  0 credentials")
+            self.assertEqual(ready("opencode")[0][0], "note")  # it has free models of its own
+            answers["auth"] = (0, "\u2514  \x1b[90m2\x1b[0m credentials")
+            self.assertEqual(ready("opencode")[0][:2], ("ok", "Signed in to 2 providers"))
+            # In the folder: what each asks once (trust, crewchat's hooks), and whether it already did.
+            answers["auth"] = (0, '{"loggedIn": true}')
+            self.assertEqual(ready("claude", folder)[1][0], "note")
+            (home / ".claude.json").write_text(json.dumps({"projects": {str(self.folder.parent): {"hasTrustDialogAccepted": True}}}))
+            self.assertEqual(ready("claude", folder)[1][:2], ("ok", "Trusts this folder"))  # a folder it is inside
+            crewchat.install_codex()
+            self.assertEqual([i[0] for i in ready("codex", folder)[1:]], ["note", "note"])
+            with open(home / ".codex" / "config.toml", "a") as f:
+                f.write('\n[projects.%s]\ntrust_level = "trusted"\n\n[hooks.state."%s:stop:0:0"]\ntrusted_hash = "h"\n'
+                        % (json.dumps(folder), crewchat.codex_config()))
+            self.assertEqual([i[:2] for i in ready("codex", folder)[1:]],
+                             [("ok", "Trusts this folder"), ("ok", "crewchat's hooks are approved")])
+            self.assertEqual([i[0] for i in ready("gemini", folder)[1:]], ["note", "note"])
+            (home / ".gemini" / "trustedFolders.json").write_text(json.dumps({folder + "/inside": "TRUST_PARENT"}))
+            (home / ".gemini" / "trusted_hooks.json").write_text(json.dumps(
+                {folder: ["crewchat-stop:" + crewchat.hook_command("gemini", "stop")]}))
+            self.assertEqual([i[0] for i in ready("gemini", folder)[1:]], ["ok", "ok"])
+            self.assertEqual(len(ready("qwen", folder)), 1)  # Qwen Code checks trust only when told to
+            self.assertEqual(ready("opencode", folder)[1][0], "note")  # its plugin not set up yet
+            (self.folder / ".opencode" / "node_modules").mkdir()
+            self.assertEqual(ready("opencode", folder)[1][:2], ("ok", "crewchat's plugin is set up"))
+            crewchat.uninstall_codex()
+            # Not installed: how to get it, and nothing else.
+            with mock.patch.object(crewchat, "find_tool", lambda tool, config: None):
+                self.assertEqual(ready("codex", folder), [("todo", "Codex CLI is not installed here", "npm install -g @openai/codex")])
+        # The page asks the server, for this project's folders only, and only as the owner.
+        opener, _ = self.owner_browser()
+        with mock.patch.object(crewchat, "tool_readiness", lambda tool, folder, config, fresh=False: [
+                {"state": "ok", "text": "%s in %s%s" % (tool, folder or "-", " again" if fresh else ""), "fix": ""}]):
+            out = json.loads(self.raw("/api/tool-check?tool=gemini&folder=" + urllib.parse.quote(folder), opener=opener)[1])
+            self.assertEqual(out["items"][0]["text"], "gemini in %s" % folder)
+            out = json.loads(self.raw("/api/tool-check?tool=gemini&fresh=1&folder=/etc", opener=opener)[1])
+            self.assertEqual(out["items"][0]["text"], "gemini in - again")  # not one of its folders: not looked at
+        self.assertEqual(self.raw("/api/tool-check?tool=vim", opener=opener)[0], 400)
+        self.assertEqual(self.raw("/api/tool-check?tool=claude")[0], 401)
+
     def test_a_launched_agent_gets_its_name_role_and_task(self):
         self.assertEqual(self.launch(name="docs-writer", role="docs", task="Write the settings guide"), {"ok": True})
         tool, folder, key, permissions = self.launched[-1]

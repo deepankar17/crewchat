@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **New agent says what a tool still needs.** Picking a tool shows whether it is installed, signed in
+  (Claude Code, Cursor, Codex and OpenCode by their own status commands; Gemini CLI and Qwen Code by
+  their settings), and what it asks once in the chosen folder (trust; Codex's and Gemini CLI's review of
+  crewchat's hooks; OpenCode's first setup of crewchat's plugin), with the command to run and **Check
+  again** (`/api/tool-check`, the owner's only, for the project's own folders).
 - **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
   chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
   and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on

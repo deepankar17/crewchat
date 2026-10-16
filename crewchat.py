@@ -4484,6 +4484,20 @@ class Handler(BaseHTTPRequestHandler):
             if not self._use_asked():
                 return
             self._json(200, launch_options(self.hub.machine_config(), self.roster.root, self.hub.chat_key))
+        elif url.path == "/api/tool-check":
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return
+            query = urllib.parse.parse_qs(url.query)
+            tool, folder = (query.get("tool") or [""])[0], (query.get("folder") or [""])[0]
+            if tool not in LAUNCH_TOOLS:
+                self._json(400, {"error": "no tool called %s" % tool[:40]})
+                return
+            config = self.hub.machine_config()
+            if folder not in [f["path"] for f in launch_folders(config, self.roster.root, self.hub.chat_key)]:
+                folder = ""  # only this project's folders on this machine
+            self._json(200, {"tool": tool, "folder": folder, "items": tool_readiness(
+                tool, folder, config, fresh=(query.get("fresh") or [""])[0] == "1")})
         elif url.path == "/api/commands":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -5285,6 +5299,189 @@ def launch_options(config, root=None, chat=""):
                            "models": tool_models(t) if exe else [], "advisors": tool_advisors(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
+
+
+# Is a tool ready for an agent (New agent says what is left to do)? Each check reads what the tool keeps
+# in the user's home, or asks the tool itself (its sign-in status command). Nothing is changed, and
+# nothing secret is read out: only whether it is there. "todo": to do before starting it; "note": what
+# it asks once in its window, or what crewchat cannot see from here; "ok": done.
+READY_EVERY = 60  # seconds a tool's sign-in answer is kept (the commands take a second or two)
+_READY = {}  # tool -> (when, its sign-in item)
+
+
+def json_file(path):
+    """A JSON file as a dict, or {} (missing, unreadable, not an object)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def ready_item(state, text, fix=""):
+    return {"state": state, "text": text, "fix": fix}
+
+
+def status_of(command):
+    """(exit code, what it printed) of a tool's own status command, or (None, "") if it did not run."""
+    try:
+        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return out.returncode, out.stdout + out.stderr
+
+
+def within(folder, parent):
+    """Is folder parent itself, or inside it?"""
+    try:
+        Path(folder).resolve().relative_to(Path(parent).expanduser().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def auth_settings(settings):
+    """The auth method Gemini CLI's or Qwen Code's settings choose ('' if none)."""
+    auth = ((settings.get("security") or {}).get("auth") or {}) if isinstance(settings.get("security"), dict) else {}
+    chosen = auth.get("selectedType") if isinstance(auth, dict) else None
+    return str(chosen or settings.get("selectedAuthType") or "")
+
+
+def signed_in(tool, exe, folder=""):
+    """Whether the tool can reach its model: signed in, or set up with a key or a provider."""
+    name = LAUNCH_TOOLS[tool][0]
+    if tool == "claude":
+        code, out = status_of([exe, "auth", "status"])
+        try:
+            status = json.loads(out[out.index("{"):])
+        except ValueError:
+            return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+        if status.get("loggedIn"):
+            return ready_item("ok", "Signed in")
+        return ready_item("todo", "%s is not signed in" % name, "claude, then /login")
+    if tool == "cursor":
+        code, out = status_of([exe, "status"])
+        if "not logged in" in out.lower():
+            command = Path(exe).stem if Path(exe).stem in ("cursor-agent", "agent") else "cursor-agent"
+            return ready_item("todo", "%s is not signed in" % name, "%s login" % command)
+        if "logged in" in out.lower():
+            return ready_item("ok", "Signed in")
+        return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+    if tool == "codex":
+        code, out = status_of([exe, "login", "status"])
+        if code == 0:
+            return ready_item("ok", "Signed in" + (" with an API key" if "api key" in out.lower() else ""))
+        try:
+            settings = codex_config().read_text(encoding="utf-8")
+        except OSError:
+            settings = ""
+        provider = re.search(r'^\s*model_provider\s*=\s*"([^"]+)"', settings.split("\n[", 1)[0], re.M)
+        if provider and provider.group(1) != "openai":
+            return ready_item("ok", "Uses its own model provider (%s)" % provider.group(1)[:40])
+        if code is None:
+            return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+        return ready_item("todo", "%s is not signed in" % name, "codex login")
+    if tool in ("gemini", "qwen"):
+        own = user_home() / (".gemini" if tool == "gemini" else ".qwen")
+        settings = [json_file(own / "settings.json")] + ([json_file(Path(folder) / MCP_FILES[tool][0])] if folder else [])
+        chosen = next((a for a in map(auth_settings, settings) if a), "")
+        keys = ("GEMINI_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA") if tool == "gemini" else ("OPENAI_API_KEY",)
+        try:
+            env_file = (own / ".env").read_text(encoding="utf-8")
+        except OSError:
+            env_file = ""
+        has_key = any(os.environ.get(k) or re.search(r"^\s*(export\s+)?%s\s*=" % k, env_file, re.M) for k in keys)
+        if chosen in ("oauth-personal", "qwen-oauth"):
+            if (own / "oauth_creds.json").is_file():
+                return ready_item("ok", "Signed in" + (" with Google" if tool == "gemini" else ""))
+            return ready_item("todo", "%s is set to sign in, but has not yet" % name, tool)
+        if chosen or has_key:
+            api_key = chosen in ("gemini-api-key", "openai") or (not chosen and has_key)
+            if api_key and not has_key and not any(isinstance(((s.get("security") or {}).get("auth") or {}).get("apiKey"), str)
+                                                    for s in settings if isinstance(s.get("security"), dict)):
+                return ready_item("note", "Set up to use an API key (%s): crewchat cannot see it from here, so make sure "
+                                          "the terminal it opens in has it" % keys[0])
+            return ready_item("ok", "Set up" + (" (%s)" % chosen if chosen else " with an API key"))
+        return ready_item("todo", "%s is not set up: open it once and choose how it signs in" % name, tool)
+    if tool == "opencode":
+        code, out = status_of([exe, "auth", "list"])
+        found = re.search(r"(\d+)\s+credentials?", re.sub(r"\x1b\[[0-9;]*m", "", out))
+        if found and int(found.group(1)) > 0:
+            return ready_item("ok", "Signed in to %s provider%s" % (found.group(1), "" if found.group(1) == "1" else "s"))
+        return ready_item("note", "No provider signed in: OpenCode can use its own free models, or sign in to one",
+                          "opencode auth login")
+    return ready_item("note", "crewchat cannot check %s" % name)
+
+
+def folder_ready(tool, folder):
+    """What the tool asks once in this folder (trust, crewchat's hooks), and whether it already has."""
+    home_dir, items = user_home(), []
+    if tool == "claude":
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        projects = json_file(Path(config_dir) / ".claude.json" if config_dir else home_dir / ".claude.json").get("projects") or {}
+        trusted = isinstance(projects, dict) and any(isinstance(v, dict) and v.get("hasTrustDialogAccepted")
+                                                     and within(folder, k) for k, v in projects.items())
+        items.append(ready_item("ok", "Trusts this folder") if trusted else
+                     ready_item("note", "Asks once whether you trust this folder: answer in its window"))
+    elif tool == "codex":
+        try:
+            settings = codex_config().read_text(encoding="utf-8")
+        except OSError:
+            settings = ""
+        trusted = False
+        for header, body in re.findall(r'^\[projects\.("(?:[^"\\]|\\.)*")\]\s*$(.*?)(?=^\[|\Z)', settings, re.M | re.S):
+            try:
+                path = json.loads(header)
+            except ValueError:
+                continue
+            if within(folder, path) and re.search(r'^\s*trust_level\s*=\s*"trusted"', body, re.M):
+                trusted = True
+        items.append(ready_item("ok", "Trusts this folder") if trusted else
+                     ready_item("note", "Asks once whether you trust this folder: answer in its window"))
+        if CODEX_BEGIN in settings:
+            reviewed = re.search(r'^\[hooks\.state\."[^"]*:stop:\d+:\d+"\]', settings, re.M)
+            items.append(ready_item("ok", "crewchat's hooks are approved") if reviewed else ready_item(
+                "note", "Asks once to review crewchat's hooks: choose Trust all and continue, or messages "
+                        "wait until it checks hub_inbox"))
+    elif tool in ("gemini", "qwen"):
+        own = home_dir / (".gemini" if tool == "gemini" else ".qwen")
+        settings = json_file(own / "settings.json")
+        trust_setting = ((settings.get("security") or {}).get("folderTrust") or {}) if isinstance(settings.get("security"), dict) else {}
+        enabled = trust_setting.get("enabled") if isinstance(trust_setting, dict) else None
+        if enabled is True or (enabled is None and tool == "gemini"):  # Gemini CLI checks by default
+            levels = json_file(own / "trustedFolders.json")
+            trusted = any(within(folder, path if level == "TRUST_FOLDER" else str(Path(path).parent))
+                          for path, level in levels.items() if level in ("TRUST_FOLDER", "TRUST_PARENT"))
+            if levels.get(str(Path(folder))) == "DO_NOT_TRUST":
+                trusted = False
+            items.append(ready_item("ok", "Trusts this folder") if trusted else
+                         ready_item("note", "Asks once whether you trust this folder: answer in its window, or its "
+                                            "hooks and crewchat's settings there are skipped"))
+        if tool == "gemini":
+            approved = json_file(own / "trusted_hooks.json").get(str(Path(folder)))
+            ours = "crewchat-stop:" + hook_command("gemini", "stop")
+            items.append(ready_item("ok", "crewchat's hooks are approved") if isinstance(approved, list) and ours in approved
+                         else ready_item("note", "Asks once to trust crewchat's hooks in this folder: answer in its window"))
+    elif tool == "opencode":
+        if (Path(folder) / OPENCODE_PLUGIN_FILE).is_file():
+            set_up = (Path(folder) / ".opencode" / "node_modules").is_dir()
+            items.append(ready_item("ok", "crewchat's plugin is set up") if set_up else ready_item(
+                "note", "Sets up crewchat's plugin the first time it opens here; if that first session gets no "
+                        "messages, close it and Reopen it"))
+    return items
+
+
+def tool_readiness(tool, folder="", config=None, fresh=False):
+    """What is left before an agent of this tool can work, on this machine and in folder (one of this
+    project's): installed, signed in, and what it asks once in the folder."""
+    exe = find_tool(tool, config or {})
+    if not exe:
+        return [ready_item("todo", "%s is not installed here" % LAUNCH_TOOLS[tool][0], TOOL_HINTS[tool].split(": ", 1)[-1])]
+    kept = _READY.get(tool)
+    if fresh or not kept or time.time() - kept[0] > READY_EVERY or kept[2] != folder:
+        kept = (time.time(), signed_in(tool, exe, folder), folder)
+        _READY[tool] = kept
+    return [kept[1]] + (folder_ready(tool, folder) if folder else [])
 
 
 def tool_options(tool, permissions="ask", base=None, model="", advisor=""):
@@ -10135,6 +10332,16 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 .inline { display: flex; gap: 10px; align-items: center; }
 .swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; background: var(--sw, var(--off)); }
 #l-perms-note.warn { color: var(--err); }
+.ready { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 8px 12px;
+  font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.ready .head { font-weight: 650; }
+.ready .item { display: flex; gap: 8px; align-items: baseline; }
+.ready .mark { flex: none; width: 1.1em; text-align: center; font-weight: 700; }
+.ready .ok .mark { color: var(--ok); } .ready .todo .mark { color: var(--err); } .ready .note .mark { color: var(--warn); }
+.ready .fix { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
+.ready .fix code { overflow-wrap: anywhere; }
+.ready button { padding: 3px 10px; font-size: 12.5px; }
+.ready .again { align-self: flex-start; }
 #l-dice { padding: 6px 12px; font-size: 16px; flex: none; }
 #launch-note, #rules-note, #project-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
 #rules-input { min-height: 180px; }
@@ -10340,6 +10547,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       </fieldset>
       <fieldset class="step" hidden>
         <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
+        <div id="l-ready" class="ready" role="status" aria-live="polite" hidden></div>
         <label for="l-model">Model</label><select id="l-model"></select>
         <label for="l-advisor">Advisor</label><select id="l-advisor"></select>
         <p class="meta" id="l-advisor-note" hidden>A stronger model it consults on its own at decision points; it reads the whole conversation and uses more tokens. For a chat-wide advisor everyone sees, give an agent the advisor role.</p>
@@ -10989,6 +11197,7 @@ function showStep(n) {
   $("l-back").hidden = n === 0;
   $("l-next").hidden = n === 3;
   $("l-start").hidden = n !== 3;
+  if (n === 2) checkTool();  // the tool, for the folder just chosen
   const first = document.querySelectorAll("#launch .step")[n].querySelector("select, input, textarea");
   if (first && $("launch").open) first.focus();
 }
@@ -11135,6 +11344,46 @@ async function browse(path) {
   box.replaceChildren(crumbs, dirs, make);
   if (keep) (dirs.querySelector("button") || crumbs.querySelector("button")).focus();  // focus stays in the list
 }
+// What the chosen tool still needs, on this machine and in the chosen folder: installed, signed in, and
+// what it asks once there (trust, crewchat's hooks). Checked when the Tool step shows or the tool changes.
+let readySeq = 0;
+async function checkTool(fresh) {
+  const box = $("l-ready"), tool = launchTools.find((t) => t.id === $("l-tool").value), seq = ++readySeq;
+  if (!tool || tool.missing) { box.hidden = true; return; }
+  box.hidden = false;
+  box.replaceChildren(el("div", "meta", "Checking " + tool.label + "…"));
+  let out;
+  try {
+    out = await request("/api/tool-check?tool=" + encodeURIComponent(tool.id) + "&folder=" +
+                        encodeURIComponent($("l-folder").value) + (fresh ? "&fresh=1" : ""));
+  } catch (err) {
+    if (seq === readySeq) box.replaceChildren(el("div", "meta", "Could not check " + tool.label + ": " + err.message));
+    return;
+  }
+  if (seq !== readySeq) return;  // another tool was picked meanwhile
+  const rows = out.items.map((item) => {
+    const row = el("div", "item " + item.state), body = el("div");
+    const mark = el("span", "mark", item.state === "ok" ? "✓" : item.state === "todo" ? "!" : "i");
+    mark.setAttribute("aria-hidden", "true");
+    body.append(el("span", "", item.text));
+    if (item.fix) {
+      const fix = el("div", "fix"), copy = el("button", "secondary", "Copy");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(item.fix); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
+      });
+      fix.append(el("span", "meta", "In a terminal:"), el("code", "", item.fix), copy);
+      body.append(fix);
+    }
+    row.append(mark, body);
+    return row;
+  });
+  const todo = out.items.some((i) => i.state === "todo"), notes = out.items.some((i) => i.state === "note");
+  const again = el("button", "secondary again", "Check again");
+  again.type = "button";
+  again.addEventListener("click", () => checkTool(true));
+  box.replaceChildren(el("div", "head", todo ? "Before it can work" : notes ? "Ready, with a note" : "Ready"), ...rows, again);
+}
 // The chosen tool: its colour, its models, and what it may do without asking.
 function showTool() {
   const tool = launchTools.find((t) => t.id === $("l-tool").value);
@@ -11147,6 +11396,7 @@ function showTool() {
   $("l-advisor").replaceChildren(new Option("None", ""), ...advisors.map(([id, label]) => new Option(label, id)));
   $("l-advisor").disabled = !advisors.length;
   $("l-advisor-note").hidden = true;
+  if (launchStep === 2) checkTool();
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
   showPermissions();

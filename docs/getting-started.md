@@ -176,6 +176,13 @@ window in its folder and checks in as the same agent, with its name, role, pictu
 path (`~/code/my-app`), or **Browse…** the folders on the host and make a **New folder** there, and
 **Connect** runs `crewchat start` in it for you (a folder that is not there yet: **Create it and connect**).
 
+When you pick its tool, New agent says what that tool still needs on this machine: whether it is
+installed, signed in (or set up with an API key or a model provider of its own), and what it asks
+once in that folder: whether you trust it, and, for Codex and Gemini CLI, crewchat's hooks. A step
+you must take first comes with the command to run in a terminal (**Copy**); **Check again** when it
+is done. crewchat only reads whether these are there (it asks each tool's own status command where
+there is one) and never changes them.
+
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 
 ## 4. Talk to them
