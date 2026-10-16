@@ -3,6 +3,18 @@
 (function () {
   "use strict";
 
+  // Firebase's own addresses (crewchat-chat.web.app) forward to the site's, as the canonical link names
+  // it; a preview channel (crewchat-chat--preview-xyz.web.app) stays where it is.
+  var canonical = document.querySelector('link[rel="canonical"]');
+  var host = location.hostname;
+  if (canonical && host.indexOf("--") === -1 && /(^|\.)(web\.app|firebaseapp\.com)$/.test(host)) {
+    var to = new URL(canonical.href);
+    if (to.hostname !== host) {
+      location.replace(to.origin + location.pathname + location.search + location.hash);
+      return;
+    }
+  }
+
   document.querySelectorAll(".code .copy").forEach(function (button) {
     if (!navigator.clipboard) return;
     button.hidden = false;

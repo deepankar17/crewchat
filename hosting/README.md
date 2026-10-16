@@ -1,7 +1,17 @@
 # crewchat's website (Firebase Hosting)
 
-The public site, https://crewchat-chat.web.app: the Hosting site `crewchat-chat` in the Firebase
-project `crewchat-ae908` (`.firebaserc`, `firebase.json`). The name `crewchat` was taken on Firebase.
+The public site, https://crewchat.dev: the Hosting site `crewchat-chat` in the Firebase project
+`crewchat-ae908` (`.firebaserc`, `firebase.json`), also at https://crewchat-chat.web.app.
+
+The domain is registered with Cloudflare, whose DNS points it at Firebase as PhonIQ's is, every record
+"DNS only" (not proxied, so Firebase can issue its certificate):
+
+| Record | Name | Value |
+|--------|------|-------|
+| A | `crewchat.dev` | `199.36.158.100` (Firebase Hosting) |
+| TXT | `crewchat.dev` | `hosting-site=crewchat-chat` (Firebase's ownership check) |
+| CNAME | `www` | `crewchat-chat.web.app` (Firebase redirects `www.crewchat.dev` to `crewchat.dev`) |
+| MX, SPF, DKIM | | Cloudflare Email Routing, managed by Cloudflare |
 
 ## Pages
 
