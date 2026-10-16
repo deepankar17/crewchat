@@ -1028,6 +1028,15 @@ class Activity(Base):
                          "Editing Login.kt")
         self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": ["a", "b"]}}), "Reading")
         self.assertEqual(say("cursor", {"tool_name": "hub_send"}), "")
+        # Gemini CLI's and Codex's own tool names and arguments.
+        self.assertEqual(say("gemini", {"tool_name": "replace", "tool_input": {"file_path": "/x/Login.kt"}}), "Editing Login.kt")
+        self.assertEqual(say("gemini", {"tool_name": "read_file", "tool_input": {"absolute_path": "/x/.env"}}), "Reading .env")
+        self.assertEqual(say("gemini", {"tool_name": "run_shell_command", "tool_input": {"command": "npm test --x=1"}}),
+                         "Running npm test")
+        self.assertEqual(say("codex", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "pytest -q x"]}}),
+                         "Running pytest")
+        self.assertEqual(say("codex", {"tool_name": "exec_command", "tool_input": {"command": ["git", "status"]}}),
+                         "Running git status")
         self.assertEqual(say("cursor", {"tool_name": "browser_navigate", "command": "npx @playwright/mcp"}), "Using browser_navigate")
         for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
             for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
@@ -1680,6 +1689,60 @@ class Launching(Base):
             self.assertFalse(crewchat.install_codex())  # a server the user set up is theirs
             self.assertEqual(path.read_text(), theirs)
         path.unlink()
+
+    def test_codex_runs_crewchats_hooks_and_keeps_its_review_of_them(self):
+        path = crewchat.codex_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        self.assertTrue(crewchat.install_codex())
+        text = path.read_text()
+        for event in ("UserPromptSubmit", "Stop", "PostToolUse"):
+            self.assertEqual(text.count("[[hooks.%s]]" % event), 1, event)
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            stop = tomllib.loads(text)["hooks"]["Stop"][0]["hooks"][0]
+            self.assertEqual(stop, {"type": "command", "command": crewchat.hook_command("codex", "stop"),
+                                    "timeout": crewchat.MAX_LISTEN + 100})
+        # Codex keeps the owner's review of the hooks in our block; a newer copy keeps it too.
+        state = '[hooks.state."crewchat:stop"]\ntrusted_hash = "abc"\n'
+        path.write_text(text.replace(crewchat.CODEX_END, state + crewchat.CODEX_END))
+        with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+            self.assertTrue(crewchat.install_codex())
+            self.assertFalse(crewchat.install_codex())
+        self.assertEqual(path.read_text().count(state), 1)
+        self.assertEqual(path.read_text().count(crewchat.CODEX_END), 1)
+        if tomllib:
+            self.assertEqual(tomllib.loads(path.read_text())["hooks"]["state"], {"crewchat:stop": {"trusted_hash": "abc"}})
+        self.assertTrue(crewchat.uninstall_codex())
+        self.assertEqual(path.read_text(), state)
+        # The user's own hooks written inline: a table of ours could not join them, so the server only.
+        theirs = '[hooks]\nStop = [{ hooks = [{ type = "command", command = "mine" }] }]\n'
+        path.write_text(theirs)
+        self.assertTrue(crewchat.install_codex())
+        self.assertNotIn("[[hooks.", path.read_text())
+        self.assertIn("[mcp_servers.crewchat]", path.read_text())
+        path.unlink()
+
+    def test_gemini_settings_get_crewchats_hooks_beside_the_users(self):
+        folder = Path(tempfile.mkdtemp(prefix="gemini-hooks-", dir=TMP)).resolve()
+        mine = {"matcher": "write_file", "hooks": [{"type": "command", "command": "echo mine"}]}
+        (folder / ".gemini").mkdir()
+        (folder / ".gemini" / "settings.json").write_text(json.dumps({"hooks": {"AfterTool": [mine]}}))
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "gemini")
+        settings = json.loads((folder / ".gemini" / "settings.json").read_text())
+        ours = lambda s: {event: [h for g in groups for h in g["hooks"] if crewchat.is_our_hook(h["command"])]  # noqa: E731
+                          for event, groups in s["hooks"].items()}
+        self.assertEqual({e: [h["name"] for h in hs] for e, hs in ours(settings).items()},
+                         {"BeforeAgent": ["crewchat-prompt"], "AfterAgent": ["crewchat-stop"], "AfterTool": ["crewchat-tool"]})
+        self.assertEqual(ours(settings)["AfterAgent"][0]["timeout"], (crewchat.MAX_LISTEN + 100) * 1000)  # milliseconds
+        self.assertEqual(settings["hooks"]["AfterTool"][0], mine)
+        crewchat.set_gemini_hooks(settings)  # again: replaced, not added
+        self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 3)
+        crewchat.disconnect_folder(folder)
+        self.assertEqual(json.loads((folder / ".gemini" / "settings.json").read_text()), {"hooks": {"AfterTool": [mine]}})
 
     def test_how_the_other_tools_are_started(self):
         prompt = crewchat.LAUNCH_PROMPT % "start-k"
@@ -2824,6 +2887,14 @@ class Hooks(Base):
             self.assertFalse(crewchat.SESSION_RE.fullmatch("abcdefgh\n"))
             cursor = {10: (9, "a", "sh -c hook"), 9: (1, "b", "/Users/x/.local/bin/cursor-agent --trust")}
             self.assertEqual(crewchat.agent_process("cursor", cursor), {"pid": 9, "started": "b", "app": "terminal"})
+            for client, command in (("codex", "/usr/local/lib/node_modules/@openai/codex/vendor/x/codex/codex resume"),
+                                    ("codex", "node /usr/local/bin/codex"),
+                                    ("gemini", "node /usr/local/bin/gemini -i hello"),
+                                    ("gemini", "node /opt/homebrew/lib/node_modules/@google/gemini-cli/dist/index.js")):
+                table = {10: (9, "a", "sh -c hook"), 9: (1, "b", command)}
+                self.assertEqual(crewchat.agent_process(client, table)["pid"], 9, command)
+                self.assertIsNone(crewchat.agent_process("cursor" if client == "codex" else "codex", table))
+            self.assertIsNone(crewchat.agent_process("opencode", table))  # a tool it cannot tell: no report
 
     def test_listening_set_on_the_chat_page_wins_over_the_folder(self):
         session, name = self.linked("page-listen")
@@ -2852,6 +2923,24 @@ class Hooks(Base):
         self.hub.agents[name]["seen"] = 0
         self.hook("cursor", "tool", {"conversation_id": "first-turn"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)  # no stop hook ran yet
+
+    def test_codex_and_gemini_get_messages_as_their_hooks_expect(self):
+        folder = Path(tempfile.mkdtemp(prefix="other-hooks-", dir=TMP))
+        crewchat.install_claude(folder, self.base, self.token)  # Codex's chat: the folder's .mcp.json
+        crewchat.install_mcp_settings(folder, self.base, self.token, "gemini")
+        for client, prompt_event in (("codex", "UserPromptSubmit"), ("gemini", "BeforeAgent")):
+            conversation = "other-%s-0001" % client
+            asked = json.loads(self.hook(client, "prompt", {"session_id": conversation}, project=folder))
+            self.assertEqual(asked["hookSpecificOutput"]["hookEventName"], prompt_event)  # strict JSON, or ignored
+            key = re.search(r'key "([^"]+)"', asked["hookSpecificOutput"]["additionalContext"]).group(1)
+            session = Session(self.base, self.token, client)
+            session.call("hub_link", key=key)
+            self.say(session.me, "hello %s" % client)
+            told = json.loads(self.hook(client, "stop", {"session_id": conversation}, project=folder))
+            self.assertEqual(told["decision"], "block")  # the reason starts the next turn
+            self.assertIn("hello %s" % client, told["reason"])
+            self.assertEqual(self.hook(client, "stop", {"session_id": conversation}, project=folder), "")  # nothing new
+            self.assertEqual(self.hook(client, "stop", {"session_id": "other-never-linked"}, project=folder), "")
 
     def test_upgrading_adds_new_hooks_and_keeps_the_users_own(self):
         folder = Path(tempfile.mkdtemp(prefix="old-hooks-", dir=TMP))

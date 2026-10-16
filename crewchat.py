@@ -5171,7 +5171,7 @@ def joined_place(project, config=None, root=None):
 # Agents launched from the chat page ---------------------------------------------------------
 LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent"), "codex": ("Codex CLI", "codex"),
                 "gemini": ("Gemini CLI", "gemini"), "qwen": ("Qwen Code", "qwen"), "opencode": ("OpenCode", "opencode")}
-MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings alone, no hooks
+MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings (Codex and Gemini: hooks too)
 PROMPT_OPTION = {"gemini": ["-i"], "qwen": ["-i"], "opencode": ["--prompt"]}  # else the prompt is the last argument
 # Options every agent started from the chat page gets: Cursor's agent is not stopped by the folder's
 # trust prompt (crewchat's MCP server alone is approved before it starts, see launch_agent).
@@ -6036,8 +6036,8 @@ def cmd_status(_args):
 # Agent-side commands: join a chat, and the hooks that check it
 # --------------------------------------------------------------------------------------------
 CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}  # the tools crewchat's hooks run in
-# Tools that join by their MCP settings alone (no hooks: their agents check hub_inbox, as crewchat's
-# instructions say): the folder's file and the key of the server's address in it. Codex keeps its
+# Tools that join by their MCP settings (Gemini CLI's hooks are in them too; Qwen Code and OpenCode have
+# none: their agents check hub_inbox, as crewchat's instructions say): the folder's file and the key of the server's address in it. Codex keeps its
 # servers in the user's own config instead (install_codex), so a Codex folder's chat is its .mcp.json.
 # For each: the file, the key its servers are under, the key of a server's address, and what else
 # crewchat's entry says (Gemini CLI and Qwen Code trust its tools, as Claude Code and Cursor do).
@@ -6129,8 +6129,18 @@ def hook_command(client, event):
     return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
+HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini")  # the tools whose hooks hand the chat's messages over
+# The file whose presence marks a connected folder, for a tool's hooks (Codex's chat is its .mcp.json).
+HOOK_MARKERS = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json", "codex": ".mcp.json",
+                "gemini": ".gemini/settings.json"}
+# Tools whose hooks work as Claude Code's: a prompt hook adds context, a stop hook answers
+# {"decision": "block", "reason": ...} to go on with the chat's messages (Cursor: followup_message).
+BLOCK_CLIENTS = ("claude", "codex", "gemini")
+PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent"}  # their prompt hooks answer in JSON
+
+
 def is_our_hook(command):
-    return " hook claude " in command or " hook cursor " in command
+    return any(" hook %s " % client in command for client in HOOK_CLIENTS)
 
 
 def write_mcp_json(project, url, token):
@@ -6318,6 +6328,21 @@ def set_claude_hooks(settings, names=(SERVER_NAME,)):
         hooks[event] = groups
 
 
+def set_gemini_hooks(settings):
+    """crewchat's hooks in Gemini CLI's settings (the folder's .gemini/settings.json), replacing its own
+    older ones and keeping the user's. Timeouts in milliseconds. Gemini CLI asks once to trust them."""
+    hooks = settings.setdefault("hooks", {})
+    for event, name, timeout in (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100),
+                                 ("AfterTool", "tool", 10)):
+        groups = [g for g in hooks.get(event, [])
+                  if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
+        group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command("gemini", name),
+                            "timeout": timeout * 1000}]}
+        if event == "AfterTool":
+            group["matcher"] = ".*"
+        hooks[event] = groups + [group]
+
+
 def install_cursor(project, url, token):
     config = read_json(project / ".cursor" / "mcp.json")
     config.setdefault("mcpServers", {})[SERVER_NAME] = {
@@ -6349,6 +6374,8 @@ def install_mcp_settings(project, url, token, client):
         return []
     data.setdefault(servers, {})[SERVER_NAME] = dict({key: url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}},
                                                      **extra)
+    if client == "gemini":
+        set_gemini_hooks(data)  # messages at the end of each turn, as Claude Code gets them
     write_json(path, data, private=True)
     return [rel]
 
@@ -6359,6 +6386,7 @@ def codex_config():
 
 
 CODEX_BEGIN, CODEX_END = "# crewchat: begin (`crewchat uninstall` takes this out)", "# crewchat: end"
+CODEX_STATE = re.compile(r"^\[hooks\.state\b.*?(?=^\[|^#|\Z)", re.M | re.S)  # Codex's record of approved hooks
 CODEX_BLOCK = re.compile(r"\n?%s\n.*?%s\n?" % (re.escape(CODEX_BEGIN), re.escape(CODEX_END)), re.S)
 # A crewchat server the user set up themselves, in any of TOML's ways ([mcp_servers.crewchat],
 # [mcp_servers."crewchat"], mcp_servers.crewchat.command = ..., crewchat = {...} under [mcp_servers]),
@@ -6377,13 +6405,25 @@ def install_codex():
         text = ""
     string = lambda v: json.dumps(v, ensure_ascii=False)  # noqa: E731  (a TOML basic string, as JSON writes one)
     command = run_command()
-    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s\n" % (
+    outside = CODEX_BLOCK.sub("\n", text)
+    # Its hooks too (messages at the end of each turn), unless the user's own hooks are written in a
+    # way a table of ours can't join (hooks = {...}, Stop = [...]). Codex asks once to review them.
+    hooks = "" if re.search(r"^\s*hooks\s*=|^\s*(Stop|UserPromptSubmit|PostToolUse)\s*=", outside, re.M) else "".join(
+        "[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\ntimeout = %d\n" % (
+            event, event, string(hook_command("codex", name)), timeout)
+        for event, name, timeout in (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100),
+                                     ("PostToolUse", "tool", 10)))
+    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s%s\n" % (
         CODEX_BEGIN, SERVER_NAME, string(command[0]),
-        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), CODEX_END)
-    if CODEX_THEIRS.search(CODEX_BLOCK.sub("\n", text)):
+        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), hooks, CODEX_END)
+    if CODEX_THEIRS.search(outside):
         return False  # the user's own crewchat, or servers written inline: not ours to change
-    if CODEX_BLOCK.search(text):
-        new = CODEX_BLOCK.sub(lambda m: ("\n" if m.group(0).startswith("\n") else "") + block, text, count=1)
+    old = CODEX_BLOCK.search(text)
+    if old and old.group(0).strip("\n") == block.strip("\n"):
+        return False  # as it should be (rewriting it could drop what Codex wrote in it)
+    if old:
+        kept = "".join(m.group(0).rstrip("\n") + "\n" for m in CODEX_STATE.finditer(old.group(0)))
+        new = CODEX_BLOCK.sub(lambda m: ("\n" if m.group(0).startswith("\n") else "") + block + kept, text, count=1)
     else:
         new = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
     if new == text:
@@ -6400,7 +6440,9 @@ def uninstall_codex():
         text = path.read_text(encoding="utf-8")
     except OSError:
         return False
-    new = CODEX_BLOCK.sub("\n", text, count=1)
+    old = CODEX_BLOCK.search(text)
+    kept = "".join(m.group(0).rstrip("\n") + "\n" for m in CODEX_STATE.finditer(old.group(0))) if old else ""
+    new = CODEX_BLOCK.sub(lambda m: "\n" + kept, text, count=1)  # Codex's own records stay its
     if new == text:
         return False
     path.write_text(new.strip("\n") + ("\n" if new.strip() else ""), encoding="utf-8")
@@ -6482,6 +6524,11 @@ def update_hooks(folder):
     if ".cursor/hooks.json" in ours and not tracked_by_git(folder, ".cursor/cli.json") and allow_cursor_tools(folder):
         git_exclude(folder, [".cursor/cli.json"])  # as when the folder joined
         changed.append(".cursor/cli.json")
+    # Gemini CLI: its settings hold crewchat's server, so its hooks belong there too (also for a folder
+    # connected before crewchat had them).
+    rel = ".gemini/settings.json"
+    if connection_entry(folder, "gemini") and not tracked_by_git(folder, rel) and edit_json(folder / rel, set_gemini_hooks):
+        changed.append(rel)
     return changed
 
 
@@ -6567,8 +6614,9 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
 
 def find_project(client):
     """The project folder a hook runs for: the one holding this client's connection file."""
-    marker = CLIENT_FILES[client]
-    starts = [os.environ.get("CREWCHAT_PROJECT"), os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()]
+    marker = HOOK_MARKERS[client]
+    starts = [os.environ.get("CREWCHAT_PROJECT"), os.environ.get("CLAUDE_PROJECT_DIR"),
+              os.environ.get("GEMINI_PROJECT_DIR"), os.getcwd()]
     for start in starts:
         if not start:
             continue
@@ -6581,7 +6629,7 @@ def find_project(client):
 
 def client_config(project, client):
     """(server address, place token) from the project's connection file, or None."""
-    entry = connection_entry(project, client)
+    entry = connection_entry(project, "claude" if client == "codex" else client)  # Codex's chat: the .mcp.json
     return entry and ((entry[0][:-4] if entry[0].endswith("/mcp") else entry[0]), entry[1])
 
 
@@ -6691,7 +6739,9 @@ def claim_launch_key(folder, key, session):
 SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
 AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a quoted path, or npm's node + cli.js)
     "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
-    "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)')}
+    "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)'),
+    "codex": re.compile(r'(^|[/\\])codex(\.exe|\.js)?"?(\s|$)'),  # its native program, or npm's codex.js
+    "gemini": re.compile(r'(^|[/\\])gemini(\.exe|\.js)?"?(\s|$)|[/\\]gemini-cli[/\\]')}
 
 
 def process_table(pids=None):
@@ -6760,13 +6810,16 @@ def agent_process(client, table=None):
     ("claude-app" under the Claude desktop app, else "terminal"), or None."""
     if os.environ.get("CREWCHAT_TEST_PROCESS"):  # tests: hooks run as subprocesses of the test
         return json.loads(os.environ["CREWCHAT_TEST_PROCESS"])
+    command_of_agent = AGENT_COMMAND.get(client)
+    if command_of_agent is None:
+        return None  # a tool crewchat cannot tell by its command line
     table = process_table() if table is None else table
     pid, found, app = os.getppid(), None, "terminal"
     for _ in range(16):
         if pid not in table:
             break
         parent, started, command = table[pid]
-        if found is None and AGENT_COMMAND[client].search(command):
+        if found is None and command_of_agent.search(command):
             found = {"pid": pid, "started": started}
         if "/Claude.app/" in command or "\\AnthropicClaude\\" in command:
             app = "claude-app"
@@ -6829,6 +6882,12 @@ TOOL_WORDS = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Wri
               "TodoWrite": "Planning"}
 
 
+OTHER_TOOL_NAMES = {"read_file": "Read", "read_many_files": "Read", "write_file": "Write", "replace": "Edit",
+                    "run_shell_command": "Bash", "glob": "Glob", "search_file_content": "Grep", "grep": "Grep",
+                    "web_fetch": "WebFetch", "google_web_search": "WebSearch",  # Gemini CLI
+                    "shell": "Bash", "exec_command": "Bash", "local_shell": "Bash", "apply_patch": "Edit"}  # Codex
+
+
 def clean_doing(value):
     return " ".join(str(value or "").split())[:80]
 
@@ -6838,6 +6897,13 @@ def tool_summary(client, data):
     program (and a well-known tool's subcommand), never their arguments or what was read or written."""
     name = str(data.get("tool_name") or "")
     args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    if name in OTHER_TOOL_NAMES:  # Gemini CLI's and Codex's own names for the same tools
+        name = OTHER_TOOL_NAMES[name]
+        command = args.get("command")
+        if isinstance(command, list):  # Codex's ["bash", "-lc", "npm test"]: the script the shell runs
+            command = command[2] if len(command) == 3 and command[1] in ("-c", "-lc") else " ".join(map(str, command))
+        args = dict(args, file_path=args.get("file_path") or args.get("absolute_path") or args.get("path"),
+                    command=command)
     if client == "cursor" and not name:  # afterFileEdit sends a file, afterShellExecution a command
         if data.get("file_path"):
             name, args = "Edit", {"file_path": data["file_path"]}
@@ -6954,12 +7020,12 @@ def run_hook(client, event):
                 return
             ignored += 1
             save(0, pending, 1)
-            if client == "claude":
-                print(HOOK_LINK % key)
+            if client in BLOCK_CLIENTS:
+                prompt_context(client, HOOK_LINK % key)
             return
         save(0, last, 0)
-        if text and client == "claude":
-            print("crewchat: new messages arrived since your last turn.\n\n" + text)
+        if text and client in BLOCK_CLIENTS:
+            prompt_context(client, "crewchat: new messages arrived since your last turn.\n\n" + text)
         return
 
     # stop: the agent finished a turn.
@@ -6974,7 +7040,7 @@ def run_hook(client, event):
         # Code is asked at its user's prompt instead; here only a session that was linked and must
         # link again (it may be listening, with no prompt to come), and Cursor, which has no
         # prompt hook.
-        if capped or asks >= MAX_LINK_ASKS or (client == "claude" and kind == "link"):
+        if capped or asks >= MAX_LINK_ASKS or (client in BLOCK_CLIENTS and kind == "link"):
             return
         save(chain + 1, pending, asks + 1)
         text = HOOK_LINK % key
@@ -6989,10 +7055,19 @@ def run_hook(client, event):
     else:
         save(1 if from_owner else chain + 1, last, 0)
         text = HOOK_REASON % text
-    if client == "claude":
+    if client in BLOCK_CLIENTS:
         print(json.dumps({"decision": "block", "reason": text}))
     else:
         print(json.dumps({"followup_message": text}))
+
+
+def prompt_context(client, text):
+    """Text a prompt hook adds to the user's prompt: Claude Code takes it as printed, Codex and Gemini
+    CLI as JSON (Codex refuses any other output)."""
+    if client in PROMPT_EVENT:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": PROMPT_EVENT[client], "additionalContext": text}}))
+    else:
+        print(text)
 
 
 def cmd_hook(args):
@@ -7833,7 +7908,10 @@ def disconnect_folder(project):
             data["enabledMcpjsonServers"] = enabled
         else:
             data.pop("enabledMcpjsonServers", None)
-        hooks = data.get("hooks") or {}
+        grouped_hooks(data)
+
+    def grouped_hooks(data):  # Claude Code's and Gemini CLI's: {event: [{"hooks": [...]}]}
+        hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
         for event in list(hooks):
             groups = []
             for group in hooks[event]:
@@ -7869,6 +7947,8 @@ def disconnect_folder(project):
             (data.get(key) or {}).pop(SERVER_NAME, None)
             if data.get(key) == {}:
                 del data[key]
+            if "hooks" in data:  # Gemini CLI's
+                grouped_hooks(data)
         try:
             edit(rel, drop)
         except SystemExit:  # not plain JSON: left as it is
@@ -12602,7 +12682,7 @@ def build_parser():
                                        "none is called that); default: a project named after the folder")
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
-    p.add_argument("client", choices=["claude", "cursor"])
+    p.add_argument("client", choices=list(HOOK_CLIENTS))
     p.add_argument("event", choices=["prompt", "stop", "tool"])
     p.set_defaults(fn=cmd_hook)
     return parser
