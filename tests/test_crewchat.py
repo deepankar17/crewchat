@@ -1102,6 +1102,29 @@ class NeedsYou(Base):
         b.text("hub_take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
 
+    def test_an_answered_question_waits_on_the_agent_not_the_owner(self):
+        a, a_name = self.agent()
+        mid = self.add("Pick the icons")
+        a.text("hub_take", id=mid)
+        a.text("hub_update", id=mid, status="blocked", note="Outline or filled?")
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: Outline" % mid)  # as the answer box in Needs you sends it
+        self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])  # the agent's turn now
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s1: about another task" % mid)
+        a.text("hub_update", id=mid, status="blocked", note="Which size?")  # asks again: it needs the owner again
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        b, b_name = self.agent()
+        self.hub.send(crewchat.OWNER, b_name, "Re #%s: Small" % mid)  # to another agent: not an answer to this one
+        self.hub.send(crewchat.OWNER, "all", "Re #%s: Small" % mid)
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        review = self.add("Polish the icons")
+        a.text("hub_take", id=review)
+        a.text("hub_update", id=review, status="review", note="Have a look")
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: thanks" % review)
+        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])  # a review waits for Mark done
+        for t in (mid, review):
+            crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": t, "status": "done"})
+
     def test_a_note_is_credited_to_the_agent_that_wrote_it(self):
         a, a_name = self.agent()
         b, b_name = self.agent()

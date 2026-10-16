@@ -863,6 +863,37 @@ class NewPage(Signed):
         c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
         self.assertEqual(c.js("[...$('log').children].filter(n => n.hidden).length"), 0)
 
+    def test_what_the_ui_test_found(self):
+        c = self.chrome
+        # A search that matches nothing says so, and the note goes with the search.
+        c.js("$('search').value = 'zzz-nothing'; $('search').dispatchEvent(new Event('input'))")
+        self.assertFalse(c.js("$('search-none').hidden"))
+        self.agent.call("hub_send", to="Owner", text="zzz-nothing after all")  # a match arriving during the search
+        c.until("$('search-none').hidden && $('log').innerText.includes('zzz-nothing after all')", what="the match shown")
+        c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
+        self.assertTrue(c.js("$('search-none').hidden"))
+        # New agent's templates read as their role's name; no install notes for tools that are not here.
+        c.js("openLaunch()")
+        c.until("$('l-template').options.length > 1", what="the templates")
+        self.assertIn("Lead role", c.js("[...$('l-template').options].map(o => o.text)"))
+        self.assertNotIn("Needs", c.js("$('launch-note').textContent"))  # no install notes for tools not here
+        c.click("#l-cancel")
+        # An agent silent for long is not shown working, whatever its hooks said last.
+        self.assertEqual(c.js("doing({activity: 'working', seen: state.now - 1200})"), "Not heard from lately")
+        self.assertEqual(c.js("doing({activity: 'working', seen: state.now})"), "Working")
+        # A message to you in Needs you: to the message, marked, with a reply to its sender started.
+        c.js("Object.defineProperty(document, 'hidden', {value: true, configurable: true})")  # unread while away
+        self.addCleanup(c.js, "delete document.hidden")
+        self.agent.call("hub_send", to="Owner", text="Can you look at the build?")
+        c.until("$('needs-list').innerText.includes('Can you look at the build?')", what="the message in Needs you")
+        c.js("""delete document.hidden; $('text').value = '';
+                [...document.querySelectorAll('#needs-list .need')].find(b => b.innerText.includes('look at the build')).click()""")
+        self.assertEqual(c.js("$('text').value"), "@%s " % self.agent.name)
+        self.assertTrue(c.js("[...document.querySelectorAll('#log .msg.flash')].some(m => m.innerText.includes('look at the build'))"))
+        self.assertTrue(c.js("$('agent-pane').hidden"))
+        c.js("$('text').value = ''")
+        self.assertEqual(c.errors, [])
+
     def test_a_new_project_from_the_tab_menu(self):
         c = self.chrome
         c.js("$('tab-add').open = true")

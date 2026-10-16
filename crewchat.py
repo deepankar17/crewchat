@@ -1705,9 +1705,13 @@ class Hub:
 
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
+            answered = {}  # (task, agent) -> the newest answer the owner sent it ("Re #12: ...", as Needs you sends one)
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
                 if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
+                reply = m["from"] == OWNER and m["kind"] == "msg" and re.match(r"Re #([A-Za-z]*\d+): ", m["text"])
+                if reply:
+                    answered.setdefault((reply.group(1), m["to"]), m["seq"])
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
         items = []
@@ -1718,6 +1722,8 @@ class Hub:
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
             if kind in ("blocked", "review") and r.get("note") == OWNER:
                 continue  # the owner set it so: nothing waits on the owner
+            if kind == "blocked" and answered.get((r["id"], said.get("from") or r["holder"]), 0) > said.get("seq", 0):
+                continue  # the agent that asked has its answer since: its turn (a review waits for Mark done)
             if kind:
                 # Named after whoever wrote the note (any agent may update a task), so an answer goes back
                 # to the agent that asked; a reclaimed task, after the agent it was taken from.
@@ -9720,6 +9726,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg { position: relative; }
 .msg.cont { margin-top: -10px; }
 #log.searching .msg.cont { margin-top: 0; }
+.msg.flash .body { animation: flash 1.6s ease-out; }
+@keyframes flash { 0%, 30% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 3px transparent; } }
+@media (prefers-reduced-motion: reduce) { .msg.flash .body { animation: none; outline: 2px solid var(--accent); } }
 #log.searching .msg.cont > .meta { position: static; width: auto; height: auto; clip-path: none; }
 #log.searching .msg.cont > .avatar { visibility: visible; height: auto; }
 .msg.cont > .avatar { visibility: hidden; height: 0; }
@@ -10015,6 +10024,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <p id="search-none" class="none" role="status" hidden>No message here matches the search.</p>
   <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
@@ -10144,7 +10154,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <dialog id="project-dialog" aria-labelledby="project-title">
   <form id="project-form" method="dialog">
     <h2 id="project-title">New project</h2>
-    <p>Its own chat, roles and task board. Connect a folder to it later with <code>crewchat start --chat NAME</code> in that folder.</p>
+    <p>Its own chat, roles and task board. Then <b>New agent</b> connects a folder to it, or makes one.</p>
     <label for="p-name">Name</label><input type="text" id="p-name" maxlength="60" autocomplete="off" required>
     <label for="p-pack">Its crew</label><select id="p-pack"></select>
     <div id="project-note" role="status"></div>
@@ -10176,7 +10186,7 @@ const state = { needs: [], notified: new Set(), after: -1, version: -1, lastSaid
 
 // The words the page uses: a software crew works in folders and commits, any other crew in plain words.
 const WORDS = {
-  software: { folder: "Project folder", none: "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use New agent below." },
+  software: { folder: "Project folder", none: "No agents yet. Use New agent below, or run crewchat start in your project folder and open Claude Code, Cursor, Codex or another agent tool there." },
   general: { folder: "Folder", none: "No agents yet. Use New agent below, or run crewchat start in a folder and open an agent there." },
 };
 const word = (key) => (WORDS[state.crew] || WORDS.software)[key];
@@ -10796,7 +10806,7 @@ async function openLaunch(role) {
   $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
   const roles = state.roles.map((r) => new Option(r.title, r.name));
   $("l-role").replaceChildren(new Option("No role", ""), ...roles.map((o) => new Option(o.text, o.value)));
-  $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option("A " + o.text.toLowerCase() + " (" + o.text + " role)", o.value)));
+  $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option(o.text + " role", o.value)));
   $("l-picture").replaceChildren(...pictureOptions(), new Option("Initials", "initials"));
   $("l-colour-tool").checked = true;
   showStep(0);
@@ -10829,10 +10839,9 @@ function showFolders(folders, pick) {
 // What stops a start (no tool, no folder), or the tools that are missing.
 function launchNote(folders) {
   const ready = launchTools.filter((t) => !t.missing);
-  const missing = launchTools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
   $("launch-note").textContent = !ready.length
     ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then come back."
-    : !folders.length ? "No folder on this machine is in this project yet: Browse to one (or make one), or type its path." : missing;
+    : !folders.length ? "No folder on this machine is in this project yet: Browse to one (or make one), or type its path." : "";
   $("l-start").disabled = !ready.length || !folders.length;
 }
 // The owner connects a folder to this project (`crewchat start` in it, on this machine). One that
@@ -11095,7 +11104,9 @@ function isWorking(a) {
   return a.activity === "working" && state.now - a.seen < 300 && !(a.session && !a.session.running);
 }
 function doing(a) {
-  return a.session && !a.session.running ? "Its session is closed" : DOING[a.activity] || "Not heard from lately";
+  if (a.session && !a.session.running) return "Its session is closed";
+  if (a.activity === "working" && !isWorking(a)) return "Not heard from lately";  // its hooks said so, long ago
+  return DOING[a.activity] || "Not heard from lately";
 }
 
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
@@ -11580,7 +11591,9 @@ function panelRoles() {
     b.type = "button";
     const n = state.agents.filter((a) => a.role === r.name).length;
     const words = el("span");
-    words.append(el("div", "", r.label), el("div", "meta", r.name + (n ? " · " + n + " agent" + (n > 1 ? "s" : "") : "") + (r.source === "yours" ? " · yours" : "")));
+    const gist = String(r.description || "").split("\n")[0].trim();
+    words.append(el("div", "", r.label), el("div", "meta", [gist.length > 70 ? gist.slice(0, 69) + "…" : gist || r.name,
+      n ? n + " agent" + (n > 1 ? "s" : "") : "", r.source === "yours" ? "yours" : ""].filter(Boolean).join(" · ")));
     b.append(roleAvatar(r), words);
     b.addEventListener("click", () => openPanel("role", r.name));
     item.append(b); list.append(item);
@@ -11686,7 +11699,7 @@ function roleForm(r) {
     return n;
   };
   const name = r ? null : input("input", "Name", "", { type: "text", maxLength: 32, placeholder: "for example designer" });
-  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat" });
+  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat (empty: from its name)" });
   const picture = el("select");
   picture.setAttribute("aria-label", "Picture");
   picture.append(...pictureOptions());
@@ -11889,6 +11902,11 @@ function applySearch() {
   const want = searchWant();
   $("log").classList.toggle("searching", !!want);
   for (const node of $("log").children) if (node.id !== "empty") node.hidden = !matches(node, want);
+  searchNote();
+}
+// Searching, with nothing shown: say so (again as messages arrive).
+function searchNote() {
+  $("search-none").hidden = !searchWant() || [...$("log").children].some((n) => !n.hidden && n.id !== "empty");
 }
 $("search").addEventListener("input", applySearch);
 
@@ -11903,7 +11921,7 @@ function welcome() {
   actButton(acts, "Roles", "See the project's roles", () => openPanel("roles"));
   box.append(img, el("h2", "", "Your crew's chat starts here"),
              el("p", "", state.agents.length ? "Say hello, or post a task: the crew settles who takes it."
-                                            : "Add an agent, or open Claude Code or Cursor in a connected folder: it joins by itself."), acts);
+                                            : "Add an agent, or open an agent tool (Claude Code, Cursor, Codex…) in a connected folder: it joins by itself."), acts);
   return box;
 }
 
@@ -11932,6 +11950,7 @@ function addMessages(list, first) {
     remember(m);
     state.after = m.seq;
   }
+  if (searchWant()) searchNote();
   if (document.hidden && !first) {
     state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
     if (state.missed) document.title = "(" + state.missed + ") " + state.title;
@@ -11982,9 +12001,18 @@ function renderNeeds(needs) {
     if (n.blocking) b.append(el("span", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
     b.addEventListener("click", () => {
       if (n.kind === "message") {
-        if (n.agent) openPanel("agent", n.agent);
+        // To the message itself, marked for a moment, with a reply to its sender started.
+        showView("chat");
         const node = [...$("log").querySelectorAll(".msg")].find((x) => x.dataset.id === n.id);
-        if (node) { showView("chat"); node.scrollIntoView({ block: "center" }); }
+        if (node) {
+          node.scrollIntoView({ block: "center" });
+          node.classList.remove("flash"); void node.offsetWidth; node.classList.add("flash");
+          setTimeout(() => node.classList.remove("flash"), 1700);
+        }
+        if (state.agents.some((a) => a.agent === n.agent) && !leadingMention(text.value)) {
+          text.value = "@" + n.agent + " " + text.value; fit();
+        }
+        text.focus({ preventScroll: true });
         markRead(n.seq);
       } else openPanel("task", n.task);
     });
@@ -12202,11 +12230,19 @@ async function uploadFile(file) {
     headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } })).id;
 }
 
+// The message box's hint, shorter on a phone (it must fit on one line).
+const narrow = matchMedia("(max-width: 760px)");
+function composerHint(asTask) {
+  return asTask ? (narrow.matches ? "Describe the task…" : "Describe the task. The crew settles who takes it…")
+    : narrow.matches ? "Message the crew" : "Message the crew (@name writes to one)";
+}
+narrow.addEventListener("change", () => { text.placeholder = composerHint(state.asTask); });
+text.placeholder = composerHint(false);
 function setTask(on) {
   state.asTask = on;
   $("as-task").setAttribute("aria-pressed", String(on));
   $("task-chip").hidden = !on;
-  text.placeholder = on ? "Describe the task. The crew settles who takes it…" : "Message the crew (@name writes to one)";
+  text.placeholder = composerHint(on);
 }
 $("as-task").addEventListener("click", () => { setTask(!state.asTask); $("plus").open = false; text.focus(); });
 $("task-off").addEventListener("click", () => setTask(false));
