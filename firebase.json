@@ -3,11 +3,8 @@
     "site": "crewchat-chat",
     "public": "hosting/public",
     "predeploy": "python3 site/build.py",
-    "cleanUrls": false,
     "ignore": [
-      "firebase.json",
-      "**/.*",
-      "**/node_modules/**"
+      "**/.*"
     ],
     "headers": [
       {

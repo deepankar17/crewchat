@@ -16,10 +16,9 @@ The domain is registered with Cloudflare, whose DNS points it at Firebase as Pho
 
 ## Pages
 
-`hosting/public/` is **generated**. Edit `site/` (templates, `site/assets`, `site/config.json`),
-then run `python3 site/build.py`, which rewrites `hosting/public/`. Never edit it by hand.
-`tests/test_site.py` checks the build (links, nothing inline under the security policy, sizes) and that
-the committed copy matches it.
+`hosting/public/` is **generated** and not in git: edit `site/` (templates, `site/assets`,
+`site/config.json`) and run `python3 site/build.py` to see it; every deploy builds it first.
+`tests/test_site.py` checks the build: links, nothing inline under the security policy, sizes.
 
 | Page | Template |
 |------|----------|

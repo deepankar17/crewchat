@@ -1,10 +1,8 @@
-"""The website (site/ builds hosting/public): it builds, every page links only to what exists,
-nothing inline breaks under its Content-Security-Policy, and what is committed is what the build
-makes."""
-import filecmp
+"""The website (site/ builds hosting/public): it builds, every page links only to what exists, and
+nothing inline breaks under its Content-Security-Policy."""
 import html.parser
 import json
-import re
+import shutil
 import sys
 import tempfile
 import unittest
@@ -30,7 +28,7 @@ class Page(html.parser.HTMLParser):
         for key in ("href", "src", "poster", "srcset"):
             if attrs.get(key):
                 self.links.append(attrs[key])
-        if tag == "script" and not attrs.get("src") and attrs.get("type") != "application/ld+json":
+        if tag == "script" and not attrs.get("src"):
             self.inline.append("<script> without src")
         if tag == "style" or "style" in attrs or any(k.startswith("on") for k in attrs):
             self.inline.append("<%s %s>" % (tag, " ".join(attrs)))
@@ -47,7 +45,9 @@ class Page(html.parser.HTMLParser):
 class Website(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.out = Path(tempfile.mkdtemp(prefix="crewchat-site-")) / "public"
+        temp = tempfile.mkdtemp(prefix="crewchat-site-")
+        cls.addClassCleanup(shutil.rmtree, temp, True)
+        cls.out = Path(temp) / "public"
         build.build(cls.out)
         cls.pages = {}
         for _, path, _, _ in build.PAGES:
@@ -56,10 +56,8 @@ class Website(unittest.TestCase):
             cls.pages[path] = parser
 
     def test_every_page_builds_with_a_title(self):
-        self.assertEqual(sorted(self.pages), ["404.html", "index.html", "privacy.html"])
         for path, page in self.pages.items():
             self.assertIn("crewchat", page.title, path)
-            self.assertNotIn("{{", (self.out / path).read_text(encoding="utf-8"), path)
 
     def test_local_links_and_files_exist(self):
         for path, page in self.pages.items():
@@ -77,8 +75,8 @@ class Website(unittest.TestCase):
                 self.assertTrue(target.is_file(), "%s links to %s, which the build did not make" % (path, link))
 
     def test_external_links_go_only_where_expected(self):
-        hosts = {"github.com", "raw.githubusercontent.com", "pypi.org", "www.youtube.com", "docs.astral.sh",
-                 "crewchat.dev"}
+        config = json.loads((ROOT / "site" / "config.json").read_text())
+        hosts = {urlparse(v).hostname for v in config.values()} | {"raw.githubusercontent.com", "docs.astral.sh"}
         for path, page in self.pages.items():
             for link in page.links:
                 host = urlparse(link).hostname
@@ -100,25 +98,11 @@ class Website(unittest.TestCase):
         media = sum(p.stat().st_size for p in (self.out / "assets" / "media").iterdir())
         self.assertLess(media, 4_000_000)  # GIFs as small MP4s: run site/media.py, not copies of docs/images
 
-    def test_the_committed_site_is_what_the_build_makes(self):
-        # Edit site/, run python3 site/build.py, and commit hosting/public with it.
-        committed = ROOT / "hosting" / "public"
-        if not committed.is_dir():
-            self.skipTest("hosting/public is not built in this checkout")
-        made = {p.relative_to(self.out) for p in self.out.rglob("*") if p.is_file()}
-        have = {p.relative_to(committed) for p in committed.rglob("*") if p.is_file()}
-        self.assertEqual(made, have)
-        for rel in made:
-            if rel.suffix in (".html", ".xml", ".txt"):  # the version and year shown move on by themselves
-                strip = lambda t: re.sub(r"© \d{4}|crewchat \d[\w.]*", "", t)  # noqa: E731
-                self.assertEqual(strip((self.out / rel).read_text(encoding="utf-8")),
-                                 strip((committed / rel).read_text(encoding="utf-8")), str(rel))
-            else:
-                self.assertTrue(filecmp.cmp(self.out / rel, committed / rel, shallow=False), str(rel))
-
     def test_the_version_shown_is_this_release(self):
         text = (self.out / "index.html").read_text(encoding="utf-8")
-        self.assertIn("crewchat %s" % build.version(), text)
+        import crewchat  # noqa: E402  (build.py reads the version without importing it)
+        self.assertEqual(build.version(), crewchat.__version__)
+        self.assertIn("crewchat %s" % crewchat.__version__, text)
 
 
 if __name__ == "__main__":

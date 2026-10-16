@@ -15,8 +15,7 @@
     }
   }
 
-  document.querySelectorAll(".code .copy").forEach(function (button) {
-    if (!navigator.clipboard) return;
+  if (navigator.clipboard) document.querySelectorAll(".code .copy").forEach(function (button) {
     button.hidden = false;
     button.addEventListener("click", function () {
       var text = button.parentElement.querySelector("code").textContent;
@@ -27,18 +26,16 @@
     });
   });
 
-  var videos = document.querySelectorAll(".clip video");
-  var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (still) {
-    videos.forEach(function (v) { v.removeAttribute("autoplay"); v.pause(); v.controls = true; });
+  var videos = document.querySelectorAll("video.clip");
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    videos.forEach(function (v) { v.controls = true; });  // they play only if asked to
     return;
   }
   if (!("IntersectionObserver" in window)) return;
   var seen = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
       if (e.isIntersecting) {
-        var playing = e.target.play();
-        if (playing && playing.catch) playing.catch(function () { e.target.controls = true; });
+        e.target.play().catch(function () { e.target.controls = true; });
       } else {
         e.target.pause();
       }
