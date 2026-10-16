@@ -2,6 +2,7 @@
 nothing inline breaks under its Content-Security-Policy."""
 import html.parser
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -66,8 +67,9 @@ class Website(unittest.TestCase):
                 if url.scheme in ("http", "https"):
                     continue
                 self.assertEqual(url.scheme, "", "%s: %s" % (path, link))
-                if url.path in ("", "/") and url.fragment:
-                    self.assertIn(url.fragment, self.pages["index.html"].ids, "%s: %s" % (path, link))
+                if url.fragment and url.path in ("", "/"):  # "#x" on this page, "/#x" on the home page
+                    ids = page.ids if url.path == "" else self.pages["index.html"].ids
+                    self.assertIn(url.fragment, ids, "%s: %s" % (path, link))
                     continue
                 target = self.out / url.path.lstrip("/")
                 if url.path.endswith("/"):
@@ -97,6 +99,19 @@ class Website(unittest.TestCase):
             self.assertLess((self.out / path).stat().st_size, 40_000, path)
         media = sum(p.stat().st_size for p in (self.out / "assets" / "media").iterdir())
         self.assertLess(media, 4_000_000)  # GIFs as small MP4s: run site/media.py, not copies of docs/images
+
+    def test_the_privacy_page_says_what_docs_privacy_says(self):
+        # privacy.html is written from docs/privacy.md: each thing crewchat connects to is on both.
+        doc = (ROOT / "docs" / "privacy.md").read_text(encoding="utf-8")
+        page = (self.out / "privacy.html").read_text(encoding="utf-8")
+        points = re.findall(r"^- \*\*([^*]+)\*\*", doc, re.M)
+        self.assertGreaterEqual(len(points), 4)
+        for point in points:
+            self.assertIn("<b>%s</b>" % point, page, "docs/privacy.md lists it; the site's privacy page should too")
+
+    def test_the_error_page_is_not_indexed(self):
+        self.assertIn('<meta name="robots" content="noindex">', (self.out / "404.html").read_text(encoding="utf-8"))
+        self.assertNotIn("404", (self.out / "sitemap.xml").read_text(encoding="utf-8"))
 
     def test_the_version_shown_is_this_release(self):
         text = (self.out / "index.html").read_text(encoding="utf-8")

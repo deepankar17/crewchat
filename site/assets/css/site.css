@@ -82,7 +82,7 @@ img, video { max-width: 100%; height: auto; display: block; }
 .gallery { margin-top: 40px; }
 .gallery figure { margin: 0; }
 .gallery figcaption { color: var(--muted); font-size: 15px; margin-top: 10px; text-align: center; }
-.gallery .clip { max-height: 520px; width: auto; margin: 0 auto; }
+.clip.tall { width: auto; height: min(520px, 80vh); max-width: 100%; margin: 0 auto; }  /* a phone: its own ratio */
 
 .code { position: relative; margin: 14px 0; background: var(--code-bg); color: var(--code-ink); border-radius: 12px;
   padding: 14px 76px 14px 16px; }

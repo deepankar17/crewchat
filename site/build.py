@@ -46,8 +46,9 @@ def clip(name, alt, sizes):
     width, height = media(name + ".mp4", sizes)
     # No autoplay: that would fetch every video at once. site.js plays each one while it is on screen
     # (muted and playsinline so it may); the poster shows until then, or always without JavaScript.
-    return ('<video class="clip" src="/assets/media/%s.mp4" poster="/assets/media/%s.jpg" width="%d" height="%d" '
-            'muted loop playsinline preload="none" aria-label="%s"></video>' % (name, name, width, height, html.escape(alt)))
+    return ('<video class="clip%s" src="/assets/media/%s.mp4" poster="/assets/media/%s.jpg" width="%d" height="%d" '
+            'muted loop playsinline preload="none" aria-label="%s"></video>'
+            % (" tall" if height > width else "", name, name, width, height, html.escape(alt)))
 
 
 def still(name, alt, sizes):
@@ -56,20 +57,19 @@ def still(name, alt, sizes):
             % (name, width, height, html.escape(alt)))
 
 
-def shot(_name, alt, sizes):
-    width, height = media("screenshot-light.jpg", sizes)
-    return ('<picture class="shot"><source srcset="/assets/media/screenshot-dark.jpg" media="(prefers-color-scheme: dark)">'
-            '<img src="/assets/media/screenshot-light.jpg" width="%d" height="%d" alt="%s" fetchpriority="high"></picture>'
-            % (width, height, html.escape(alt)))
+def shot(alt, sizes):
+    (dark_w, dark_h), (width, height) = media("screenshot-dark.jpg", sizes), media("screenshot-light.jpg", sizes)
+    return ('<picture class="shot"><source srcset="/assets/media/screenshot-dark.jpg" width="%d" height="%d" '
+            'media="(prefers-color-scheme: dark)"><img src="/assets/media/screenshot-light.jpg" width="%d" height="%d" '
+            'alt="%s" fetchpriority="high"></picture>' % (dark_w, dark_h, width, height, html.escape(alt)))
 
 
-TAGS = {"clip": clip, "still": still, "shot": shot}
+TAGS = {"clip": clip, "still": still}
 
 
 def render(text, values, sizes):
-    # {{clip:NAME|ALT}}, {{still:NAME|ALT}}, {{shot:ALT}}
-    text = re.sub(r"\{\{(clip|still|shot):(?:([\w-]+)\|)?([^}]*)\}\}",
-                  lambda m: TAGS[m.group(1)](m.group(2), m.group(3), sizes), text)
+    text = re.sub(r"\{\{(clip|still):([\w-]+)\|([^}]*)\}\}", lambda m: TAGS[m.group(1)](m.group(2), m.group(3), sizes), text)
+    text = re.sub(r"\{\{shot:([^}]*)\}\}", lambda m: shot(m.group(1), sizes), text)
 
     def value(m):
         if m.group(1) not in values:
@@ -97,7 +97,8 @@ def build(out=OUT):
     common = dict(config, version=version(), year=datetime.date.today().year)
     for template, path, title, description in PAGES:
         page = (SITE / "templates" / template).read_text(encoding="utf-8")
-        values = dict(common, title=title, description=description, canonical=url(base_url, path))
+        values = dict(common, title=title, description=description, canonical=url(base_url, path),
+                      robots="noindex" if path == "404.html" else "index, follow")
         (out / path).write_text(render(base.replace("{{> main}}", page), values, sizes), encoding="utf-8")
     (out / "sitemap.xml").write_text(
         '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'

@@ -19,10 +19,11 @@
     button.hidden = false;
     button.addEventListener("click", function () {
       var text = button.parentElement.querySelector("code").textContent;
-      navigator.clipboard.writeText(text).then(function () {
-        button.textContent = "Copied";
+      var said = function (word) {
+        button.textContent = word;
         setTimeout(function () { button.textContent = "Copy"; }, 1600);
-      });
+      };
+      navigator.clipboard.writeText(text).then(function () { said("Copied"); }, function () { said("Select and copy"); });
     });
   });
 
@@ -31,7 +32,10 @@
     videos.forEach(function (v) { v.controls = true; });  // they play only if asked to
     return;
   }
-  if (!("IntersectionObserver" in window)) return;
+  if (!("IntersectionObserver" in window)) {
+    videos.forEach(function (v) { v.controls = true; });
+    return;
+  }
   var seen = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
       if (e.isIntersecting) {

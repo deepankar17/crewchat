@@ -3,8 +3,8 @@
 The public site, https://crewchat.dev: the Hosting site `crewchat-chat` in the Firebase project
 `crewchat-ae908` (`.firebaserc`, `firebase.json`), also at https://crewchat-chat.web.app.
 
-The domain is registered with Cloudflare, whose DNS points it at Firebase as PhonIQ's is, every record
-"DNS only" (not proxied, so Firebase can issue its certificate):
+The domain is registered with Cloudflare, whose DNS points it at Firebase, every record "DNS only"
+(not proxied, so Firebase can issue its certificate):
 
 | Record | Name | Value |
 |--------|------|-------|
