@@ -46,6 +46,11 @@ TAGS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TAGS += [a + b for a in TAGS for b in TAGS]
 
 
+def tag_rank(tag):
+    """A machine tag's place in TAGS (A, B, ... Z, AA, ...): the lowest coordinates when nothing else decides."""
+    return TAGS.index(tag) if tag in TAGS else len(TAGS)
+
+
 class PeerError(Exception):
     def __init__(self, message, status=0):
         super().__init__(message)
@@ -228,6 +233,45 @@ class PeerSync(crewchat.ProjectLink):
         self.agents = {}  # member id -> its last roster
         self.stopped = threading.Event()
         self.removed_me = False
+        self._coordinator, self._term = None, 0  # who this machine last saw coordinating, and how many changes
+
+    def coordinator(self):
+        """Which machine coordinates now (roadmap Y1): the owner's preferred machine if this one can reach it,
+        else the machine with the lowest tag among those it can reach (itself included). Every machine applies
+        the same rule to what it can reach, so they agree while they can reach each other; the term goes up
+        at every change this machine sees. The coordinator never orders messages: they stay leaderless."""
+        me, members = self.mesh.me, self.mesh.members()
+        preferred = str((self.mesh.data.get("preferred") or {}).get("id") or "")
+        here = {me["id"]: me}
+        here.update({mid: m for mid, m in members.items() if self.reachable(mid)})
+        pick = preferred if preferred in here else min(here, key=lambda mid: (tag_rank(here[mid].get("tag")), mid))
+        with self.mesh.lock:
+            if pick != self._coordinator:
+                if self._coordinator is not None:
+                    self.log("%s coordinates now" % here[pick]["name"])
+                self._coordinator, self._term = pick, self._term + 1
+            term = self._term
+        named = dict(members, **{me["id"]: me}).get(preferred) or {}
+        return {"name": here[pick]["name"], "me": pick == me["id"], "term": term, "preferred": named.get("name", "")}
+
+    def set_preferred(self, name):
+        """The owner's preferred coordinator (a machine's name), or none. It travels to the others with the next
+        pull; the newest choice wins."""
+        name = str(name or "").strip()
+        if name.lower() in ("", "none"):
+            mid = ""
+        elif name == self.mesh.me["name"]:
+            mid = self.mesh.me["id"]
+        else:
+            mid = self.mesh.find(name)
+            if mid is None:
+                raise PeerError("no machine called %s; `crewchat peers status` lists them" % name)
+        with self.mesh.lock:
+            self.mesh.data["preferred"] = {"id": mid, "at": time.time()}
+            self.mesh.save()
+        with self.hub.lock:
+            self.hub._changed()  # wakes the others' waiting pulls, so they hear of it now
+        return self.coordinator()
 
     def link_status(self):
         members = self.mesh.members()
@@ -441,6 +485,11 @@ class PeerSync(crewchat.ProjectLink):
                 return
             for new in self.mesh.merge(out.get("members") or {}, removed):
                 self._member_joined(new, self.mesh.members().get(new, {}).get("name", new))
+            theirs, mine = out.get("preferred"), self.mesh.data.get("preferred") or {}
+            if isinstance(theirs, dict) and float(theirs.get("at") or 0) > float(mine.get("at") or 0):
+                with self.mesh.lock:  # the owner chose on that machine more recently: theirs holds
+                    self.mesh.data["preferred"] = {"id": str(theirs.get("id") or ""), "at": float(theirs["at"])}
+                    self.mesh.save()
         for gone in removed:
             self.hub.drop_remote(gone)
         cursor = self._key(mid)
@@ -551,10 +600,11 @@ class PeerSync(crewchat.ProjectLink):
         return 200, answer
 
     @staticmethod
-    def _state_key(agents):
-        """What changed in this machine's roster, ignoring 'last seen' moving within a minute."""
+    def _state_key(agents, preferred=None):
+        """What changed in this machine's roster (or its owner's preferred coordinator), ignoring 'last seen'
+        moving within a minute."""
         rows = [dict(r, seen=int(r.get("seen") or 0) // 60) for r in agents]
-        return hashlib.sha256(json.dumps(rows, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(json.dumps([rows, preferred], sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
     def _pull(self, body):
         """Wait until this machine has written messages past `since` or its roster differs from
@@ -572,12 +622,13 @@ class PeerSync(crewchat.ProjectLink):
             while True:
                 own = [m for m in hub.messages if m["seq"] > since and m.get("origin") == self.device_id]
                 agents = hub.local_state()
-                key = self._state_key(agents)
+                key = self._state_key(agents, self.mesh.data.get("preferred"))
                 if own or key != known or time.time() >= deadline or self.stopped.is_set():
                     break
                 hub.lock.wait(timeout=max(0.0, deadline - time.time()))
             own = [dict(m) for m in own[:MAX_BATCH]]
-        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {})}
+        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
+               "preferred": self.mesh.data.get("preferred")}
         if self.chat is None:
             out["members"] = self.mesh.everyone()
         else:

@@ -2669,9 +2669,16 @@ class CommandsTab(Base):
             def link_status(self):
                 return {"via": "cloud", "me": "mac", "online": True, "approved": True}
 
+        class Coordinated(Link):
+            def coordinator(self):
+                return {"name": "laptop", "me": False, "term": 3, "preferred": ""}
+
         hub = lambda sync: type("Hub", (), {"sync": sync})()  # noqa: E731
-        self.assertEqual(crewchat.link_info(hub(Link()), shared=False),
-                         {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False})
+        self.assertEqual(crewchat.link_info(hub(Link()), shared=False),  # a link that cannot say who coordinates
+                         {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False,
+                          "coordinator": None})
+        self.assertEqual(crewchat.link_info(hub(Coordinated()))["coordinator"],
+                         {"name": "laptop", "me": False, "term": 3, "preferred": ""})
         self.assertEqual(crewchat.link_info(hub(None)), {"via": "none"})
 
     def test_every_runnable_command_parses(self):

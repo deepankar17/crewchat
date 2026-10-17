@@ -3936,6 +3936,11 @@ COMMANDS = [
          "Let a task be marked done only after the advisor (the agent with the advisor role) approves it. Off "
          "unless set; with no value, shows it.", None),
     ]),
+    ("Linked machines' coordinator", [
+        ("coordinator", "Which of your linked machines coordinates now: settles claims for a machine that is off, "
+         "and serves catch-up and files. Whichever machine is on takes over.", {"argv": ["coordinator"]}),
+        ("coordinator NAME|none", "The machine that should coordinate whenever it is on (none: whichever is on).", None),
+    ]),
     ("Project folders", [
         ("listen on [--minutes N] [--project FOLDER]", "Agents in this folder wait up to N minutes (1 to 55) for messages after each turn.", None),
         ("listen off [--project FOLDER]", "Check once at the end of each turn, then go idle.", None),
@@ -4131,10 +4136,16 @@ def connect_folder(path, chat, root=None, create=False):
 def link_info(hub, shared=True):
     """How this machine reaches the others, for the page: the link says (over Tailscale, with cloud
     sync through Firestore), or not at all."""
-    return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
+    if hub.sync is None:
+        return {"via": "none"}
+    try:
+        coordinator = hub.sync.coordinator()
+    except Exception:  # a link that cannot say just now (the cloud unreachable): the page shows the rest
+        coordinator = None
+    return dict(hub.sync.link_status(), shared=shared, coordinator=coordinator)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/coordinator")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4724,6 +4735,23 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _coordinator(self, data):
+        """Which linked machine coordinates (roadmap Y1), and the owner's choice of the one that should when it
+        is on (op prefer, name: a machine's name, or none)."""
+        sync = self.projects.primary.hub.sync  # machines link as a whole, through the first project
+        if sync is None:
+            raise HubError("this machine is not linked to others: there is nothing to coordinate")
+        try:
+            if data.get("op") == "prefer":
+                return sync.set_preferred(str(data.get("name") or ""))
+            if data.get("op") not in (None, "show"):
+                raise HubError("op is show or prefer")
+            return sync.coordinator()
+        except HubError:
+            raise
+        except Exception as e:  # the link's own errors (no machine of that name, the cloud unreachable)
+            raise HubError(str(e))
+
     def _push(self, data):
         """Web Push for the chat page: this machine's key to subscribe with, a browser's notifications for
         this project (all, mentions or off), and what waits for its service worker."""
@@ -4989,7 +5017,7 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
-                         "/api/push": self._push}
+                         "/api/push": self._push, "/api/coordinator": self._coordinator}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -5910,6 +5938,13 @@ class ProjectLink:
     def link_status(self):
         """What the chat page shows about this link (link_info adds whether the project is shared)."""
         return {"via": "linked"}
+
+    def coordinator(self):
+        """Which machine coordinates (roadmap Y1): {name, me, term, preferred}. A link says; see the subclasses."""
+        return {"name": self.hub.device or "", "me": True, "term": 0, "preferred": ""}
+
+    def set_preferred(self, name):
+        raise HubError("this link has no coordinator to choose")
 
     def share(self, hub, name):
         """Link another project of this machine: with the same-named project on the others."""
@@ -8957,6 +8992,13 @@ def cmd_rules(args):
                                                        out["folders"]))
 
 
+def cmd_coordinator(args):
+    out = owner_call("/api/coordinator", {"op": "prefer", "name": args.prefer} if args.prefer else {"op": "show"})
+    who = out["name"] or "nobody yet (no machine holds the lease)"
+    print("Coordinating now: %s%s." % (who, " (this machine)" if out["me"] else ""))
+    print("Preferred: %s." % (out["preferred"] or "none (whichever machine is on)"))
+
+
 def cmd_tasks(args):
     if args.action == "list":
         out = owner_tool("hub_tasks", view="all")
@@ -9944,6 +9986,8 @@ function renderLink(link) {
     parts.push("This machine only. crewchat connect links another, over Tailscale or with cloud sync.");
   }
   if (link.via !== "none" && link.shared === false) parts.push("(this project stays on this machine)");
+  if (link.coordinator && link.coordinator.name)
+    parts.push(el("span", "meta", "· " + (link.coordinator.me ? "this machine" : link.coordinator.name) + " coordinates"));
   line.replaceChildren();
   parts.forEach((part, i) => { if (i) line.append(" "); line.append(part); });
 }
@@ -12244,6 +12288,11 @@ def build_parser():
     p.add_argument("--local-only", action="store_true",
                    help="only a folder connected to this machine's own chat (registered for every folder)")
     p.set_defaults(fn=cmd_stdio)
+
+    p = sub.add_parser("coordinator", help="which of your linked machines coordinates now, or choose the one "
+                                           "that should whenever it is on")
+    p.add_argument("prefer", nargs="?", metavar="NAME|none", help="the machine that should coordinate when it is on")
+    p.set_defaults(fn=cmd_coordinator)
 
     p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
     p.set_defaults(fn=cmd_projects)
