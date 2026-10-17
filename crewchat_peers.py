@@ -317,7 +317,7 @@ class PeerSync(crewchat.ProjectLink):
         """Who gets a task: settled by the machine it was posted on, under its claim key (the task's
         id, or a new key each time it was given back)."""
         with self.hub.lock:
-            msg = next((m for m in self.hub.messages if m["id"] == task), None)
+            msg = self.hub.by_id.get(task)
             row = getattr(self.hub, "sheet", {}).get(task) or {}
         origin = (msg or {}).get("origin") or row.get("origin") or self.device_id
         if origin == self.device_id:

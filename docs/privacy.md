@@ -23,6 +23,14 @@ What crewchat connects to, and only these:
   key kept on your machine; the page then fetches what is new from your own server. Nothing from the
   chat goes through the push service.
 
+What crewchat reads on your machine and keeps there:
+
+- **Token counts.** At the end of each turn of a Claude Code agent, its hook reads how many tokens
+  the turn used from the session's own transcript: the model and the numbers, never the
+  conversation. They go to this machine's chat (or the one the folder is connected to), are added
+  to the agent and the task it works on, and are shown to you as totals with a cost estimate.
+  `crewchat usage off` stops it for a project; `crewchat setup --activity off` stops it everywhere.
+
 Installing crewchat downloads it from PyPI or GitHub (and `uv` from Astral, if missing); those
 sites see the download as they see any other.
 
