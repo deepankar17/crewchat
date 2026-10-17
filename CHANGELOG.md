@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The chat page loads faster, most of all on a phone.** It is sent compressed (47 KB instead of 170 KB),
+  and the browser keeps it and asks whether it changed: a reload transfers under 1 KB. The chat's messages
+  and settings are still never kept on the device.
 - **state.json is rewritten a third as often under load.** Read positions, status lines and presence are
   saved within a second instead of on every call; task claims, links and the task sheet still at once.
   Stopping the server (`crewchat stop`, or its login service) saves what waits first. After a hard crash an

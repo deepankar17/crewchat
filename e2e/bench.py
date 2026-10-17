@@ -9,7 +9,7 @@ It measures, as the agents and the page see them:
 - hook calls end to end, run exactly as Claude Code runs them (a process each): a tool call that tells
   the server, one the hook skips (it told the server a moment ago), a prompt, and the end of a turn;
 - one /api/poll round trip of the chat page, opening the chat and catching up on one new message,
-  and how big each answer is;
+  and how big each answer is; and what loading the page itself transfers, the first time and on a reload;
 - what every agent loads (the tool definitions) and reads (an inbox of 50 messages), in characters;
 - how often state.json is rewritten under a fixed busy load (in this process, against a Hub);
 - server startup with that messages.jsonl, until /health answers, and its memory then; with --log-mb, again
@@ -207,6 +207,15 @@ def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     a.call("hub_send", to="all", text="one more")
     numbers["poll: one new message (s)"] = timed(lambda: poll(last), runs)
     numbers["poll: one new message (bytes)"] = sizes[-1]
+
+    # The chat page as a browser fetches it: the first time, and a reload with what it kept (headers and body).
+    status, body, headers = H.request(m.url + "/", headers={"Accept-Encoding": "gzip, deflate, br"}, opener=owner.opener)
+    numbers["page: first load (bytes)"] = len(body) + len(str(headers))
+    asked = {"Accept-Encoding": "gzip, deflate, br"}
+    if headers.get("ETag"):
+        asked["If-None-Match"] = headers["ETag"]
+    status, body, headers = H.request(m.url + "/", headers=asked, opener=owner.opener)
+    numbers["page: reload (bytes)"] = len(body) + len(str(headers))
 
     # What every agent loads, and what reading a full inbox costs it, in characters (the model's tokens).
     numbers["tools/list (chars)"] = len(json.dumps(a._rpc("tools/list", {})["tools"]))

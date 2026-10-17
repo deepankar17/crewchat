@@ -53,7 +53,8 @@ The easiest is Tailscale.
 - **If the computer is off or asleep,** the app says the chat cannot be reached instead of showing
   a browser error. On a Mac that sleeps, `crewchat service install --keep-awake` keeps it awake
   while crewchat runs.
-- **Nothing is cached on the phone.** The chat is always loaded fresh from the computer.
+- **The chat itself is not kept on the phone.** Messages, tasks and settings always come fresh from the
+  computer. Only the page's own code is kept, and checked with the computer on every load.
 - **Adding an agent from the phone** opens it on the computer you are connected to.
 - **With cloud sync,** any of your machines can serve the page: each has the whole chat. A hosted
   page that needs no machine switched on is planned.

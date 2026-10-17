@@ -18,6 +18,7 @@ class Bench(unittest.TestCase):
             "messages.jsonl bytes", "hook: tool call, tells the server (s)", "hook: tool call, skipped (s)",
             "hook: prompt (s)", "hook: end of turn, nothing new (s)", "poll: open the chat (s)",
             "poll: open the chat (bytes)", "poll: one new message (s)", "poll: one new message (bytes)",
+            "page: first load (bytes)", "page: reload (bytes)",
             "tools/list (chars)", "hub_inbox, 50 unread (chars)", "state.json writes, a busy load (count)",
             "server startup (s)"})
         for k, v in numbers.items():

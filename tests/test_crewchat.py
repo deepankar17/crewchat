@@ -3,6 +3,7 @@ import argparse
 import ast
 import base64
 import contextlib
+import gzip
 import http.cookiejar
 import io
 import json
@@ -2562,6 +2563,33 @@ class ChatPage(Base):
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         self.assertEqual(self.raw("/login?code=" + code, headers={"X-Forwarded-For": "7.7.7.2"})[0], 401)
 
+    def test_the_page_is_compressed_and_a_reload_is_a_304(self):
+        opener, _ = self.owner_browser()
+        status, body, headers = self.raw("/", headers={"Accept-Encoding": "gzip, deflate, br"}, opener=opener)
+        self.assertEqual((status, headers["Content-Encoding"]), (200, "gzip"))
+        self.assertEqual(gzip.decompress(body), crewchat.PAGE_BYTES)
+        self.assertLess(len(body), len(crewchat.PAGE_BYTES) / 3)
+        self.assertEqual(headers["Vary"], "Accept-Encoding")
+        etag = headers["ETag"]
+        for k in ("Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(headers[k], crewchat.PAGE_HEADERS[k], k)  # the page's protections, unchanged
+        # A reload: the browser asks with the ETag it kept, and gets nothing but headers.
+        for asked in (etag, "W/" + etag, '"other", ' + etag):
+            status, body, headers = self.raw("/", headers={"If-None-Match": asked, "Accept-Encoding": "gzip"}, opener=opener)
+            self.assertEqual((status, body), (304, b""), asked)
+            self.assertEqual(headers["ETag"], etag)
+            self.assertEqual(headers["Content-Security-Policy"], crewchat.PAGE_HEADERS["Content-Security-Policy"])
+            self.assertLess(len(str(headers)), 1024)  # the whole answer: under 1 KB
+        status, body, _ = self.raw("/", headers={"If-None-Match": '"an older page"'}, opener=opener)
+        self.assertEqual((status, body), (200, crewchat.PAGE_BYTES))  # changed: the whole page, uncompressed here
+        for refused in ("identity", "gzip;q=0", "br"):
+            self.assertNotIn("Content-Encoding", self.raw("/", headers={"Accept-Encoding": refused}, opener=opener)[2], refused)
+        # Signed out, a kept page's ETag gets the sign-in page, never a 304.
+        status, _, headers = self.raw("/", headers={"If-None-Match": etag})
+        self.assertEqual((status, headers["Location"]), (303, "/login"))
+        self.assertEqual(json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1]) and
+                         self.raw("/api/boot", opener=opener)[2]["Cache-Control"], "no-store")  # the chat's data never kept
+
     def test_chat_page_and_api(self):
         session, name = self.agent("cursor")
         opener, _ = self.owner_browser()
@@ -2569,7 +2597,7 @@ class ChatPage(Base):
         self.assertEqual(status, 200)
         self.assertIn(b"<title>crewchat</title>", body)
         self.assertIn(b'id="panel"', body)  # the page from 0.14
-        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Cache-Control"], "private, no-cache")  # kept, and asked about each time
         self.assertEqual(self.raw("/classic", opener=opener)[0], 404)  # the page before 0.14 is gone
         send = lambda obj, extra=None: self.raw(  # noqa: E731
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)

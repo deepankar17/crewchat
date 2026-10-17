@@ -36,7 +36,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | Done | P0 |
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | Done | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | Done | none |
-| [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
+| [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | Done | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | To do | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | To do | S1 |
@@ -317,7 +317,7 @@ at load when there are renames.
 
 ### P7
 
-**Compress and cache the chat page** · P3 · effort S · To do
+**Compress and cache the chat page** · P3 · effort S · Done
 
 **Goal.** Fast reloads of the 156 KB page, especially on phones.
 
@@ -341,6 +341,11 @@ at load when there are renames.
 - None significant.
 
 **Depends on:** nothing
+
+**Status.** Done. The page was 170 KB and sent with `Cache-Control: no-store`, so the browser kept nothing and
+never asked again with an ETag. Owner's choice (18 Oct): the page's HTML (the same for everyone, no chat data)
+is `private, no-cache` with an ETag, so a reload is a 304 of 491 bytes; the first load is gzipped (47 KB). The
+API stays `no-store`, the sign-in check comes before any 304, and the CSP is unchanged.
 
 ## Storage rules
 

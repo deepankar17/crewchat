@@ -29,6 +29,7 @@ See README.md for the full guide.
 """
 import argparse
 import base64
+import gzip
 import hashlib
 import itertools
 import json
@@ -4257,6 +4258,16 @@ def app_icon(size):
         return _icons[size]
 
 
+def takes_gzip(accept):
+    """Does an Accept-Encoding header take gzip (and not refuse it with q=0)?"""
+    for part in accept.lower().split(","):
+        name, _, params = part.strip().partition(";")
+        if name.strip() in ("gzip", "*"):
+            q = params.strip()
+            return not (q.startswith("q=") and q[2:].strip() in ("0", "0.0", "0.00", "0.000"))
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "crewchat/" + __version__
     protocol_version = "HTTP/1.1"
@@ -4316,6 +4327,25 @@ class Handler(BaseHTTPRequestHandler):
         headers = {"Cache-Control": "no-store"}
         headers.update(extra or {})
         self._reply(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"), extra=headers)
+
+    def _chat_page(self):
+        """The chat page: the same for everyone (its data comes from the API), so the browser may keep it and
+        ask whether it changed (ETag: 304, a few hundred bytes); compressed when the browser takes gzip.
+        Only after the sign-in check, as before."""
+        headers = dict(PAGE_HEADERS, **{"Cache-Control": "private, no-cache", "ETag": PAGE_ETAG,
+                                        "Vary": "Accept-Encoding"})
+        asked = [t.strip() for t in self.headers.get("If-None-Match", "").split(",")]
+        if PAGE_ETAG in asked or "W/" + PAGE_ETAG in asked:
+            self.send_response(304)
+            for k, v in headers.items():
+                self.send_header(k, v)
+            self.end_headers()
+            return
+        if takes_gzip(self.headers.get("Accept-Encoding", "")):
+            headers["Content-Encoding"] = "gzip"
+            self._reply(200, PAGE_GZIP, ctype="text/html; charset=utf-8", extra=headers)
+        else:
+            self._reply(200, PAGE_BYTES, ctype="text/html; charset=utf-8", extra=headers)
 
     def _html(self, code, html, extra=None):
         headers = dict(PAGE_HEADERS)
@@ -4464,7 +4494,7 @@ class Handler(BaseHTTPRequestHandler):
             self._reply(405, b"", extra={"Allow": "POST, DELETE"})
         elif url.path == "/":
             if self._owner_session():
-                self._html(200, CHAT_PAGE)
+                self._chat_page()
             else:
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/login":
@@ -12115,6 +12145,10 @@ loop();
 """
 LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
+# The chat page as served (Handler._chat_page): made once, compressed once, and named by its contents.
+PAGE_BYTES = CHAT_PAGE.encode("utf-8")
+PAGE_GZIP = gzip.compress(PAGE_BYTES, 9, mtime=0)
+PAGE_ETAG = '"%s"' % hashlib.sha256(PAGE_BYTES).hexdigest()[:20]
 
 
 # --------------------------------------------------------------------------------------------
