@@ -2790,7 +2790,7 @@ class Hub:
         with self.lock:
             while self.version == version and time.time() < deadline:
                 self.lock.wait(timeout=max(0.0, deadline - time.time()))
-            new = [m for m in self.messages if m["seq"] > after]
+            new = self.messages[self._after(after):]
             # A new page (after -1) shows the latest messages. After that the page catches up in order, a batch
             # at a time ("more": ask again at once), so one that slept through a busy night misses nothing.
             batch = new[-PAGE_BATCH:] if after < 0 else new[:PAGE_BATCH]
@@ -2804,22 +2804,38 @@ class Hub:
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
                 "agents": self._rows(),
-                "roles": self.roster.page_roles,  # their instructions come from /api/roles
                 "pack": self.roster.pack,
                 "crew": self.roster.crew,
-                "statuses": STATUSES,
-                "tools": TOOLS_INFO,
-                "presets": PICTURE_PRESETS,
-                "art": ART_PICTURES,
-                "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
+                "update": getattr(self, "newer", ""),
+                "boot": self.boot()["tag"],  # what /api/boot gives: fetched again when this changes
+            }
+
+    def _after(self, seq):
+        """Where the messages after seq start (they are in seq order). Caller holds the lock."""
+        low, high = 0, len(self.messages)
+        while low < high:
+            mid = (low + high) // 2
+            if self.messages[mid]["seq"] <= seq:
+                low = mid + 1
+            else:
+                high = mid
+        return low
+
+    def boot(self):
+        """What the chat page needs and changes only with the server or the project's roles (/api/boot),
+        with a tag that changes with it: the page's poll carries the tag, not all of this."""
+        roles = self.roster.page_roles  # their instructions come from /api/roles
+        cached = getattr(self, "_boot", None)
+        if cached and cached[0] is roles:
+            return cached[1]
+        data = {"roles": roles, "statuses": STATUSES, "tools": TOOLS_INFO, "presets": PICTURE_PRESETS,
+                "art": ART_PICTURES, "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
                 "advisors": {tool: tool_advisors(tool) for tool in LAUNCH_TOOLS},
-                "names": AGENT_NAMES,
-                "images": INLINE_IMAGES,
-                "max_upload": MAX_UPLOAD,
-                "update": getattr(self, "newer", ""),
-                "releases": RELEASES,
-            }
+                "names": AGENT_NAMES, "images": INLINE_IMAGES, "max_upload": MAX_UPLOAD, "releases": RELEASES}
+        data["tag"] = sha(__version__ + json.dumps(data, sort_keys=True))[:12]
+        self._boot = (roles, data)
+        return data
 
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing=""):
         """What an agent's hook asks: are there messages for the session with this link key?
@@ -4461,6 +4477,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(401, {"error": "sign in"})
                 return
             self._json(200, {"groups": commands_catalog()})
+        elif url.path == "/api/boot":
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return
+            if self._use_asked():
+                self._json(200, self.hub.boot())
         elif url.path == "/api/poll":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -11769,6 +11791,18 @@ function renderHeader() {
   $("space-meta").textContent = [plural(state.agents.length, "agent"), plural(machines, "machine"), plural(open, "open task")].join(" · ");
 }
 
+// What changes only with the server or the project's roles: fetched at load, and again when the poll's tag
+// for it changes.
+async function loadBoot() {
+  const boot = await request("/api/boot");
+  state.roles = boot.roles || []; state.statuses = boot.statuses || {};
+  state.tools = boot.tools || {}; state.presets = boot.presets || {}; state.art = boot.art || {};
+  state.models = boot.models || {}; state.advisors = boot.advisors || {}; state.pictures = boot.pictures;
+  state.agentNames = boot.names || []; state.images = boot.images || []; state.maxUpload = boot.max_upload || state.maxUpload;
+  state.releases = boot.releases || "";
+  state.boot = boot.tag;
+}
+
 async function loop() {
   for (;;) {
     try {
@@ -11786,20 +11820,18 @@ async function loop() {
       }
       if (!res.ok) throw new Error("HTTP " + res.status);
       const data = await res.json();
+      if (data.boot !== state.boot) await loadBoot();  // the server or the roles changed (or the page is new)
       state.failures = 0;
       $("banner").classList.remove("show");
       const first = state.version < 0;
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
       state.more = !!data.more;
-      state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
-      state.tools = data.tools || {}; state.presets = data.presets || {}; state.art = data.art || {};
-      state.models = data.models || {}; state.advisors = data.advisors || {}; state.pictures = data.pictures; state.agentNames = data.names || [];
-      state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
+      state.progress = data.progress || {};
       state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
       state.held = {};
       for (const r of state.sheet) if (r.holder && r.status !== "done") state.held[r.holder] = r;
       state.many = new Set(state.agents.map((a) => a.device)).size > 1;
-      showUpdate(data.update || "", data.releases || "");
+      showUpdate(data.update || "", state.releases);
       if (data.project && data.project + " · crewchat" !== state.title) {
         state.title = data.project + " · crewchat";
         state.project = data.project;

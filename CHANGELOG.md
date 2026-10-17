@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **The chat page's poll carries only what changes.** Roles, task statuses, tools, pictures, models, names
+  and other fixed data come from `/api/boot` once, and again when the poll's `boot` tag changes (an
+  upgraded server, or roles edited): a poll with one new message goes from about 5.7 KB to 2.3 KB. New
+  messages are found by halving instead of a scan of the last 2,000.
 - **A long chat starts as fast as a new one.** The server reads `messages.jsonl` from its end, only the
   2,000 messages it keeps, instead of the whole file: with a 500 MB log, startup goes from about 4 s to
   0.1 s and the memory it needs while loading from 2.6 GB to 63 MB. Linking a project with other machines

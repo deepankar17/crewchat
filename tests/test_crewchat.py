@@ -273,7 +273,7 @@ class Identity(Base):
         finally:
             cli("setup", "--agent-names", "people")
         self.assertEqual(crewchat.load_config()["agent_names"], "people")
-        self.assertEqual(self.hub.poll(-1, -1, 0)["names"], crewchat.AGENT_NAMES)
+        self.assertEqual(self.hub.boot()["names"], crewchat.AGENT_NAMES)
 
     def test_sessions_sharing_one_folder_get_their_own_names(self):
         self.place_names()
@@ -532,6 +532,16 @@ class Advisor(Base):
         self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
 
 
+class PollAfter(unittest.TestCase):
+    def test_the_messages_after_a_number_are_found_by_halving(self):
+        hub = crewchat.Hub.__new__(crewchat.Hub)
+        for seqs in ([], [1], [1, 2, 3], [2, 5, 9, 10, 40], list(range(1, 2001)), [3, 7] + list(range(100, 160))):
+            hub.messages = [{"seq": n} for n in seqs]
+            for after in [-1, 0] + seqs + [n + 1 for n in seqs] + [10 ** 6]:
+                self.assertEqual(hub.messages[hub._after(after):], [m for m in hub.messages if m["seq"] > after],
+                                 (seqs[:5], after))
+
+
 class TrimmedTools(Base):
     """What every agent loads is short (roadmap P2): one hub_task for the task sheet, and inbox and history
     answers that fit a cap without losing a message."""
@@ -689,10 +699,10 @@ class Teams(Base):
         status, _, _ = self.raw("/api/role", json.dumps({"agent": dev_name, "role": "qa"}).encode(),
                                 {"Content-Type": "application/json", "Origin": self.base}, opener)
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
-        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
-        qa = next(r for r in poll["roles"] if r["name"] == "qa")
+        boot = json.loads(self.raw("/api/boot", opener=opener)[1])
+        qa = next(r for r in boot["roles"] if r["name"] == "qa")
         self.assertEqual((qa["title"], qa["picture"], qa["source"]), ("QA", "art:scientist", "pack"))
-        self.assertNotIn("description", qa)  # instructions come from /api/roles, not every poll
+        self.assertNotIn("description", qa)  # instructions come from /api/roles
 
     def test_there_is_one_lead(self):
         (one, n1), (two, n2) = self.agent(), self.agent()
@@ -956,6 +966,29 @@ class Roles(Base):
     def poll(self):
         return self.hub.poll(-1, -1, 0)
 
+    def test_the_poll_carries_a_tag_and_api_boot_the_rest(self):
+        # What changes only with the server or the roles comes from /api/boot (roadmap P4); the poll says
+        # when to fetch it again.
+        self.assertEqual(self.raw("/api/boot")[0], 401)
+        opener, _ = self.owner_browser()
+        boot = json.loads(self.raw("/api/boot", opener=opener)[1])
+        moved = {"roles", "statuses", "tools", "presets", "art", "pictures", "models", "advisors", "names", "images",
+                 "max_upload", "releases"}
+        self.assertEqual(set(boot), moved | {"tag"})
+        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
+        self.assertFalse(set(poll) & moved)
+        self.assertEqual(poll["boot"], boot["tag"])
+        self.assertEqual(self.poll()["boot"], boot["tag"])  # the same while nothing changes
+        self.op(op="create", name="tagger", label="Tagger", description="You tag things.")
+        try:
+            changed = self.hub.boot()
+            self.assertNotEqual(changed["tag"], boot["tag"])  # a role edited: the page fetches again
+            self.assertEqual(self.poll()["boot"], changed["tag"])
+            self.assertIn("tagger", [r["name"] for r in changed["roles"]])
+        finally:
+            self.op(op="delete", name="tagger")
+        self.assertEqual(self.hub.boot()["tag"], boot["tag"])
+
     def test_only_the_owner_changes_roles(self):
         self.assertEqual(self.op(token=self.token, op="list")["status"], 403)
         listing = self.op(op="list")
@@ -967,7 +1000,7 @@ class Roles(Base):
         role = self.op(op="create", name="designer", label="Designer", description="You design screens.",
                        picture="preset:palette", tool="cursor")["role"]
         self.assertEqual(role["name"], "designer")
-        page = {r["name"]: r for r in self.poll()["roles"]}
+        page = {r["name"]: r for r in self.hub.boot()["roles"]}
         self.assertEqual((page["designer"]["title"], page["designer"]["tool"]), ("Designer", "cursor"))
         session, name = self.agent()
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "designer"})
@@ -981,7 +1014,7 @@ class Roles(Base):
         self.assertEqual(self.op(op="delete", name="docs"), {"deleted": "docs"})
         self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")
         self.assertIn("You no longer have a role", session.text("hub_inbox"))
-        self.assertNotIn("docs", [r["name"] for r in self.poll()["roles"]])
+        self.assertNotIn("docs", [r["name"] for r in self.hub.boot()["roles"]])
         self.assertIn("no role called docs", self.op(op="edit", name="docs", label="x")["error"])
 
     def test_a_pack_sets_the_crew_and_takes_away_roles_it_does_not_have(self):
@@ -991,11 +1024,11 @@ class Roles(Base):
         self.assertEqual(self.poll()["crew"], "software")
         listing = self.op(op="pack", pack="youtube")
         self.assertEqual(listing["pack"], "youtube")
-        poll = self.poll()
+        poll, boot = self.poll(), self.hub.boot()
         self.assertEqual((poll["pack"], poll["crew"]), ("youtube", "general"))
         self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")  # no qa in youtube
         self.assertIn("You no longer have a role", session.text("hub_inbox"))
-        self.assertEqual(next(r for r in poll["roles"] if r["name"] == "lead")["title"], "Producer")
+        self.assertEqual(next(r for r in boot["roles"] if r["name"] == "lead")["title"], "Producer")
         self.op(op="pack", pack="software")
         self.assertEqual(self.poll()["crew"], "software")
 
@@ -2424,7 +2457,7 @@ class Profiles(Base):
         self.assertIn("picture art:fox", session.text("hub_profile", picture="fox"))
         self.assertEqual(crewchat.clean_picture("art:../x"), "")
         self.assertEqual(set(crewchat.ART_DATA), set(crewchat.ART_PICTURES))
-        self.assertEqual(self.hub.poll(-1, -1, 0)["art"]["bot"], "Robot")
+        self.assertEqual(self.hub.boot()["art"]["bot"], "Robot")
         self.assertIn("picture preset:robot", session.text("hub_profile", picture="robot"))  # the emoji, still
 
     def test_uploaded_picture_limits(self):
@@ -4282,7 +4315,8 @@ class Lifecycle(Base):
         opener, _ = self.owner_browser()
         poll = lambda: json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])  # noqa: E731
         self.hub.set_update("99.0.0")
-        self.assertEqual((poll()["update"], poll()["releases"]), ("99.0.0", crewchat.RELEASES))
+        self.assertEqual(poll()["update"], "99.0.0")
+        self.assertEqual(json.loads(self.raw("/api/boot", opener=opener)[1])["releases"], crewchat.RELEASES)
         self.hub.set_update("")
         self.assertEqual(poll()["update"], "")
         page = self.raw("/", opener=opener)[1].decode()

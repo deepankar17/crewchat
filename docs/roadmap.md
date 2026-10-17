@@ -33,7 +33,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | Done | P0 |
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | Done | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | Done | P0 |
-| [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | To do | P0 |
+| [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | Done | P0 |
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
@@ -217,7 +217,7 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 
 ### P4
 
-**Split fixed data out of /api/poll** · P2 · effort S · To do
+**Split fixed data out of /api/poll** · P2 · effort S · Done
 
 **Goal.** The chat page's long-poll carries only what changed, not every constant on every change.
 
@@ -243,6 +243,11 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 - Both CHAT_PAGE and CLASSIC_PAGE read these fields.
 
 **Depends on:** [P0](#p0)
+
+**Status.** Done. The classic page was gone already. Owner's choices (17 Oct): roles move to /api/boot as
+well, and every poll carries `boot`, a tag of what /api/boot returns, which changes with the server version
+or the roles, so the page fetches it again then; `statuses` moved too. The poll finds new messages by
+halving (no `bisect` key on Python 3.9). The answer for one new message went from 5,659 to 2,333 bytes.
 
 ### P5
 

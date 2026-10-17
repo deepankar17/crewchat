@@ -390,6 +390,7 @@ class NewPage(Signed):
         c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
         c.until("$('panel-title').textContent === 'Roles' && !$('panel-body').innerText.includes('Designer')",
                 what="the role gone")
+        c.until("!state.roles.some(r => r.name === 'designer')", what="the page's list to follow (the poll's boot tag)")
         self.assertEqual(c.errors, [])
 
     def test_the_task_board_and_a_task_in_the_panel(self):
