@@ -2950,6 +2950,86 @@ class Hooks(Base):
         self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
         self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
 
+    def test_a_permission_prompt_is_answered_on_the_page(self):
+        session, name = self.linked("asks-first")
+        asked = {"session_id": "asks-first", "tool_name": "Bash",
+                 "tool_input": {"command": "rm -rf build", "description": "Clean the build"}}
+
+        def ask():  # the hook waits for an answer: run it beside the test, and get the item it puts up
+            out = {}
+            t = threading.Thread(target=lambda: out.update(text=self.hook("claude", "permission", asked)))
+            t.start()
+            for _ in range(200):
+                item = next((n for n in self.hub.needs_you() if n["kind"] == "permission"), None)
+                if item:
+                    return t, out, item
+                time.sleep(0.05)
+            self.fail("the prompt never reached Needs you")
+
+        t, out, item = ask()
+        self.assertEqual((item["agent"], item["tool"], item["text"]), (name, "Bash", "rm -rf build\n(Clean the build)"))
+        self.assertEqual(self.hub.needs_you()[0]["kind"], "permission")  # before anything else
+        answer = lambda pid, a: crewchat.post_json(self.base + "/api/permission", self.owner, {"id": pid, "answer": a})  # noqa: E731
+        with self.assertRaises(urllib.error.HTTPError):
+            answer(item["id"], "maybe")
+        self.assertEqual(answer(item["id"], "allow"), {"agent": name, "answer": "allow"})
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"],
+                         {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}})
+        self.assertFalse([n for n in self.hub.needs_you() if n["kind"] == "permission"])  # handled: gone
+        with self.assertRaises(urllib.error.HTTPError):
+            answer(item["id"], "deny")  # answered already
+
+        t, out, item = ask()
+        answer(item["id"], "deny")
+        t.join(30)
+        decision = json.loads(out["text"])["hookSpecificOutput"]["decision"]
+        self.assertEqual(decision["behavior"], "deny")
+        self.assertIn("denied", decision["message"])
+
+        # Answered in its terminal instead: its next turn (or the end of this one) takes the item away,
+        # and the hook says nothing.
+        t, out, item = ask()
+        self.hook("claude", "prompt", {"session_id": "asks-first"})
+        t.join(30)
+        self.assertEqual(out["text"], "")
+        self.assertFalse([n for n in self.hub.needs_you() if n["kind"] == "permission"])
+
+        # A session that never checked in, or the owner keeping prompts in the terminal: no wait at all.
+        self.assertEqual(self.hook("claude", "permission", dict(asked, session_id="never-linked")), "")
+        config = crewchat.load_config()
+        config["permissions"] = "terminal"
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            started = time.time()
+            self.assertEqual(self.hook("claude", "permission", asked), "")
+            self.assertLess(time.time() - started, 15)
+        finally:
+            config.pop("permissions")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+    def test_nobody_answers_a_permission_prompt_in_time(self):
+        session, name = self.linked("asks-nobody")
+        place = self.hub.agents[name]["place"]
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        self.assertEqual(self.hub.ask_permission(place, key, "Write", "notes.md", wait=0.3), "")  # its own prompt shows
+        self.assertFalse(self.hub.permissions)
+        self.assertEqual(self.hub.ask_permission(place, "unknownkey123", "Write", "x", wait=5), "")  # not linked
+        with self.assertRaises(crewchat.HubError):
+            self.hub.ask_permission(place, "bad key!", "Write", "x")
+
+    def test_what_a_permission_prompt_shows(self):
+        self.assertEqual(crewchat.permission_text({"tool_name": "Write", "tool_input": {"file_path": "/a/b.py", "content": "x"}}),
+                         ("Write", "/a/b.py"))
+        self.assertEqual(crewchat.permission_text({"tool_name": "WebFetch", "tool_input": {"url": "https://x.dev", "prompt": "p"}}),
+                         ("WebFetch", "https://x.dev"))
+        self.assertEqual(crewchat.permission_text({"tool_name": "mcp__x__y", "tool_input": {"a": 1}}), ("mcp__x__y", '{"a": 1}'))
+        self.assertEqual(len(crewchat.permission_text({"tool_name": "Bash", "tool_input": {"command": "x" * 9000}})[1]),
+                         crewchat.MAX_PERMISSION_TEXT)
+        self.assertEqual(crewchat.permission_text({}), ("", ""))
+
     def test_a_session_is_reported_once(self):
         session, name = self.linked("sess-0001-abc")
         self.hook("claude", "stop", {"session_id": "sess-0001-abc"},
@@ -3116,7 +3196,11 @@ class Hooks(Base):
         self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
                          {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
-        self.assertEqual(sorted(claude), ["PostToolUse", "Stop", "UserPromptSubmit"])
+        self.assertEqual(sorted(claude), ["PermissionRequest", "PostToolUse", "Stop", "UserPromptSubmit"])
+        asks = [h for g in claude["PermissionRequest"] for h in g["hooks"]]
+        self.assertEqual(len(asks), 1)
+        self.assertTrue(asks[0]["command"].endswith(" hook claude permission"))
+        self.assertGreater(asks[0]["timeout"], crewchat.PERMISSION_WAIT)  # the hook outlives its wait
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
         self.assertEqual((len(tool), tool[0]), (2, "echo mine"))
         self.assertTrue(tool[1].endswith(" hook claude tool"))

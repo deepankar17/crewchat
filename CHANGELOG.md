@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **Allow or Deny a Claude Code agent's permission prompts from the page.** When an agent wants to do
+  something it has not been allowed, a new `PermissionRequest` hook puts it first in **Needs you**: the
+  agent, the tool, and the command, file or address in full, with **Allow** and **Deny** (and a
+  notification while the page is in the background). With no answer in 10 minutes, or one given in its
+  terminal, the item goes and Claude Code asks there as before. `crewchat setup --permissions terminal`
+  keeps prompts in the terminal; `/api/permission` answers one. The server adds the hook to folders
+  connected before.
 - **The classic page is gone.** The page from before 0.14, kept at `/classic` for one release, is
   removed with its link in the project menu.
 - **New agent says what a tool still needs.** Picking a tool shows whether it is installed, signed in

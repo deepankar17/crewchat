@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.request
@@ -515,6 +516,36 @@ class NewPage(Signed):
         c.until("$('log').innerText.includes('Done with the button')", what="the message on the page")
         c.js("$('log').scrollTop = $('log').scrollHeight; markRead()")
         c.until("!state.needs.some(n => n.kind === 'message')", what="read while in front")
+    def test_allow_or_deny_a_permission_prompt(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+
+        def ask(command):  # the agent's tool waits on its prompt; its hook asks the page
+            out = {}
+            t = threading.Thread(target=lambda: out.update(text=self.agent.hook(
+                "permission", extra={"tool_name": "Bash", "tool_input": {"command": command}})))
+            t.start()
+            c.until("$('needs-list').innerText.includes(%s)" % json.dumps(command), what="the prompt in Needs you")
+            return t, out
+
+        t, out = ask("npm publish --tag next")
+        item = "[...document.querySelectorAll('#needs-list .need.ask')].find(e => e.innerText.includes('npm publish'))"
+        self.assertIn("ASKS PERMISSION", c.js(item + ".querySelector('.k').innerText").upper())
+        self.assertIn(self.agent.name, c.js(item + ".textContent"))
+        self.assertEqual(c.js("$('needs-list').firstElementChild.classList.contains('ask')"), True)  # first of all
+        c.js(item + ".querySelector('button:not(.ghost)').click()")
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+        c.until("!$('needs-list').innerText.includes('npm publish')", what="the prompt to go")
+
+        t, out = ask("<img src=x onerror=window.pwned=1>")
+        c.js("[...document.querySelectorAll('#needs-list .need.ask button')].find(b => b.textContent === 'Deny').click()")
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertIsNone(c.js("window.pwned"))
+        self.assertEqual(self.shown_though_hidden(), [])
+        self.assertEqual(c.errors, [])
+
     def test_dragging_a_card_with_the_mouse(self):
         c = self.chrome
         c.click("#view-tasks")

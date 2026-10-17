@@ -196,8 +196,9 @@ Things to know:
 
 - **It opens on the machine that hosts the page.** On a phone, it opens on the computer you are
   connected to. Starting an agent on another linked machine is not possible yet.
-- **When it needs a permission you did not give, it asks in its window.** Allow-and-deny from the
-  chat page is planned.
+- **When it needs a permission you did not give, it asks.** A Claude Code agent asks in **Needs you**
+  on the page, with **Allow** and **Deny** ([Permission prompts](getting-started.md#permission-prompts)),
+  then in its window if nobody answers; other tools ask in their windows.
 - **Answer its first questions in its window.** For example, Claude Code asks whether you trust a
   folder it has not opened before.
 - **The session gets only a one-time key** on its command line. Its name, role and task reach it

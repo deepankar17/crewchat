@@ -89,6 +89,8 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an agent (config: max_chain)
 MAX_LISTEN = 55 * 60
+PERMISSION_WAIT = 10 * 60  # how long a permission prompt waits for Allow or Deny on the page (then: the agent's own)
+MAX_PERMISSION_TEXT = 2000  # of what the agent asks to run or change, shown with Allow and Deny
 DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
 LISTEN_GRACE = 15  # a listening hook re-asks within this many seconds; after that it has stopped
 ONLINE_SECS = 900  # an agent heard from this recently counts as online
@@ -1089,6 +1091,7 @@ class Hub:
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
+        self.permissions = {}  # id -> an agent's permission prompt waiting for Allow or Deny (memory only)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self.started = time.time()  # nobody can be heard while the server is down (memory only)
@@ -1732,13 +1735,62 @@ class Hub:
                 items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": agent, "holder": r["holder"],
                               "text": said.get("text", "") if fits else "",
                               "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
+        with self.lock:
+            for ask in self.permissions.values():
+                if not ask["answer"]:
+                    items.append({"kind": "permission", "id": ask["id"], "agent": ask["agent"], "tool": ask["tool"],
+                                  "text": ask["text"], "ts": ask["ts"], "blocking": 0})
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
-        order = {"blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
+        order = {"permission": -1, "blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
         items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
         self._needs = (version, items)
         return items
+
+    # Permission prompts ------------------------------------------------------------------------
+    def ask_permission(self, place, key, tool, text, wait=PERMISSION_WAIT):
+        """An agent's tool waits on a permission prompt (Claude Code's PermissionRequest hook): it waits in
+        Needs you for the owner's Allow or Deny, up to wait seconds. Returns "allow", "deny", or "" when
+        nobody answered here (the agent's own prompt shows then), the agent is not linked, or the owner
+        keeps permission prompts in the agents' terminals."""
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            raise HubError("bad key")
+        with self.lock:
+            name = self.links.get(key)
+            agent = self.agents.get(name) if name else None
+            if agent is None or agent["place"] != place or self.machine_config().get("permissions") == "terminal":
+                return ""
+            ask = {"id": secrets.token_hex(6), "agent": name, "tool": clean_doing(tool)[:60] or "a tool",
+                   "text": str(text or "")[:MAX_PERMISSION_TEXT], "ts": time.time(), "answer": ""}
+            self.permissions[ask["id"]] = ask
+            self.touch(name, active=True)
+            self._changed()
+            try:
+                self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self.permissions, timeout=wait)
+            finally:
+                self.permissions.pop(ask["id"], None)
+                self._changed()
+        return ask["answer"] if ask["answer"] in ("allow", "deny") else ""
+
+    def answer_permission(self, pid, answer):
+        """The owner's Allow or Deny for a permission prompt in Needs you."""
+        if answer not in ("allow", "deny"):
+            raise HubError("answer is allow or deny")
+        with self.lock:
+            ask = self.permissions.get(pid) if isinstance(pid, str) else None
+            if ask is None or ask["answer"]:
+                raise HubError("that permission prompt is not waiting any more")
+            ask["answer"] = answer
+            self._changed()
+        return {"agent": ask["agent"], "answer": answer}
+
+    def _drop_permissions(self, name):
+        """A turn of the agent began or ended: what it asked was answered elsewhere (in its terminal).
+        Caller holds the lock."""
+        for ask in list(self.permissions.values()):
+            if ask["agent"] == name and not ask["answer"]:
+                del self.permissions[ask["id"]]
 
     def owner_read(self, seq):
         """The owner has seen the chat up to seq (the page, while it is in front)."""
@@ -2756,6 +2808,7 @@ class Hub:
                 return {}
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
+            self._drop_permissions(name)
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -3813,11 +3866,11 @@ COMMANDS = [
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
-        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off]",
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off] [--permissions page|terminal]",
          "Change settings: the chat's name, the local port, the address other machines use, how many turns in "
          "a row an agent may take on other agents' messages before only you can wake it (default 10), and how new "
          "agents are named: a first name (people) or their tool and folder (place), and whether the page shows what agents are "
-         "doing (--activity).", None),
+         "doing (--activity), and whether Claude Code agents ask permission in Needs you first (--permissions).", None),
     ]),
     ("The server", [
         ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
@@ -4080,7 +4133,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4894,7 +4947,8 @@ class Handler(BaseHTTPRequestHandler):
         owner_actions = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
                          "/api/read": self._read, "/api/folders": self._folders,
-                         "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}
+                         "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
+                         "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer"))}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -4912,6 +4966,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "hooks use a place token"})
                 return
             data = self._object(raw)
+            if data.get("event") == "permission":
+                try:
+                    self._json(200, {"answer": self.hub.ask_permission(who[1], data.get("key"), str(data.get("tool") or ""),
+                                                                       str(data.get("text") or ""))})
+                except HubError:
+                    self._json(400, {"error": "bad request"})
+                return
             try:
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
@@ -5057,7 +5118,7 @@ def free_port(start):
     return start
 
 
-def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None):
+def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None, permissions=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
     config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
@@ -5073,6 +5134,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
         config["agent_names"] = agent_names
     if activity:
         config["activity"] = activity
+    if permissions:
+        config["permissions"] = permissions
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -5084,7 +5147,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
 
 def cmd_setup(args):
     config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None),
-                        getattr(args, "agent_names", None), getattr(args, "activity", None))
+                        getattr(args, "agent_names", None), getattr(args, "activity", None),
+                        getattr(args, "permissions", None))
     print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
@@ -6539,7 +6603,9 @@ def set_claude_hooks(settings, names=(SERVER_NAME,)):
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
                                                  "statusMessage": "Waiting for crewchat messages"}),
-                               ("PostToolUse", "tool", {"timeout": 10})):  # a sign of life
+                               ("PostToolUse", "tool", {"timeout": 10}),  # a sign of life
+                               ("PermissionRequest", "permission", {"timeout": PERMISSION_WAIT + 30,
+                                                                    "statusMessage": "Asking on the crewchat page"})):
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
         groups.append({"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]})
@@ -7209,6 +7275,20 @@ def clean_doing(value):
     return " ".join(str(value or "").split())[:80]
 
 
+def permission_text(data):
+    """What a tool asks permission for, in full for the owner to decide on (the page shows it as text):
+    the tool and its command, file, address or search, or else its input."""
+    name = str(data.get("tool_name") or "")
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    for field in ("command", "file_path", "notebook_path", "url", "pattern", "query", "path"):
+        if isinstance(args.get(field), str) and args[field].strip():
+            text = args[field]
+            if field == "command" and isinstance(args.get("description"), str) and args["description"].strip():
+                text += "\n(" + args["description"].strip() + ")"
+            return name, text[:MAX_PERMISSION_TEXT]
+    return name, (json.dumps(args, ensure_ascii=False) if args else "")[:MAX_PERMISSION_TEXT]
+
+
 def tool_summary(client, data):
     """What an agent's tool call was, in a few safe words for the chat page: a file's name, a command's
     program (and a well-known tool's subcommand), never their arguments or what was read or written."""
@@ -7296,6 +7376,21 @@ def run_hook(client, event):
         key = launched
     else:
         key = state.get("key") or secrets.token_urlsafe(12)
+    if event == "permission":
+        # A tool waits on a permission prompt: ask the owner on the chat page first. Allow or Deny there
+        # answers it; with no answer in time (or the owner keeps prompts in the terminal), the agent's own
+        # prompt shows.
+        if client != "claude" or not state.get("key") and key != launched:
+            return  # a session that never checked in is not in the chat
+        tool, text = permission_text(data)
+        out = post_json(base + "/api/hook", token, {"key": key, "event": "permission", "tool": tool, "text": text},
+                        timeout=PERMISSION_WAIT + 20) or {}
+        if out.get("answer") == "allow":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}))
+        elif out.get("answer") == "deny":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+                "behavior": "deny", "message": "The owner denied this on the crewchat page."}}}))
+        return
     chain = int(state.get("chain", 0))
     asks = int(state.get("asks", 0))
     # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:
@@ -8801,6 +8896,10 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .need .t { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .need .q { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .need .blk { font-size: 11px; font-weight: 650; color: var(--ink); }
+.need.ask:hover { background: var(--soft); }
+.need .cmd { margin: 4px 0 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9em; overflow-y: auto;
+  background: var(--panel); border-radius: 8px; padding: 6px 8px; color: var(--text); }
+.need .acts { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 #needs-list { max-height: 45vh; overflow-y: auto; }
 #needs-count { background: var(--err); color: var(--err-ink); border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
 #needs-count:empty { display: none; }
@@ -10162,7 +10261,9 @@ function showPermissions(event) {
   }
   $("l-perms-note").textContent = pick.value === "all"
     ? "Careful: it will run commands and change files with nobody watching. Use it in a folder you can restore (git), on a machine without secrets it could leak."
-    : "When it needs something else, it asks in its terminal window.";
+    : $("l-tool").value === "claude"
+      ? "When it needs something else, it asks here, in Needs you, with Allow and Deny (and in its terminal window if nobody answers)."
+      : "When it needs something else, it asks in its terminal window.";
   $("l-perms-note").className = pick.value === "all" ? "meta warn" : "meta";
 }
 async function startAgent(event) {
@@ -11186,7 +11287,7 @@ $("update-close").addEventListener("click", () => {
 });
 
 // Needs you: blocked tasks (with the agent's question), reviews, unread messages to you, tasks given back.
-const NEED_LOOK = { blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
+const NEED_LOOK = { permission: ["Asks permission", "var(--err)"], blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
                     message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"] };
 const needKey = (n) => n.kind + ":" + (n.task || n.id);
 function renderNeeds(needs) {
@@ -11200,6 +11301,7 @@ function renderNeeds(needs) {
     $("needs-said").textContent = added.length + " new: " + added.map((n) => (NEED_LOOK[n.kind] || [""])[0] + (n.task ? " #" + n.task : "") + (n.agent ? " from " + n.agent : "")).join("; ");
   state.needsShown = new Set(needs.map(needKey));
   box.replaceChildren(...needs.map((n) => {
+    if (n.kind === "permission") return permissionItem(n);
     const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
     const b = el("button", "need");
     b.setAttribute("role", "listitem");
@@ -11228,6 +11330,36 @@ function renderNeeds(needs) {
     });
     return b;
   }));
+}
+// A permission prompt of an agent's tool: what it asks to run or change, and Allow or Deny. With no answer
+// here in time, the agent asks in its terminal instead.
+function permissionItem(n) {
+  const box = el("div", "need ask");
+  box.setAttribute("role", "listitem");
+  box.style.setProperty("--need", NEED_LOOK.permission[1]);
+  box.append(el("span", "k", NEED_LOOK.permission[0] + " · " + n.agent), el("span", "t", n.tool));
+  if (n.text) box.append(el("pre", "cmd", n.text));
+  const acts = el("div", "acts"), said = el("span", "meta");
+  said.setAttribute("role", "status");
+  for (const [answer, label] of [["allow", "Allow"], ["deny", "Deny"]]) {
+    const b = el("button", answer === "allow" ? "" : "ghost", label);
+    b.type = "button";
+    b.setAttribute("aria-label", label + " " + n.agent + ": " + n.tool);
+    b.addEventListener("click", async () => {
+      for (const x of acts.querySelectorAll("button")) x.disabled = true;
+      try {
+        await postJSON("/api/permission", { id: n.id, answer });
+        said.textContent = answer === "allow" ? "Allowed" : "Denied";
+      } catch (e) {
+        said.textContent = e.message || "Not sent";
+        for (const x of acts.querySelectorAll("button")) x.disabled = false;
+      }
+    });
+    acts.append(b);
+  }
+  acts.append(said);
+  box.append(acts);
+  return box;
 }
 // What you have seen of the chat: messages to you count as read while the page is in front.
 // (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
@@ -11286,9 +11418,16 @@ function notify(needs) {
   for (const n of wanted.slice(0, 3)) {
     const [label] = NEED_LOOK[n.kind] || [""];
     const note = Notice((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
-                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text,
+                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "")
+                                          : n.kind === "permission" ? n.tool + (n.text ? ": " + n.text.slice(0, 200) : "") : n.text,
                                     tag: (state.chat || CHAT) + ":" + needKey(n) });
-    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close?.(); };
+    note.onclick = () => {
+      window.focus();
+      if (n.kind === "message") openPanel("agent", n.agent);
+      else if (n.kind === "permission") $("needs-you").scrollIntoView({ block: "nearest" });
+      else openPanel("task", n.task);
+      note.close?.();
+    };
   }
   if (wanted.length > 3) {
     const more = Notice((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (state.chat || CHAT) + ":more" });
@@ -11616,6 +11755,10 @@ def build_parser():
                    "before only you can wake it (default %d, at most %d)" % (MAX_CHAIN, MAX_CHAIN_LIMIT))
     p.add_argument("--activity", choices=["on", "off"], help="show on the chat page what each agent is doing, from its "
                    "tool calls (a file's name, a command's program; on by default)")
+    p.add_argument("--permissions", choices=["page", "terminal"], help="where a Claude Code agent's permission "
+                   "prompts are answered: in Needs you on the chat page first, with Allow and Deny, then in its "
+                   "terminal if nobody answers in %d minutes (page, the default), or only in its terminal"
+                   % (PERMISSION_WAIT // 60))
     p.add_argument("--agent-names", choices=["people", "place"], help="how new agents are named: a first "
                    "name such as Maya (people, the default), or after their tool and folder, such as claude-macbook (place)")
     p.set_defaults(fn=cmd_setup)
@@ -11812,7 +11955,7 @@ def build_parser():
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=list(HOOK_CLIENTS))
-    p.add_argument("event", choices=["prompt", "stop", "tool"])
+    p.add_argument("event", choices=["prompt", "stop", "tool", "permission"])
     p.set_defaults(fn=cmd_hook)
     return parser
 

@@ -259,7 +259,7 @@ class Agent:
     def _hook_command(self, event):
         if self.client == "claude":
             settings = json.loads((self.folder / ".claude" / "settings.local.json").read_text())
-            key = {"prompt": "UserPromptSubmit", "stop": "Stop"}[event]
+            key = {"prompt": "UserPromptSubmit", "stop": "Stop", "permission": "PermissionRequest"}[event]
             return settings["hooks"][key][0]["hooks"][0]["command"]
         hooks = json.loads((self.folder / ".cursor" / "hooks.json").read_text())
         return hooks["hooks"]["stop"][0]["command"]
