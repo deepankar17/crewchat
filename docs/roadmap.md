@@ -35,7 +35,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | Done | P0 |
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | Done | P0 |
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | Done | P0 |
-| [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
+| [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | Done | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | To do | P1 |
@@ -285,7 +285,7 @@ load in its own process: 179 before, 60 after.
 
 ### P6
 
-**Index messages by id** · P3 · effort S · To do
+**Index messages by id** · P3 · effort S · Done
 
 **Goal.** Remove linear scans when looking up a message by id.
 
@@ -309,6 +309,11 @@ load in its own process: 179 before, 60 after.
 - Forgetting to update the dict when messages are renamed or trimmed.
 
 **Depends on:** nothing
+
+**Status.** Done: `Hub.by_id`, kept by `_store` (and its trimming) and rebuilt with `ids` by `_index` after a
+load, `_apply_renames` and `adopt_open_tasks`; used by `_task`, the advisor's answers, `adopt_open_tasks` and
+crewchat_peers' `claim_task`. `_apply_renames` stays a scan (it also follows `task` references) and runs only
+at load when there are renames.
 
 ### P7
 

@@ -4055,6 +4055,63 @@ class StateWrites(Base):
         self.assertEqual(self.on_disk()["agents"][name]["status"], "waiting to be saved")
 
 
+class MessageIndex(unittest.TestCase):
+    """Hub.by_id finds a message by its id without a scan (roadmap P6), and always matches the messages."""
+
+    def hub(self, lines=()):
+        root = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
+        crewchat.save_config({"project": "index"}, root)
+        (root / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in lines))
+        return crewchat.Hub(crewchat.Roster(root))
+
+    def assertIndexed(self, hub):
+        self.assertEqual(hub.by_id, {m["id"]: m for m in hub.messages})
+        self.assertTrue(all(hub.by_id[m["id"]] is m for m in hub.messages))  # the same objects, not copies
+        self.assertEqual(hub.ids, {m["id"]: m["seq"] for m in hub.messages})
+
+    def test_loaded_sent_trimmed_and_ingested(self):
+        hub = self.hub([{"id": str(i), "seq": i, "ts": 1, "from": "Owner", "to": "all", "text": "x"} for i in range(1, 6)])
+        self.assertIndexed(hub)
+        with hub.lock:
+            for i in range(crewchat.KEEP_MESSAGES + 10):
+                hub._append(crewchat.OWNER, "all", "m%d" % i, "msg")
+        self.assertEqual(len(hub.messages), crewchat.KEEP_MESSAGES)
+        self.assertIndexed(hub)
+        self.assertNotIn("1", hub.by_id)  # trimmed out of memory: out of the index too
+        self.assertTrue(hub.ingest({"id": "B7", "from": "Teo", "to": "all", "text": "from another machine", "ts": 2}))
+        self.assertFalse(hub.ingest({"id": "B7", "from": "Teo", "to": "all", "text": "again", "ts": 2}))
+        self.assertEqual(hub.by_id["B7"]["text"], "from another machine")
+        self.assertIndexed(hub)
+
+    def test_renamed_tasks_are_found_by_their_new_ids(self):
+        hub = self.hub()
+        with hub.lock:
+            hub._append(crewchat.OWNER, "all", "warm up", "msg")
+        old = hub.add_row(crewchat.OWNER, "Ship the release", "", "", "")["id"]
+        before = (hub.home / "messages.jsonl").read_bytes()
+        renamed = hub.adopt_open_tasks("A", "device-a")  # linking machines: open tasks get the device's tag
+        self.assertEqual(renamed, {old: "A" + old})
+        self.assertIndexed(hub)
+        self.assertNotIn(old, hub.by_id)
+        self.assertEqual(hub._task("A" + old)["text"], "Ship the release")
+        # A log a crash left with the old number (state saved, log not yet rewritten): put right in memory,
+        # and in the index, on load.
+        (hub.home / "messages.jsonl").write_bytes(before)
+        again = crewchat.Hub(hub.roster)
+        self.assertNotIn(old, again.by_id)
+        self.assertIndexed(again)
+        self.assertEqual(again.by_id["A" + old]["text"], "Ship the release")
+
+    def test_questions_and_answers_are_found_by_id(self):
+        hub = self.hub()
+        with hub.lock:
+            ask = hub._append("Maya", "Wren", "Is this safe?", "ask")
+            hub._append(crewchat.OWNER, "all", "unrelated", "msg")
+            self.assertIs(hub.by_id[ask["id"]], ask)
+        with self.assertRaises(crewchat.HubError):
+            hub.answer("Wren", "999", "no such question")
+
+
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
         session, name = self.agent()
@@ -4684,11 +4741,14 @@ class Lifecycle(Base):
         with hub.lock:
             kept = list(hub.messages)
             hub.messages = [m for m in hub.messages if m["id"] != login]
+            hub._index()  # as trimming leaves it
+            self.assertIsNone(hub.by_id.get(login))
         try:
             self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[login]["status"], "done")
         finally:
             with hub.lock:
                 hub.messages = kept
+                hub._index()
         # Agents cannot use the owner's sheet controls.
         with self.assertRaises(urllib.error.HTTPError) as e:
             crewchat.post_json(self.base + "/api/task", self.token, {"op": "remove", "task": crash})

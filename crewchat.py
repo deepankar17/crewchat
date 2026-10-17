@@ -1102,6 +1102,7 @@ class Hub:
         self.lock = threading.Condition()
         self.messages = []  # {id, seq, ts, from, to, text, kind[, task, origin]}; kind: msg|task|take|event
         self.ids = {}  # message id -> seq, for the messages in memory
+        self.by_id = {}  # message id -> the message, for the same ones (_index, _store)
         self.agents = {}  # name -> {place, client, created, seen, active, cursor, status, checked, role, listen}
         self.sessions = {}  # MCP session id -> {agent (None until first tool call), place, client, created}
         self.links = {}  # hook link key -> agent name
@@ -1151,7 +1152,7 @@ class Hub:
             self.messages.reverse()
             if self.messages:
                 self.next_seq = self.messages[-1]["seq"] + 1
-            self.ids = {m["id"]: m["seq"] for m in self.messages}
+            self._index()
         try:
             data = json.loads((self.home / "state.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1202,7 +1203,13 @@ class Hub:
                 new = self.renamed[msg["id"]]
                 msg.update(id=new, origin=(self.sheet.get(new) or {}).get("origin") or msg.get("origin"), history="1")
         if stale:
-            self.ids = {m["id"]: m["seq"] for m in self.messages}
+            self._index()
+
+    def _index(self):
+        """Hub.ids and Hub.by_id again, from the messages in memory (after a load or a rename). Ids are
+        unique: ingest and _store never add one that is here."""
+        self.ids = {m["id"]: m["seq"] for m in self.messages}
+        self.by_id = {m["id"]: m for m in self.messages}
 
     def _save(self):
         """Write state.json now, with everything in it (what _save_soon let wait too). Caller holds the lock."""
@@ -1240,9 +1247,11 @@ class Hub:
         """Add a message to memory and to messages.jsonl. Caller holds the lock."""
         self.messages.append(msg)
         self.ids[msg["id"]] = msg["seq"]
+        self.by_id[msg["id"]] = msg
         if len(self.messages) > KEEP_MESSAGES:
             for old in self.messages[:-KEEP_MESSAGES]:
                 self.ids.pop(old["id"], None)
+                self.by_id.pop(old["id"], None)
                 if old["id"] not in self.sheet:  # a task on the sheet keeps its state
                     self.progress.pop(old["id"], None)
             del self.messages[:-KEEP_MESSAGES]
@@ -1351,7 +1360,8 @@ class Hub:
             self._save()
         elif kind == "answer" and msg.get("task") in self.sheet and msg.get("verdict") in VERDICTS:
             row = self.sheet[msg["task"]]
-            ask = next((m for m in reversed(self.messages) if m["id"] == msg.get("answers") and m["kind"] == "ask"), None)
+            ask = self.by_id.get(msg.get("answers"))
+            ask = ask if ask is not None and ask["kind"] == "ask" else None
             # Only an answer to the newest check, from the advisor it was asked of (or the owner), settles it.
             if row.get("check") == msg.get("answers") and (msg["from"] == OWNER or (
                     ask is not None and msg["from"] == ask["to"] and msg["from"] != ask["from"])):
@@ -2101,11 +2111,10 @@ class Hub:
         one; the old numbers keep working here. Returns {old id: new id}."""
         with self.lock:
             rename = {}
-            by_id = {m["id"]: m for m in self.messages}
             for mid, row in self.sheet.items():
                 if row.get("removed") or row.get("origin") or self._row_status(mid) == "done":
                     continue
-                msg = by_id.get(mid)
+                msg = self.by_id.get(mid)
                 if msg is not None and not msg.get("origin") and not mid.startswith(prefix):
                     rename[mid] = prefix + mid
             if not rename:
@@ -2121,7 +2130,7 @@ class Hub:
                 msg.update(id=rename[msg["id"]], origin=origin, history="1", seq=self.next_seq)
                 self.next_seq += 1
                 self.messages.append(msg)
-            self.ids = {m["id"]: m["seq"] for m in self.messages}
+            self._index()
             for table in (self.sheet, self.taken, self.progress, self.claim_gen):
                 for old, new in rename.items():
                     if old in table:
@@ -2170,7 +2179,7 @@ class Hub:
 
     def _task(self, mid):
         """The task message with this id. Caller holds the lock."""
-        task = next((m for m in reversed(self.messages) if m["id"] == mid), None)
+        task = self.by_id.get(mid)
         if task is None and mid in self.sheet:
             row = self.sheet[mid]
             task = {"id": mid, "from": row["from"], "to": row["to"], "text": row["title"], "kind": "task"}
@@ -2289,7 +2298,8 @@ class Hub:
         if verdict and verdict not in VERDICTS:
             raise HubError("verdict is approve or changes")
         with self.lock:
-            ask = next((m for m in reversed(self.messages) if m["id"] == ask_id and m["kind"] == "ask"), None)
+            ask = self.by_id.get(ask_id)
+            ask = ask if ask is not None and ask["kind"] == "ask" else None
             if ask is None:
                 raise HubError("#%s is not a question asked with hub_ask" % ask_id)
             if advisor != OWNER and advisor == ask["from"]:
