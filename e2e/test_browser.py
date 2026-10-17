@@ -589,9 +589,14 @@ class NewPage(Signed):
                 break
         self.assertEqual(msg["result"]["result"]["value"], 200)
         c.call("Target.detachFromTarget", sessionId=session)
-        c.call("ServiceWorker.deliverPushMessage", origin=self.m.url, registrationId=reg, data="")
-        c.until("navigator.serviceWorker.getRegistration().then(r => r.getNotifications())"
-                ".then(n => n.some(x => x.body === 'Something new needs you.'))", what="the notification")
+        shown = ("navigator.serviceWorker.getRegistration().then(r => r.getNotifications())"
+                 ".then(n => n.some(x => x.body === 'Something new needs you.'))")
+
+        def pushed():  # a push that reaches a worker still starting is dropped: send it again until one shows
+            c.call("ServiceWorker.deliverPushMessage", origin=self.m.url, registrationId=reg, data="")
+            return any(c.js(shown) or time.sleep(0.2) for _ in range(10))
+        c.js("navigator.serviceWorker.ready.then(() => true)")
+        eventually(pushed, timeout=30, what="the notification")
         c.call("ServiceWorker.disable")
         self.assertEqual(c.errors, [])
 
