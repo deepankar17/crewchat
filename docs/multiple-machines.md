@@ -193,7 +193,8 @@ pair the projects you mean.
   when it is on.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
-  a file when someone first opens it. With cloud sync, a file can only be opened on the machine it
-  was shared on, for now.
+  a file when someone first opens it. With cloud sync, a file up to 5 MB travels with its message,
+  encrypted, and is deleted from the cloud with it; a bigger one opens only on the machine it was
+  shared on.
 
 Back to the [README](../README.md) · Next: [Your phone](phone.md)
