@@ -6352,7 +6352,16 @@ def write_json(path, data, private=False, indent=2):
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=indent) + "\n")
-    os.replace(tmp, path)
+    for attempt in range(6):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            # Windows refuses to replace a file another process has open for a moment (a reader such as
+            # `crewchat status`, the virus scanner, the search indexer): try again shortly.
+            if sys.platform != "win32" or attempt == 5:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def git_exclude(project, paths):

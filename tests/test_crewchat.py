@@ -96,6 +96,9 @@ class Base(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # What waits to be saved (Hub._save_soon) is written now, as a stopping server does: a timer left
+        # behind would write this class's state into the next class's home.
+        crewchat.flush_all(cls.server.RequestHandlerClass.projects)
         cls.server.shutdown()
         cls.server.server_close()
 
@@ -4044,6 +4047,23 @@ class StateWrites(Base):
         self.assertEqual(disk["taken"][str(tid)], name)  # no flush, no wait: on disk already
         session.call("hub_task", action="update", id=tid, status="blocked", note="need a key")
         self.assertEqual(self.on_disk()["progress"][str(tid)]["status"], "blocked")
+
+    def test_windows_tries_again_when_the_file_is_held(self):
+        path = Path(tempfile.mkdtemp(prefix="held-", dir=TMP)) / "state.json"
+        real, calls = os.replace, []
+
+        def held_twice(src, dst):
+            calls.append(dst)
+            if len(calls) <= 2:
+                raise PermissionError(32, "The process cannot access the file because it is being used by another process")
+            return real(src, dst)
+        with mock.patch.object(crewchat.os, "replace", held_twice), mock.patch.object(crewchat.sys, "platform", "win32"), \
+                mock.patch.object(crewchat.time, "sleep"):
+            crewchat.write_json(path, {"ok": 1})
+        self.assertEqual((len(calls), json.loads(path.read_text())), (3, {"ok": 1}))
+        with mock.patch.object(crewchat.os, "replace", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):  # elsewhere a refusal is not a moment's: it is an error
+                crewchat.write_json(path, {"ok": 2})
 
     def test_an_immediate_write_takes_what_was_waiting_with_it(self):
         session, name = self.agent()
