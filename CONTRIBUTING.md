@@ -49,6 +49,19 @@ instead of this checkout, `CREWCHAT_LOAD=80` sends more messages in the load tes
 Firebase project, so it is covered by `tests/test_cloud.py` with a stand-in store; Windows is not
 covered here.
 
+## Measuring speed
+
+A speed change comes with numbers from before and after it, from the benchmark: a real server with
+5 agents and 5,000 messages, its hook calls, the chat page's poll and server startup, as medians.
+
+```bash
+python3 e2e/bench.py --json before.json      # on the code before the change
+python3 e2e/bench.py --compare before.json   # after it: exit 1 if a median got over 20% worse
+```
+
+Compare on the same machine and Python. `CREWCHAT_BIN=/path/to/crewchat` measures an installed copy,
+whose hooks import a cached `.pyc` instead of compiling `crewchat.py` on every call.
+
 ## Trying a change by hand
 
 Use a throwaway home so you do not touch your real chat:

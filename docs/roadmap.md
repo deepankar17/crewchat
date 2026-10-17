@@ -29,7 +29,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 
 | ID | Task | Area | Priority | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
-| [P0](#p0) | Benchmark harness | Speed and efficiency | P1 | S | To do | none |
+| [P0](#p0) | Benchmark harness | Speed and efficiency | P1 | S | Done | none |
 | [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | To do | P0 |
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | To do | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | To do | P0 |
@@ -37,7 +37,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
-| [S1](#s1) | Storage decision record | Storage rules | P1 | S | In progress | none |
+| [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | To do | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | To do | S1 |
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
@@ -63,7 +63,7 @@ Make every agent turn cheaper and the server lighter. Benchmark first.
 
 ### P0
 
-**Benchmark harness** · P1 · effort S · To do
+**Benchmark harness** · P1 · effort S · Done
 
 **Goal.** Measure before changing anything, so every speed-up below can be proven and regressions caught.
 
@@ -88,6 +88,11 @@ Make every agent turn cheaper and the server lighter. Benchmark first.
 - Timings are noisy on CI runners; compare medians of several runs.
 
 **Depends on:** nothing
+
+**Status.** Done: `python3 e2e/bench.py` (`--json FILE` saves the medians, `--compare FILE` exits 1 on one
+over 20% worse; not run in CI). It prints the Python and the crewchat command it ran, because the numbers
+depend on both: from a checkout the hooks run `python crewchat.py`, which compiles the file on every call,
+while an installed crewchat (`CREWCHAT_BIN=...`) imports a cached `.pyc`. Baseline in the pull request.
 
 ### P1
 
@@ -305,7 +310,7 @@ Make every agent turn cheaper and the server lighter. Benchmark first.
 
 ### S1
 
-**Storage decision record** · P1 · effort S · In progress
+**Storage decision record** · P1 · effort S · Done
 
 > **Decided:** docs/storage.md written in the roadmap pull request; done when it merges.
 
@@ -326,6 +331,8 @@ Make every agent turn cheaper and the server lighter. Benchmark first.
 **Done when**
 
 - Doc merged; referenced from CONTRIBUTING.md.
+
+**Status.** Done: docs/storage.md merged in #60, linked from CONTRIBUTING.md.
 
 **Depends on:** nothing
 
