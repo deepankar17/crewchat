@@ -2522,6 +2522,132 @@ class ChatPage(Base):
         self.assertIn(b"serviceWorker.register('/sw.js')", self.raw("/", opener=opener)[1])
 
 
+class WebPush(Base):
+    ENDPOINT = "https://fcm.googleapis.com/fcm/send/abc123"
+
+    def projects(self):
+        return self.server.RequestHandlerClass.projects
+
+    def store(self):
+        return crewchat.push_store(self.projects().base)
+
+    def tearDown(self):
+        store = self.store()
+        for sub in list(store.subs):
+            store.forget(sub["endpoint"])
+
+    def test_the_key_and_its_signatures(self):
+        d = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721  # RFC 6979, A.2.5
+        self.assertEqual(crewchat.p256_public(d).hex(),
+                         "04" "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6"
+                         "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299")
+        message = b"a push"
+        sig = crewchat.es256_sign(d, message)
+        r, s_ = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+        n, z = crewchat._N, int.from_bytes(crewchat.hashlib.sha256(message).digest(), "big")
+        w = pow(s_, n - 2, n)  # ECDSA verification, by the book
+        point = crewchat._p256_add(crewchat._p256_mul(z * w % n), crewchat._p256_mul(r * w % n, crewchat._p256_mul(d)))
+        self.assertEqual(point[0] % n, r)
+        self.assertNotEqual(crewchat.es256_sign(d, message), sig)  # a fresh nonce each time
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec, utils
+        except ImportError:
+            return
+        key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), crewchat.p256_public(d))
+        key.verify(utils.encode_dss_signature(r, s_), message, ec.ECDSA(hashes.SHA256()))
+
+    def test_only_push_services_are_posted_to(self):
+        for ok in (self.ENDPOINT, "https://web.push.apple.com/QGuA", "https://updates.push.services.mozilla.com/wpush/v2/x",
+                   "https://wns2-par02p.notify.windows.com/w/?token=x"):
+            self.assertTrue(crewchat.push_host_ok(ok), ok)
+        for bad in ("http://fcm.googleapis.com/x", "https://evil.example/x", "https://fcm.googleapis.com.evil.example/x",
+                    "https://127.0.0.1/x", "https://user@fcm.googleapis.com/x", "https://fcm.googleapis.com:8443/x",
+                    "https://push.apple.com.evil/x", "https://evilpush.apple.com/x", "https://x/" + "a" * 1000, "", None):
+            self.assertFalse(crewchat.push_host_ok(bad or ""), bad)
+
+    def test_subscriptions_and_the_vapid_headers(self):
+        store = self.store()
+        key = store.public_key()
+        self.assertEqual(len(base64.urlsafe_b64decode(key + "=")), 65)
+        self.assertEqual(oct(os.stat(store.path).st_mode & 0o777), "0o600")
+        store.set_mode(self.ENDPOINT, "demo", "all")
+        store.set_mode(self.ENDPOINT, "other", "mentions")
+        self.assertEqual(store.wanted("demo"), [(self.ENDPOINT, "all")])
+        self.assertEqual(crewchat.PushStore(store.path.parent).subs, store.subs)  # kept on disk
+        self.assertEqual(crewchat.PushStore(store.path.parent).public_key(), key)
+        with self.assertRaises(crewchat.HubError):
+            store.set_mode("https://evil.example/x", "demo", "all")
+        with self.assertRaises(crewchat.HubError):
+            store.set_mode(self.ENDPOINT, "demo", "loud")
+        headers = store.headers(self.ENDPOINT)
+        jwt, k = re.match(r"vapid t=([^,]+), k=(.+)$", headers["Authorization"]).groups()
+        self.assertEqual(k, key)
+        head, claims, sig = jwt.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
+        self.assertEqual(claims["aud"], "https://fcm.googleapis.com")
+        self.assertGreater(claims["exp"], time.time())
+        self.assertEqual(len(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))), 64)
+        store.set_mode(self.ENDPOINT, "demo", "off")
+        store.set_mode(self.ENDPOINT, "other", "off")
+        self.assertEqual(store.subs, [])  # no project left: the browser is forgotten
+
+    def test_what_is_new_is_pushed_only_while_no_page_is_open(self):
+        store, seen, sent = self.store(), {}, []
+        store.set_mode(self.ENDPOINT, self.projects().primary.id, "all")
+        send = lambda st, endpoint: sent.append(endpoint)  # noqa: E731
+        self.hub.page_seen = 0
+        session, name = self.agent()
+        session.call("hub_send", to="Owner", text="first, before the server looked")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual((sent, store.take(self.ENDPOINT)), ([], []))  # what was there already is not news
+        session.call("hub_send", to="Owner", text="Can I merge?")
+        crewchat.push_round(self.projects(), store, seen, send)
+        time.sleep(0.2)
+        self.assertEqual(sent, [self.ENDPOINT])
+        notes = store.take(self.ENDPOINT)
+        self.assertEqual((notes[0]["title"], notes[0]["body"], notes[0]["url"]), ("Demo: Message · " + name, "Can I merge?", "/"))
+        self.assertEqual(store.take(self.ENDPOINT), [])  # handed over once
+        self.hub.page_seen = time.time()  # a page is open: it notifies by itself
+        session.call("hub_send", to="Owner", text="Merged")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual(sent, [self.ENDPOINT])
+        self.hub.page_seen = 0
+        store.set_mode(self.ENDPOINT, self.projects().primary.id, "mentions")
+        tid = self.say("all", "Ship it", "task")
+        session.call("hub_take", id=tid)
+        session.call("hub_update", id=tid, status="blocked", note="Which branch?")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual(sent, [self.ENDPOINT])  # messages only: a blocked task is not pushed
+
+    def test_a_subscription_the_service_dropped_is_forgotten(self):
+        store = self.store()
+        store.set_mode(self.ENDPOINT, "demo", "all")
+        gone = urllib.error.HTTPError(self.ENDPOINT, 410, "Gone", {}, io.BytesIO(b""))
+        with mock.patch.object(crewchat.urllib.request, "urlopen", side_effect=gone):
+            self.assertEqual(crewchat.send_push(store, self.ENDPOINT), 410)
+        self.assertEqual(store.subs, [])
+
+    def test_the_page_subscribes_and_its_service_worker_fetches(self):
+        opener, _ = self.owner_browser()
+        post = lambda body, extra=None: self.raw("/api/push", json.dumps(body).encode(), dict(  # noqa: E731
+            {"Content-Type": "application/json", "Origin": self.base}, **(extra or {})), opener)
+        self.assertEqual(self.raw("/api/push", b'{"op":"key"}', {"Content-Type": "application/json"})[0], 401)
+        self.assertEqual(post({"op": "key"}, {"Origin": "https://evil.example"})[0], 403)
+        status, body, _ = post({"op": "key"})
+        self.assertEqual((status, json.loads(body)["key"]), (200, self.store().public_key()))
+        self.assertEqual(post({"op": "mode", "endpoint": "https://evil.example/x", "mode": "all"})[0], 400)
+        self.assertEqual(post({"op": "mode", "endpoint": self.ENDPOINT, "mode": "all"})[0], 200)
+        self.assertEqual(self.store().wanted(self.projects().primary.id), [(self.ENDPOINT, "all")])
+        self.store().queue(self.ENDPOINT, {"title": "t", "body": "b", "tag": "x", "url": "/"})
+        self.assertEqual(json.loads(post({"op": "notices", "endpoint": self.ENDPOINT})[1])["notices"][0]["title"], "t")
+        self.assertEqual(json.loads(post({"op": "notices", "endpoint": self.ENDPOINT})[1])["notices"], [])
+        self.assertEqual(post({"op": "nope"})[0], 400)
+        _, sw, _ = self.raw("/sw.js")
+        self.assertIn(b"addEventListener('push'", sw)
+        self.assertIn(b"addEventListener('notificationclick'", sw)
+
+
 class CommandsTab(Base):
     """The chat page's connection line and Commands tab (help for every command, and Run for the safe ones)."""
 

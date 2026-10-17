@@ -39,6 +39,7 @@ class Chrome:
         self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], suppress_origin=True)
         self.n = 0
         self.errors = []
+        self.events = []  # the other events, newest last (ServiceWorker.* when that domain is on)
         for domain in ("Page", "Runtime", "DOM", "Network"):
             self.call(domain + ".enable")
 
@@ -49,6 +50,8 @@ class Chrome:
             msg = json.loads(self.ws.recv())
             if msg.get("method") == "Runtime.exceptionThrown":
                 self.errors.append(msg["params"]["exceptionDetails"])
+            elif msg.get("method"):
+                self.events = (self.events + [msg])[-200:]
             if msg.get("id") == self.n:
                 if "error" in msg:
                     raise RuntimeError("%s: %s" % (method, msg["error"]))
@@ -544,6 +547,52 @@ class NewPage(Signed):
         self.assertEqual(json.loads(out["text"])["hookSpecificOutput"]["decision"]["behavior"], "deny")
         self.assertIsNone(c.js("window.pwned"))
         self.assertEqual(self.shown_though_hidden(), [])
+        self.assertEqual(c.errors, [])
+
+    def test_notifications_subscribe_to_push_and_a_push_shows_one(self):
+        c = self.chrome
+        self.addCleanup(c.js, "try { localStorage.removeItem(notifyKey()); } catch (e) {} showBell()")
+        # The page subscribes when notifications are turned on (the push service stubbed: no Google here).
+        c.js("""window.pushed = []; window.realPost = postJSON;
+                postJSON = (path, body) => { window.pushed.push([path, body]); return window.realPost(path, body); };
+                Object.defineProperty(navigator.serviceWorker, 'ready', {configurable: true, value: Promise.resolve({pushManager: {
+                  getSubscription: async () => null,
+                  subscribe: async (o) => { window.serverKey = o.applicationServerKey.length;
+                                            return {endpoint: 'https://fcm.googleapis.com/fcm/send/e2e'}; }}})});
+                window.Notification = class { static requestPermission() { return Promise.resolve('granted'); } };
+                Notification.permission = 'granted';""")
+        self.addCleanup(c.js, "postJSON = window.realPost; delete navigator.serviceWorker.ready; delete window.Notification")
+        c.js("document.querySelector('[data-notify=mentions]').click()")
+        c.until("window.pushed.some(p => p[1].op === 'mode')", what="the subscription sent")
+        self.assertEqual(c.js("window.serverKey"), 65)  # this machine's VAPID key, uncompressed P-256
+        self.assertEqual(c.js("window.pushed.find(p => p[1].op === 'mode')[1]"),
+                         {"op": "mode", "endpoint": "https://fcm.googleapis.com/fcm/send/e2e", "mode": "mentions"})
+        # A push reaches the service worker (as from the push service): it shows a notification.
+        c.call("Browser.grantPermissions", permissions=["notifications"], origin=self.m.url)
+        c.call("ServiceWorker.enable")
+        reg = eventually(lambda: c.js("0") or next((r["registrationId"] for e in c.events
+                                                    if e["method"] == "ServiceWorker.workerRegistrationUpdated"
+                                                    for r in e["params"]["registrations"]
+                                                    if r["scopeURL"].startswith(self.m.url)), None), what="the service worker")
+        # Its fetch of what the push is about is signed in, as the page is (its cookie goes with it).
+        worker = next(v["targetId"] for e in c.events if e["method"] == "ServiceWorker.workerVersionUpdated"
+                      for v in e["params"]["versions"] if v["registrationId"] == reg and v.get("targetId"))
+        session = c.call("Target.attachToTarget", targetId=worker, flatten=True)["sessionId"]
+        c.n += 1
+        c.ws.send(json.dumps({"id": c.n, "sessionId": session, "method": "Runtime.evaluate", "params": {
+            "expression": "fetch('/api/push', {method: 'POST', headers: {'Content-Type': 'application/json'},"
+                          " body: JSON.stringify({op: 'notices', endpoint: 'x'})}).then(r => r.status)",
+            "awaitPromise": True, "returnByValue": True}}))
+        while True:
+            msg = json.loads(c.ws.recv())
+            if msg.get("id") == c.n:
+                break
+        self.assertEqual(msg["result"]["result"]["value"], 200)
+        c.call("Target.detachFromTarget", sessionId=session)
+        c.call("ServiceWorker.deliverPushMessage", origin=self.m.url, registrationId=reg, data="")
+        c.until("navigator.serviceWorker.getRegistration().then(r => r.getNotifications())"
+                ".then(n => n.some(x => x.body === 'Something new needs you.'))", what="the notification")
+        c.call("ServiceWorker.disable")
         self.assertEqual(c.errors, [])
 
     def test_dragging_a_card_with_the_mouse(self):

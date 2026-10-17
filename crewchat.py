@@ -1092,6 +1092,7 @@ class Hub:
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
         self.permissions = {}  # id -> an agent's permission prompt waiting for Allow or Deny (memory only)
+        self.page_seen = 0  # when a chat page of this project last polled (Web Push skips an open page)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self.started = time.time()  # nobody can be heard while the server is down (memory only)
@@ -4133,7 +4134,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4166,6 +4167,29 @@ self.addEventListener('fetch', e => {
   if (e.request.mode !== 'navigate' || e.request.method !== 'GET') return;
   e.respondWith(fetch(e.request).catch(() =>
     new Response(OFFLINE, {headers: {'Content-Type': 'text/html; charset=utf-8'}})));
+});
+// Web Push: the push is empty; what it is about comes from the server, signed in as the page is.
+self.addEventListener('push', e => e.waitUntil((async () => {
+  let notes = [];
+  try {
+    const sub = await self.registration.pushManager.getSubscription();
+    const r = await fetch('/api/push', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                        body: JSON.stringify({op: 'notices', endpoint: sub ? sub.endpoint : ''})});
+    if (r.ok) notes = (await r.json()).notices || [];
+  } catch (err) {}
+  if (!notes.length) notes = [{title: 'crewchat', body: 'Something new needs you.', tag: 'crewchat', url: '/'}];
+  for (const n of notes.slice(0, 3))
+    await self.registration.showNotification(n.title, {body: n.body, tag: n.tag, icon: '/icon-192.png', data: {url: n.url}});
+})()));
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const url = e.notification.data && e.notification.data.url;
+  e.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(list => {
+    const open = list.find(c => new URL(c.url).origin === self.location.origin);
+    if (open && url) return open.navigate(url).then(c => (c || open).focus());
+    if (open) return open.focus();
+    return self.clients.openWindow(url || '/');
+  }));
 });
 """
 SW_REGISTER = ("<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')"
@@ -4569,7 +4593,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "bad query"})
                 return
+            self.hub.page_seen = time.time()
             data = self.hub.poll(after, version, wait)
+            self.hub.page_seen = time.time()
             data["chat"] = self.project.id
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
@@ -4697,6 +4723,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
+
+    def _push(self, data):
+        """Web Push for the chat page: this machine's key to subscribe with, a browser's notifications for
+        this project (all, mentions or off), and what waits for its service worker."""
+        store, op = push_store(self.projects.base), data.get("op")
+        if op == "key":
+            return {"key": store.public_key()}
+        endpoint = data.get("endpoint")
+        if op == "mode":
+            store.set_mode(endpoint, self.project.id, data.get("mode"))
+            return {}
+        if op == "notices":
+            return {"notices": store.take(endpoint)}
+        raise HubError("op is key, mode or notices")
 
     def _read(self, data):
         try:
@@ -4948,7 +4988,8 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
-                         "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer"))}
+                         "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
+                         "/api/push": self._push}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -5962,6 +6003,7 @@ def cmd_serve(args):
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=push_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -8020,6 +8062,247 @@ def reclaim_checks(projects):
                 project.hub.reclaim_silent()
             except Exception as e:  # one bad check must not stop the next
                 sys.stderr.write("%s could not check for silent task holders: %s\n" % (now_iso(), e))
+
+
+# --------------------------------------------------------------------------------------------
+# Web Push: notifications while no chat page is open
+# --------------------------------------------------------------------------------------------
+# A browser that turned notifications on subscribes with its push service (Google's, Apple's,
+# Mozilla's, Microsoft's). When something new needs the owner and no page of that project has polled
+# for a while, the server sends that service an empty push, signed with this machine's VAPID key
+# (ES256). The page's service worker wakes, fetches what is new from the server (signed in, as the
+# page is) and shows it. Nothing about the chat goes through the push service.
+PUSH_FILE = "push.json"  # in the crewchat home: the VAPID key and the browsers subscribed (private)
+PUSH_HOSTS = ("fcm.googleapis.com", "android.googleapis.com", ".push.apple.com", ".push.services.mozilla.com",
+              ".notify.windows.com")
+PUSH_PAGE_GONE = 45  # seconds since a page last polled a project: none of its pages is open
+PUSH_EVERY = 3  # how often the server looks for something new to push (seconds)
+MAX_PUSH_SUBS = 20
+MAX_PUSH_NOTICES = 10  # kept per browser until its service worker fetches them
+NEED_LABELS = {"permission": "Asks permission", "blocked": "Needs you", "review": "Ready for review", "message": "Message",
+               "given_back": "Given back", "reclaimed": "Reclaimed"}  # as the page says them (NEED_LOOK)
+
+# P-256 (NIST, FIPS 186-4): enough of it to make a key and sign, in plain Python. Only this machine's own
+# key is used, on what it sends; nothing received is ever verified with it.
+_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+_A = _P - 3
+_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+      0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def _p256_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        slope = (3 * a[0] * a[0] + _A) * pow(2 * a[1], _P - 2, _P) % _P
+    else:
+        slope = (b[1] - a[1]) * pow(b[0] - a[0], _P - 2, _P) % _P
+    x = (slope * slope - a[0] - b[0]) % _P
+    return x, (slope * (a[0] - x) - a[1]) % _P
+
+
+def _p256_mul(k, point=_G):
+    out = None
+    for bit in bin(k)[2:]:
+        out = _p256_add(out, out)
+        if bit == "1":
+            out = _p256_add(out, point)
+    return out
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def p256_public(d):
+    """The public key of private key d, uncompressed (65 bytes), as browsers take a VAPID key."""
+    x, y = _p256_mul(d)
+    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def es256_sign(d, message):
+    """An ES256 signature (r and s, 32 bytes each, as JWTs carry them) of message by private key d."""
+    z = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    while True:
+        k = secrets.randbelow(_N - 1) + 1
+        r = _p256_mul(k)[0] % _N
+        s = pow(k, _N - 2, _N) * (z + r * d) % _N
+        if r and s:
+            return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def push_host_ok(endpoint):
+    """Is this a push service's address (https, a known service)? Only those are ever posted to."""
+    try:
+        url = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return False
+    host = (url.hostname or "").lower()
+    return url.scheme == "https" and len(endpoint) <= 1000 and not url.username and url.port in (None, 443) and \
+        any(host == h or (h.startswith(".") and host.endswith(h)) for h in PUSH_HOSTS)
+
+
+class PushStore:
+    """This machine's VAPID key, the browsers subscribed to push and, for each, the projects it wants
+    notified (all that needs the owner, or messages only) and what is waiting for its service worker."""
+
+    def __init__(self, base):
+        self.path = Path(base) / PUSH_FILE
+        self.lock = threading.Lock()
+        self.notices = {}  # endpoint -> [notice] (memory only)
+        data = read_json(self.path) if self.path.exists() else {}
+        try:
+            self.key = int(data.get("vapid") or "0", 16)
+        except (TypeError, ValueError):
+            self.key = 0
+        subs = data.get("subscriptions")
+        self.subs = [x for x in subs if isinstance(x, dict) and push_host_ok(x.get("endpoint", ""))] \
+            if isinstance(subs, list) else []
+
+    def _save(self):
+        write_json(self.path, {"vapid": "%064x" % self.key, "subscriptions": self.subs}, private=True)
+
+    def public_key(self):
+        with self.lock:
+            if not 0 < self.key < _N:
+                self.key = secrets.randbelow(_N - 1) + 1
+                self._save()
+            return b64url(p256_public(self.key))
+
+    def set_mode(self, endpoint, chat, mode):
+        """A browser's notifications for one project: all, mentions (messages to the owner) or off."""
+        if not isinstance(endpoint, str) or not push_host_ok(endpoint):
+            raise HubError("not a push service's address")
+        if mode not in ("all", "mentions", "off"):
+            raise HubError("mode is all, mentions or off")
+        with self.lock:
+            sub = next((x for x in self.subs if x["endpoint"] == endpoint), None)
+            if sub is None:
+                if mode == "off":
+                    return
+                sub = {"endpoint": endpoint, "modes": {}}
+                self.subs = (self.subs + [sub])[-MAX_PUSH_SUBS:]
+            if mode == "off":
+                sub["modes"].pop(chat, None)
+            else:
+                sub["modes"][chat] = mode
+            if not sub["modes"]:
+                self.subs.remove(sub)
+                self.notices.pop(endpoint, None)
+            self._save()
+
+    def wanted(self, chat):
+        """(endpoint, mode) of every browser that wants this project's notifications."""
+        with self.lock:
+            return [(x["endpoint"], x["modes"][chat]) for x in self.subs if x["modes"].get(chat) in ("all", "mentions")]
+
+    def queue(self, endpoint, notice):
+        with self.lock:
+            self.notices[endpoint] = (self.notices.get(endpoint, []) + [notice])[-MAX_PUSH_NOTICES:]
+
+    def take(self, endpoint):
+        """What waits for this browser's service worker, once."""
+        with self.lock:
+            return self.notices.pop(endpoint, []) if isinstance(endpoint, str) else []
+
+    def forget(self, endpoint):
+        """The push service says this subscription is gone (the browser unsubscribed, or cleared the site)."""
+        with self.lock:
+            before = len(self.subs)
+            self.subs = [x for x in self.subs if x["endpoint"] != endpoint]
+            self.notices.pop(endpoint, None)
+            if len(self.subs) != before:
+                self._save()
+
+    def headers(self, endpoint):
+        """The VAPID headers for one push: a JWT for the push service's origin, signed with this machine's key."""
+        url = urllib.parse.urlsplit(endpoint)
+        claims = {"aud": "%s://%s" % (url.scheme, url.netloc), "exp": int(time.time()) + 12 * 3600,
+                  "sub": "https://crewchat.dev"}
+        public = self.public_key()
+        signed = b64url(b'{"typ":"JWT","alg":"ES256"}') + "." + b64url(json.dumps(claims, separators=(",", ":")).encode())
+        jwt = signed + "." + b64url(es256_sign(self.key, signed.encode("ascii")))
+        return {"Authorization": "vapid t=%s, k=%s" % (jwt, public), "TTL": "86400", "Urgency": "high",
+                "Content-Length": "0"}
+
+
+_push_stores = {}
+_push_stores_lock = threading.Lock()
+
+
+def push_store(base):
+    with _push_stores_lock:
+        key = str(Path(base))
+        if key not in _push_stores:
+            _push_stores[key] = PushStore(base)
+        return _push_stores[key]
+
+
+def send_push(store, endpoint):
+    """One empty push to a browser, through its push service. A subscription the service says is gone
+    is forgotten."""
+    req = urllib.request.Request(endpoint, data=b"", headers=store.headers(endpoint), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            store.forget(endpoint)
+        return e.code
+    except (OSError, ValueError):
+        return 0
+
+
+def push_notice(project, item):
+    """A Needs you item as a notification, worded as the page words its own."""
+    label = NEED_LABELS.get(item["kind"], "Needs you")
+    if item.get("task"):
+        body = "#%s %s" % (item["task"], item.get("title") or "") + ("\n" + item["text"] if item.get("text") else "")
+    elif item["kind"] == "permission":
+        body = item.get("tool", "") + (": " + item["text"][:200] if item.get("text") else "")
+    else:
+        body = item.get("text", "")
+    return {"title": "%s: %s" % (project.name, label) + (" · " + item["agent"] if item.get("agent") else ""),
+            "body": body[:400], "tag": "%s:%s:%s" % (project.id, item["kind"], item.get("task") or item.get("id") or ""),
+            "url": "/" if project.primary else "/?chat=" + urllib.parse.quote(project.id)}
+
+
+def push_round(projects, store, seen, send=send_push):
+    """One look at every project: what is new in Needs you since the last look is pushed to the browsers
+    that want it, unless one of the project's pages is open (it notifies by itself). seen holds what each
+    project's Needs you had; a project seen for the first time pushes nothing (a restart is not news)."""
+    for project in projects.all():
+        items = project.hub.needs_you()
+        keys = {"%s:%s" % (i["kind"], i.get("task") or i.get("id")): i for i in items}
+        before, seen[project.id] = seen.get(project.id), set(keys)
+        if before is None or time.time() - project.hub.page_seen < PUSH_PAGE_GONE:
+            continue
+        fresh = [i for k, i in keys.items() if k not in before]
+        if not fresh:
+            continue
+        for endpoint, mode in store.wanted(project.id):
+            wanted = [i for i in fresh if mode == "all" or i["kind"] == "message"]
+            for item in wanted[:3]:
+                store.queue(endpoint, push_notice(project, item))
+            if wanted:
+                threading.Thread(target=send, args=(store, endpoint), daemon=True).start()
+
+
+def push_checks(projects):
+    """Every PUSH_EVERY seconds, push what is new to browsers with no chat page open."""
+    store, seen = push_store(projects.base), {}
+    while True:
+        try:
+            if store.subs or seen:
+                push_round(projects, store, seen)
+        except Exception as e:  # one bad look must not stop the next
+            sys.stderr.write("%s could not check what to push: %s\n" % (now_iso(), e))
+        time.sleep(PUSH_EVERY)
 
 
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
@@ -11399,8 +11682,27 @@ for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("
     try { localStorage.setItem(notifyKey(), "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
   showBell();
   if (typeof Notification !== "undefined" && Notification.permission === "denied") $("bell-note").textContent = "The browser blocks notifications for this page: allow them in its site settings, then turn them on here.";
+  syncPush();
 });
 showBell();
+// Web Push: with notifications on, this browser subscribes, so they come even while no page of the chat is
+// open (the server pushes only then). Needs a secure page (localhost, or https) and a browser with push.
+async function syncPush() {
+  const mode = notifyMode();
+  if (!("serviceWorker" in navigator) || typeof PushManager === "undefined") return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub && (mode === "off" || typeof Notification === "undefined" || Notification.permission !== "granted")) return;
+    if (!sub) {
+      const { key } = await postJSON("/api/push", { op: "key" });
+      const raw = atob(key.replace(/-/g, "+").replace(/_/g, "/"));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true,
+                                               applicationServerKey: Uint8Array.from(raw, (c) => c.charCodeAt(0)) });
+    }
+    await postJSON("/api/push", { op: "mode", endpoint: sub.endpoint, mode });
+  } catch (e) {}  // no push here: notifications still come while the page is open
+}
 function Notice(title, options) {
   try { return new Notification(title, options); }
   catch (e) {  // Android Chrome: only a service worker may show one
@@ -11499,7 +11801,7 @@ async function loop() {
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
       state.needs = data.needs || [];
-      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); }
+      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); syncPush(); }
       renderNeeds(state.needs);
       try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();

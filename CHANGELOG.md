@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
+  with its push service; when something new needs you and no page of the project is open, the
+  server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the
+  page's service worker fetches what is new from the server and shows it. Nothing from the chat goes
+  through the push service. Works on a computer, and on a phone with the app installed, at an
+  `https` address (`tailscale serve`). Standard library only: the signing is plain Python.
 - **Allow or Deny a Claude Code agent's permission prompts from the page.** When an agent wants to do
   something it has not been allowed, a new `PermissionRequest` hook puts it first in **Needs you**: the
   agent, the tool, and the command, file or address in full, with **Allow** and **Deny** (and a

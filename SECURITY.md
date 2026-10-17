@@ -39,6 +39,20 @@ with your normal permissions for that tool, so it asks before acting unless you 
 edits. Anyone who can sign in to your chat page can start agents on that machine: keep sign-in
 codes to yourself.
 
+## Permission prompts and notifications
+
+**Allow** and **Deny** in Needs you answer a Claude Code agent's permission prompt. Only the owner
+can (a signed-in chat page, or the owner token), and the prompt shows what the tool asks for in
+full, as text. Anyone who can sign in to your chat page can allow what your agents ask: one more
+reason to keep sign-in codes to yourself. `crewchat setup --permissions terminal` turns it off.
+
+With notifications on, a browser that supports Web Push subscribes with its own push service
+(Google's, Apple's, Mozilla's or Microsoft's). While no chat page is open, the server sends that
+service an **empty** push, signed with a key kept in `~/.crewchat/push.json` (readable by you
+only); the page's service worker then fetches what is new from your server, signed in as the page
+is. Nothing from the chat goes through the push service, and the server posts only to those
+services' addresses.
+
 ## Linking machines over Tailscale
 
 - **Who can reach a server.** It still listens only on 127.0.0.1. `tailscale serve` makes it

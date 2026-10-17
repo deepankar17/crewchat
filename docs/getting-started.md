@@ -253,7 +253,11 @@ every prompt in the agents' terminals. Other tools still ask in their own window
 **Notifications.** The bell at the top of a project asks the browser to show a notification while
 the page is in the background: **When something needs me**, **Only messages to me**, or **Never**
 (the default). It is set for each project, in this browser. Clicking a notification opens what it
-is about. They work while the page is open, in a tab or installed as an app.
+is about. They come while the page is open, in a tab or installed as an app, and with **Web Push**
+also when it is closed: on a computer, and on a phone with the app on its home screen (an iPhone
+from iOS 16.4) when the page is reached at an `https` address ([Your phone](phone.md)). Nothing
+from the chat goes through the browser's push service: the push only wakes the page's service
+worker, which fetches what is new from your computer.
 
 ## 5. Share screenshots and files
 
