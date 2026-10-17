@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Shared files open on your other machines with cloud sync too**, up to 5 MB: a screenshot or a log
+  travels with its message, encrypted on your machine, and is deleted from the cloud with the message.
+  A bigger file says which machine has it.
+- **A coordinator among your linked machines, whichever is on.** One machine at a time is the
+  coordinator, so work that needs one machine to act for the others (coming next: claims on a task whose
+  machine is off, catch-up, files) never waits on a machine you switched off. With cloud sync it holds a
+  lease that another machine takes over when it runs out; over Tailscale every machine picks the same one
+  from those it can reach. `crewchat coordinator NAME` names the one you prefer whenever it is on; the
+  page's connection line shows who coordinates now.
 - **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
   with its push service; when something new needs you and no page of the project is open, the
   server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the

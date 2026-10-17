@@ -18,10 +18,12 @@ How the pieces fit:
 Firestore layout, all under users/{uid}/ (the security rules confine an account to its own):
   meta/account      {founder, key_id}                 the account key currently in use
   meta/trust        {devices, version, signer, sig}   the trusted devices, signed by one of them
+  meta/coordinator  {device, term, expires, preferred} which machine coordinates, on a lease (Y1)
   devices/{id}      {name, tag, pub, fp, keys, key_sigs, wrapped_by, seen, synced_to}
   messages/{msgid}  {dev, key_id, nonce, ct, created}  one chat message, encrypted
   state/{id}        {dev, key_id, nonce, ct, updated}  one machine's agents, encrypted
   tasks/{msgid}     {dev, key_id, nonce, ct, created}  who took a task: the first create wins
+  files/{fid}-{n}   {dev, key_id, nonce, ct, created, parts}  part n of a shared file (5 MB at most), encrypted
   spaces/{space}    {created}                          a project besides the first, shared by name:
     messages/, state/, tasks/  as above, for that project only
     marks/{id}        {seen, synced_to}                how far each machine has read it
@@ -57,14 +59,18 @@ SEEN_EVERY = 300  # "last seen" alone is published at most this often
 HEARTBEAT = 15 * 60  # an otherwise quiet machine with agents says it is alive this often
 HOUSEKEEPING = 10 * 60  # delete delivered messages this often
 CLAIM_TIMEOUT = 20
+LEASE_SECS = 90  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
+LEASE_RENEW = 30  # and any approved machine online takes it once it has run out
 
 
 class CloudError(Exception):
     pass
 
 
-COLLECTIONS = ("messages", "tasks", "state", "devices")  # the layout above, besides meta and spaces
-SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks")  # in each spaces/{space}
+COLLECTIONS = ("messages", "tasks", "state", "devices", "files")  # the layout above, besides meta and spaces
+SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "files")  # in each spaces/{space}
+CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (Firestore's quota)
+FILE_PART = 512 * 1024  # bytes of a file in one document: sealed and in base64 twice, under Firestore's 1 MB
 NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
                  "or: pip install \"crewchat[cloud]\"")
 
@@ -741,6 +747,7 @@ class Account:
                 self.store.delete("%s/%s" % (collection, doc_id))
         self.store.delete("meta/trust")
         self.store.delete("meta/account")
+        self.store.delete("meta/coordinator")
 
     def rotate(self):
         device = self.device
@@ -791,6 +798,66 @@ class CloudSync(crewchat.ProjectLink):
         self.unsubscribe = []
         self.marks_file = device.dir / ("sync.json" if chat is None else "sync-%s.json" % self.space)
         self.marks = read_json(self.marks_file, {"published": 0, "synced_to": 0})
+        self.clock = time.time  # the lease's clock (the tests move it)
+        self.lease = {}  # meta/coordinator as last read
+
+    # The coordinator (roadmap Y1) --------------------------------------------------------------
+    def coordinator(self):
+        """Which machine coordinates now: the holder of a lease that has not run out (meta/coordinator)."""
+        doc = self.lease or {}
+        live = float(doc.get("expires") or 0) > self.clock()
+        names = {i: d.get("name", i) for i, d in self.store.list("devices")} if doc else {}
+        return {"name": names.get(doc.get("device"), "") if live else "", "me": live and doc.get("device") == self.device.id,
+                "term": int(doc.get("term") or 0), "preferred": names.get(doc.get("preferred") or "", "")}
+
+    def renew_lease(self):
+        """Hold the coordinator's lease, or take it: when this machine holds it, when it has run out, or when
+        this is the owner's preferred machine. A conditional write, so two machines never both take it; the
+        term goes up when it changes hands. Another machine's live lease is left alone."""
+        if not self.device.ready:
+            return self.lease
+        now = self.clock()
+
+        def update(doc):
+            doc = dict(doc or {})
+            mine = doc.get("device") == self.device.id
+            if mine or float(doc.get("expires") or 0) <= now or doc.get("preferred") == self.device.id:
+                doc.update(device=self.device.id, term=int(doc.get("term") or 0) + (0 if mine else 1),
+                           expires=now + LEASE_SECS)
+                return doc
+            return None
+        try:
+            self.store.transact("meta/coordinator", update)
+            self.lease = self.store.get("meta/coordinator") or {}
+        except Exception as e:  # offline for now: the lease runs out, and someone online takes it
+            self.log("could not renew the coordinator's lease (%s)" % e)
+        return self.lease
+
+    def release_lease(self):
+        """Stopping: let the lease run out now, so another machine takes over at its next renewal."""
+        now = self.clock()
+
+        def update(doc):
+            return dict(doc, expires=now) if doc and doc.get("device") == self.device.id else None
+        try:
+            self.store.transact("meta/coordinator", update)
+        except Exception:
+            pass
+
+    def set_preferred(self, name):
+        """The owner's preferred coordinator (a device's name or id), or none: it takes the lease at its next
+        renewal whenever it is online."""
+        name = str(name or "").strip()
+        device = "" if name.lower() in ("", "none") else self.account.find(name)[0]
+        self.store.transact("meta/coordinator", lambda doc: dict(doc or {}, preferred=device))
+        self.lease = self.renew_lease() if device == self.device.id else (self.store.get("meta/coordinator") or {})
+        return self.coordinator()
+
+    def _leaser(self):
+        while not self.stop_event.is_set():
+            self.renew_lease()
+            if self.stop_event.wait(LEASE_RENEW):
+                return
 
     def _all(self):
         """This link and every project's."""
@@ -820,7 +887,7 @@ class CloudSync(crewchat.ProjectLink):
             self.unsubscribe += [self.store.listen("devices", self._on_devices),
                                  self.store.listen("meta", self._on_meta)]
         self._republish()
-        for target in (self._worker, self._ticker):
+        for target in (self._worker, self._ticker) + ((self._leaser,) if self.chat is None else ()):
             threading.Thread(target=target, daemon=True).start()
         self.dirty.set()
         if self.chat is None and not self.device.ready:
@@ -830,6 +897,8 @@ class CloudSync(crewchat.ProjectLink):
 
     def stop(self):
         self.stop_event.set()
+        if self.chat is None:
+            self.release_lease()
         for unsubscribe in self.unsubscribe:
             try:
                 unsubscribe()
@@ -898,9 +967,54 @@ class CloudSync(crewchat.ProjectLink):
         doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._scope(), msg["id"], self.device_id), payload)
         doc["created"] = SERVER_TIME
         self.store.set(self.base + "messages/" + msg["id"], doc)
+        for info in msg.get("files") or []:
+            self._send_file(info)
         if msg["seq"] > int(self.marks.get("published", 0)):
             self.marks["published"] = msg["seq"]
             self._save_marks()
+
+    # Shared files (roadmap Y4) ----------------------------------------------------------------
+    def _file_aad(self, fid, part):
+        return "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, part, self.device_id)
+
+    def _send_file(self, info):
+        """A file shared with a message written here, into the cloud beside it: encrypted, in FILE_PART pieces,
+        deleted with the messages. Only files up to CLOUD_FILE_MAX; a bigger one stays on this machine."""
+        fid = str(info.get("id") or "")
+        meta, path = self.hub.file(fid)
+        if meta is None or meta["size"] > CLOUD_FILE_MAX:
+            return
+        data = path.read_bytes()
+        parts = max(1, -(-len(data) // FILE_PART))
+        for n in range(parts):
+            doc = self._seal(self._file_aad(fid, n), {"data": b64(data[n * FILE_PART:(n + 1) * FILE_PART])})
+            doc.update(created=SERVER_TIME, parts=parts)
+            self.store.set(self.base + "files/%s-%d" % (fid, n), doc)
+
+    def fetch_file(self, origin, fid):
+        """The bytes of a file shared on another machine (Hub.open_file), from the cloud: what that machine
+        sealed with the message. A file too big to travel, or gone (delivered and deleted, or past the
+        retention), is on that machine only."""
+        name = next((d.get("name") for i, d in self.store.list("devices") if i == origin), "") or "another machine"
+        first = self.store.get(self.base + "files/%s-0" % fid)
+        if not first or first.get("dev") != origin:
+            raise crewchat.HubError("that file is on %s only (files over %s stay on their machine, and the cloud keeps "
+                                    "them %d hours): open it there" % (name, crewchat.human_size(CLOUD_FILE_MAX),
+                                                                     self.ttl // 3600))
+        pieces = []
+        try:
+            parts = int(first.get("parts") or 1)
+            if parts > -(-crewchat.MAX_UPLOAD // FILE_PART):
+                raise ValueError("too many parts")
+            for n in range(parts):
+                doc = first if n == 0 else self.store.get(self.base + "files/%s-%d" % (fid, n))
+                if not doc or doc.get("dev") != origin:
+                    raise ValueError("part %d is missing" % n)
+                aad = "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, n, origin)
+                pieces.append(unb64(self._open(aad, doc)["data"]))
+        except Exception as e:  # missing, tampered with, or sealed with a key this machine lacks
+            raise crewchat.HubError("cannot fetch that file from the cloud (%s); open it on %s" % (e, name))
+        return b"".join(pieces)
 
     def _send_state(self):
         rows = self.hub.local_state()
@@ -988,6 +1102,10 @@ class CloudSync(crewchat.ProjectLink):
         for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
             if now - float(doc.get("created") or now) > self.ttl:
                 self.store.delete(self.base + "tasks/" + doc_id)
+        for doc_id, doc in self.store.list(self.base + "files", where=("dev", self.device_id)):
+            created = float(doc.get("created") or now)
+            if created <= everyone_has or now - created > self.ttl:  # as its message is
+                self.store.delete(self.base + "files/" + doc_id)
 
     # Tasks -------------------------------------------------------------------------------------
     def claim_task(self, task_id, agent, key=None):
@@ -1092,6 +1210,8 @@ class CloudSync(crewchat.ProjectLink):
                     self.stop()
             elif doc_id == "account" and self.account.accept_account(doc):
                 self._after_keys()
+            elif doc_id == "coordinator":
+                self.lease = doc or {}
 
     def _after_keys(self):
         if self.device.ready:

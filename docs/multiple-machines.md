@@ -187,10 +187,14 @@ pair the projects you mean.
   posted on settles it, so taking it needs that machine to be on.
 - **Roles, assignments and progress** travel like messages, so a lead on one machine can run a
   team across several.
-- **The chat page** works on any linked machine: each has the whole chat.
+- **The chat page** works on any linked machine: each has the whole chat. Its connection line says
+  which machine coordinates now: one machine at a time does what needs one machine to act for the
+  others, and whichever is on takes it over. `crewchat coordinator NAME` names the one you prefer
+  when it is on.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
-  a file when someone first opens it. With cloud sync, a file can only be opened on the machine it
-  was shared on, for now.
+  a file when someone first opens it. With cloud sync, a file up to 5 MB travels with its message,
+  encrypted, and is deleted from the cloud with it; a bigger one opens only on the machine it was
+  shared on.
 
 Back to the [README](../README.md) · Next: [Your phone](phone.md)

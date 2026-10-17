@@ -2,7 +2,9 @@
 
 Needs the `cryptography` library; skipped without it. Google's Firestore library is not needed.
 """
+import base64
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -190,6 +192,82 @@ class Sync(unittest.TestCase):
     def tearDown(self):
         for m in (self.a, self.b):
             m.stop()
+
+    def test_shared_files_open_on_the_other_machine(self):
+        # Roadmap Y4: a file up to 5 MB travels with its message, encrypted, in pieces under Firestore's limit.
+        data = os.urandom(cloud.CLOUD_FILE_MAX)  # a 5 MB screenshot: ten pieces
+        meta = self.a.hub.add_file("screenshot.png", data, "image/png")
+        msg = self.a.hub.send(crewchat.OWNER, "all", "see the screenshot", files=[meta])
+        wait_until(lambda: self.b.has("see the screenshot"), message="the message")
+        wait_until(lambda: self.store.get("files/%s-9" % meta["id"]), message="the file's last piece")
+        got, path = self.b.hub.open_file(meta["id"])
+        self.assertEqual((got["name"], path.read_bytes()), ("screenshot.png", data))
+        # Firestore holds ciphertext only: neither the bytes, nor the name, nor the message.
+        stored = json.dumps(self.store.docs, default=str)
+        self.assertNotIn("screenshot", stored)
+        self.assertNotIn(base64.b64encode(data[:300]).decode()[:200], stored)
+        self.assertEqual(self.store.get("files/%s-0" % meta["id"])["parts"], 10)
+        self.assertTrue(all(len(json.dumps(d)) < 1024 * 1024 for k, d in self.store.docs.items() if k.startswith("files/")))
+        # A file too big to travel stays on its machine, and says so.
+        big = self.a.hub.add_file("video.mov", os.urandom(cloud.CLOUD_FILE_MAX + 1), "video/quicktime")
+        self.a.hub.send(crewchat.OWNER, "all", "the video", files=[big])
+        wait_until(lambda: self.b.has("the video"), message="the second message")
+        with self.assertRaises(crewchat.HubError) as e:
+            self.b.hub.open_file(big["id"])
+        self.assertIn("on mac only", str(e.exception))
+        self.assertIsNone(self.store.get("files/%s-0" % big["id"]))
+        # A piece changed in the cloud does not open.
+        small = self.a.hub.add_file("notes.txt", b"tamper with me", "text/plain")
+        self.a.hub.send(crewchat.OWNER, "all", "the notes", files=[small])
+        wait_until(lambda: self.store.get("files/%s-0" % small["id"]), message="the notes in the cloud")
+        doc = dict(self.store.get("files/%s-0" % small["id"]))
+        doc["ct"] = doc["ct"][:-4] + ("AAAA" if not doc["ct"].endswith("AAAA") else "BBBB")
+        self.store.set("files/%s-0" % small["id"], doc)
+        with self.assertRaises(crewchat.HubError) as e:
+            self.b.hub.open_file(small["id"])
+        self.assertIn("cannot fetch that file from the cloud", str(e.exception))
+        # Delivered everywhere: the pieces go with the messages.
+        for m in (self.a, self.b):
+            m.sync.marks["synced_to"] = time.time() + 60
+            m.sync.housekeeping()
+        self.a.sync.housekeeping()
+        self.assertFalse([k for k in self.store.docs if k.startswith("files/")])
+        self.assertTrue(msg)
+
+    def test_whichever_machine_is_on_holds_the_coordinators_lease(self):
+        # Roadmap Y1: a lease in meta/coordinator, renewed by its holder, taken over once it runs out.
+        now = [time.time()]
+        for m in (self.a, self.b):
+            m.sync.clock = lambda: now[0]
+        self.a.sync.renew_lease()
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        term = self.a.sync.coordinator()["term"]
+        self.b.sync.renew_lease()  # a live lease is left alone
+        self.assertEqual((self.b.sync.coordinator()["name"], self.b.sync.coordinator()["me"]), ("mac", False))
+        # The mac goes offline: its lease runs out, and the other machine takes it at its next renewal.
+        self.a.link.online = False
+        self.a.sync.renew_lease()  # cannot reach the cloud: nothing changes there
+        now[0] += cloud.LEASE_SECS + 1
+        self.b.sync.renew_lease()
+        self.assertEqual(self.b.sync.coordinator(), {"name": "windows", "me": True, "term": term + 1, "preferred": ""})
+        self.a.link.online = True
+        self.a.sync.renew_lease()
+        self.assertFalse(self.a.sync.coordinator()["me"])  # back, but the lease is someone else's now
+        # The owner prefers the mac: it takes the role back at its next renewal, and the other lets go.
+        self.assertEqual(self.b.sync.set_preferred("mac")["preferred"], "mac")
+        self.a.sync.renew_lease()
+        self.assertEqual(self.a.sync.coordinator()["term"], term + 2)
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.b.sync.renew_lease()
+        self.assertFalse(self.b.sync.coordinator()["me"])
+        # Stopping hands it on at once rather than after LEASE_SECS.
+        self.a.sync.release_lease()
+        self.b.sync.renew_lease()
+        self.assertTrue(self.b.sync.coordinator()["me"])
+        self.b.sync.set_preferred("none")
+        self.assertEqual(self.b.sync.coordinator()["preferred"], "")
+        with self.assertRaises(cloud.CloudError):
+            self.b.sync.set_preferred("nowhere")
 
     def test_messages_reach_the_other_machine_with_global_ids(self):
         msg = self.a.say("all", "hello from the mac")

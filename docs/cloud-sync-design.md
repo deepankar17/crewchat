@@ -70,6 +70,7 @@ Everything lives under the account's own ID:
 | `users/{uid}/devices/{deviceId}` | Device name, public key, the approval signature, the account key wrapped for this device, last-seen time | Names and public keys are readable; the wrapped key is not usable without the device's private key |
 | `users/{uid}/messages/{id}` | Sending device, key ID, nonce, ciphertext, server timestamp | Only the envelope; the content is encrypted |
 | `users/{uid}/tasks/{taskMessageId}` | Which device took the task, encrypted agent name | Device ID only |
+| `users/{uid}/files/{fileId}-{n}` | Part n of a file shared with a message (5 MB at most, in 512 KB parts), encrypted; deleted with its message | Device ID, number of parts |
 | `users/{uid}/state/{deviceId}` | That device's roster, statuses and read positions, encrypted | No |
 | `users/{uid}/spaces/{space}/...` | A project besides the first: its own `messages`, `tasks` and `state` as above, and `marks/{deviceId}` (how far each machine has read it) | The space is a hash of the project's name and the account, so the name is not stored |
 
@@ -139,6 +140,28 @@ No server is primary. Each kind of state has one clear owner:
 **Offline behaviour.** Agents on one machine keep talking to each other with no internet.
 Messages queue and sync when the connection returns. Taking a task that came from another
 machine needs to be online, because Firestore is what makes "only one taker" true.
+
+## 8a. A coordinator, whichever machine is on
+
+Some work needs one machine to act for the others while the machine it would normally fall to is off:
+settling a claim on a task whose posting machine is off, serving catch-up history and serving shared
+files (roadmap Y2 to Y4). No machine is assumed to be always on, so the role moves to whichever is.
+
+- **What it does, and does not.** Only those three jobs. It never orders or numbers messages: those stay
+  leaderless (section 8), so a hand-over never loses or reorders the chat.
+- **Cloud sync:** a lease, `meta/coordinator` `{device, term, expires, preferred}`. The holder renews it
+  about every 30 seconds for 90; any approved machine that is online takes it once it has run out, with a
+  conditional write (the same one task claims use), so two never both take it. The term goes up each
+  time the lease changes hands. A machine that stops cleanly lets its lease run out at once.
+- **Tailscale:** there is no referee, so every machine applies the same rule to the members it can reach:
+  the owner's preferred machine if it is reachable, else the reachable machine (itself included) with the
+  lowest tag. They agree while they can reach each other; during a network split each side may have its
+  own, which is why every decision carries its term and machine, so conflicts can be settled afterwards
+  (the earlier claim wins; Y2).
+- **The owner's preferred machine** (`crewchat coordinator NAME`, or `none`) takes the role whenever it is
+  on: in cloud sync at its next renewal, over Tailscale as soon as the others reach it. Over Tailscale the
+  choice travels with the machines' pulls, the newest one winning.
+- **On the page:** the connection line says which machine coordinates now.
 
 ## 9. Presence and quota
 

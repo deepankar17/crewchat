@@ -11,7 +11,7 @@ What crewchat connects to, and only these:
 - **GitHub, for the update check.** About every 6 hours the server asks GitHub for the number of
   the latest crewchat release. Nothing about you, your machine or your chat is sent.
   `CREWCHAT_NO_UPDATE_CHECK=1` turns it off.
-- **Your own Firebase project, if you turn on cloud sync.** Messages, tasks and agent lists are
+- **Your own Firebase project, if you turn on cloud sync.** Messages, tasks, agent lists and shared files (up to 5 MB) are
   encrypted on your machine before they are sent, with a key only your machines hold; Firestore
   stores the ciphertext under your Google account. You sign in with Google to your own project.
   Details: [cloud sync design](cloud-sync-design.md).
