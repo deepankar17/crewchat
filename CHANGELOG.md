@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **The classic page is gone.** The page from before 0.14, kept at `/classic` for one release, is
+  removed with its link in the project menu.
 - **New agent says what a tool still needs.** Picking a tool shows whether it is installed, signed in
   (Claude Code, Cursor, Codex and OpenCode by their own status commands; Gemini CLI and Qwen Code by
   their settings), and what it asks once in the chosen folder (trust; Codex's and Gemini CLI's review of

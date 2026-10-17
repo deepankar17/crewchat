@@ -84,8 +84,7 @@ class Chrome:
 
 
 class Signed(unittest.TestCase):
-    """A machine with one agent, and Chrome signed in to its chat page at PATH."""
-    PATH = "/"
+    """A machine with one agent, and Chrome signed in to its chat page."""
 
     @classmethod
     def setUpClass(cls):
@@ -102,9 +101,6 @@ class Signed(unittest.TestCase):
         cls.chrome.type_into("input[name=code]", code.lower())  # as typed on a phone
         cls.chrome.js("document.querySelector('form').submit()")
         cls.chrome.until("location.pathname === '/' && !!document.getElementById('log')", what="the chat page")
-        if cls.PATH != "/":
-            cls.chrome.open(cls.m.url + cls.PATH)
-            cls.chrome.until("!!document.getElementById('log')", what="the page at " + cls.PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -118,309 +114,6 @@ class Signed(unittest.TestCase):
         """Elements marked hidden that the page's styles show anyway."""
         return self.chrome.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
                               ".map(e => e.id || e.className)")
-
-
-@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
-class Page(Signed):
-    """The page before 0.14, at /classic for one release."""
-    PATH = "/classic"
-
-    def test_the_page_shows_the_chat_and_the_agent(self):
-        c = self.chrome
-        self.assertEqual(c.js("document.getElementById('project').textContent"), "Demo")
-        c.until("document.getElementById('agents').innerText.includes(%s)" % json.dumps(self.agent.name))
-        self.assertIn(self.agent.name, c.js("[...document.getElementById('to').options].map(o => o.value).join(' ')"))
-        self.assertEqual(c.errors, [])
-
-    def test_send_a_message_and_a_task_from_the_page(self):
-        c = self.chrome
-        c.until("[...document.getElementById('to').options].some(o => o.value === %s)" % json.dumps(self.agent.name))
-        c.js("document.getElementById('to').value = %s" % json.dumps(self.agent.name))
-        c.type_into("#text", "hello from the page")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        self.assertIn("hello from the page", eventually(self.agent.stop_hook, what="the agent to get it"))
-        c.js("document.getElementById('to').value = 'all'")
-        c.js("document.getElementById('task').checked = true")
-        c.type_into("#text", "a task from the page")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        task = self.m.owner.wait_for("a task from the page")
-        self.assertEqual(task["kind"], "task")
-        c.js("document.getElementById('task').checked = false")
-        self.agent.call("hub_take", id=task["id"])
-        c.until("document.getElementById('log').innerText.includes('took task #%s')" % task["id"])
-
-    def test_agent_messages_are_shown_as_text(self):
-        c = self.chrome
-        self.agent.call("hub_send", to="Owner", text='<img src=x onerror="window.pwned=1"><b>bold?</b>')
-        c.until("document.getElementById('log').innerText.includes('onerror=')", what="the message on the page")
-        time.sleep(0.5)
-        self.assertIsNone(c.js("window.pwned"))
-        self.assertEqual(c.js("document.querySelectorAll('#log img[src=x], #log b.bold').length"), 0)
-        self.assertEqual(c.errors, [])
-
-    def test_set_a_role_from_the_agent_card(self):
-        c = self.chrome
-        sel = "select[aria-label='Role for %s']" % self.agent.name
-        c.until("!!document.querySelector(%s)" % json.dumps(sel))
-        c.js("(() => { const s = document.querySelector(%s); s.value = 'qa'; s.dispatchEvent(new Event('change')); })()"
-             % json.dumps(sel))
-        eventually(lambda: self.m.owner.row(self.agent.name)["role"] == "qa", what="the role to be set")
-        self.assertIn("Your role in this chat is now: QA", self.agent.stop_hook())
-        c.until("document.getElementById('agents').innerText.includes('QA')")
-
-    def test_session_controls_follow_its_state(self):
-        c = self.chrome
-        c.until("state.agents.length > 0", what="the agents")
-        # Rows as the server sends them (the page's own data), drawn by the page's own code.
-        out = c.js("""(() => {
-            const saved = state.agents, savedModels = toolModels;
-            toolModels = {claude: [["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]};
-            const base = state.agents[0];
-            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
-            state.agents = [
-              row("running-one", {session: {app: "terminal", running: true, since: state.now - 60, tool: "claude", reopen: true}}),
-              row("in-the-app", {session: {app: "claude-app", running: true, since: state.now, tool: "claude", reopen: true}}),
-              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
-              row("closed-cursor", {session: {app: "terminal", running: false, since: state.now, tool: "cursor", reopen: false}}),
-              row("far-one", {remote: true, device: "laptop", session: null}),
-              row("never-reported", {session: null})];
-            state.names = "";
-            renderAgents();
-            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
-            const buttons = (n) => [...card(n).querySelectorAll('button')].map(b => b.textContent);
-            const out = {
-              running: buttons("running-one"), app: card("in-the-app").innerText,
-              closed: buttons("closed-one"), closedText: card("closed-one").innerText,
-              far: buttons("far-one"), never: buttons("never-reported"), cursor: buttons("closed-cursor"),
-              models: [...card("running-one").querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
-            };
-            state.agents = saved; toolModels = savedModels; state.names = ""; renderAgents();  // as the server says
-            return out;
-        })()""")
-        self.assertIn("Stop", out["running"])
-        self.assertNotIn("Reopen", out["running"])
-        self.assertIn("Running in the Claude app", out["app"])
-        self.assertIn("Reopen", out["closed"])
-        self.assertNotIn("Stop", out["closed"])
-        self.assertIn("Session closed 4 min ago", out["closedText"])
-        for name in ("far", "never", "cursor"):  # no session it could act on here (Cursor: not yet)
-            self.assertNotIn("Stop", out[name])
-            self.assertNotIn("Reopen", out[name])
-        self.assertIn("Switch running-one's model", out["models"])
-        self.assertEqual(c.errors, [])
-
-    def test_avatars_follow_the_profile(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        c.js("""(() => {
-            window.savedAgents = state.agents;
-            const base = state.agents[0];
-            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false, session: null}, extra);
-            state.agents = [
-              row("rocket-cursor", {client: "cursor", picture: "preset:rocket", colour: ""}),
-              row("lost-picture", {client: "claude", picture: "file:" + "0".repeat(16), colour: "#000000",
-                                   remote: true, device: "pc", os: "windows"})];
-            state.names = "";
-            renderAgents();
-            buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi", ts: state.now})
-              .setAttribute("id", "avatar-probe");
-        })()""")
-        c.until("""(() => { const a = [...document.querySelectorAll('#agents .agent')]
-                     .find(e => e.innerText.includes('lost-picture')); return a && !a.querySelector('.avatar img'); })()""",
-                what="the missing picture to fall back to initials")
-        c.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-color-scheme", "value": "dark"}])
-        self.addCleanup(c.call, "Emulation.setEmulatedMedia", features=[])
-        self.assertTrue(c.js("matchMedia('(prefers-color-scheme: dark)').matches"))
-        out = c.js("""(() => {
-            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
-            const av = (n) => card(n).querySelector('.avatar');
-            const probe = buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi",
-                                        ts: state.now});
-            const out = {
-              rocket: av("rocket-cursor").innerText, rocketColour: av("rocket-cursor").style.getPropertyValue("--av"),
-              mark: av("rocket-cursor").querySelector('.mark').textContent,
-              lost: av("lost-picture").querySelector('.initials').textContent,
-              lostInk: getComputedStyle(av("lost-picture").querySelector('.initials')).color,
-              ring: getComputedStyle(av("lost-picture")).boxShadow,
-              os: !!av("lost-picture").querySelector('.os'), osTitle: av("lost-picture").querySelector('.os').title,
-              inMessage: !!probe.querySelector('.avatar'),
-              pictureAction: [...card("rocket-cursor").querySelectorAll('summary')].map(s => s.textContent),
-              remoteAction: [...card("lost-picture").querySelectorAll('summary')].map(s => s.textContent),
-            };
-            state.agents = window.savedAgents; state.names = ""; renderAgents();  // as the server says
-            return out;
-        })()""")
-        self.assertIn("\U0001F680", out["rocket"])
-        self.assertEqual(out["rocketColour"], "#1a1a1a")  # Cursor's own colour
-        self.assertEqual(out["mark"], "Cu")
-        self.assertEqual(out["lost"], "LP")  # its picture is on another machine: initials, not a broken image
-        self.assertEqual(out["lostInk"], "rgb(255, 255, 255)")  # white on black
-        self.assertNotEqual(out["ring"], "none")
-        self.assertTrue(out["os"])  # two machines: each agent says which OS it runs on
-        self.assertEqual(out["osTitle"], "Windows")
-        self.assertTrue(out["inMessage"])
-        self.assertIn("Picture", out["pictureAction"])
-        self.assertNotIn("Picture", out["remoteAction"])  # change it on its own machine
-        self.assertEqual(c.errors, [])
-
-    def test_message_avatars_survive_roster_changes(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        out = c.js("""(() => {
-            const saved = state.agents;
-            const base = state.agents[0];
-            const node = buildMessage({id: "av-2", seq: 2, kind: "msg", from: base.agent, to: "all", text: "kept", ts: state.now});
-            $("log").append(node);
-            state.agents = saved.concat([Object.assign({}, base, {agent: "newcomer", session: null})]);  // someone joins
-            renderAgents();
-            const kept = node.querySelector('[data-who].avatar, .meta > span:first-child').className;
-            state.agents = saved.concat([Object.assign({}, base, {agent: "odd", client: "constructor", session: null}),
-                                         Object.assign({}, base, {agent: "odder", client: "__proto__", colour: "zz",
-                                                                  session: null})]);
-            let threw = "";
-            try { renderAgents(); } catch (e) { threw = String(e); }
-            const odd = [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes("odd"));
-            const oddColour = odd ? odd.querySelector('.avatar').style.getPropertyValue("--av") : "";
-            node.remove(); state.agents = saved; state.names = ""; renderAgents();
-            return {kept, threw, oddColour};
-        })()""")
-        self.assertIn("avatar", out["kept"])  # still drawn as an avatar after the names changed
-        self.assertEqual(out["threw"], "")  # a tool called "constructor" is just an unknown tool
-        self.assertEqual(out["oddColour"], "#6b7280")
-        self.assertEqual(c.errors, [])
-
-    def test_closing_the_picture_menu_shows_what_changed(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        c.js("""(() => { window.savedAgents = state.agents;
-                 state.agents = [Object.assign({}, state.agents[0], {agent: "menu-one", remote: false, session: null})];
-                 renderAgents(); })()""")
-        c.js("document.querySelector('#agents .picmenu').open = true")
-        c.js("""(() => { state.agents = [Object.assign({}, state.agents[0], {status: "changed while open"})];
-                 renderAgents(); })()""")
-        self.assertNotIn("changed while open", c.js("$('agents').innerText"))  # frozen while choosing
-        c.js("document.querySelector('#agents .picmenu').open = false")
-        c.until("$('agents').innerText.includes('changed while open')", what="the cards to catch up")
-        c.js("state.agents = window.savedAgents; renderAgents()")
-
-    def test_one_machine_shows_no_os_badge(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        self.assertGreater(c.js("document.querySelectorAll('#agents .avatar').length"), 0)
-        self.assertEqual(c.js("document.querySelectorAll('#agents .avatar .os').length"), 0)
-
-    def test_attach_a_file(self):
-        c = self.chrome
-        path = H.TMP / "from-the-page.txt"
-        path.write_text("attached from the page\n")
-        node = c.call("DOM.querySelector", nodeId=c.call("DOM.getDocument")["root"]["nodeId"], selector="#files")
-        c.call("DOM.setFileInputFiles", nodeId=node["nodeId"], files=[str(path)])
-        c.until("document.getElementById('pending').innerText.includes('from-the-page.txt')", what="the file to be attached")
-        c.js("document.getElementById('to').value = %s" % json.dumps(self.agent.name))
-        c.type_into("#text", "see the file")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        got = eventually(self.agent.stop_hook, what="the agent to get the file")
-        fid = got.split("[file ")[1].split(":")[0]
-        self.assertIn("attached from the page", self.agent.call("hub_file", id=fid))
-
-    def test_a_page_that_was_offline_catches_up_on_everything(self):
-        c = self.chrome
-        c.until("document.querySelectorAll('#log .msg').length > 0 || true")
-        before = c.js("document.querySelectorAll('#log .msg').length")
-        c.call("Network.emulateNetworkConditions", offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        time.sleep(1)
-        for i in range(600):
-            self.agent.call("hub_send", to="Owner", text="overnight %d" % i)
-        c.call("Network.emulateNetworkConditions", offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        c.js("window.dispatchEvent(new Event('online'))")
-        c.until("document.querySelectorAll('#log .msg').length >= %d" % (before + 600), timeout=60,
-                what="all 600 messages on the page")
-        texts = c.js("[...document.querySelectorAll('#log .msg .body')].map(e => e.innerText)"
-                     ".filter(t => t.startsWith('overnight '))")
-        self.assertEqual(texts, ["overnight %d" % i for i in range(600)])
-
-    def test_the_task_sheet_on_the_page(self):
-        c = self.chrome
-        c.click("#view-tasks")
-        c.type_into("#t-title", "Write the release notes")
-        c.type_into("#t-areas", "docs/")
-        c.js("document.getElementById('task-form').requestSubmit()")
-        c.until("document.getElementById('sheet').innerText.includes('Write the release notes')", what="the new task")
-        self.assertIn("Write the release notes", self.agent.call("hub_tasks"))
-        row = c.js("[...document.querySelectorAll('#sheet tbody tr')].findIndex(r => r.innerText.includes('release notes'))")
-        c.js("document.querySelectorAll('#sheet tbody tr')[%d].querySelector('button[title^=\"Mark\"]').click()" % row)
-        c.until("document.querySelectorAll('#sheet tbody tr')[%d].className === 'done'" % row, what="done")
-        c.click("#view-chat")
-        self.assertEqual(c.errors, [])
-
-    def test_the_commands_tab_and_the_connection_line(self):
-        c = self.chrome
-        c.until("!document.getElementById('link').hidden", what="the connection line")
-        self.assertIn("This machine only", c.js("document.getElementById('link').innerText"))
-        c.click("#view-commands")
-        c.until("document.querySelectorAll('#cmd-list .cmd').length > 40", what="the commands")
-        row = "[...document.querySelectorAll('#cmd-list .cmd')].find(r => r.querySelector('code').innerText === 'crewchat projects')"
-        c.js(row + ".querySelector('button.run').click()")
-        c.until("!%s.querySelector('pre').hidden && %s.querySelector('pre').innerText.length > 0" % (row, row),
-                timeout=60, what="what projects printed")
-        self.assertEqual(c.js(row + ".querySelector('pre').className"), "", c.js(row + ".querySelector('pre').innerText"))
-        # Searching hides rows; clearing the search brings them back with their output still there.
-        shown = "[...document.querySelectorAll('#cmd-list .cmd')].filter(r => !r.hidden).length"
-        everything = c.js(shown)
-        c.type_into("#cmd-filter", "task sheet")
-        c.until("%s < %d" % (shown, everything), what="the search to hide rows")
-        c.js("const f = document.getElementById('cmd-filter'); f.value = ''; f.dispatchEvent(new Event('input'))")
-        self.assertEqual(c.js(shown), everything)
-        self.assertFalse(c.js(row + ".querySelector('pre').hidden"))
-        c.click("#view-chat")
-        self.assertEqual(c.errors, [])
-
-    def test_what_is_hidden_is_not_shown(self):
-        c = self.chrome
-        # What the agent may do without asking depends on the tool: "Also edit files" is Claude Code's only.
-        c.click("#add-agent")
-        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list")
-        c.js("const t = document.getElementById('l-tool'); t.value = [...t.options].find(o => o.value !== 'claude').value;"
-             "t.dispatchEvent(new Event('change'))")
-        self.assertNotIn("edits", c.js("[...document.getElementById('l-perms').options].map(o => o.value)"))
-        self.assertEqual(self.shown_though_hidden(), [])
-        c.click("#l-cancel")
-        # Opened again, the list starts on its first tool: the box shows exactly when that is Claude Code.
-        c.js("document.getElementById('l-tool').replaceChildren()")  # so that the wait below sees the new list
-        c.click("#add-agent")
-        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list again")
-        self.assertEqual("edits" in c.js("[...document.getElementById('l-perms').options].map(o => o.value)"),
-                         c.js("document.getElementById('l-tool').value === 'claude'"))
-        c.click("#l-cancel")
-        self.assertEqual(c.errors, [])
-
-    def test_phone_and_dark_mode(self):
-        c = self.chrome
-        try:
-            c.size(375, 812, mobile=True, dark=True)
-            c.open(self.m.url + self.PATH)
-            c.until("!!document.getElementById('log')")
-            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
-            bg = c.js("getComputedStyle(document.body).backgroundColor")
-            self.assertNotEqual(bg, "rgb(255, 255, 255)")
-            self.assertEqual(c.errors, [])
-        finally:
-            c.size(1280, 900)
-            c.open(self.m.url + self.PATH)
-            c.until("!!document.getElementById('log')")
-
-    def test_add_an_agent_form_opens_and_closes(self):
-        c = self.chrome
-        c.click("#add-agent")
-        c.until("!document.getElementById('launch').hidden || getComputedStyle(document.getElementById('launch')).display !== 'none'",
-                what="the form to open")
-        c.until("document.getElementById('l-folder').options.length > 0", what="the folder list")
-        self.assertIn("notes-app", c.js("document.getElementById('l-folder').innerText"))
-        c.click("#l-cancel")
-        self.assertEqual(c.errors, [])
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
@@ -441,10 +134,50 @@ class NewPage(Signed):
         self.assertIn(["D\nDemo", "page"], tabs)  # (and one for each other project, not current)
         self.assertEqual([t for t in tabs if t[1] == "page"], [["D\nDemo", "page"]])
         self.assertIn("1 agent", c.js("$('space-meta').textContent"))
-        self.assertTrue(c.js("$('classic-link').href").endswith("/classic"))
         self.assertTrue(c.js("$('panel').hidden"))
         self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])
+
+    def test_agent_messages_are_shown_as_text(self):
+        c = self.chrome
+        self.agent.call("hub_send", to="Owner", text='<img src=x onerror="window.pwned=1"><b>bold?</b>')
+        c.until("$('log').innerText.includes('onerror=')", what="the message on the page")
+        time.sleep(0.5)
+        self.assertIsNone(c.js("window.pwned"))
+        self.assertEqual(c.js("document.querySelectorAll('#log img[src=x], #log b').length"), 0)
+        self.assertEqual(c.errors, [])
+
+    def test_attach_a_file(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        path = H.TMP / "from-the-page.txt"
+        path.write_text("attached from the page\n")
+        node = c.call("DOM.querySelector", nodeId=c.call("DOM.getDocument")["root"]["nodeId"], selector="#files")
+        c.call("DOM.setFileInputFiles", nodeId=node["nodeId"], files=[str(path)])
+        c.until("$('pending').innerText.includes('from-the-page.txt')", what="the file to be attached")
+        c.type_into("#text", "@%s see the file" % self.agent.name)
+        c.js("$('text').dispatchEvent(new Event('input'))")
+        c.click("#send")
+        got = eventually(self.agent.stop_hook, what="the agent to get the file")
+        fid = got.split("[file ")[1].split(":")[0]
+        self.assertIn("attached from the page", self.agent.call("hub_file", id=fid))
+        self.assertEqual(c.errors, [])
+
+    def test_a_page_that_was_offline_catches_up_on_everything(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        before = c.js("document.querySelectorAll('#log .msg').length")
+        c.call("Network.emulateNetworkConditions", offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
+        time.sleep(1)
+        for i in range(600):
+            self.agent.call("hub_send", to="Owner", text="overnight %d" % i)
+        c.call("Network.emulateNetworkConditions", offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
+        c.js("window.dispatchEvent(new Event('online'))")
+        c.until("document.querySelectorAll('#log .msg').length >= %d" % (before + 600), timeout=60,
+                what="all 600 messages on the page")
+        texts = c.js("[...document.querySelectorAll('#log .msg .body')].map(e => e.innerText)"
+                     ".filter(t => t.startsWith('overnight '))")
+        self.assertEqual(texts, ["overnight %d" % i for i in range(600)])
 
     def test_mention_writes_to_one_agent_and_post_as_task(self):
         c = self.chrome

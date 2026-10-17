@@ -2420,9 +2420,8 @@ class Profiles(Base):
 
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
-        for path in ("/", "/classic"):
-            status, _, headers = self.raw(path)
-            self.assertEqual((status, headers["Location"]), (303, "/login"))
+        status, _, headers = self.raw("/")
+        self.assertEqual((status, headers["Location"]), (303, "/login"))
         self.assertEqual(self.raw("/api/poll")[0], 401)
         self.assertEqual(self.raw("/api/send", b"{}", {"Content-Type": "application/json"})[0], 401)
         status, body, headers = self.raw("/login")
@@ -2456,10 +2455,7 @@ class ChatPage(Base):
         self.assertIn(b"<title>crewchat</title>", body)
         self.assertIn(b'id="panel"', body)  # the page from 0.14
         self.assertEqual(headers["Cache-Control"], "no-store")
-        status, classic, _ = self.raw("/classic", opener=opener)  # the page before it, for one release
-        self.assertEqual(status, 200)
-        self.assertIn(b'id="views"', classic)
-        self.assertNotIn(b'id="panel"', classic)
+        self.assertEqual(self.raw("/classic", opener=opener)[0], 404)  # the page before 0.14 is gone
         send = lambda obj, extra=None: self.raw(  # noqa: E731
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)
         self.assertEqual(send({"to": "all", "text": "x"}, {"Origin": "https://evil.example"})[0], 403)
