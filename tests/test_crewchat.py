@@ -2572,7 +2572,8 @@ class WebPush(Base):
         store = self.store()
         key = store.public_key()
         self.assertEqual(len(base64.urlsafe_b64decode(key + "=")), 65)
-        self.assertEqual(oct(os.stat(store.path).st_mode & 0o777), "0o600")
+        if os.name != "nt":  # Windows has no such modes: the file is in the user's own profile
+            self.assertEqual(oct(os.stat(store.path).st_mode & 0o777), "0o600")
         store.set_mode(self.ENDPOINT, "demo", "all")
         store.set_mode(self.ENDPOINT, "other", "mentions")
         self.assertEqual(store.wanted("demo"), [(self.ENDPOINT, "all")])
