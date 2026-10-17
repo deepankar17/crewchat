@@ -156,6 +156,7 @@ Registered under another name than `crewchat`, its tools are allowed without ask
 | `crewchat peers invite` | Print a join command for another machine (sets up this machine's tailnet address the first time) |
 | `crewchat peers join URL CODE` | Link this machine, with the command from an invite |
 | `crewchat peers status` | Linked machines, and which are reachable |
+| `crewchat coordinator [NAME\|none]` | Which linked machine coordinates now (settles claims for a machine that is off, serves catch-up and files); with a name, the one that should whenever it is on |
 | `crewchat peers remove NAME` | Drop a machine and change the shared key (asks first; `--yes` does not) |
 | `crewchat peers leave` | Unlink this machine (asks first, naming it; `--yes` does not) |
 

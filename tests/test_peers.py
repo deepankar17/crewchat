@@ -562,6 +562,40 @@ class OfflineAndRemoval(unittest.TestCase):
             a.stop()
             b.stop()
 
+    def test_whichever_machine_is_on_coordinates(self):
+        # Roadmap Y1: the preferred machine when reachable, else the reachable one with the lowest tag.
+        a = Machine("first").found()
+        b = Machine("second").join(a)
+        c = Machine("third").join(b)
+        machines = [a, b, c]
+        try:
+            who = lambda m: m.sync.coordinator()["name"]  # noqa: E731
+            eventually(lambda: all(who(m) == "first" for m in machines), timeout=30, what="the lowest tag to lead")
+            self.assertTrue(a.sync.coordinator()["me"])
+            self.assertFalse(b.sync.coordinator()["me"])
+            # The owner prefers the second machine (on the third): every machine hears of it with its pulls.
+            self.assertEqual(c.sync.set_preferred("second")["preferred"], "second")
+            eventually(lambda: all(who(m) == "second" for m in machines), timeout=30, what="the preferred machine")
+            with self.assertRaises(peers.PeerError):
+                a.sync.set_preferred("nowhere")
+            # It goes off: the others fall back to the lowest tag they can reach, and the term goes up.
+            term = a.sync.coordinator()["term"]
+            port, root = b.port, b.root
+            b.stop()
+            eventually(lambda: who(a) == "first" and who(c) == "first", timeout=60, what="a fallback without it")
+            self.assertGreater(a.sync.coordinator()["term"], term)
+            # Back on, it takes the role back.
+            b = machines[1] = Machine("second", port, root)
+            b.sync = peers.start(b.hub, root)
+            eventually(lambda: all(who(m) == "second" for m in machines), timeout=90, what="the preferred one back")
+            a.sync.set_preferred("none")
+            eventually(lambda: all(who(m) == "first" for m in machines), timeout=30, what="no preference again")
+            info = crewchat.link_info(a.hub)
+            self.assertEqual(info["coordinator"]["name"], "first")
+        finally:
+            for m in machines:
+                m.stop()
+
     def test_taking_a_task_needs_the_machine_that_posted_it(self):
         a = Machine("poster").found()
         b = Machine("taker").join(a)
