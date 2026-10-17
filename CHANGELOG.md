@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **How many tokens your agents use, and roughly what that would cost.** At the end of each turn a Claude
+  Code agent's hook reads the turn's token counts from its own transcript (numbers only, never the
+  conversation) and adds them to the agent, the day and the task it works on. `crewchat usage` shows them
+  with an estimate at API prices (a Claude subscription does not pay per token), and so does the agent's
+  panel on the page. Not available for Cursor, whose hooks do not say. `crewchat usage off` turns it off
+  for a project.
 - **The chat page loads faster, most of all on a phone.** It is sent compressed (47 KB instead of 170 KB),
   and the browser keeps it and asks whether it changed: a reload transfers under 1 KB. The chat's messages
   and settings are still never kept on the device.

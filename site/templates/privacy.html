@@ -19,6 +19,13 @@
       <li><b>Tailscale, if you link machines with it.</b> Your machines talk to each other over your own
         tailnet.</li>
     </ul>
+    <h2>What crewchat reads on your machine and keeps there</h2>
+    <ul>
+      <li><b>Token counts.</b> At the end of each turn of a Claude Code agent, its hook reads how many tokens the
+        turn used from the session's own transcript: the model and the numbers, never the conversation. They are
+        added to the agent and the task it works on, and shown to you as totals with a cost estimate.
+        <code>crewchat usage off</code> stops it for a project.</li>
+    </ul>
     <p>Installing crewchat downloads it from PyPI or GitHub (and uv from Astral, if missing); those sites see the
       download as they see any other. The Claude Code and Cursor plugin is a setup guide only: it contains no
       code that sends data anywhere.</p>

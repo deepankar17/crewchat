@@ -53,7 +53,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | To do | P4, X4 |
-| [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | To do | P1 |
+| [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
 | [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | To do | X1 |
 | [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | To do | X2 |
 
@@ -860,7 +860,7 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 
 ### X4
 
-**Token and cost tracking** · P1 · effort M · To do
+**Token and cost tracking** · P1 · effort M · Done
 
 **Goal.** Know how many tokens each agent, task and model uses, and roughly what that costs, without reading any conversation content.
 
@@ -892,6 +892,15 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 - Price table goes stale; show the date it was last updated.
 
 **Depends on:** [P1](#p1)
+
+**Status.** Done. The stop hook (full crewchat, not the light script: only the tool-call hook moved in P1)
+reads the transcript from its last offset and sends `{model: [input, output, cache read, cache write, cache
+write 1h]}` as its own `/api/hook` call (`event: usage`), counting each assistant message once (its lines
+repeat the usage). Kept in state.json (`usage`: day, agent, model; and on the sheet row of the task the agent
+last reported on). Cursor: its hooks give a transcript path but no token counts, and its transcript holds
+none, so it shows "not available". Prices from Anthropic's list of 2026-10-06 (`PRICES`, `PRICES_DATE`).
+Shown by `crewchat usage`, `/api/usage` and a line in the agent panel. Not done yet: carrying the totals to
+other machines (the spec's "can"), left for X1.
 
 ### X2
 

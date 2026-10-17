@@ -546,6 +546,28 @@ class PollAfter(unittest.TestCase):
                                  (seqs[:5], after))
 
 
+class TokenPrices(unittest.TestCase):
+    def test_prices_and_transcripts(self):
+        self.assertEqual(crewchat.model_price("claude-opus-5-5"), crewchat.PRICES["claude-opus-5-5"])
+        self.assertEqual(crewchat.model_price("claude-opus-5-5[1m]"), crewchat.PRICES["claude-opus-5-5"])
+        self.assertEqual(crewchat.model_price("claude-haiku-4-5-20251001"), crewchat.PRICES["claude-haiku-4-5"])
+        self.assertEqual(crewchat.model_price("claude-opus-5"), crewchat.PRICES["claude-opus-5"])  # not 5-5's
+        self.assertIsNone(crewchat.model_price("gpt-9"))
+        self.assertEqual(crewchat.usage_cost({"gpt-9": [1, 1, 1, 1, 1]}), (0.0, ["gpt-9"]))
+        path = Path(tempfile.mkdtemp(prefix="transcript-", dir=TMP)) / "t.jsonl"
+        line = lambda mid, n: json.dumps({"type": "assistant", "message": {"id": mid, "model": "m",  # noqa: E731
+                                                                         "usage": {"input_tokens": n, "output_tokens": n}}})
+        path.write_text(line("a", 1) + "\n" + line("a", 1) + "\n" + line("b", 2) + "\n" + line("c", 3)[:20])  # c: half written
+        found, offset, last = crewchat.transcript_usage(path)
+        self.assertEqual((found, last), ({"m": [3, 3, 0, 0, 0]}, "b"))
+        with open(path, "a") as f:
+            f.write(line("c", 3)[20:] + "\n" + json.dumps({"type": "assistant", "message": {"id": "s", "model": "<synthetic>",
+                                                                                          "usage": {"input_tokens": 0}}}) + "\n")
+        self.assertEqual(crewchat.transcript_usage(path, offset, last)[0], {"m": [3, 3, 0, 0, 0]})  # c, finished; nothing for 0s
+        path.write_text(line("z", 5) + "\n")  # a shorter, new transcript: read from its start
+        self.assertEqual(crewchat.transcript_usage(path, offset, last)[0], {"m": [5, 5, 0, 0, 0]})
+
+
 class TrimmedTools(Base):
     """What every agent loads is short (roadmap P2): one hub_task for the task sheet, and inbox and history
     answers that fit a cap without losing a message."""
@@ -3487,6 +3509,82 @@ class Hooks(Base):
                 ["PostToolUse"] for h in g["hooks"]]
         self.assertEqual(len(tool), 1)
         self.assertIn(crewchat.HOOK_SCRIPT_FILE, tool[0])
+
+    @staticmethod
+    def transcript(path, turns, secret="the secret plan"):
+        """A Claude Code transcript: each assistant message on several lines (one per content block) with the
+        same usage, as Claude Code writes them, between user lines that hold text."""
+        with open(path, "a", encoding="utf-8") as f:
+            for mid, model, usage in turns:
+                f.write(json.dumps({"type": "user", "message": {"role": "user", "content": secret + " (usage: none)"}}) + "\n")
+                for block in ("thinking", "text", "tool_use"):
+                    f.write(json.dumps({"type": "assistant", "requestId": "req_" + mid, "message": {
+                        "id": mid, "model": model, "role": "assistant", "usage": usage,
+                        "content": [{"type": block, "text": secret}]}}) + "\n")
+
+    def test_token_usage_comes_from_the_transcript_counts_only(self):
+        session, name = self.linked("usage-turns")
+        path = Path(self.state) / "usage-transcript.jsonl"
+        u = lambda i, o, cr=0, cw=0, hour=0: {"input_tokens": i, "output_tokens": o, "cache_read_input_tokens": cr,  # noqa: E731
+                                            "cache_creation_input_tokens": cw, "service_tier": "standard",
+                                            "cache_creation": {"ephemeral_5m_input_tokens": cw - hour, "ephemeral_1h_input_tokens": hour}}
+        self.transcript(path, [("msg_1", "claude-opus-5-5", u(10, 200, 30000, 5000)),
+                               ("msg_2", "claude-opus-5-5", u(3, 50, 35000, 400, 100))])
+        tid = self.say("all", "count my tokens", "task")
+        session.call("hub_task", action="take", id=tid)
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        # The transcript's own numbers, each message once: 13 in, 250 out, 65,000 read, 5,400 written (100 of them
+        # for an hour).
+        self.assertEqual(self.hub.usage[day][name], {"claude-opus-5-5": [13, 250, 65000, 5300, 100]})
+        self.assertEqual(self.hub.sheet[str(tid)]["usage"], {"claude-opus-5-5": [13, 250, 65000, 5300, 100]})
+        # The next turn sends only what the transcript gained since.
+        self.transcript(path, [("msg_3", "claude-haiku-5-5", u(1, 2))])
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        self.assertEqual(self.hub.usage[day][name]["claude-haiku-5-5"], [1, 2, 0, 0, 0])
+        self.assertEqual(self.hub.usage[day][name]["claude-opus-5-5"], [13, 250, 65000, 5300, 100])  # not again
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        self.assertEqual(self.hub.usage[day][name]["claude-haiku-5-5"], [1, 2, 0, 0, 0])  # nothing new: nothing added
+        self.hub.flush()
+        saved = (self.hub.home / "state.json").read_text()
+        self.assertNotIn("secret plan", saved)  # no conversation text reaches the server
+        self.assertNotIn("secret plan", json.dumps(self.hub.usage_report()))
+        report = crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "view"})
+        row = report["agents"][name]
+        self.assertEqual(row["all"], 13 + 250 + 65000 + 5300 + 100 + 3)
+        cost = (13 * 4 + 250 * 20 + 65000 * 0.20 + 5300 * 4 * 1.25 + 100 * 4 * 2 + 1 * 0.1 + 2 * 0.5) / 1e6
+        self.assertAlmostEqual(row["cost_all"], cost)
+        self.assertEqual(report["tasks"][0]["id"], str(tid))
+        self.assertEqual(report["prices"], crewchat.PRICES_DATE)
+        page_row = next(r for r in self.hub.rows() if r["agent"] == name)["usage"]
+        self.assertEqual((page_row["today"], page_row["all"]), (row["all"], row["all"]))
+
+    def test_token_usage_is_off_when_the_owner_says_so(self):
+        session, name = self.linked("usage-off")
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        place = self.hub.agents[name]["place"]
+        crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "off"})
+        try:
+            self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"kept": False})
+            self.assertIn("not kept", cli("usage"))
+        finally:
+            crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "on"})
+        config = crewchat.load_config()
+        config["activity"] = "off"  # what agents do kept off the page: their tokens too
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"kept": False})
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+        self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]})["kept"], True)
+        self.assertEqual(self.hub.record_usage(place, "unknownkey99", {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"link": True})
+        for bad in ({"m": [1, 2]}, {"m": [-1, 0, 0, 0, 0]}, {"m": ["1", 0, 0, 0, 0]}, ["m"]):
+            with self.assertRaises(crewchat.HubError, msg=bad):
+                self.hub.record_usage(place, key, bad)
+        self.assertIn(name, cli("usage"))
 
     def test_a_launched_cursor_agent_is_alive_before_its_first_turn_ends(self):
         key = self.hub.new_start()

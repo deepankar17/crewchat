@@ -842,6 +842,7 @@ class Roster:
         self.page_roles = [{"name": n, "title": r["label"], "picture": r["picture"], "colour": r["colour"],
                             "tool": r["tool"], "source": r["source"]} for n, r in self.role_rows.items()]
         self.project = str(config["project"])
+        self.usage = "off" if config.get("usage") == "off" else "on"  # agents' token counts kept (X4)
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
         except (TypeError, ValueError):
@@ -1044,6 +1045,106 @@ class Projects:
 # --------------------------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------------------------
+# What tokens cost at Anthropic's API prices, USD per million: (input, output, cache read). Cache writes cost 1.25x
+# input (5-minute entries) or 2x (1-hour). Only for estimates: a Claude subscription does not pay per token, and
+# Haiku 5.5's price above 100K tokens of prompt is not modelled. Updated with each release (PRICES_DATE).
+PRICES_DATE = "2026-10-06"
+PRICES = {
+    "claude-fable-5-1": (10.0, 50.0, 0.25), "claude-mythos-5-1": (10.0, 50.0, 0.25), "claude-fable-5": (10.0, 50.0, 1.0),
+    "claude-opus-5-5": (4.0, 20.0, 0.20), "claude-opus-5": (5.0, 25.0, 0.50), "claude-opus-4-8": (5.0, 25.0, 0.50),
+    "claude-opus-4-7": (5.0, 25.0, 0.50), "claude-opus-4-6": (5.0, 25.0, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20), "claude-sonnet-5": (2.0, 10.0, 0.20), "claude-sonnet-4-6": (3.0, 15.0, 0.30),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01), "claude-haiku-4-5": (1.0, 5.0, 0.10),
+}
+USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "cache_write_1h")  # the counts kept, in this order
+USAGE_DAYS = 400  # days of usage kept per project
+MAX_USAGE_READ = 64 * 1024 * 1024  # of a transcript, in one turn (a session joined long after it began)
+
+
+def model_price(model):
+    """PRICES for a model id as transcripts write it (perhaps with a date or a [1m] suffix), or None."""
+    model = str(model or "").split("[")[0]
+    best = max((k for k in PRICES if model == k or model.startswith(k + "-")), key=len, default=None)
+    return PRICES.get(best)
+
+
+def usage_cost(by_model):
+    """Estimated USD for {model: [input, output, cache read, cache write, cache write 1h]}, and the models with no
+    price (left out of it)."""
+    total, unpriced = 0.0, []
+    for model, counts in by_model.items():
+        price = model_price(model)
+        if price is None:
+            unpriced.append(model)
+            continue
+        i, o, cr, cw, cw1h = (list(counts) + [0] * 5)[:5]
+        total += (i * price[0] + o * price[1] + cr * price[2] + cw * price[0] * 1.25 + cw1h * price[0] * 2) / 1e6
+    return total, unpriced
+
+
+def add_usage(into, by_model):
+    """Add {model: counts} into another such table, in place."""
+    for model, counts in by_model.items():
+        row = into.setdefault(model, [0] * len(USAGE_KEYS))
+        for i, n in enumerate(counts[:len(USAGE_KEYS)]):
+            row[i] += n
+
+
+def transcript_usage(path, offset=0, last_id=""):
+    """Tokens a Claude Code transcript gained after byte offset: ({model: [input, output, cache read, cache
+    write, cache write 1h]}, new offset, last message id). Only each assistant message's usage numbers are
+    kept, once per message (its lines repeat them), never any text. A half-written last line waits for the
+    next turn; a transcript shorter than offset (a new one) is read from its start."""
+    out, seen = {}, {last_id}
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        if offset > size:
+            offset = 0
+        f.seek(offset)
+        chunk = f.read(min(size - offset, MAX_USAGE_READ))
+    end = chunk.rfind(b"\n") + 1
+    for raw in chunk[:end].split(b"\n"):
+        if b'"usage"' not in raw:
+            continue
+        try:
+            line = json.loads(raw.decode("utf-8"))
+            msg = line["message"] if line.get("type") == "assistant" else None
+            usage, mid = msg["usage"], str(msg.get("id") or "")
+        except (ValueError, KeyError, TypeError):
+            continue
+        if not isinstance(usage, dict) or (mid and mid in seen):
+            continue
+        seen.add(mid)
+        last_id = mid or last_id
+        num = lambda v: v if isinstance(v, int) and v >= 0 else 0  # noqa: E731
+        split = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+        hour = num(split.get("ephemeral_1h_input_tokens"))
+        counts = [num(usage.get("input_tokens")), num(usage.get("output_tokens")),
+                  num(usage.get("cache_read_input_tokens")), max(0, num(usage.get("cache_creation_input_tokens")) - hour), hour]
+        if any(counts):
+            add_usage(out, {str(msg.get("model") or "unknown")[:60]: counts})
+    return out, offset + end, last_id
+
+
+def usage_tokens(by_model):
+    """All the tokens in {model: counts}."""
+    return sum(sum(counts) for counts in by_model.values())
+
+
+def clean_usage(value):
+    """A hook's usage report as the server keeps it: at most 20 models, whole non-negative counts."""
+    if not isinstance(value, dict):
+        raise HubError("usage is {model: counts}")
+    out = {}
+    for model, counts in list(value.items())[:20]:
+        if not isinstance(model, str) or not isinstance(counts, list) or len(counts) != len(USAGE_KEYS):
+            raise HubError("usage is {model: [%s]}" % ", ".join(USAGE_KEYS))
+        if not all(isinstance(n, int) and 0 <= n < 10 ** 12 for n in counts):
+            raise HubError("token counts are whole numbers")
+        out[model[:60]] = counts
+    return out
+
+
 def read_back(path, block=1 << 16):
     """A file's lines, last first, read from its end a block at a time (bytes, without the newline; a
     Windows line keeps its \\r). The first one yielded is what follows the last newline: empty, or a line a
@@ -1136,6 +1237,7 @@ class Hub:
         self._running = {}  # agent -> its session's process running at the server's last look (memory only)
         self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
         self._dirty = False  # state.json is behind memory, by what _save_soon let wait
+        self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self._load()
 
     # Persistence ---------------------------------------------------------------------------
@@ -1190,6 +1292,9 @@ class Hub:
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
+        self.usage = {str(day): {str(a): {str(m): c for m, c in models.items() if isinstance(c, list)}
+                                 for a, models in agents.items() if isinstance(models, dict)}
+                      for day, agents in (data.get("usage") or {}).items() if isinstance(agents, dict)}
         self._apply_renames()
 
     def _apply_renames(self):
@@ -1219,6 +1324,7 @@ class Hub:
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
+            "usage": self.usage,
         }, private=True, indent=None)
 
     def _save_soon(self):
@@ -1667,6 +1773,20 @@ class Hub:
                 for n, a in self.agents.items()
             ]
 
+    def _usage_row(self, name):
+        """An agent's tokens today and in all, with their estimated cost, for its row on the page ({} if none).
+        Caller holds the lock."""
+        today, total = {}, {}
+        for day, agents in self.usage.items():
+            if name in agents:
+                add_usage(total, agents[name])
+                if day == time.strftime("%Y-%m-%d", time.gmtime()):
+                    add_usage(today, agents[name])
+        if not total:
+            return {}
+        return {"today": usage_tokens(today), "all": usage_tokens(total), "cost_today": round(usage_cost(today)[0], 4),
+                "cost_all": round(usage_cost(total)[0], 4)}
+
     def _doing(self, agent, now):
         """What an agent was doing a moment ago (a tool call), or "" once it is old news."""
         return agent.get("doing", "") if now - float(agent.get("doing_at") or 0) < DOING_FRESH else ""
@@ -1680,7 +1800,8 @@ class Hub:
              "activity": self._activity(n, now), "role": a.get("role", ""), "listen": a.get("listen", ""),
              "session": self._session_state(a), "startable": self.startable(n),
              "picture": a.get("picture", ""), "colour": a.get("colour", ""),
-             "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now)}
+             "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now),
+             "usage": self._usage_row(n)}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -1854,6 +1975,66 @@ class Hub:
         for ask in list(self.permissions.values()):
             if ask["agent"] == name and not ask["answer"]:
                 del self.permissions[ask["id"]]
+
+    # Token usage (X4) ---------------------------------------------------------------------------
+    def usage_on(self):
+        """Are the agents' token counts kept? Not for a project the owner turned it off for, nor while the
+        owner keeps what agents do off the page (crewchat setup --activity off)."""
+        return self.roster.usage != "off" and self.machine_config().get("activity") != "off"
+
+    def record_usage(self, place, key, usage):
+        """Tokens an agent's turn used ({model: counts}, from its stop hook), added to its day and to the
+        task it is working on. Never any of the conversation: only the counts."""
+        usage = clean_usage(usage)
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            raise HubError("bad key")
+        with self.lock:
+            name = self.links.get(key)
+            agent = self.agents.get(name) if name else None
+            if agent is None or agent["place"] != place:
+                return {"link": True}
+            if not self.usage_on():
+                return {"kept": False}
+            day = time.strftime("%Y-%m-%d", time.gmtime())
+            add_usage(self.usage.setdefault(day, {}).setdefault(name, {}), usage)
+            for old in sorted(self.usage)[:-USAGE_DAYS]:
+                del self.usage[old]
+            task = self._usage_task(name)
+            if task:
+                add_usage(self.sheet[task].setdefault("usage", {}), usage)
+            self._save_soon()
+            self._changed()
+            return {"kept": True, "task": task or ""}
+
+    def _usage_task(self, name):
+        """The task an agent's tokens go to: the one it holds and last reported on. Caller holds the lock."""
+        held = [mid for mid, holder in self.taken.items() if holder == name and mid in self.sheet
+                and self._row_status(mid) not in ("done", "removed")]
+        return max(held, key=lambda mid: float((self.progress.get(mid) or {}).get("ts") or 0), default="")
+
+    def usage_report(self, days=7):
+        """Tokens and estimated cost per agent (today, the last days, in all), per day, and per task on the sheet."""
+        with self.lock:
+            today = time.strftime("%Y-%m-%d", time.gmtime())
+            recent = sorted(self.usage)[-days:]
+            agents, per_day = {}, []
+            for day in sorted(self.usage):
+                total = {}
+                for name, models in self.usage[day].items():
+                    row = agents.setdefault(name, {"today": {}, "all": {}})
+                    add_usage(row["all"], models)
+                    if day == today:
+                        add_usage(row["today"], models)
+                    add_usage(total, models)
+                if day in recent:
+                    per_day.append({"day": day, "tokens": usage_tokens(total), "cost": usage_cost(total)[0]})
+            tasks = [{"id": mid, "title": row.get("title", ""), "tokens": usage_tokens(row["usage"]),
+                      "cost": usage_cost(row["usage"])[0]} for mid, row in self.sheet.items() if row.get("usage")]
+        return {"on": self.usage_on(), "prices": PRICES_DATE, "days": per_day, "tasks": tasks,
+                "agents": {name: {"today": usage_tokens(r["today"]), "all": usage_tokens(r["all"]),
+                                  "cost_today": usage_cost(r["today"])[0], "cost_all": usage_cost(r["all"])[0],
+                                  "models": sorted(r["all"]), "unpriced": usage_cost(r["all"])[1]}
+                           for name, r in agents.items()}}
 
     def owner_read(self, seq):
         """The owner has seen the chat up to seq (the page, while it is in front)."""
@@ -3861,6 +4042,9 @@ COMMANDS = [
         ("tasks reclaim [MINUTES|off|default] [ID]",
          "Put a task back on the sheet when its holder is silent this long (no tool calls, no hooks): for the "
          "project (60 min unless set), or one task (default: as the project). With no value, shows it.", None),
+        ("usage [show|on|off] [--days N]",
+         "The tokens this project's agents used (Claude Code, counted at the end of each turn) per agent, day and "
+         "task, and roughly what they would cost at API prices. on or off: keep counting them, or not.", None),
         ("tasks advisor [on|off]",
          "Let a task be marked done only after the advisor (the agent with the advisor role) approves it. Off "
          "unless set; with no value, shows it.", None),
@@ -4063,7 +4247,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4688,6 +4872,25 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _usage(self, data):
+        """The agents' tokens and estimated cost (op view), or the project's switch for keeping them (on, off)."""
+        op = data.get("op") or "view"
+        if op in ("on", "off"):
+            config = load_config(self.roster.root)
+            if op == "off":
+                config["usage"] = "off"
+            else:
+                config.pop("usage", None)
+            save_config(config, self.roster.root)
+            self.roster.refresh(force=True)
+        elif op != "view":
+            raise HubError("op is view, on or off")
+        try:
+            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
+        except (TypeError, ValueError):
+            raise HubError("days is a number")
+        return self.hub.usage_report(days)
+
     def _push(self, data):
         """Web Push for the chat page: this machine's key to subscribe with, a browser's notifications for
         this project (all, mentions or off), and what waits for its service worker."""
@@ -4953,7 +5156,7 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
-                         "/api/push": self._push}
+                         "/api/push": self._push, "/api/usage": self._usage}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -4971,6 +5174,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "hooks use a place token"})
                 return
             data = self._object(raw)
+            if data.get("event") == "usage":
+                try:
+                    self._json(200, self.hub.record_usage(who[1], data.get("key"), data.get("usage")))
+                except HubError as e:
+                    self._json(400, {"error": str(e)})
+                return
             if data.get("event") == "permission":
                 try:
                     self._json(200, {"answer": self.hub.ask_permission(who[1], data.get("key"), str(data.get("tool") or ""),
@@ -7541,7 +7750,8 @@ def run_hook(client, event):
         state_file.parent.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
                                           "ignored": ignored, "alive": state.get("alive", 0),
-                                          "doing": state.get("doing", ""), "doing_at": state.get("doing_at", 0)}))
+                                          "doing": state.get("doing", ""), "doing_at": state.get("doing_at", 0),
+                                          "usage": state.get("usage") or {}}))
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
@@ -7569,6 +7779,8 @@ def run_hook(client, event):
         return
 
     # stop: the agent finished a turn.
+    if client == "claude" and isinstance(data.get("transcript_path"), str):
+        report_usage(base, token, key, state, state_file, data["transcript_path"])
     if client == "cursor":
         if data.get("status") not in (None, "completed"):
             return
@@ -7599,6 +7811,29 @@ def run_hook(client, event):
         print(json.dumps({"decision": "block", "reason": text}))
     else:
         print(json.dumps({"followup_message": text}))
+
+
+def report_usage(base, token, key, state, state_file, path):
+    """Send the tokens this session's transcript gained since the last turn (transcript_usage: counts only),
+    and remember how far it was read. Not sent, the place stays: the next turn sends it. A session not
+    linked yet keeps its place too, so its first turns count once it links."""
+    mark = state.get("usage") if isinstance(state.get("usage"), dict) else {}
+    offset = int(mark.get("offset") or 0) if mark.get("path") == path else 0
+    try:
+        found, offset, last = transcript_usage(path, offset, str(mark.get("last") or ""))
+        if found:
+            out = post_json(base + "/api/hook", token, {"key": key, "event": "usage", "usage": found}, timeout=10) or {}
+            if out.get("link"):
+                return
+    except (OSError, ValueError, urllib.error.URLError):
+        return
+    state["usage"] = {"path": path, "offset": offset, "last": last}
+    try:
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        saved = json.loads(state_file.read_text()) if state_file.exists() else {}
+        state_file.write_text(json.dumps(dict(saved, usage=state["usage"])))
+    except (OSError, ValueError):
+        pass
 
 
 def prompt_context(client, text):
@@ -9072,6 +9307,34 @@ def cmd_rules(args):
     print("%s the rules of the project %s. Its agents got them as a message, and every folder of the project "
           "on this machine has them (updated: %d)." % ("Set" if text.strip() else "Cleared", out["project"],
                                                        out["folders"]))
+
+
+def cmd_usage(args):
+    report = owner_call("/api/usage", {"op": "view" if args.mode == "show" else args.mode, "days": args.days})
+    if args.mode != "show":
+        print("Token usage is %s for this project." % ("kept" if report["on"] else "not kept"))
+        return
+    if not report["on"]:
+        print("Token usage is not kept for this project%s. `crewchat usage on` turns it on." % (
+            "" if report["agents"] else " (or this machine keeps what agents do off the page)"))
+    if not report["agents"]:
+        print("No token usage yet. It is counted for Claude Code agents, at the end of each turn; Cursor's hooks "
+              "do not say how many tokens a turn used, so it is not available for Cursor.")
+        return
+    money = lambda v: "$%.2f" % v  # noqa: E731
+    print("Tokens (input, output and cache), and what they would cost at API prices (an estimate: a Claude "
+          "subscription does not pay per token; prices of %s):" % report["prices"])
+    for name, row in sorted(report["agents"].items()):
+        print("  %-14s today %12s  ~%s   in all %12s  ~%s%s" % (
+            name, "{:,}".format(row["today"]), money(row["cost_today"]), "{:,}".format(row["all"]),
+            money(row["cost_all"]), "  (no price for %s)" % ", ".join(row["unpriced"]) if row["unpriced"] else ""))
+    print("By day (UTC):")
+    for day in report["days"]:
+        print("  %s %12s  ~%s" % (day["day"], "{:,}".format(day["tokens"]), money(day["cost"])))
+    if report["tasks"]:
+        print("By task:")
+        for task in sorted(report["tasks"], key=lambda t: -t["tokens"]):
+            print("  #%-6s %12s  ~%s  %s" % (task["id"], "{:,}".format(task["tokens"]), money(task["cost"]), task["title"][:60]))
 
 
 def cmd_tasks(args):
@@ -11093,6 +11356,13 @@ function card(heading, ...children) {
   box.append(...children);
   return box;
 }
+// An agent's tokens (Claude Code, counted at the end of each turn) and what they would cost at API prices: an
+// estimate, as a Claude subscription does not pay per token.
+function usageLine(u) {
+  const n = (v) => v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? Math.round(v / 1e3) + "k" : String(v);
+  const usd = (v) => "$" + (v < 0.01 && v > 0 ? "0.01" : v.toFixed(2));
+  return "today " + n(u.today) + " (~" + usd(u.cost_today) + "), in all " + n(u.all) + " (~" + usd(u.cost_all) + "), estimated at API prices";
+}
 function field(label, value) {
   const row = el("div", "field");
   row.append(el("span", "", label));
@@ -11129,6 +11399,8 @@ function panelAgent(name) {
   const last = state.lastSaid[a.agent];
   if (last) now.push(field("Said", last.text.length > 160 ? last.text.slice(0, 160) + "…" : last.text));
   if (a.unread) now.push(field("Unread", a.unread + " message" + (a.unread > 1 ? "s" : "")));
+  if (a.usage && a.usage.all) now.push(field("Tokens", usageLine(a.usage)));
+  else if (!a.remote && a.client === "cursor") now.push(field("Tokens", "Not available for Cursor (its hooks do not say)"));
 
   const pick = el("select");
   pick.setAttribute("aria-label", "Role for " + a.agent);
@@ -12376,11 +12648,17 @@ def build_parser():
                    help="only a folder connected to this machine's own chat (registered for every folder)")
     p.set_defaults(fn=cmd_stdio)
 
+    p = sub.add_parser("usage", help="the tokens this project's agents used, and roughly what that would cost at "
+                                     "API prices; or turn keeping them on or off")
+    p.add_argument("mode", nargs="?", default="show", choices=["show", "on", "off"])
+    p.add_argument("--days", type=int, default=7, help="days shown (default 7)")
+    p.set_defaults(fn=cmd_usage)
+
     p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
     p.set_defaults(fn=cmd_projects)
 
     for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
-                 "rules", "skills", "tasks"):
+                 "rules", "skills", "tasks", "usage"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "
