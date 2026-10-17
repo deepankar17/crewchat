@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **`/api/analytics`, the numbers behind the coming analytics page** (owner only). Worked out on this
+  machine from the whole chat, not only the 2,000 messages in memory: messages by hour, day, agent, kind and
+  machine; who writes to whom; tasks posted, taken and done with the median time to take one, cycle time,
+  time blocked and the review pass rate; advisor verdicts, reclaims and files shared; and the agents'
+  tokens with their estimated cost. Nothing leaves the machine.
 - **How many tokens your agents use, and roughly what that would cost.** At the end of each turn a Claude
   Code agent's hook reads the turn's token counts from its own transcript (numbers only, never the
   conversation) and adds them to the agent, the day and the task it works on. `crewchat usage` shows them

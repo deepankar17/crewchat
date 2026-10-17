@@ -1145,6 +1145,122 @@ def clean_usage(value):
     return out
 
 
+def median(values):
+    values = sorted(values)
+    if not values:
+        return None
+    mid = len(values) // 2
+    return values[mid] if len(values) % 2 else (values[mid - 1] + values[mid]) / 2
+
+
+class Analytics:
+    """What /api/analytics shows (X1), as running totals over the whole chat: built once from messages.jsonl
+    (every message, not only those in memory), then fed each new one. Derived only (docs/storage.md): kept
+    in memory and built again at each start."""
+
+    def __init__(self, log):
+        self.log = Path(log)
+        self.lock = threading.Lock()
+        self.built = threading.Event()
+        self.cutoff = 0  # the build counts the log up to this number; newer messages come by add
+        self.hours, self.days, self.pairs, self.tasks, self.agents = {}, {}, {}, {}, {}
+        self.verdicts, self.kinds = {}, {}
+        self.reclaims = self.files = self.total = 0
+
+    def build(self):
+        """Count every message in the log (once; new ones arrive by add while it runs)."""
+        if self.built.is_set():
+            return
+        try:
+            with open(self.log, "rb") as f:
+                for raw in f:
+                    msg = log_message(raw.rstrip(b"\n"))
+                    if msg is not None and msg["seq"] <= self.cutoff:
+                        self.add(msg)
+        except OSError:
+            pass
+        self.built.set()
+
+    def add(self, msg):
+        with self.lock:
+            mid = msg.get("id")
+            ts, sender, to, kind = float(msg.get("ts") or 0), str(msg.get("from") or ""), str(msg.get("to") or ""), msg.get("kind", "msg")
+            if kind == "event":
+                return  # joined, left, renamed: not a message anyone sent
+            self.total += 1
+            hour, day = int(ts // 3600) * 3600, time.strftime("%Y-%m-%d", time.gmtime(ts))
+            for bucket in (self.hours.setdefault(hour, {}), self.days.setdefault(day, {})):
+                bucket["messages"] = bucket.get("messages", 0) + 1
+                agents = bucket.setdefault("agents", {})
+                agents[sender] = agents.get(sender, 0) + 1
+                machines = bucket.setdefault("machines", {})
+                where = str(msg.get("origin") or "here")
+                machines[where] = machines.get(where, 0) + 1
+            self.kinds[kind] = self.kinds.get(kind, 0) + 1
+            self.pairs[(sender, to)] = self.pairs.get((sender, to), 0) + 1
+            agent = self.agents.setdefault(sender, {"messages": 0, "first": ts, "last": ts})
+            agent["messages"] += 1
+            agent["first"], agent["last"] = min(agent["first"], ts), max(agent["last"], ts)
+            if msg.get("files"):
+                self.files += len(msg["files"])
+            if kind == "answer" and msg.get("verdict"):
+                self.verdicts[msg["verdict"]] = self.verdicts.get(msg["verdict"], 0) + 1
+            task_id = mid if kind == "task" else msg.get("task")
+            if not task_id:
+                return
+            task = self.tasks.setdefault(str(task_id), {"history": []})
+            if kind == "task":
+                task.setdefault("posted", ts)
+            elif kind == "take":
+                task.setdefault("taken", ts)
+            elif kind == "update" and msg.get("status") in STATUSES:
+                status = msg["status"]
+                if msg.get("reclaimed"):
+                    self.reclaims += 1
+                if task.get("blocked_at") is not None:
+                    task["blocked_for"] = task.get("blocked_for", 0) + max(0.0, ts - task.pop("blocked_at"))
+                if status == "blocked":
+                    task["blocked_at"] = ts
+                task.setdefault(status, ts)
+                task["history"].append(status)
+
+    def report(self, hub, days=7):
+        """The totals, the last days by hour and by day, and the crew now (from the hub)."""
+        self.build()
+        now = time.time()
+        with self.lock:
+            since = now - days * 86400
+            hours = [{"hour": h, **v} for h, v in sorted(self.hours.items()) if h >= since - 3600]
+            day_rows = [{"day": d, **v} for d, v in sorted(self.days.items())][-days:]
+            posted = [t for t in self.tasks.values() if "posted" in t]
+            done = [t for t in posted if "done" in t]
+            reviewed = [t for t in self.tasks.values() if "review" in t["history"]]
+            passed = [t for t in reviewed if t["history"][t["history"].index("review") + 1:][:1] == ["done"]]
+            out = {
+                "messages": self.total, "kinds": dict(self.kinds), "files": self.files, "reclaims": self.reclaims,
+                "verdicts": dict(self.verdicts), "hours": hours, "days": day_rows,
+                "pairs": [[a, b, n] for (a, b), n in sorted(self.pairs.items(), key=lambda kv: -kv[1])],
+                "tasks": {
+                    "posted": len(posted), "taken": sum(1 for t in posted if "taken" in t), "done": len(done),
+                    "in_review": sum(1 for t in posted if t["history"][-1:] == ["review"]),
+                    "blocked_now": sum(1 for t in posted if t.get("blocked_at") is not None),
+                    "time_to_take": median([t["taken"] - t["posted"] for t in posted if "taken" in t]),
+                    "cycle_time": median([t["done"] - t["posted"] for t in done]),
+                    "time_blocked": median([t["blocked_for"] for t in posted if t.get("blocked_for")]),
+                    "review_pass_rate": len(passed) / len(reviewed) if reviewed else None,
+                    "done_today": sum(1 for t in done if time.gmtime(t["done"])[:3] == time.gmtime(now)[:3]),
+                },
+                "agents": {name: dict(row) for name, row in self.agents.items() if name not in (OWNER, SERVER_NAME)},
+            }
+        for row in hub.rows():  # the crew now: what each agent is doing, and whether it is online
+            agent = out["agents"].setdefault(row["agent"], {"messages": 0, "first": None, "last": None})
+            agent.update(activity=row.get("activity", ""), online=row.get("online", False), role=row.get("role", ""),
+                         device=row.get("device", ""), seen=row.get("seen", 0))
+        out["usage"] = hub.usage_report(days)
+        out["built"] = now
+        return out
+
+
 def read_back(path, block=1 << 16):
     """A file's lines, last first, read from its end a block at a time (bytes, without the newline; a
     Windows line keeps its \\r). The first one yielded is what follows the last newline: empty, or a line a
@@ -1238,7 +1354,9 @@ class Hub:
         self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
         self._dirty = False  # state.json is behind memory, by what _save_soon let wait
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
+        self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self._load()
+        self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
     # Persistence ---------------------------------------------------------------------------
     def _load(self):
@@ -1352,6 +1470,7 @@ class Hub:
 
     def _store(self, msg):
         """Add a message to memory and to messages.jsonl. Caller holds the lock."""
+        self.analytics.add(msg)
         self.messages.append(msg)
         self.ids[msg["id"]] = msg["seq"]
         self.by_id[msg["id"]] = msg
@@ -4247,7 +4366,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4872,6 +4991,14 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _analytics(self, data):
+        """Everything the analytics page shows, worked out here from the chat (X1): nothing leaves the machine."""
+        try:
+            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
+        except (TypeError, ValueError):
+            raise HubError("days is a number")
+        return self.hub.analytics.report(self.hub, days)
+
     def _usage(self, data):
         """The agents' tokens and estimated cost (op view), or the project's switch for keeping them (on, off)."""
         op = data.get("op") or "view"
@@ -5156,7 +5283,8 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
-                         "/api/push": self._push, "/api/usage": self._usage}
+                         "/api/push": self._push, "/api/usage": self._usage,
+                         "/api/analytics": self._analytics}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -6177,6 +6305,8 @@ def cmd_serve(args):
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=push_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=lambda: [p.hub.analytics.build() for p in server.RequestHandlerClass.projects.all()],
+                     daemon=True).start()  # so the first /api/analytics answers at once
     # A login service stops the server with SIGTERM: end like Ctrl+C, so what waits to be saved is.
     def stop(signum, frame):
         raise KeyboardInterrupt

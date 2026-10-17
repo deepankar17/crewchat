@@ -546,6 +546,64 @@ class PollAfter(unittest.TestCase):
                                  (seqs[:5], after))
 
 
+class AnalyticsTotals(unittest.TestCase):
+    """/api/analytics' numbers, worked out from the whole message log (roadmap X1)."""
+
+    def hub(self, lines=()):
+        root = Path(tempfile.mkdtemp(prefix="analytics-", dir=TMP))
+        crewchat.save_config({"project": "numbers"}, root)
+        (root / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in lines))
+        return crewchat.Hub(crewchat.Roster(root))
+
+    def test_a_day_of_work_in_numbers(self):
+        t0 = time.time() - 3600
+        msg = lambda seq, sender, to, kind="msg", **kw: dict({"id": str(seq), "seq": seq, "ts": t0 + seq * 60,  # noqa: E731
+                                                            "from": sender, "to": to, "kind": kind, "text": "x"}, **kw)
+        lines = [msg(1, "Owner", "all", "task"), msg(2, "Maya", "all", "take", task="1"),
+                 msg(3, "Maya", "Owner", "update", task="1", status="in_progress"),
+                 msg(4, "Maya", "Owner", "update", task="1", status="blocked"),
+                 msg(6, "Maya", "Owner", "update", task="1", status="in_progress"),
+                 msg(7, "Maya", "Owner", "update", task="1", status="review"),
+                 msg(8, "Maya", "Owner", "update", task="1", status="done"),
+                 msg(9, "Owner", "all", "task"), msg(10, "Teo", "all", "take", task="9"),
+                 msg(11, "Teo", "Owner", "update", task="9", status="review"),
+                 msg(12, "Teo", "Owner", "update", task="9", status="in_progress"),
+                 msg(13, "Teo", "Owner", "update", task="9", status="review"),
+                 msg(14, "crewchat", "all", "update", task="9", status="todo", reclaimed="Teo"),
+                 msg(15, "Wren", "Teo", "answer", answers="9", verdict="approve"),
+                 msg(16, "Teo", "Maya", files=[{"id": "a" * 16}, {"id": "b" * 16}]),
+                 msg(17, "crewchat", "all", "event")]
+        hub = self.hub(lines)
+        report = hub.analytics.report(hub)
+        self.assertEqual(report["messages"], 15)  # the event (who joined) is not a message
+        tasks = report["tasks"]
+        self.assertEqual((tasks["posted"], tasks["taken"], tasks["done"]), (2, 2, 1))
+        self.assertEqual(tasks["time_to_take"], 60)
+        self.assertEqual(tasks["cycle_time"], 7 * 60)
+        self.assertEqual(tasks["time_blocked"], 2 * 60)  # blocked at 4, going again at 6
+        self.assertEqual(tasks["review_pass_rate"], 0.5)  # #1 passed its first review, #9 did not
+        self.assertEqual((report["reclaims"], report["files"], report["verdicts"]), (1, 2, {"approve": 1}))
+        self.assertIn(["Maya", "Owner", 5], report["pairs"])
+        self.assertEqual(report["agents"]["Teo"]["messages"], 5)  # the take, three updates, the files
+        self.assertNotIn("crewchat", report["agents"])
+        self.assertEqual(sum(h["messages"] for h in report["hours"]), 15)
+        # New messages count as they come, once.
+        with hub.lock:
+            hub._append("Maya", "all", "and one more", "msg")
+        self.assertEqual(hub.analytics.report(hub)["messages"], 16)
+
+    def test_the_whole_log_counts_not_only_what_is_in_memory(self):
+        n = crewchat.KEEP_MESSAGES + 500
+        hub = self.hub([{"id": str(i), "seq": i, "ts": 1.0 + i, "from": "Maya", "to": "all", "kind": "msg", "text": "x"}
+                        for i in range(1, n + 1)])
+        with hub.lock:
+            hub._append("Teo", "all", "after the start", "msg")  # before the build: still counted once
+        self.assertEqual(len(hub.messages), crewchat.KEEP_MESSAGES)
+        report = hub.analytics.report(hub)
+        self.assertEqual(report["messages"], n + 1)
+        self.assertEqual(hub.analytics.report(hub)["messages"], n + 1)  # built once
+
+
 class TokenPrices(unittest.TestCase):
     def test_prices_and_transcripts(self):
         self.assertEqual(crewchat.model_price("claude-opus-5-5"), crewchat.PRICES["claude-opus-5-5"])
@@ -2584,6 +2642,17 @@ class ChatPage(Base):
         self.assertIn("HttpOnly", headers["Set-Cookie"])
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         self.assertEqual(self.raw("/login?code=" + code, headers={"X-Forwarded-For": "7.7.7.2"})[0], 401)
+
+    def test_analytics_are_the_owners_only(self):
+        self.assertEqual(self.raw("/api/analytics", b"{}", {"Content-Type": "application/json"})[0], 401)
+        self.assertEqual(self.raw("/api/analytics", b"{}", {"Content-Type": "application/json",
+                                                           "Authorization": "Bearer " + self.token})[0], 403)
+        report = crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 3})
+        for key in ("messages", "hours", "days", "pairs", "tasks", "agents", "usage", "verdicts"):
+            self.assertIn(key, report)
+        status, body, _ = self.raw("/api/analytics", b'{"days": "x"}', {"Content-Type": "application/json",
+                                                                       "Authorization": "Bearer " + self.owner})
+        self.assertEqual((status, json.loads(body)["error"]), (400, "days is a number"))
 
     def test_the_page_is_compressed_and_a_reload_is_a_304(self):
         opener, _ = self.owner_browser()

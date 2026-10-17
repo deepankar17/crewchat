@@ -52,7 +52,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
-| [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | To do | P4, X4 |
+| [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | In progress | P4, X4 |
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
 | [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | To do | X1 |
 | [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | To do | X2 |
@@ -822,7 +822,7 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 
 ### X1
 
-**Analytics data endpoint** · P1 · effort M · To do
+**Analytics data endpoint** · P1 · effort M · In progress
 
 > **Decided:** Yes, show token and cost numbers per agent (owner, 17 Oct). Collection is specced in X4.
 
@@ -855,6 +855,17 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 - Activity history is in memory today; may need a small persisted timeline to show past days.
 
 **Depends on:** [P4](#p4), [X4](#x4)
+
+**Status.** In progress. Owner-only `POST /api/analytics {days}`: `Analytics` keeps running totals built once
+from the whole messages.jsonl in a background thread at start (counting the log up to the number it held then;
+newer messages come through `_store`, so nothing counts twice and no id set is kept), then fed every new
+message. Messages per hour and per day (by agent and machine), by kind, who-to-whom pairs, the task funnel
+(posted, taken, done, in review, blocked now; median time to take, cycle time, time blocked; review pass rate;
+done today), advisor verdicts, reclaims, files shared, each agent's message counts and first and last message
+with its activity and online state now, and X4's tokens and estimated cost. 50,000 messages: built in about
+140 ms, answered in under 1 ms. **Waiting on the owner:** agent timelines over past days (working, listening,
+idle) need activity history kept somewhere; today only the present state is known (see the question with C0
+about where local event data that cannot be rebuilt from messages.jsonl is kept).
 
 **Owner's note:** yes i want
 

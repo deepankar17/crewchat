@@ -1,5 +1,6 @@
 """The benchmark (bench.py, roadmap P0) runs, measures what it says, and catches a regression."""
 import json
+import statistics
 import os
 import tempfile
 import unittest
@@ -12,6 +13,8 @@ class Bench(unittest.TestCase):
         numbers = bench.measure(agents=2, messages=30, runs=2, say=lambda *a: None, log_mb=2)
         self.assertGreater(numbers.pop("messages.jsonl bytes, grown"), 2 * 1024 * 1024 * 0.9)
         self.assertTrue(numbers.pop("server startup, 2 MB log (s)"))
+        self.assertLess(statistics.median(numbers.pop("analytics: answer, 50,000 messages (s)")), 0.2)  # X1's limit
+        self.assertTrue(numbers.pop("analytics: build, 50,000 messages (s)"))
         for k in ("server memory after startup (MB)", "server memory, 2 MB log (MB)"):
             self.assertGreater(numbers.pop(k, 1), 0, k)  # where ps can read it
         self.assertEqual(set(numbers), {

@@ -167,6 +167,29 @@ def state_writes(agents=5, rounds=20):
     return count[0]
 
 
+def analytics_times(messages=50000, runs=9):
+    """/api/analytics' work on a chat of that many messages, in this process: building its totals from the
+    log once, and then answering (what the endpoint does each time). None before X1 had it."""
+    sys.path.insert(0, str(H.ROOT))
+    import crewchat
+    if not hasattr(crewchat, "Analytics"):
+        return None, None
+    root = H.Path(H.tempfile.mkdtemp(prefix="analytics-", dir=H.TMP))
+    crewchat.save_config({"project": "numbers", "port": 9}, root)
+    statuses = ["in_progress", "blocked", "in_progress", "review", "done"]
+    with open(root / "messages.jsonl", "w") as f:
+        for i in range(1, messages + 1):
+            kind, extra = ("task", {}) if i % 50 == 0 else ("update", {"task": str(i - i % 50), "status": statuses[i % 5]}) \
+                if i % 50 < 6 and i > 50 else ("msg", {})
+            f.write(json.dumps(dict({"id": str(i), "seq": i, "ts": 1.7e9 + i * 30, "from": "agent%d" % (i % 5),
+                                     "to": "all", "kind": kind, "text": "message %d" % i}, **extra)) + "\n")
+    hub = crewchat.Hub(crewchat.Roster(root))
+    start = time.perf_counter()
+    hub.analytics.build()
+    build = time.perf_counter() - start
+    return build, timed(lambda: hub.analytics.report(hub), runs)
+
+
 def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     m = H.Machine("bench")
     m.start(client="claude")
@@ -226,6 +249,10 @@ def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     numbers["hub_inbox, 50 unread (chars)"] = len(reader.call("hub_inbox"))
 
     numbers["state.json writes, a busy load (count)"] = state_writes(agents)
+    build, answer = analytics_times(runs=runs)
+    if answer:
+        numbers["analytics: build, 50,000 messages (s)"] = [build]
+        numbers["analytics: answer, 50,000 messages (s)"] = answer
 
     memory = []
     numbers["server startup (s)"] = startup(m, runs, memory)
