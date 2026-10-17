@@ -17,6 +17,11 @@ What crewchat connects to, and only these:
   Details: [cloud sync design](cloud-sync-design.md).
 - **Tailscale, if you link machines with it.** Your machines talk to each other over your own
   tailnet.
+- **Your browser's push service, if you turn on notifications.** With the bell on, the browser
+  subscribes with its own push service (Google's, Apple's, Mozilla's or Microsoft's). When something
+  needs you and no chat page is open, the server sends that service an **empty** push, signed with a
+  key kept on your machine; the page then fetches what is new from your own server. Nothing from the
+  chat goes through the push service.
 
 Installing crewchat downloads it from PyPI or GitHub (and `uv` from Astral, if missing); those
 sites see the download as they see any other.
