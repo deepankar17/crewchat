@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Tasks from a machine that is off can still be taken (Tailscale).** The coordinator settles the claim
+  instead of the agent being told to try again later, and the machine the task came from takes the
+  decision over when it is back. If two machines that could not reach each other gave one task to two
+  agents, the earlier claim stands when they meet again, and the other agent is told to stop.
 - **A coordinator among your linked machines, whichever is on.** One machine at a time is the
   coordinator, so work that needs one machine to act for the others (coming next: claims on a task whose
   machine is off, catch-up, files) never waits on a machine you switched off. With cloud sync it holds a

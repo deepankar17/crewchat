@@ -161,6 +161,11 @@ files (roadmap Y2 to Y4). No machine is assumed to be always on, so the role mov
   on: in cloud sync at its next renewal, over Tailscale as soon as the others reach it. Over Tailscale the
   choice travels with the machines' pulls, the newest one winning.
 - **On the page:** the connection line says which machine coordinates now.
+- **Claims (Y2, Tailscale):** a claim on a task whose posting machine is off goes to the coordinator, which
+  settles it under its term. Every claim decision records a Lamport clock and the deciding machine's tag;
+  machines send their decisions in their pulls, a claim decided in one place only is adopted, and when two
+  machines decided one claim for two agents during a split, the earlier (clock, then tag) stands: the
+  machine whose holder changes posts the settled take and tells the other agent to stop.
 
 ## 9. Presence and quota
 
