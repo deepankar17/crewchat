@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+- **The chat page loads faster, most of all on a phone.** It is sent compressed (47 KB instead of 170 KB),
+  and the browser keeps it and asks whether it changed: a reload transfers under 1 KB. The chat's messages
+  and settings are still never kept on the device.
+- **state.json is rewritten a third as often under load.** Read positions, status lines and presence are
+  saved within a second instead of on every call; task claims, links and the task sheet still at once.
+  Stopping the server (`crewchat stop`, or its login service) saves what waits first. After a hard crash an
+  agent may be shown up to a second of messages it had already read; nothing is lost.
+- **The chat page's poll carries only what changes.** Roles, task statuses, tools, pictures, models, names
+  and other fixed data come from `/api/boot` once, and again when the poll's `boot` tag changes (an
+  upgraded server, or roles edited): a poll with one new message goes from about 5.7 KB to 2.3 KB. New
+  messages are found by halving instead of a scan of the last 2,000.
+- **A long chat starts as fast as a new one.** The server reads `messages.jsonl` from its end, only the
+  2,000 messages it keeps, instead of the whole file: with a 500 MB log, startup goes from about 4 s to
+  0.1 s and the memory it needs while loading from 2.6 GB to 63 MB. Linking a project with other machines
+  rewrites the log a line at a time. A message whose text held a Unicode line separator (U+2028) is no
+  longer lost when the server restarts.
+- **Breaking: the five task tools are one, `hub_task`, with an `action`.** What every agent loads is
+  half the size (the tool definitions from 13,074 to 6,948 characters), and how to use the tools is in
+  the project guide crewchat writes into each folder instead. Old and new:
+
+  | Before | Now |
+  |---|---|
+  | `hub_tasks` (`view`: next, mine, all) | `hub_task` `action=view` (`show`: next, mine, all) |
+  | `hub_task_add` | `hub_task` `action=add` |
+  | `hub_take` | `hub_task` `action=take` |
+  | `hub_assign` (`text`, `task`) | `hub_task` `action=assign` (`title` and `parent` for new work, or `id` for a task on the sheet) |
+  | `hub_update` | `hub_task` `action=update` |
+
+  There are no aliases: a session started before the upgrade is told to restart when it calls an old
+  name. The server rewrites every connected folder's guide and allow rules when it starts.
+- **`hub_inbox` and `hub_history` answer in at most 6,000 characters of whole messages**, with a shorter
+  time on each (`[#12 14:05]`, UTC). What does not fit stays unread: `hub_inbox` says how many more, and
+  the next call brings them. A message is never cut.
+- **The hook after each tool call is about four times faster.** It runs a small script crewchat writes
+  from its own code, `~/.crewchat/crewchat-hook.py`, instead of loading all of crewchat: about 20 ms
+  instead of 80 for an installed crewchat on a Mac. It talks to this machine's server over a plain socket
+  (urllib for a chat on another machine). The server points connected folders' hooks at it when it starts;
+  Codex and Gemini CLI ask once more to review crewchat's hooks. Other hooks are unchanged.
 - **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
   with its push service; when something new needs you and no page of the project is open, the
   server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the

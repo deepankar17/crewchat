@@ -21,11 +21,13 @@ def ffmpeg(*args):
     subprocess.run(["ffmpeg", "-loglevel", "error", "-y", *args], check=True)
 
 
+def probe(path, entries):
+    return subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0",
+                           str(path)], capture_output=True, text=True, check=True).stdout.strip()
+
+
 def size(path):
-    out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
-                          "-of", "csv=p=0", str(path)], capture_output=True, text=True, check=True).stdout
-    width, height = out.strip().split(",")[:2]
-    return [int(width), int(height)]
+    return [int(n) for n in probe(path, "stream=width,height").split(",")[:2]]
 
 
 def main():
@@ -34,20 +36,16 @@ def main():
     shutil.rmtree(OUT, ignore_errors=True)  # only what the lists above name
     OUT.mkdir(parents=True)
     for name in CLIPS:
-        gif = IMAGES / (name + ".gif")
+        mp4 = OUT / (name + ".mp4")
         # H.264 needs even sides; yuv420p and faststart so every browser plays it at once.
-        ffmpeg("-i", str(gif), "-movflags", "+faststart", "-pix_fmt", "yuv420p", "-an",
-               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-crf", "26", "-preset", "slow",
-               str(OUT / (name + ".mp4")))
+        ffmpeg("-i", str(IMAGES / (name + ".gif")), "-movflags", "+faststart", "-pix_fmt", "yuv420p", "-an",
+               "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-crf", "26", "-preset", "slow", str(mp4))
         # The poster: a frame from the middle, since many demos open on an empty screen.
-        middle = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0",
-                                       str(OUT / (name + ".mp4"))], capture_output=True, text=True, check=True).stdout) / 2
-        ffmpeg("-ss", "%.2f" % middle, "-i", str(OUT / (name + ".mp4")), "-frames:v", "1", "-q:v", "4",
-               str(OUT / (name + ".jpg")))
+        middle = float(probe(mp4, "format=duration")) / 2
+        ffmpeg("-ss", "%.2f" % middle, "-i", str(mp4), "-frames:v", "1", "-q:v", "4", str(OUT / (name + ".jpg")))
     for name, width in STILLS.items():
         ffmpeg("-i", str(IMAGES / (name + ".png")), "-vf", "scale=%d:-2" % width, "-q:v", "3",
                str(OUT / (name + ".jpg")))
-    shutil.copyfile(IMAGES / "logo.svg", OUT.parent / "logo.svg")
     # Each file's width and height, so build.py sets them and pages do not jump while loading.
     sizes = {p.name: size(p) for p in sorted(OUT.iterdir()) if p.suffix in (".mp4", ".jpg")}
     (ROOT / "site" / "media.json").write_text(json.dumps(sizes, indent=1) + "\n")

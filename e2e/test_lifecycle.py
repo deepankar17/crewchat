@@ -62,6 +62,37 @@ class StopRestart(unittest.TestCase):
             m.stop()
 
 
+class NothingLostInACrash(unittest.TestCase):
+    """state.json waits up to a second for read positions and presence, never for claims (roadmap P5)."""
+
+    def test_claims_survive_kill_9_and_read_positions_a_stop(self):
+        m = H.Machine("crasher")
+        try:
+            m.start()
+            agents = [m.agent() for _ in range(3)]
+            for a in agents:
+                a.link()
+            tids = [m.owner.task("all", "crash test %d" % i) for i in range(6)]
+            for i, tid in enumerate(tids):
+                agents[i % 3].call("hub_task", action="take", id=tid)
+            m.kill(hard=True)  # kill -9, at once: nothing flushed
+            m.cli("start", "--no-service", "--no-open", cwd=m.folder)
+            m.wait_up()
+            sheet = agents[0].call("hub_task", action="view", show="all")
+            for i, tid in enumerate(tids):
+                self.assertIn("#%s [doing] crash test %d (from Owner; held by %s" % (tid, i, agents[i % 3].name), sheet)
+            # A stop (SIGTERM, crewchat stop) writes what waits: a message read just before is not shown again.
+            for stop in (lambda: m.kill(hard=False), lambda: m.cli("stop")):
+                m.owner.send(agents[1].name, "read me once")
+                self.assertIn("read me once", agents[1].call("hub_inbox"))
+                stop()
+                m.cli("start", "--no-service", "--no-open", cwd=m.folder)
+                m.wait_up()
+                self.assertEqual(agents[1].call("hub_inbox"), "No new messages.")
+        finally:
+            m.stop()
+
+
 class UpdateNotice(unittest.TestCase):
     def machine(self, github):
         m = H.Machine("notice")

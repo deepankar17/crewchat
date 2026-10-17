@@ -119,7 +119,7 @@ class OneMachine(unittest.TestCase):
         self.m.owner.send(a.name, "please check the build")
         reason = a.stop_hook()
         self.assertIn("please check the build", reason)
-        self.assertIn("first send hub_update in_progress", reason)
+        self.assertIn("first send hub_task update in_progress", reason)
         self.assertEqual(a.stop_hook(), "")  # handled: not shown again
         self.assertEqual(a.hook("prompt"), "")
 
@@ -261,7 +261,7 @@ class OneMachine(unittest.TestCase):
 
         def take(agent):
             try:
-                results[agent.name] = agent.call("hub_take", id=tid)
+                results[agent.name] = agent.call("hub_task", action="take", id=tid)
             except ToolError as e:
                 results[agent.name] = e
 
@@ -272,7 +272,7 @@ class OneMachine(unittest.TestCase):
             t.join()
         winners = [n for n, r in results.items() if isinstance(r, str)]
         self.assertEqual(len(winners), 1, results)
-        self.assertIn("hub_update id=%s status=in_progress" % tid, results[winners[0]])
+        self.assertIn("hub_task action=update id=%s status=in_progress" % tid, results[winners[0]])
         for n, r in results.items():
             if n not in winners:
                 self.assertIn("already taken by %s" % winners[0], str(r))
@@ -283,22 +283,22 @@ class OneMachine(unittest.TestCase):
         a, b = self.linked(), self.linked()
         tid = self.m.owner.task(a.name, "only for a")
         with self.assertRaises(ToolError) as e:
-            b.call("hub_take", id=tid)
+            b.call("hub_task", action="take", id=tid)
         self.assertIn("was given to %s" % a.name, str(e.exception))
-        a.call("hub_take", id=tid)
+        a.call("hub_task", action="take", id=tid)
         with self.assertRaises(ToolError):
-            a.call("hub_take", id="999999")
+            a.call("hub_task", action="take", id="999999")
 
     def test_status_updates_go_to_owner_without_a_lead(self):
         a = self.linked()
         tid = self.m.owner.task("all", "update the README")
-        a.call("hub_take", id=tid)
+        a.call("hub_task", action="take", id=tid)
         for status in ("in_progress", "blocked", "review", "done"):
-            a.call("hub_update", id=tid, status=status, note="now " + status)
+            a.call("hub_task", action="update", id=tid, status=status, note="now " + status)
             self.m.owner.wait_for("now " + status, kind="update", to="Owner", status=status)
         self.assertEqual(self.m.owner.poll()["progress"][tid]["status"], "done")
         with self.assertRaises(ToolError):
-            a.call("hub_update", id=tid, status="finished", note="x")
+            a.call("hub_task", action="update", id=tid, status="finished", note="x")
 
 
 class Team(unittest.TestCase):
@@ -322,10 +322,10 @@ class Team(unittest.TestCase):
     def test_roles_reach_the_agents_with_their_instructions(self):
         lead_view = self.lead.stop_hook()
         self.assertIn("Your role in this chat is now: Lead", lead_view)
-        self.assertIn("give that agent its next task with hub_assign", lead_view)
+        self.assertIn("give that agent its next task with hub_task assign", lead_view)
         dev_view = self.dev.stop_hook()
         self.assertIn("Developer", dev_view)
-        self.assertIn("first send hub_update on it with in_progress", dev_view)
+        self.assertIn("first send hub_task update on it with in_progress", dev_view)
         self.assertEqual(self.owner.row(self.lead.name)["role"], "lead")
         self.assertIn("lead", self.lead.call("hub_agents"))
 
@@ -335,19 +335,19 @@ class Team(unittest.TestCase):
         job = self.owner.task("all", "build the settings screen")
         self.assertIn("build the settings screen", self.lead.stop_hook())
         with self.assertRaises(ToolError):
-            self.dev.call("hub_assign", to=self.dev2.name, text="not a lead")
-        out = self.lead.call("hub_assign", to=self.dev.name, text="make the toggle", task=job)
+            self.dev.call("hub_task", action="assign", to=self.dev2.name, title="not a lead")
+        out = self.lead.call("hub_task", action="assign", to=self.dev.name, title="make the toggle", parent=job)
         piece = re.search(r"#(\d+)", out).group(1)
         got = self.dev.stop_hook()
         self.assertIn("[TASK, assigned to you, part of #%s]" % job, got)
         # The developer confirms first, and the lead hears it.
-        self.dev.call("hub_update", id=piece, status="in_progress", note="adding a Switch to SettingsScreen")
+        self.dev.call("hub_task", action="update", id=piece, status="in_progress", note="adding a Switch to SettingsScreen")
         self.assertIn("adding a Switch", self.lead.stop_hook())
-        self.dev.call("hub_update", id=piece, status="done", note="toggle works")
+        self.dev.call("hub_task", action="update", id=piece, status="done", note="toggle works")
         lead_sees = self.lead.stop_hook()
         self.assertIn("toggle works", lead_sees)
         self.assertIn("%s is free" % self.dev.name, lead_sees)
-        self.assertIn("give it its next task with hub_assign", lead_sees)
+        self.assertIn("give it its next task with hub_task assign", lead_sees)
         # The owner sees all of it on the page, and the hint is not shown to the owner.
         update = self.owner.wait_for("toggle works", kind="update")
         self.assertEqual(update["to"], self.lead.name)
@@ -357,14 +357,14 @@ class Team(unittest.TestCase):
             a.stop_hook()
         tid = self.owner.task(self.dev.name, "fix the crash on Windows")
         self.assertIn("fix the crash on Windows", self.dev.stop_hook())
-        self.dev.call("hub_update", id=tid, status="in_progress", note="reading the stack trace")
+        self.dev.call("hub_task", action="update", id=tid, status="in_progress", note="reading the stack trace")
         self.owner.wait_for("reading the stack trace", kind="update", to="Owner")
         self.assertNotIn("reading the stack trace", self.lead.stop_hook())
 
     def test_an_open_task_taken_by_a_developer_is_reported_to_the_lead(self):
         tid = self.owner.task("all", "write release notes")
-        self.dev2.call("hub_take", id=tid)
-        self.dev2.call("hub_update", id=tid, status="in_progress", note="starting the notes")
+        self.dev2.call("hub_task", action="take", id=tid)
+        self.dev2.call("hub_task", action="update", id=tid, status="in_progress", note="starting the notes")
         self.owner.wait_for("starting the notes", kind="update", to=self.lead.name)
 
     def test_one_lead_at_a_time_and_roles_can_be_removed(self):
@@ -480,7 +480,7 @@ class Restarts(unittest.TestCase):
             a.stop_hook()
             m.owner.role(a.name, "lead")
             tid = m.owner.task("all", "persist me")
-            b.call("hub_take", id=tid)
+            b.call("hub_task", action="take", id=tid)
             b.call("hub_status", text="on the persist task")
             for crash in (False, True):
                 if crash:

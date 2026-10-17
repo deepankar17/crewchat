@@ -1,14 +1,24 @@
 # crewchat's website (Firebase Hosting)
 
-The public site, https://crewchat-chat.web.app: the Hosting site `crewchat-chat` in the Firebase
-project `crewchat-ae908` (`.firebaserc`, `firebase.json`). The name `crewchat` was taken on Firebase.
+The public site, https://crewchat.dev: the Hosting site `crewchat-chat` in the Firebase project
+`crewchat-ae908` (`.firebaserc`, `firebase.json`), also at https://crewchat-chat.web.app.
+
+The domain is registered with Cloudflare, whose DNS points it at Firebase, every record "DNS only"
+(not proxied, so Firebase can issue its certificate):
+
+| Record | Name | Value |
+|--------|------|-------|
+| A | `crewchat.dev` | `199.36.158.100` (Firebase Hosting) |
+| TXT | `crewchat.dev` | `hosting-site=crewchat-chat` (Firebase's ownership check) |
+| CNAME | `www` | `crewchat-chat.web.app` (Firebase redirects `www.crewchat.dev` to `crewchat.dev`) |
+| MX, SPF, DKIM | | Cloudflare Email Routing, managed by Cloudflare |
+| TXT | `_dmarc` | `v=DMARC1; p=quarantine; rua=mailto:support@crewchat.dev` |
 
 ## Pages
 
-`hosting/public/` is **generated**. Edit `site/` (templates, `site/assets`, `site/config.json`),
-then run `python3 site/build.py`, which rewrites `hosting/public/`. Never edit it by hand.
-`tests/test_site.py` checks the build (links, nothing inline under the security policy, sizes) and that
-the committed copy matches it.
+`hosting/public/` is **generated** and not in git: edit `site/` (templates, `site/assets`,
+`site/config.json`) and run `python3 site/build.py` to see it; every deploy builds it first.
+`tests/test_site.py` checks the build: links, nothing inline under the security policy, sizes.
 
 | Page | Template |
 |------|----------|

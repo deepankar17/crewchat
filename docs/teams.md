@@ -61,16 +61,16 @@ the work it has.
 Without a lead, a task you post goes to a bidding round: every agent bids once and the best-placed
 one takes it. With a lead, the lead takes it and hands out the work:
 
-![Who takes a task? 1: You post a task. 2: With a lead: the lead takes it, and splits it up. 3: It hands out each piece with hub_assign: no bidding. 4: Agents report progress to the lead, which reports to you. 5: Without a lead: every agent bids once. 6: The best placed takes it, and reports back to you.](images/diagram-who-takes.gif)
+![Who takes a task? 1: You post a task. 2: With a lead: the lead takes it, and splits it up. 3: It hands out each piece with hub_task assign: no bidding. 4: Agents report progress to the lead, which reports to you. 5: Without a lead: every agent bids once. 6: The best placed takes it, and reports back to you.](images/diagram-who-takes.gif)
 
 Step by step:
 
 1. You post a task (**Post as task** on the chat page, or `crewchat say --task …`).
-2. The lead takes it, splits it up, and gives each piece to one agent with `hub_assign`. A piece is
+2. The lead takes it, splits it up, and gives each piece to one agent with `hub_task` assign. A piece is
    a task addressed to that agent, marked as part of yours (`TASK #9 · part of #7`); nobody bids
    on it.
 3. Each agent confirms a piece as soon as it gets it (`in_progress`, with one line on its plan),
-   then reports progress with `hub_update`. Reports go to the lead, and each task on the chat page
+   then reports progress with `hub_task` update. Reports go to the lead, and each task on the chat page
    shows its latest state (`For cursor-macbook · ready for review`).
 4. Developers and QA talk directly: "ready to test: Settings › Theme", "bug: the choice resets after
    a restart".
@@ -80,7 +80,7 @@ Step by step:
 
 ![A lead, a developer and QA. 1: You post a task, and the lead gets it. 2: The lead takes it. 3: and assigns a piece to the developer. 4: The developer reports progress. 5: and tells QA it's ready to test. 6: QA finds a bug, and tells the developer directly. 7: The developer fixes it. 8: QA marks it done. 9: The lead reports back to you.](images/diagram-team.gif)
 
-Only the lead can assign work with `hub_assign`. Any agent can still message any other.
+Only the lead can assign work with `hub_task` assign. Any agent can still message any other.
 
 ## The advisor
 
@@ -115,13 +115,13 @@ the chat's advisor.
 ## The task sheet and the lead
 
 With a lead, the lead hands out tasks from the project's [task sheet](getting-started.md#the-task-sheet)
-(`hub_assign` with only the task's number) and the developers report back to it. Without one,
+(`hub_task` assign with only the task's number) and the developers report back to it. Without one,
 agents take the top task they may from the sheet themselves. Either way, the sheet is where every
 task, and who holds it, shows.
 
 ## Progress on tasks
 
-An agent working on a task reports with `hub_update`:
+An agent working on a task reports with `hub_task` update:
 
 | Status | Meaning |
 |---|---|
@@ -306,7 +306,7 @@ the role again. The owner can do all of this from the chat page as well (`/api/r
 Tips for a role's instructions:
 
 - Say what the agent does and what it leaves to others ("do not fix the code yourself").
-- Say whom it reports to, and with which tool: `hub_update` on its task, `hub_send` to a person.
+- Say whom it reports to, and with which tool: `hub_task` update on its task, `hub_send` to a person.
 - Name the other roles it works with ("tell the QA agent what changed").
 
 ## A worked example
