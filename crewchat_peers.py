@@ -46,6 +46,14 @@ TAGS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TAGS += [a + b for a in TAGS for b in TAGS]
 
 
+MAX_DECISIONS = 500  # claim decisions kept (and sent in pulls), newest first
+
+
+def tag_rank(tag):
+    """A machine tag's place in TAGS (A, B, ... Z, AA, ...): the lowest coordinates when nothing else decides."""
+    return TAGS.index(tag) if tag in TAGS else len(TAGS)
+
+
 class PeerError(Exception):
     def __init__(self, message, status=0):
         super().__init__(message)
@@ -83,10 +91,16 @@ class Mesh:
         self.lock = threading.RLock()
         self.data = {}
         if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            except ValueError:
-                raise PeerError("%s is damaged; remove it and join again" % self.path)
+            for attempt in range(6):
+                try:
+                    self.data = json.loads(self.path.read_text(encoding="utf-8"))
+                    break
+                except PermissionError:  # Windows: the server is replacing it this moment
+                    if sys.platform != "win32" or attempt == 5:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                except ValueError:
+                    raise PeerError("%s is damaged; remove it and join again" % self.path)
 
     @property
     def exists(self):
@@ -194,14 +208,59 @@ class Mesh:
             self.data.setdefault("cursors", {})[mid] = int(seq)
             self.save()
 
-    def claim(self, task, agent):
-        """Settle a task posted here: the first agent to ask gets it. Returns the holder."""
+    def claim(self, task, agent, origin=None, term=0):
+        """Settle a claim: the first agent to ask gets it. Returns the holder. Each decision is recorded with
+        the machine it was for (origin: this one, unless it settles for a machine that is off, as the
+        coordinator), its term, and a Lamport clock and this machine's tag, so that two decisions on one claim
+        made while machines could not reach each other can be ordered afterwards (merge_decisions)."""
         with self.lock:
             claims = self.data.setdefault("claims", {})
             if task not in claims:
                 claims[task] = agent
+                clock = self.data["clock"] = int(self.data.get("clock") or 0) + 1
+                decided = self.data.setdefault("decided", {})
+                decided[task] = {"agent": agent, "clock": clock, "tag": self.me["tag"], "term": int(term),
+                                 "origin": origin or self.me["id"]}
+                for old in sorted(decided, key=lambda k: decided[k]["clock"])[:-MAX_DECISIONS]:
+                    del decided[old]
                 self.save()
             return claims[task]
+
+    def decisions(self):
+        with self.lock:
+            return {k: dict(v) for k, v in self.data.get("decided", {}).items()}
+
+    def merge_decisions(self, decisions):
+        """Another machine's claim decisions. A claim decided only there is adopted; one decided both here and
+        there for two agents keeps the earlier (Lamport clock, then tag). Returns [(key, winner, loser)] for
+        the claims whose holder changed here: this machine tells the others (the one that switched, so the
+        news is given once)."""
+        changed, touched = [], False
+        with self.lock:
+            claims = self.data.setdefault("claims", {})
+            decided = self.data.setdefault("decided", {})
+            clock = start = int(self.data.get("clock") or 0)
+            for key, theirs in (decisions or {}).items():
+                try:
+                    theirs = {"agent": str(theirs["agent"]), "clock": int(theirs["clock"]), "tag": str(theirs["tag"]),
+                              "term": int(theirs.get("term") or 0), "origin": str(theirs.get("origin") or "")}
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not isinstance(key, str) or not crewchat.NAME_RE.match(theirs["agent"]):
+                    continue
+                clock = max(clock, theirs["clock"])  # Lamport: the next decision here (+1) comes after all seen
+                holder = claims.get(key)
+                if holder is None:
+                    claims[key], decided[key], touched = theirs["agent"], theirs, True
+                elif holder != theirs["agent"]:
+                    mine = decided.get(key) or {"clock": 0, "tag": ""}  # settled before decisions were kept: first
+                    if (theirs["clock"], tag_rank(theirs["tag"])) < (int(mine["clock"]), tag_rank(mine["tag"])):
+                        claims[key], decided[key], touched = theirs["agent"], theirs, True
+                        changed.append((key, theirs["agent"], holder))
+            if touched or clock != start:  # most pulls bring nothing new: peers.json is not rewritten for them
+                self.data["clock"] = clock
+                self.save()
+        return changed
 
 
 # --------------------------------------------------------------------------------------------
@@ -228,6 +287,46 @@ class PeerSync(crewchat.ProjectLink):
         self.agents = {}  # member id -> its last roster
         self.stopped = threading.Event()
         self.removed_me = False
+        self._coordinator, self._term = None, 0  # who this machine last saw coordinating, and how many changes
+
+    def coordinator(self, exclude=()):
+        """Which machine coordinates now (roadmap Y1): the owner's preferred machine if this one can reach it,
+        else the machine with the lowest tag among those it can reach (itself included). Every machine applies
+        the same rule to what it can reach, so they agree while they can reach each other; the term goes up
+        at every change this machine sees. The coordinator never orders messages: they stay leaderless."""
+        me, members = self.mesh.me, self.mesh.members()
+        preferred = str((self.mesh.data.get("preferred") or {}).get("id") or "")
+        here = {me["id"]: me}
+        here.update({mid: m for mid, m in members.items() if self.reachable(mid) and mid not in exclude})
+        pick = preferred if preferred in here else min(here, key=lambda mid: (tag_rank(here[mid].get("tag")), mid))
+        with self.mesh.lock:
+            if pick != self._coordinator:
+                if self._coordinator is not None:
+                    self.log("%s coordinates now" % here[pick]["name"])
+                self._coordinator, self._term = pick, self._term + 1
+            term = self._term
+        named = dict(members, **{me["id"]: me}).get(preferred) or {}
+        return {"name": here[pick]["name"], "me": pick == me["id"], "term": term, "preferred": named.get("name", ""),
+                "id": pick}
+
+    def set_preferred(self, name):
+        """The owner's preferred coordinator (a machine's name), or none. It travels to the others with the next
+        pull; the newest choice wins."""
+        name = str(name or "").strip()
+        if name.lower() in ("", "none"):
+            mid = ""
+        elif name == self.mesh.me["name"]:
+            mid = self.mesh.me["id"]
+        else:
+            mid = self.mesh.find(name)
+            if mid is None:
+                raise PeerError("no machine called %s; `crewchat peers status` lists them" % name)
+        with self.mesh.lock:
+            self.mesh.data["preferred"] = {"id": mid, "at": time.time()}
+            self.mesh.save()
+        with self.hub.lock:
+            self.hub._changed()  # wakes the others' waiting pulls, so they hear of it now
+        return self.coordinator()
 
     def link_status(self):
         members = self.mesh.members()
@@ -322,15 +421,28 @@ class PeerSync(crewchat.ProjectLink):
         origin = (msg or {}).get("origin") or row.get("origin") or self.device_id
         if origin == self.device_id:
             return self.mesh.claim(self._key(key or task), agent)
-        member = self.mesh.members().get(origin)
+        members = self.mesh.members()
+        member = members.get(origin)
         if member is None:
             raise crewchat.HubError("task #%s came from a machine that has left the chat" % task)
         try:
             return self._call(member, "/peer/claim", {"id": task, "agent": agent, "key": key or task},
                               timeout=15)["holder"]
         except (PeerError, KeyError) as e:
-            raise crewchat.HubError("cannot reach %s, the machine task #%s was posted on (%s). Try again when "
-                                    "it is back." % (member["name"], task, e))
+            unreachable = e
+        # The machine it was posted on is off: the coordinator settles it, under its term (roadmap Y2); that
+        # machine adopts the decision when it is back.
+        coordinator = self.coordinator(exclude={origin})
+        if coordinator["me"]:
+            return self.mesh.claim(self._key(key or task), agent, origin, coordinator["term"])
+        try:
+            return self._call(members[coordinator["id"]], "/peer/claim", {
+                "id": task, "agent": agent, "key": key or task, "for": origin, "term": coordinator["term"]},
+                timeout=15)["holder"]
+        except (PeerError, KeyError) as e:
+            raise crewchat.HubError("cannot reach %s, the machine task #%s was posted on (%s), nor %s, which "
+                                    "coordinates (%s). Try again when one is back." % (
+                                        member["name"], task, unreachable, coordinator["name"], e))
 
     def fetch_file(self, origin, fid):
         """The bytes of a file shared on another member (Hub.open_file)."""
@@ -441,8 +553,14 @@ class PeerSync(crewchat.ProjectLink):
                 return
             for new in self.mesh.merge(out.get("members") or {}, removed):
                 self._member_joined(new, self.mesh.members().get(new, {}).get("name", new))
+            theirs, mine = out.get("preferred"), self.mesh.data.get("preferred") or {}
+            if isinstance(theirs, dict) and float(theirs.get("at") or 0) > float(mine.get("at") or 0):
+                with self.mesh.lock:  # the owner chose on that machine more recently: theirs holds
+                    self.mesh.data["preferred"] = {"id": str(theirs.get("id") or ""), "at": float(theirs["at"])}
+                    self.mesh.save()
         for gone in removed:
             self.hub.drop_remote(gone)
+        self._settle(out.get("decisions"))
         cursor = self._key(mid)
         start = last = self.mesh.cursor(cursor)
         for msg in out.get("messages") or []:
@@ -463,6 +581,20 @@ class PeerSync(crewchat.ProjectLink):
         with self.hub.lock:  # (reentrant) detach() lets go of the hub under this lock
             if self.hub.sync is self:
                 self.hub.set_remote(mid, member["name"], self.agents[mid], time.time())
+
+    def _settle(self, decisions):
+        """Claim decisions another machine made (for this link's project): adopt them, and where two machines
+        gave one task to two agents, keep the earlier claim and say so (Hub.settle_claim)."""
+        if not isinstance(decisions, dict):
+            return
+        prefix = "" if self.chat is None else self.chat + "|"
+        mine = {k: v for k, v in decisions.items() if isinstance(k, str) and k.startswith(prefix) and (prefix or "|" not in k)}
+        for key, winner, loser in self.mesh.merge_decisions(mine):
+            task = key[len(prefix):].split("@")[0]
+            try:
+                self.hub.settle_claim(task, winner, loser)
+            except Exception as e:  # a task this machine no longer has: nothing to tell
+                self.log("could not settle the claim on #%s (%s)" % (task, e))
 
     # Requests from members -------------------------------------------------------------------
     def peer_request(self, path, token, device, body):
@@ -503,11 +635,19 @@ class PeerSync(crewchat.ProjectLink):
             with self.hub.lock:
                 ours = any(m["id"] == task and m.get("origin") == self.device_id for m in self.hub.messages) or (
                     (getattr(self.hub, "sheet", {}).get(task) or {}).get("origin") == self.device_id)
-            if not ours:
-                return 404, {"error": "task #%s was not posted here" % task}
             agent = str(body.get("agent") or "")
             if not crewchat.NAME_RE.match(agent):
                 return 400, {"error": "bad agent name"}
+            origin = str(body.get("for") or "")
+            if not ours and origin and origin in self.mesh.members():
+                # Asked as the coordinator, for a machine that is off: settle it here if this machine does
+                # coordinate (it cannot reach that machine either); it adopts the decision when back.
+                coordinator = self.coordinator(exclude={origin})
+                if not coordinator["me"]:
+                    return 409, {"error": "%s coordinates, not this machine" % coordinator["name"]}
+                return 200, {"holder": self.mesh.claim(self._key(key), agent, origin, coordinator["term"])}
+            if not ours:
+                return 404, {"error": "task #%s was not posted here" % task}
             # This machine posted the task and saw every give-back of it: its count of them decides the
             # key, not the asker's, which may lag (a machine that joined later, or lost old messages).
             key = self.hub.claim_key(task) if hasattr(self.hub, "claim_key") else key
@@ -551,10 +691,11 @@ class PeerSync(crewchat.ProjectLink):
         return 200, answer
 
     @staticmethod
-    def _state_key(agents):
-        """What changed in this machine's roster, ignoring 'last seen' moving within a minute."""
+    def _state_key(agents, preferred=None):
+        """What changed in this machine's roster (or its owner's preferred coordinator), ignoring 'last seen'
+        moving within a minute."""
         rows = [dict(r, seen=int(r.get("seen") or 0) // 60) for r in agents]
-        return hashlib.sha256(json.dumps(rows, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+        return hashlib.sha256(json.dumps([rows, preferred], sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
     def _pull(self, body):
         """Wait until this machine has written messages past `since` or its roster differs from
@@ -572,12 +713,13 @@ class PeerSync(crewchat.ProjectLink):
             while True:
                 own = [m for m in hub.messages if m["seq"] > since and m.get("origin") == self.device_id]
                 agents = hub.local_state()
-                key = self._state_key(agents)
+                key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock")])
                 if own or key != known or time.time() >= deadline or self.stopped.is_set():
                     break
                 hub.lock.wait(timeout=max(0.0, deadline - time.time()))
             own = [dict(m) for m in own[:MAX_BATCH]]
-        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {})}
+        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
+               "preferred": self.mesh.data.get("preferred"), "decisions": self.mesh.decisions()}
         if self.chat is None:
             out["members"] = self.mesh.everyone()
         else:

@@ -140,6 +140,33 @@ No server is primary. Each kind of state has one clear owner:
 Messages queue and sync when the connection returns. Taking a task that came from another
 machine needs to be online, because Firestore is what makes "only one taker" true.
 
+## 8a. A coordinator, whichever machine is on
+
+Some work needs one machine to act for the others while the machine it would normally fall to is off:
+settling a claim on a task whose posting machine is off, serving catch-up history and serving shared
+files (roadmap Y2 to Y4). No machine is assumed to be always on, so the role moves to whichever is.
+
+- **What it does, and does not.** Only those three jobs. It never orders or numbers messages: those stay
+  leaderless (section 8), so a hand-over never loses or reorders the chat.
+- **Cloud sync:** a lease, `meta/coordinator` `{device, term, expires, preferred}`. The holder renews it
+  about every 30 seconds for 90; any approved machine that is online takes it once it has run out, with a
+  conditional write (the same one task claims use), so two never both take it. The term goes up each
+  time the lease changes hands. A machine that stops cleanly lets its lease run out at once.
+- **Tailscale:** there is no referee, so every machine applies the same rule to the members it can reach:
+  the owner's preferred machine if it is reachable, else the reachable machine (itself included) with the
+  lowest tag. They agree while they can reach each other; during a network split each side may have its
+  own, which is why every decision carries its term and machine, so conflicts can be settled afterwards
+  (the earlier claim wins; Y2).
+- **The owner's preferred machine** (`crewchat coordinator NAME`, or `none`) takes the role whenever it is
+  on: in cloud sync at its next renewal, over Tailscale as soon as the others reach it. Over Tailscale the
+  choice travels with the machines' pulls, the newest one winning.
+- **On the page:** the connection line says which machine coordinates now.
+- **Claims (Y2, Tailscale):** a claim on a task whose posting machine is off goes to the coordinator, which
+  settles it under its term. Every claim decision records a Lamport clock and the deciding machine's tag;
+  machines send their decisions in their pulls, a claim decided in one place only is adopted, and when two
+  machines decided one claim for two agents during a split, the earlier (clock, then tag) stands: the
+  machine whose holder changes posts the settled take and tells the other agent to stop.
+
 ## 9. Presence and quota
 
 Firestore has no "this device disconnected" signal, so presence is written by each server:

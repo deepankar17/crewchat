@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -562,19 +563,141 @@ class OfflineAndRemoval(unittest.TestCase):
             a.stop()
             b.stop()
 
-    def test_taking_a_task_needs_the_machine_that_posted_it(self):
-        a = Machine("poster").found()
-        b = Machine("taker").join(a)
+    def test_whichever_machine_is_on_coordinates(self):
+        # Roadmap Y1: the preferred machine when reachable, else the reachable one with the lowest tag.
+        a = Machine("first").found()
+        b = Machine("second").join(a)
+        c = Machine("third").join(b)
+        machines = [a, b, c]
         try:
-            task = a.say("all", "posted on one", "task")
-            eventually(lambda: b.has("posted on one"), what="taker to get the task")
-            agent = b.agent()
-            a.stop()
-            with self.assertRaises(crewchat.HubError) as caught:
-                b.hub.take(agent, task["id"])
-            self.assertIn("cannot reach poster", str(caught.exception))
-        finally:
+            who = lambda m: m.sync.coordinator()["name"]  # noqa: E731
+            eventually(lambda: all(who(m) == "first" for m in machines), timeout=30, what="the lowest tag to lead")
+            self.assertTrue(a.sync.coordinator()["me"])
+            self.assertFalse(b.sync.coordinator()["me"])
+            # The owner prefers the second machine (on the third): every machine hears of it with its pulls.
+            self.assertEqual(c.sync.set_preferred("second")["preferred"], "second")
+            eventually(lambda: all(who(m) == "second" for m in machines), timeout=30, what="the preferred machine")
+            with self.assertRaises(peers.PeerError):
+                a.sync.set_preferred("nowhere")
+            # It goes off: the others fall back to the lowest tag they can reach, and the term goes up.
+            term = a.sync.coordinator()["term"]
+            port, root = b.port, b.root
             b.stop()
+            eventually(lambda: who(a) == "first" and who(c) == "first", timeout=60, what="a fallback without it")
+            self.assertGreater(a.sync.coordinator()["term"], term)
+            # Back on, it takes the role back.
+            b = machines[1] = Machine("second", port, root)
+            b.sync = peers.start(b.hub, root)
+            eventually(lambda: all(who(m) == "second" for m in machines), timeout=90, what="the preferred one back")
+            a.sync.set_preferred("none")
+            eventually(lambda: all(who(m) == "first" for m in machines), timeout=30, what="no preference again")
+            info = crewchat.link_info(a.hub)
+            self.assertEqual(info["coordinator"]["name"], "first")
+        finally:
+            for m in machines:
+                m.stop()
+
+    def test_a_task_from_a_machine_that_is_off_is_settled_by_the_coordinator(self):
+        # Roadmap Y2: with the posting machine off, the coordinator settles claims; exactly one taker.
+        a = Machine("poster").found()
+        b = Machine("second").join(a)
+        c = Machine("third").join(b)
+        machines = [b, c]
+        try:
+            task = a.say("all", "posted, then switched off", "task")
+            eventually(lambda: b.has("posted, then switched off") and c.has("posted, then switched off"),
+                       what="the task everywhere")
+            port, root = a.port, a.root
+            a.stop()
+            eventually(lambda: not b.sync.reachable(a.sync.device_id) and not c.sync.reachable(a.sync.device_id),
+                       timeout=30, what="the poster to be seen off")
+            self.assertEqual(b.sync.coordinator(exclude={a.sync.device_id})["name"], "second")
+            agents = [b.agent(), c.agent()]
+            results = {}
+
+            def take(machine, agent):
+                try:
+                    machine.hub.take(agent, task["id"])
+                    results[agent] = "took"
+                except crewchat.HubError as e:
+                    results[agent] = str(e)
+            threads = [threading.Thread(target=take, args=(m, ag)) for m, ag in zip(machines, agents)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(30)
+            took = [ag for ag, r in results.items() if r == "took"]
+            self.assertEqual(len(took), 1, results)  # exactly one taker, and no "cannot reach" for the other
+            self.assertNotIn("cannot reach", " ".join(results.values()))
+            winner = took[0]
+            # The poster comes back and adopts what the coordinator decided.
+            a = Machine("poster", port, root)
+            a.sync = peers.start(a.hub, root)
+            machines.append(a)
+            eventually(lambda: a.sync.mesh.data.get("claims", {}).get(task["id"]) == winner, timeout=60,
+                       what="the poster to adopt the decision")
+            self.assertEqual(a.sync.mesh.claim(task["id"], "someone-else"), winner)  # settled: stays settled
+        finally:
+            for m in machines:
+                m.stop()
+
+    def test_after_a_split_the_earlier_claim_wins(self):
+        root = Path(tempfile.mkdtemp(prefix="split-", dir=TMP))
+        mesh = peers.Mesh(root)
+        mesh.found("here", "http://127.0.0.1:1")
+        self.assertEqual(mesh.claim("12", "maya"), "maya")
+        clock = mesh.decisions()["12"]["clock"]
+        # Another machine, cut off from this one, gave #12 to teo: earlier on its clock, so teo holds it now.
+        changed = mesh.merge_decisions({"12": {"agent": "teo", "clock": clock - 1, "tag": "B", "origin": "x"}})
+        self.assertEqual(changed, [("12", "teo", "maya")])
+        self.assertEqual(mesh.claim("12", "anyone"), "teo")
+        # A later decision for someone else loses, and changes nothing here.
+        self.assertEqual(mesh.merge_decisions({"12": {"agent": "wren", "clock": clock + 5, "tag": "C"}}), [])
+        # Equal clocks: the lower tag wins. One decided only there is adopted.
+        mesh.claim("13", "maya")
+        same = mesh.decisions()["13"]["clock"]
+        self.assertEqual(mesh.merge_decisions({"13": {"agent": "teo", "clock": same, "tag": "A"},
+                                               "14": {"agent": "wren", "clock": 1, "tag": "C"}}), [])
+        self.assertEqual((mesh.claim("13", "x"), mesh.claim("14", "x")), ("maya", "wren"))
+        mesh.claim("17", "maya")
+        self.assertGreater(mesh.decisions()["17"]["clock"], clock + 5)  # Lamport: after every clock it has seen
+        self.assertEqual(mesh.merge_decisions({"15": {"agent": "not a name!", "clock": 1, "tag": "C"}, "16": "x"}), [])
+
+    def test_peers_json_is_read_again_while_windows_holds_it(self):
+        root = Path(tempfile.mkdtemp(prefix="held-", dir=TMP))
+        peers.Mesh(root).found("here", "http://127.0.0.1:1")
+        real, calls = Path.read_text, []
+
+        def held_once(path, *a, **kw):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied")
+            return real(path, *a, **kw)
+        with mock.patch.object(Path, "read_text", held_once), mock.patch.object(peers.sys, "platform", "win32"), \
+                mock.patch.object(peers.time, "sleep"):
+            self.assertEqual(peers.Mesh(root).me["name"], "here")
+        self.assertEqual(len(calls), 2)
+        # And a pull that brings nothing new does not rewrite it.
+        mesh = peers.Mesh(root)
+        mesh.claim("1", "maya")
+        with mock.patch.object(mesh, "save") as save:
+            mesh.merge_decisions(mesh.decisions())
+            save.assert_not_called()
+
+    def test_the_agent_whose_claim_lost_is_told(self):
+        a = Machine("teller").found()
+        try:
+            loser = a.agent()
+            task = a.say("all", "split task", "task")
+            a.hub.take(loser, task["id"])
+            a.sync._settle({task["id"]: {"agent": "claude-elsewhere", "clock": 0, "tag": "B", "origin": a.sync.device_id}})
+            self.assertEqual(a.hub.taken[task["id"]], "claude-elsewhere")
+            told = [m for m in a.hub.messages if m["to"] == loser and m["from"] == crewchat.SERVER_NAME]
+            self.assertIn("Stop work on it", told[-1]["text"])
+            settled = [m for m in a.hub.messages if m.get("settled")]
+            self.assertEqual((settled[-1]["kind"], settled[-1]["from"]), ("take", "claude-elsewhere"))
+        finally:
+            a.stop()
 
     def test_removing_a_machine_shuts_it_out(self):
         a = Machine("keep").found()

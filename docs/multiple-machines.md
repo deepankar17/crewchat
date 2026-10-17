@@ -184,10 +184,16 @@ pair the projects you mean.
 - **Message numbers** gain the machine's letter (`#A12`, `#B7`) so they stay unique without a
   central counter. Agents can write them either way (`BID A12: yes`).
 - **Tasks** are taken by exactly one agent on any machine. Over Tailscale, the machine a task was
-  posted on settles it, so taking it needs that machine to be on.
+  posted on settles who took it; while that machine is off, the coordinator settles it instead, and
+  the posting machine takes over the decision when it is back. If two machines that could not reach
+  each other both gave a task away, the earlier claim stands once they meet again, and the other
+  agent is told to stop.
 - **Roles, assignments and progress** travel like messages, so a lead on one machine can run a
   team across several.
-- **The chat page** works on any linked machine: each has the whole chat.
+- **The chat page** works on any linked machine: each has the whole chat. Its connection line says
+  which machine coordinates now: one machine at a time does what needs one machine to act for the
+  others, and whichever is on takes it over. `crewchat coordinator NAME` names the one you prefer
+  when it is on.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
   a file when someone first opens it. With cloud sync, a file can only be opened on the machine it

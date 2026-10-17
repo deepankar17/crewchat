@@ -299,16 +299,19 @@ class Outages(unittest.TestCase):
         self.assertIn("and back", eventually(self.y.stop_hook, timeout=60, what="the message"))
 
     def test_a_task_from_a_machine_that_is_down_cannot_be_taken_twice(self):
+        # Roadmap Y2: the desk is down, so the coordinator (the laptop) settles the claim; back, the desk keeps it.
         tid = self.a.owner.task("all", "a task from the desk")
         eventually(lambda: tid in self.y.call("hub_history"), what="the task to reach the laptop")
         self.a.kill(hard=True)
-        with self.assertRaises(ToolError) as e:
-            self.y.call("hub_take", id=tid)
-        self.assertIn("Try again when it is back", str(e.exception))
+        self.assertIn("is yours", self.y.call("hub_take", id=tid))  # no "try again when it is back"
         self.a.cli("start", "--no-service", "--no-open")
         self.a.wait_up()
-        self.y.call("hub_take", id=tid)
-        eventually(lambda: self.a.owner.poll()["taken"].get(tid) == self.y.name, what="the take to travel")
+        eventually(lambda: self.a.owner.poll()["taken"].get(tid) == self.y.name, timeout=60, what="the take to travel")
+        x = self.a.agent()  # (the desk's agent before the restart was not linked again)
+        x.link()
+        with self.assertRaises(ToolError) as e:
+            x.call("hub_take", id=tid)
+        self.assertIn("taken by %s" % self.y.name, str(e.exception))
 
     def test_leaving_and_removing(self):
         self.b.cli("peers", "leave")
