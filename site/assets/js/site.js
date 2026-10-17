@@ -3,30 +3,43 @@
 (function () {
   "use strict";
 
-  document.querySelectorAll(".code .copy").forEach(function (button) {
-    if (!navigator.clipboard) return;
+  // Firebase's own addresses (crewchat-chat.web.app) forward to the site's, as the canonical link names
+  // it; a preview channel (crewchat-chat--preview-xyz.web.app) stays where it is.
+  var canonical = document.querySelector('link[rel="canonical"]');
+  var host = location.hostname;
+  if (canonical && host.indexOf("--") === -1 && /(^|\.)(web\.app|firebaseapp\.com)$/.test(host)) {
+    var to = new URL(canonical.href);
+    if (to.hostname !== host) {
+      location.replace(to.origin + location.pathname + location.search + location.hash);
+      return;
+    }
+  }
+
+  if (navigator.clipboard) document.querySelectorAll(".code .copy").forEach(function (button) {
     button.hidden = false;
     button.addEventListener("click", function () {
       var text = button.parentElement.querySelector("code").textContent;
-      navigator.clipboard.writeText(text).then(function () {
-        button.textContent = "Copied";
+      var said = function (word) {
+        button.textContent = word;
         setTimeout(function () { button.textContent = "Copy"; }, 1600);
-      });
+      };
+      navigator.clipboard.writeText(text).then(function () { said("Copied"); }, function () { said("Select and copy"); });
     });
   });
 
-  var videos = document.querySelectorAll(".clip video");
-  var still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-  if (still) {
-    videos.forEach(function (v) { v.removeAttribute("autoplay"); v.pause(); v.controls = true; });
+  var videos = document.querySelectorAll("video.clip");
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) {
+    videos.forEach(function (v) { v.controls = true; });  // they play only if asked to
     return;
   }
-  if (!("IntersectionObserver" in window)) return;
+  if (!("IntersectionObserver" in window)) {
+    videos.forEach(function (v) { v.controls = true; });
+    return;
+  }
   var seen = new IntersectionObserver(function (entries) {
     entries.forEach(function (e) {
       if (e.isIntersecting) {
-        var playing = e.target.play();
-        if (playing && playing.catch) playing.catch(function () { e.target.controls = true; });
+        e.target.play().catch(function () { e.target.controls = true; });
       } else {
         e.target.pause();
       }
