@@ -78,21 +78,19 @@ img, video { max-width: 100%; height: auto; display: block; }
 .split.reverse > :first-child { order: 2; }
 @media (max-width: 860px) { .split { grid-template-columns: 1fr; gap: 24px; } .split.reverse > :first-child { order: 0; } }
 .split p { color: var(--muted); }
-.clip { margin: 0; }
-.clip video, .still { border-radius: 14px; border: 1px solid var(--line); box-shadow: var(--shadow); background: var(--panel); width: 100%; }
+.clip, .still { border-radius: 14px; border: 1px solid var(--line); box-shadow: var(--shadow); background: var(--panel); width: 100%; }
 .gallery { margin-top: 40px; }
 .gallery figure { margin: 0; }
 .gallery figcaption { color: var(--muted); font-size: 15px; margin-top: 10px; text-align: center; }
-.gallery .clip video[height] { max-height: 520px; width: auto; margin: 0 auto; }
+.clip.tall { width: auto; height: min(520px, 80vh); max-width: 100%; margin: 0 auto; }  /* a phone: its own ratio */
 
 .code { position: relative; margin: 14px 0; background: var(--code-bg); color: var(--code-ink); border-radius: 12px;
-  padding: 14px 76px 14px 16px; overflow-x: auto; }
+  padding: 14px 76px 14px 16px; }
 .code code { background: none; padding: 0; color: inherit; white-space: pre-wrap; word-break: break-all; }
 .copy { position: absolute; top: 9px; right: 9px; font: 600 13px/1 system-ui, sans-serif; color: var(--code-ink);
   background: rgba(255, 255, 255, .12); border: 0; border-radius: 8px; padding: 7px 10px; cursor: pointer; }
 .copy:hover { background: rgba(255, 255, 255, .2); }
 .installs { margin-top: 28px; text-align: left; }
-.installs .card { display: flex; flex-direction: column; }
 
 .prose h2 { margin-top: 36px; font-size: 26px; }
 .prose li { margin-bottom: 10px; }
