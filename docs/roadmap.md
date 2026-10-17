@@ -34,7 +34,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | Done | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | Done | P0 |
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | Done | P0 |
-| [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
+| [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | Done | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
@@ -251,7 +251,7 @@ halving (no `bisect` key on Python 3.9). The answer for one new message went fro
 
 ### P5
 
-**Coalesce state.json writes** · P3 · effort S · To do
+**Coalesce state.json writes** · P3 · effort S · Done
 
 **Goal.** Fewer full rewrites of state.json as the task sheet grows.
 
@@ -276,6 +276,12 @@ halving (no `bisect` key on Python 3.9). The answer for one new message went fro
 - Up to one second of roster changes lost on a crash; acceptable for presence data only.
 
 **Depends on:** [P0](#p0)
+
+**Status.** Done. A one-shot timer (`_save_soon`, `SAVE_DELAY` 1 s) rather than a thread of its own. Owner's
+choices (17 Oct): read positions, status lines, sessions and presence wait; claims, links, the sheet and
+progress, renames, removals and owner settings are written at once (an immediate write takes what waits
+with it). SIGTERM and `crewchat stop` flush first. The benchmark counts state.json writes for a fixed busy
+load in its own process: 179 before, 60 after.
 
 ### P6
 

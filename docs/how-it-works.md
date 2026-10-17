@@ -166,7 +166,7 @@ On each machine, in `~/.crewchat` (or `CREWCHAT_HOME`):
 | `config.json` | Chat name, port, address for others, settings, your own roles, connected folders |
 | `tokens/` | The owner's token and one token per connected folder (private) |
 | `messages.jsonl` | Every message |
-| `state.json` | Agents, sessions, read positions, who took which task, progress (private) |
+| `state.json` | Agents, sessions, read positions, who took which task, progress (private). Claims, links and the task sheet are written at once; read positions, status lines and presence within a second, and when the server stops |
 | `hub.log` | The server's log |
 | `files/` | Files shared in the chat, one folder each (private) |
 | `peers.json` | Linking over Tailscale: members, shared key (private) |

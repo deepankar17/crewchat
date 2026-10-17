@@ -89,6 +89,7 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an agent (config: max_chain)
 MAX_LISTEN = 55 * 60
+SAVE_DELAY = 1.0  # seconds state.json may lag behind read positions, status lines and presence (Hub._save_soon)
 PERMISSION_WAIT = 10 * 60  # how long a permission prompt waits for Allow or Deny on the page (then: the agent's own)
 MAX_PERMISSION_TEXT = 2000  # of what the agent asks to run or change, shown with Allow and Deny
 DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
@@ -1132,6 +1133,7 @@ class Hub:
         self.started = time.time()  # nobody can be heard while the server is down (memory only)
         self._running = {}  # agent -> its session's process running at the server's last look (memory only)
         self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
+        self._dirty = False  # state.json is behind memory, by what _save_soon let wait
         self._load()
 
     # Persistence ---------------------------------------------------------------------------
@@ -1203,11 +1205,30 @@ class Hub:
             self.ids = {m["id"]: m["seq"] for m in self.messages}
 
     def _save(self):
+        """Write state.json now, with everything in it (what _save_soon let wait too). Caller holds the lock."""
+        self._dirty = False
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
         }, private=True, indent=None)
+
+    def _save_soon(self):
+        """Write state.json within SAVE_DELAY, for what changes on nearly every call and may be lost for that
+        long in a crash: read positions, status lines, sessions and presence. Each save rewrites the whole
+        file, so under load these coalesce into one. Claims, links and the task sheet use _save. Caller
+        holds the lock."""
+        if not self._dirty:
+            self._dirty = True
+            timer = threading.Timer(SAVE_DELAY, self.flush)
+            timer.daemon = True
+            timer.start()
+
+    def flush(self):
+        """Write what _save_soon let wait (its timer, and the server stopping)."""
+        with self.lock:
+            if self._dirty:
+                self._save()
 
     def _changed(self):
         self.version += 1
@@ -1444,14 +1465,14 @@ class Hub:
             self._prune()
             sid = secrets.token_urlsafe(24)
             self.sessions[sid] = {"agent": None, "place": place, "client": client, "created": time.time()}
-            self._save()
+            self._save_soon()
             return sid
 
     def close_session(self, sid, place):
         with self.lock:
             if self.sessions.get(sid, {}).get("place") == place:
                 del self.sessions[sid]
-                self._save()
+                self._save_soon()
 
     def session(self, sid, place):
         """The session row for this id if it belongs to this place, else None."""
@@ -1697,7 +1718,7 @@ class Hub:
     def rows(self):
         with self.lock:
             if self._prune():
-                self._save()
+                self._save_soon()
                 self._changed()
             return self._rows()
 
@@ -1829,7 +1850,7 @@ class Hub:
             seq = min(int(seq), self.next_seq - 1)
             if seq > self.owner_cursor:
                 self.owner_cursor = seq
-                self._save()
+                self._save_soon()
                 self._changed()
         return self.owner_cursor
 
@@ -2394,7 +2415,7 @@ class Hub:
             if ack > self._cursor(name):
                 # The caller confirms it has handled everything up to this message.
                 self._set_cursor(name, min(ack, self.next_seq - 1))
-                self._save()
+                self._save_soon()
                 self._changed()
             unread = self._unread(name)
             while not ready(unread) and time.time() < deadline:
@@ -2406,7 +2427,7 @@ class Hub:
                 return []
             if not peek:
                 self._set_cursor(name, unread[-1]["seq"])
-                self._save()
+                self._save_soon()
                 self._changed()
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"])) for m in unread]
 
@@ -2415,13 +2436,13 @@ class Hub:
         with self.lock:
             if seq > self._cursor(name):
                 self._set_cursor(name, min(seq, self.next_seq - 1))
-                self._save()
+                self._save_soon()
                 self._changed()
 
     def set_status(self, name, text):
         with self.lock:
             self.agents[name]["status"] = text
-            self._save()
+            self._save_soon()
             self._changed()
 
     def history(self, limit):
@@ -2874,7 +2895,7 @@ class Hub:
                          default=0)
             if newest > max(agent["active"], agent["checked"]):
                 agent["checked"] = time.time()
-                self._save()
+                self._save_soon()
                 return {"link": True, "again": True}
             agent["seen"] = now = time.time()
             if event == "prompt":
@@ -3107,7 +3128,7 @@ class Hub:
             return
         if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.agent_folders(name):
             self.agents[name]["session"] = kept
-            self._save()
+            self._save_soon()
 
     def _listen_override(self, name):
         """Seconds an agent's stop hook waits for messages as the owner set it on the chat page, or
@@ -4715,7 +4736,7 @@ class Handler(BaseHTTPRequestHandler):
             elif op == "shutdown":
                 # Answer first, then end the process: everything is already on disk.
                 sys.stderr.write("%s stopping, as the owner asked (crewchat stop)\n" % now_iso())
-                threading.Timer(0.5, os._exit, [0]).start()
+                threading.Timer(0.5, lambda: (flush_all(self.projects), os._exit(0))).start()
             elif op == "remove-place":
                 place = data.get("place")
                 if place not in list_places(self.roster.root):
@@ -5907,10 +5928,16 @@ def cmd_serve(args):
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=push_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    # A login service stops the server with SIGTERM: end like Ctrl+C, so what waits to be saved is.
+    def stop(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, stop)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
+    finally:
+        flush_all(server.RequestHandlerClass.projects)
 
 
 def find_tailscale():
@@ -8061,6 +8088,15 @@ def upgrade_folders(projects):
                 update_hooks(folder)
             except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
                 sys.stderr.write("%s could not update crewchat's files in %s: %s\n" % (now_iso(), folder, e))
+
+
+def flush_all(projects):
+    """Write what every project let wait (Hub._save_soon), before the server stops."""
+    for project in projects.all():
+        try:
+            project.hub.flush()
+        except Exception as e:  # the others still get saved
+            sys.stderr.write("%s could not save %s: %s\n" % (now_iso(), project.name, e))
 
 
 def reclaim_checks(projects):

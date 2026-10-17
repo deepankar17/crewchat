@@ -11,6 +11,7 @@ It measures, as the agents and the page see them:
 - one /api/poll round trip of the chat page, opening the chat and catching up on one new message,
   and how big each answer is;
 - what every agent loads (the tool definitions) and reads (an inbox of 50 messages), in characters;
+- how often state.json is rewritten under a fixed busy load (in this process, against a Hub);
 - server startup with that messages.jsonl, until /health answers, and its memory then; with --log-mb, again
   with the log grown to that size.
 Timings are noisy (more so on CI runners): compare medians, on the same machine.
@@ -124,6 +125,48 @@ def startup(machine, runs, memory=None):
     return out
 
 
+def state_writes(agents=5, rounds=20):
+    """state.json writes for a fixed busy load, run in this process against a Hub of a throwaway project:
+    each round every agent sends a message, reads its inbox and (every fifth round) sets its status, and
+    a task is added, taken and done. Counted until what may wait (SAVE_DELAY) is written too."""
+    sys.path.insert(0, str(H.ROOT))
+    import crewchat
+    root = H.Path(H.tempfile.mkdtemp(prefix="state-writes-", dir=H.TMP))
+    crewchat.save_config({"project": "writes", "port": 9}, root)
+    hub = crewchat.Hub(crewchat.Roster(root))
+    sids = [hub.open_session("bench", "claude-code") for _ in range(agents)]
+    for sid in sids:
+        crewchat.call_tool(hub, sid, "hub_agents", {})
+    time.sleep(getattr(crewchat, "SAVE_DELAY", 0) + 0.2)
+    count, real = [0], crewchat.write_json
+
+    def counting(path, *a, **kw):
+        count[0] += str(path).endswith("state.json")
+        return real(path, *a, **kw)
+    crewchat.write_json = counting
+    try:
+        task = "hub_task" if "hub_task" in crewchat.HUB_TOOL_NAMES else None
+        for r in range(rounds):
+            for i, sid in enumerate(sids):
+                crewchat.call_tool(hub, sid, "hub_send", {"to": "all", "text": "round %d from %d" % (r, i)})
+                crewchat.call_tool(hub, sid, "hub_inbox", {})
+                if r % 5 == 0:
+                    crewchat.call_tool(hub, sid, "hub_status", {"text": "round %d" % r})
+            sid = sids[r % agents]
+            if task:
+                tid = crewchat.call_tool(hub, None, task, {"action": "add", "title": "t%d" % r}, owner=True).split("#")[1].split()[0]
+                crewchat.call_tool(hub, sid, task, {"action": "take", "id": tid})
+                crewchat.call_tool(hub, sid, task, {"action": "update", "id": tid, "status": "done", "note": "ok"})
+            else:  # before P2: the task tools of their own
+                tid = crewchat.call_tool(hub, None, "hub_task_add", {"title": "t%d" % r}, owner=True).split("#")[1].split()[0]
+                crewchat.call_tool(hub, sid, "hub_take", {"id": tid})
+                crewchat.call_tool(hub, sid, "hub_update", {"id": tid, "status": "done", "note": "ok"})
+        time.sleep(getattr(crewchat, "SAVE_DELAY", 0) + 0.5)
+    finally:
+        crewchat.write_json = real
+    return count[0]
+
+
 def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     m = H.Machine("bench")
     m.start(client="claude")
@@ -172,6 +215,8 @@ def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     for i in range(50):
         a.call("hub_send", to="all", text="Message %d: the login screen is done, tests pass, see LoginViewModel.kt" % i)
     numbers["hub_inbox, 50 unread (chars)"] = len(reader.call("hub_inbox"))
+
+    numbers["state.json writes, a busy load (count)"] = state_writes(agents)
 
     memory = []
     numbers["server startup (s)"] = startup(m, runs, memory)

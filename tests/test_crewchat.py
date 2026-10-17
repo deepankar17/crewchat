@@ -3997,6 +3997,64 @@ class LogLoading(unittest.TestCase):
                 self.assertEqual(list(crewchat.read_back(path, block)), data.split(b"\n")[::-1], (data, block))
 
 
+class StateWrites(Base):
+    """state.json is rewritten at most once a SAVE_DELAY for read positions, status lines and presence, at
+    once for claims, links and the task sheet (roadmap P5)."""
+
+    def writes(self):
+        count = [0]
+        real = crewchat.write_json
+
+        def counting(path, *a, **kw):
+            if Path(path).name == "state.json":
+                count[0] += 1
+            return real(path, *a, **kw)
+        patch = mock.patch.object(crewchat, "write_json", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return count
+
+    def on_disk(self):
+        return json.loads((self.hub.home / "state.json").read_text(encoding="utf-8"))
+
+    def test_presence_and_read_positions_wait_and_come_together(self):
+        sender, _ = self.agent()
+        reader, name = self.agent()
+        self.hub.flush()
+        count = self.writes()
+        for i in range(20):
+            sender.call("hub_send", to=name, text="m%d" % i)
+            reader.call("hub_inbox")
+            reader.call("hub_status", text="reading %d" % i)
+        self.assertNotEqual(self.on_disk()["agents"][name]["status"], "reading 19")  # not yet
+        time.sleep(crewchat.SAVE_DELAY + 0.5)
+        self.assertLessEqual(count[0], 3)  # a handful, not one per call
+        disk = self.on_disk()["agents"][name]
+        self.assertEqual(disk["status"], "reading 19")  # within SAVE_DELAY
+        self.assertEqual(disk["cursor"], self.hub.agents[name]["cursor"])
+
+    def test_claims_links_and_the_sheet_are_written_at_once(self):
+        session, name = self.agent()
+        self.hub.flush()
+        session.call("hub_link", key="key-at-once-01")
+        self.assertEqual(self.on_disk()["links"]["key-at-once-01"], name)
+        tid = self.say("all", "claim me", "task")
+        session.call("hub_task", action="take", id=tid)
+        disk = self.on_disk()
+        self.assertEqual(disk["taken"][str(tid)], name)  # no flush, no wait: on disk already
+        session.call("hub_task", action="update", id=tid, status="blocked", note="need a key")
+        self.assertEqual(self.on_disk()["progress"][str(tid)]["status"], "blocked")
+
+    def test_an_immediate_write_takes_what_was_waiting_with_it(self):
+        session, name = self.agent()
+        session.call("hub_status", text="waiting to be saved")
+        self.assertTrue(self.hub._dirty)
+        tid = self.say("all", "and a claim", "task")
+        session.call("hub_task", action="take", id=tid)
+        self.assertFalse(self.hub._dirty)
+        self.assertEqual(self.on_disk()["agents"][name]["status"], "waiting to be saved")
+
+
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
         session, name = self.agent()
@@ -4005,6 +4063,7 @@ class Persistence(Base):
         task = self.say("all", "persist me", "task")
         session.call("hub_task", action="take", id=task)
         session.call("hub_inbox")
+        self.hub.flush()  # a server that is stopped writes what waits (its read position) first
         again = crewchat.Hub(crewchat.Roster())  # what a restarted server loads
         self.assertEqual(again.agent_for(session.sid, create=False), name)
         self.assertEqual(again.links["key-persist-001"], name)

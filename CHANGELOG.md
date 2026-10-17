@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **state.json is rewritten a third as often under load.** Read positions, status lines and presence are
+  saved within a second instead of on every call; task claims, links and the task sheet still at once.
+  Stopping the server (`crewchat stop`, or its login service) saves what waits first. After a hard crash an
+  agent may be shown up to a second of messages it had already read; nothing is lost.
 - **The chat page's poll carries only what changes.** Roles, task statuses, tools, pictures, models, names
   and other fixed data come from `/api/boot` once, and again when the poll's `boot` tag changes (an
   upgraded server, or roles edited): a poll with one new message goes from about 5.7 KB to 2.3 KB. New
