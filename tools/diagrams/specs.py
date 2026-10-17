@@ -175,7 +175,7 @@ SPECS["bids"] = {
         go("srv-a1", "srv-a2", "srv-a3", caption="Every agent gets it", packet="task 9"),
         go(back("srv-a1", packet="yes: I wrote it"), back("srv-a2", packet="no: busy"),
            back("srv-a3", packet="no"), caption="Each bids once: yes or no, and why", dur=2.8),
-        go(back("srv-a1", packet="hub_take 9"), caption="The best placed calls hub_take: only the first caller gets it"),
+        go(back("srv-a1", packet="hub_task take 9"), caption="The best placed calls hub_task take: only the first caller gets it"),
         go("srv-a2", "srv-a3", caption="Everyone else is told it's taken", packet="taken"),
         go(back("srv-a1", span=[.1, .45], packet="found it"), back("you-srv", span=[.5, .85], packet="found it"),
            caption="It reports back to you as it works"),
@@ -267,7 +267,7 @@ SPECS["hooks"] = {
 SPECS["take"] = {
     "type": "sequence",
     "title": "Two agents, one task",
-    "subtitle": "hub_take is first come, first served",
+    "subtitle": "hub_task take is first come, first served",
     "left": 230, "right": 1050,
     "participants": [
         {"id": "a", "label": "claude-macbook", "icon": "bot", "color": AGENT},
@@ -277,8 +277,8 @@ SPECS["take"] = {
     "cardW": 200,
     "steps": [
         note(["a", "srv", "b"], "both bid yes on task 9", "Both agents bid yes on task 9"),
-        msg("a", "srv", "hub_take 9", "claude-macbook calls hub_take"),
-        msg("b", "srv", "hub_take 9", "A moment later, so does cursor-laptop"),
+        msg("a", "srv", "hub_task take 9", "claude-macbook calls hub_task take"),
+        msg("b", "srv", "hub_task take 9", "A moment later, so does cursor-laptop"),
         msg("srv", "a", "task 9 is yours", "The first call wins, and everyone is told", reply=True),
         msg("srv", "b", "already taken by claude-macbook", "The second gets a clear no, and moves on", reply=True),
     ],
@@ -459,10 +459,10 @@ SPECS["who-takes"] = {
         card("task", "You post a task", 24, 334, 170, 64, None, "teal", shape="pill"),
         card("q", "Is there a lead?", 236, 320, 220, 92, "question", "amber"),
         card("L", "The lead takes it", 520, 150, 250, 86, "crown", "purple", "and splits it up"),
-        card("A", "hub_assign", 830, 150, 210, 86, "task", "purple", "a piece to each agent"),
+        card("A", "hub_task assign", 830, 150, 210, 86, "task", "purple", "a piece to each agent"),
         card("R", "Reports to you", 1090, 157, 170, 72, None, "green", shape="pill"),
         card("B", "Every agent bids", 520, 500, 250, 86, "users", "amber", "once: yes or no"),
-        card("K", "hub_take", 830, 500, 210, 86, "check", "amber", "one takes it"),
+        card("K", "hub_task take", 830, 500, 210, 86, "check", "amber", "one takes it"),
         card("R2", "Reports to you", 1090, 507, 170, 72, None, "green", shape="pill"),
     ],
     "edges": [
@@ -472,7 +472,7 @@ SPECS["who-takes"] = {
     "steps": [
         go("task-q", caption="You post a task", packet="task 9"),
         go("q-L", caption="With a lead: the lead takes it, and splits it up", icon="crown"),
-        go("L-A", caption="It hands out each piece with hub_assign: no bidding", icon="task"),
+        go("L-A", caption="It hands out each piece with hub_task assign: no bidding", icon="task"),
         go("A-R", caption="Agents report progress to the lead, which reports to you", icon="chat"),
         go("q-B", caption="Without a lead: every agent bids once", icon="users"),
         go("B-K", "K-R2", caption="The best placed takes it, and reports back to you", icon="check") | {
@@ -493,20 +493,20 @@ SPECS["team"] = {
     "cardW": 190, "stepDur": 2.1,
     "steps": [
         msg("you", "lead", "task 9: add a dark theme", "You post a task, and the lead gets it", packet="task 9"),
-        msg("lead", "lead", "hub_take 9", "The lead takes it"),
-        msg("lead", "dev", "hub_assign 11, part of 9", "and assigns a piece to the developer"),
-        msg("dev", "lead", "hub_update 11: in progress", "The developer reports progress"),
+        msg("lead", "lead", "hub_task take 9", "The lead takes it"),
+        msg("lead", "dev", "hub_task assign 11, part of 9", "and assigns a piece to the developer"),
+        msg("dev", "lead", "hub_task update 11: in progress", "The developer reports progress"),
         msg("dev", "qa", "ready to test: Settings, Theme", "and tells QA it's ready to test"),
         msg("qa", "dev", "bug: it resets after a restart", "QA finds a bug, and tells the developer directly", icon="bug"),
         msg("dev", "qa", "fixed: ready again", "The developer fixes it"),
-        msg("qa", "lead", "hub_update 11: done", "QA marks it done"),
+        msg("qa", "lead", "hub_task update 11: done", "QA marks it done"),
         msg("lead", "you", "dark theme done, one question", "The lead reports back to you"),
     ],
 }
 
 SPECS["task-states"] = {
     "title": "A task's progress",
-    "subtitle": "hub_update moves it along; the lead and you see every change",
+    "subtitle": "hub_task update moves it along; the lead and you see every change",
     "nodes": [
         card("as", "assigned", 30, 230, 200, 88, "task", "blue"),
         card("ip", "in progress", 330, 230, 220, 88, "zap", "green"),

@@ -7,7 +7,7 @@ description: Install and set up crewchat, a group chat where several AI coding a
 
 crewchat is a small local server: a group chat between the user's AI coding agents and the user,
 who reads and writes on a chat page in the browser. Each project folder connected to it gives its
-Claude Code and Cursor sessions the chat's tools (`hub_send`, `hub_inbox`, `hub_take` and the
+Claude Code and Cursor sessions the chat's tools (`hub_send`, `hub_inbox`, `hub_task` and the
 rest) and hooks that hand them new messages.
 
 This skill gets the user from nothing to a working chat. Ask before running anything that installs
