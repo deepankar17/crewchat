@@ -7,6 +7,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -658,8 +659,30 @@ class OfflineAndRemoval(unittest.TestCase):
         self.assertEqual(mesh.merge_decisions({"13": {"agent": "teo", "clock": same, "tag": "A"},
                                                "14": {"agent": "wren", "clock": 1, "tag": "C"}}), [])
         self.assertEqual((mesh.claim("13", "x"), mesh.claim("14", "x")), ("maya", "wren"))
-        self.assertGreater(mesh.data["clock"], clock + 5)  # Lamport: past every clock it has seen
+        mesh.claim("17", "maya")
+        self.assertGreater(mesh.decisions()["17"]["clock"], clock + 5)  # Lamport: after every clock it has seen
         self.assertEqual(mesh.merge_decisions({"15": {"agent": "not a name!", "clock": 1, "tag": "C"}, "16": "x"}), [])
+
+    def test_peers_json_is_read_again_while_windows_holds_it(self):
+        root = Path(tempfile.mkdtemp(prefix="held-", dir=TMP))
+        peers.Mesh(root).found("here", "http://127.0.0.1:1")
+        real, calls = Path.read_text, []
+
+        def held_once(path, *a, **kw):
+            calls.append(path)
+            if len(calls) == 1:
+                raise PermissionError(13, "Permission denied")
+            return real(path, *a, **kw)
+        with mock.patch.object(Path, "read_text", held_once), mock.patch.object(peers.sys, "platform", "win32"), \
+                mock.patch.object(peers.time, "sleep"):
+            self.assertEqual(peers.Mesh(root).me["name"], "here")
+        self.assertEqual(len(calls), 2)
+        # And a pull that brings nothing new does not rewrite it.
+        mesh = peers.Mesh(root)
+        mesh.claim("1", "maya")
+        with mock.patch.object(mesh, "save") as save:
+            mesh.merge_decisions(mesh.decisions())
+            save.assert_not_called()
 
     def test_the_agent_whose_claim_lost_is_told(self):
         a = Machine("teller").found()

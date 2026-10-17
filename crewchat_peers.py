@@ -91,10 +91,16 @@ class Mesh:
         self.lock = threading.RLock()
         self.data = {}
         if self.path.exists():
-            try:
-                self.data = json.loads(self.path.read_text(encoding="utf-8"))
-            except ValueError:
-                raise PeerError("%s is damaged; remove it and join again" % self.path)
+            for attempt in range(6):
+                try:
+                    self.data = json.loads(self.path.read_text(encoding="utf-8"))
+                    break
+                except PermissionError:  # Windows: the server is replacing it this moment
+                    if sys.platform != "win32" or attempt == 5:
+                        raise
+                    time.sleep(0.05 * (attempt + 1))
+                except ValueError:
+                    raise PeerError("%s is damaged; remove it and join again" % self.path)
 
     @property
     def exists(self):
@@ -229,11 +235,11 @@ class Mesh:
         there for two agents keeps the earlier (Lamport clock, then tag). Returns [(key, winner, loser)] for
         the claims whose holder changed here: this machine tells the others (the one that switched, so the
         news is given once)."""
-        changed = []
+        changed, touched = [], False
         with self.lock:
             claims = self.data.setdefault("claims", {})
             decided = self.data.setdefault("decided", {})
-            clock = int(self.data.get("clock") or 0)
+            clock = start = int(self.data.get("clock") or 0)
             for key, theirs in (decisions or {}).items():
                 try:
                     theirs = {"agent": str(theirs["agent"]), "clock": int(theirs["clock"]), "tag": str(theirs["tag"]),
@@ -242,17 +248,18 @@ class Mesh:
                     continue
                 if not isinstance(key, str) or not crewchat.NAME_RE.match(theirs["agent"]):
                     continue
-                clock = max(clock, theirs["clock"])
+                clock = max(clock, theirs["clock"])  # Lamport: the next decision here (+1) comes after all seen
                 holder = claims.get(key)
                 if holder is None:
-                    claims[key], decided[key] = theirs["agent"], theirs
+                    claims[key], decided[key], touched = theirs["agent"], theirs, True
                 elif holder != theirs["agent"]:
                     mine = decided.get(key) or {"clock": 0, "tag": ""}  # settled before decisions were kept: first
                     if (theirs["clock"], tag_rank(theirs["tag"])) < (int(mine["clock"]), tag_rank(mine["tag"])):
-                        claims[key], decided[key] = theirs["agent"], theirs
+                        claims[key], decided[key], touched = theirs["agent"], theirs, True
                         changed.append((key, theirs["agent"], holder))
-            self.data["clock"] = clock + 1
-            self.save()
+            if touched or clock != start:  # most pulls bring nothing new: peers.json is not rewritten for them
+                self.data["clock"] = clock
+                self.save()
         return changed
 
 
