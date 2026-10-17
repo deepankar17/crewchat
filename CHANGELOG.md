@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- **Breaking: the five task tools are one, `hub_task`, with an `action`.** What every agent loads is
+  half the size (the tool definitions from 13,074 to 6,948 characters), and how to use the tools is in
+  the project guide crewchat writes into each folder instead. Old and new:
+
+  | Before | Now |
+  |---|---|
+  | `hub_tasks` (`view`: next, mine, all) | `hub_task` `action=view` (`show`: next, mine, all) |
+  | `hub_task_add` | `hub_task` `action=add` |
+  | `hub_take` | `hub_task` `action=take` |
+  | `hub_assign` (`text`, `task`) | `hub_task` `action=assign` (`title` and `parent` for new work, or `id` for a task on the sheet) |
+  | `hub_update` | `hub_task` `action=update` |
+
+  There are no aliases: a session started before the upgrade is told to restart when it calls an old
+  name. The server rewrites every connected folder's guide and allow rules when it starts.
+- **`hub_inbox` and `hub_history` answer in at most 6,000 characters of whole messages**, with a shorter
+  time on each (`[#12 14:05]`, UTC). What does not fit stays unread: `hub_inbox` says how many more, and
+  the next call brings them. A message is never cut.
+- **The hook after each tool call is about four times faster.** It runs a small script crewchat writes
+  from its own code, `~/.crewchat/crewchat-hook.py`, instead of loading all of crewchat: about 20 ms
+  instead of 80 for an installed crewchat on a Mac. It talks to this machine's server over a plain socket
+  (urllib for a chat on another machine). The server points connected folders' hooks at it when it starts;
+  Codex and Gemini CLI ask once more to review crewchat's hooks. Other hooks are unchanged.
 - **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
   with its push service; when something new needs you and no page of the project is open, the
   server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the

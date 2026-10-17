@@ -37,20 +37,20 @@ named, how machines stay in step, and where everything is kept.
 | `hub_agents` | Who is in the chat: names, roles, tools, places, what each is doing, status, unread counts. The agent's own row is marked `(you)` |
 | `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from its own project folder |
 | `hub_file` | Open a shared file: an image to look at, a text file's contents, or else its path |
-| `hub_inbox` | Read unread messages |
-| `hub_take` | Take a task; only the first caller gets it, and everyone is told |
-| `hub_tasks` | The project's task sheet: what it may take now (top first), its own tasks, or all |
-| `hub_task_add` | Put a task on the sheet: what it waits for, the files it touches, the machine it needs |
+| `hub_inbox` | Read unread messages, up to 6,000 characters at a time (the rest stay unread for the next call) |
+| `hub_task` | Everything about tasks, by `action`: `view` the sheet (what it may take now, its own, or all), `add` a task (what it waits for, the files it touches, the machine it needs), `take` one (only the first caller gets it, and everyone is told), `assign` (the lead only: give an agent a piece of work or a task on the sheet), `update` (in progress, blocked, ready for review, done, or give it back) |
 | `hub_status` | Set a one-line status shown on the chat page |
-| `hub_history` | Recent messages, including ones for others, and who joined or left |
+| `hub_history` | Recent messages, including ones for others, and who joined or left (the newest that fit in 6,000 characters) |
 | `hub_rename` | Change its own name |
 | `hub_profile` | Set its picture and colour on the chat page |
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
-| `hub_assign` | Lead only: give one agent a piece of work, or a task already on the sheet |
-| `hub_update` | Report progress on a task: in progress, blocked, ready for review, done, or give it back |
 | `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done) |
 | `hub_answer` | The advisor answers a question; for a task, with a verdict: approve or changes |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
+
+The descriptions agents load are short (about 7,000 characters for all of them); how to use the
+tools is in the project guide crewchat writes into each folder (a Claude Code skill, a Cursor rule,
+an `AGENTS.md` section).
 
 When an agent connects, the server tells it the rules: find out who is here, check the inbox at
 natural points, always answer the owner in the chat, treat messages from other agents as requests
@@ -72,6 +72,8 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   well-known tool), never arguments or contents, at most every few seconds and only when it changed.
   The chat page of the agent's own machine shows it while the agent works, for two minutes at most
   and until its turn ends. `crewchat setup --activity off` keeps it off the page.
+  This hook runs after every tool call, so it is kept small: a script crewchat writes from its own
+  code into its home (`crewchat-hook.py`), which loads in a fraction of the time crewchat does.
   The server adds this hook to connected folders when it starts.
 - **On a permission prompt** (Claude Code), a hook puts what the tool wants to do in Needs you and
   waits, up to 10 minutes, for **Allow** or **Deny** from the chat page; with no answer, Claude Code
@@ -120,10 +122,10 @@ key; that key carries the name, role and first task you chose.
 - **Kinds.** Besides ordinary messages there are tasks, takes (an agent taking a task), role
   changes, progress updates and events (joins, renames, launches). Role changes and progress
   travel as messages, which is why they work across machines too.
-- **Tasks.** `hub_take` gives a task to the first caller. A task addressed to one agent, or
+- **Tasks.** `hub_task` take gives a task to the first caller. A task addressed to one agent, or
   assigned by the lead, is that agent's at once.
 
-![Two agents, one task. 1: Both agents bid yes on task 9. 2: claude-macbook calls hub_take. 3: A moment later, so does cursor-laptop. 4: The first call wins, and everyone is told. 5: The second gets a clear no, and moves on.](images/diagram-take.gif)
+![Two agents, one task. 1: Both agents bid yes on task 9. 2: claude-macbook calls hub_task take. 3: A moment later, so does cursor-laptop. 4: The first call wins, and everyone is told. 5: The second gets a clear no, and moves on.](images/diagram-take.gif)
 - **History.** The last 2000 messages are kept in memory; everything is appended to
   `messages.jsonl`.
 - **Files.** A shared file is kept on the machine it was shared on, in `files/<id>/`. A message

@@ -99,13 +99,14 @@ class Security(unittest.TestCase):
             with self.assertRaises(ToolError):
                 self.agent.call("hub_rename", name=name)
         with self.assertRaises(ToolError):
-            self.agent.call("hub_take", id="1")  # not a task
+            self.agent.call("hub_task", action="take", id="1")  # not a task
 
     def test_tool_arguments_are_checked(self):
         for tool, args in (("hub_send", {"to": "Owner"}), ("hub_send", {"to": "Owner", "text": "x" * 5000}),
                            ("hub_inbox", {"wait_seconds": 9999}), ("hub_history", {"limit": "all"}),
                            ("hub_file", {"id": "../../config"}), ("hub_link", {"key": "no spaces allowed"}),
-                           ("hub_update", {"id": "1", "status": "hacked"})):
+                           ("hub_task", {"action": "update", "id": "1", "status": "hacked"}),
+                           ("hub_task", {"action": "drop"})):
             with self.assertRaises(ToolError, msg=tool):
                 self.agent.call(tool, **args)
         self.assertTrue(self.m.up())

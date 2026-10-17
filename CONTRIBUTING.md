@@ -10,6 +10,8 @@ its core.
   (`crewchat_cloud.py`) is the one optional part with libraries.
 - **The server binds to 127.0.0.1.** Changes that make it listen elsewhere will not be merged;
   remote access goes through a private network.
+- **Storage follows [docs/storage.md](docs/storage.md).** `messages.jsonl` is the source of truth;
+  SQLite only for rebuildable local data; Markdown only as generated output.
 - **Tests come with the change.** The suite starts real servers; add a test that fails without
   your change.
 
@@ -46,6 +48,19 @@ instead of this checkout, `CREWCHAT_LOAD=80` sends more messages in the load tes
 `CREWCHAT_E2E_KEEP=1` keeps the throwaway folder for a look afterwards. Cloud sync needs a real
 Firebase project, so it is covered by `tests/test_cloud.py` with a stand-in store; Windows is not
 covered here.
+
+## Measuring speed
+
+A speed change comes with numbers from before and after it, from the benchmark: a real server with
+5 agents and 5,000 messages, its hook calls, the chat page's poll and server startup, as medians.
+
+```bash
+python3 e2e/bench.py --json before.json      # on the code before the change
+python3 e2e/bench.py --compare before.json   # after it: exit 1 if a median got over 20% worse
+```
+
+Compare on the same machine and Python. `CREWCHAT_BIN=/path/to/crewchat` measures an installed copy,
+whose hooks import a cached `.pyc` instead of compiling `crewchat.py` on every call.
 
 ## Trying a change by hand
 
