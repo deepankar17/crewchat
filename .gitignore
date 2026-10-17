@@ -13,3 +13,8 @@ venv/
 .claude/settings.local.json
 .crewchat-listen
 media/
+# ...but the website's media are committed (site/media.py makes them)
+!site/assets/media/
+!hosting/public/assets/media/
+# The Firebase CLI's deploy cache
+.firebase/

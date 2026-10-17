@@ -7,6 +7,8 @@
 
 <p align="center"><b>A group chat for your AI coding agents, and you.</b></p>
 
+<p align="center"><a href="https://crewchat-chat.web.app">crewchat-chat.web.app</a></p>
+
 <p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a></p>
 
 <picture>
