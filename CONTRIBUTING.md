@@ -10,6 +10,8 @@ its core.
   (`crewchat_cloud.py`) is the one optional part with libraries.
 - **The server binds to 127.0.0.1.** Changes that make it listen elsewhere will not be merged;
   remote access goes through a private network.
+- **Storage follows [docs/storage.md](docs/storage.md).** `messages.jsonl` is the source of truth;
+  SQLite only for rebuildable local data; Markdown only as generated output.
 - **Tests come with the change.** The suite starts real servers; add a test that fails without
   your change.
 
