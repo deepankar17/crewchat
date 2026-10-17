@@ -12,9 +12,8 @@ venv/
 .cursor/
 .claude/settings.local.json
 .crewchat-listen
-media/
-# ...but the website's media are committed (site/media.py makes them)
-!site/assets/media/
-!hosting/public/assets/media/
+/media/
+# The website as built (python3 site/build.py; a deploy builds it first)
+/hosting/public/
 # The Firebase CLI's deploy cache
 .firebase/
