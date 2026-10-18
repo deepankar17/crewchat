@@ -107,11 +107,11 @@ class TwoMachines(unittest.TestCase):
         tid = self.mac.owner.task(self.dev.name, "fix the Windows installer")
         got = eventually(self.dev.stop_hook, what="the task to reach the dev")
         self.assertIn("fix the Windows installer", got)
-        self.assertIn("first send hub_update in_progress", got)
-        self.dev.call("hub_update", id=tid, status="in_progress", note="stopping running processes first")
+        self.assertIn("first send hub_task update in_progress", got)
+        self.dev.call("hub_task", action="update", id=tid, status="in_progress", note="stopping running processes first")
         for m in (self.mac, self.win):
             m.owner.wait_for("stopping running processes first", kind="update", to="Owner")
-        self.dev.call("hub_update", id=tid, status="done", note="installer fixed")
+        self.dev.call("hub_task", action="update", id=tid, status="done", note="installer fixed")
         self.mac.owner.wait_for("installer fixed", kind="update", to="Owner")
         self.assertNotIn("installer fixed", self.lead.stop_hook())
         self.mac.owner.role(self.lead.name, "none")
@@ -123,18 +123,18 @@ class TwoMachines(unittest.TestCase):
         self.lead.stop_hook()
         job = self.mac.owner.task("all", "ship the website")
         self.assertIn("ship the website", self.lead.stop_hook())
-        out = self.lead.call("hub_assign", to=self.dev.name, text="build the download page", task=job)
+        out = self.lead.call("hub_task", action="assign", to=self.dev.name, title="build the download page", parent=job)
         piece = re.search(r"#(\w+)", out).group(1)
         got = eventually(self.dev.stop_hook, what="the piece to reach the dev")
         self.assertIn("[TASK, assigned to you, part of #%s]" % job, got)
-        self.dev.call("hub_update", id=piece, status="in_progress", note="starting the download page")
+        self.dev.call("hub_task", action="update", id=piece, status="in_progress", note="starting the download page")
         self.assertIn("starting the download page", eventually(self.lead.stop_hook, what="the lead to hear"))
-        self.dev.call("hub_update", id=piece, status="done", note="download page live")
+        self.dev.call("hub_task", action="update", id=piece, status="done", note="download page live")
         heard = eventually(self.lead.stop_hook, what="the lead to hear it is done")
         self.assertIn("download page live", heard)
         self.assertIn("%s is free" % self.dev.name, heard)
         with self.assertRaises(ToolError):
-            self.dev.call("hub_assign", to=self.lead.name, text="not the lead")
+            self.dev.call("hub_task", action="assign", to=self.lead.name, title="not the lead")
         self.mac.owner.role(self.lead.name, "none")
 
     def test_one_task_one_taker_across_machines(self):
@@ -150,7 +150,7 @@ class TwoMachines(unittest.TestCase):
 
             def take(agent):
                 try:
-                    results[agent.name] = agent.call("hub_take", id=tid)
+                    results[agent.name] = agent.call("hub_task", action="take", id=tid)
                 except ToolError as e:
                     results[agent.name] = e
 
@@ -168,17 +168,17 @@ class TwoMachines(unittest.TestCase):
         tid = self.mac.owner.task("all", "a task that changes hands")
         for agent in (self.lead, self.dev):
             eventually(lambda: tid in agent.call("hub_history", limit=50), what="the task on both machines")
-        self.dev.call("hub_take", id=tid)
-        self.dev.call("hub_update", id=tid, status="todo", note="giving it back")
+        self.dev.call("hub_task", action="take", id=tid)
+        self.dev.call("hub_task", action="update", id=tid, status="todo", note="giving it back")
         eventually(lambda: tid not in self.mac.owner.poll()["taken"], what="the give-back on the Mac")
-        self.lead.call("hub_take", id=tid)  # was refused before: the first claim never released
+        self.lead.call("hub_task", action="take", id=tid)  # was refused before: the first claim never released
         for m in (self.mac, self.win):
             eventually(lambda: m.owner.poll()["taken"].get(tid) == self.lead.name, what="both to agree")
         # The owner puts it back too, and it can be taken afresh, from the other machine.
         self.win.owner.post("/api/task", {"op": "status", "task": tid, "status": "todo"})
         eventually(lambda: tid not in self.win.owner.poll()["taken"], what="the owner's give-back")
         eventually(lambda: tid not in self.mac.owner.poll()["taken"], what="the owner's give-back on the Mac")
-        self.dev.call("hub_take", id=tid)
+        self.dev.call("hub_task", action="take", id=tid)
         for m in (self.mac, self.win):
             eventually(lambda: m.owner.poll()["taken"].get(tid) == self.dev.name, what="both to agree again")
 
@@ -245,8 +245,8 @@ class SharedProjects(unittest.TestCase):
             tid = win.owner.post("/api/task?chat=t2", {"op": "add", "title": "shared sheet task"})
             self.assertEqual(tid[0], 200)
             task = H.json.loads(tid[1])["id"]
-            eventually(lambda: task in x.call("hub_tasks", view="all"), timeout=60, what="the task on the Mac's sheet")
-            x.call("hub_take", id=task)
+            eventually(lambda: task in x.call("hub_task", action="view", show="all"), timeout=60, what="the task on the Mac's sheet")
+            x.call("hub_task", action="take", id=task)
             eventually(lambda: win.owner.poll()["taken"].get(task) == x.name, timeout=60, what="the laptop to know")
         finally:
             mac.stop()
@@ -303,14 +303,14 @@ class Outages(unittest.TestCase):
         tid = self.a.owner.task("all", "a task from the desk")
         eventually(lambda: tid in self.y.call("hub_history"), what="the task to reach the laptop")
         self.a.kill(hard=True)
-        self.assertIn("is yours", self.y.call("hub_take", id=tid))  # no "try again when it is back"
+        self.assertIn("is yours", self.y.call("hub_task", action="take", id=tid))  # no "try again when it is back"
         self.a.cli("start", "--no-service", "--no-open")
         self.a.wait_up()
         eventually(lambda: self.a.owner.poll()["taken"].get(tid) == self.y.name, timeout=60, what="the take to travel")
         x = self.a.agent()  # (the desk's agent before the restart was not linked again)
         x.link()
         with self.assertRaises(ToolError) as e:
-            x.call("hub_take", id=tid)
+            x.call("hub_task", action="take", id=tid)
         self.assertIn("taken by %s" % self.y.name, str(e.exception))
 
     def test_leaving_and_removing(self):

@@ -91,7 +91,7 @@ class Load(unittest.TestCase):
         def race(agent):
             for t in random.Random(agent.name).sample(tasks, len(tasks)):
                 try:
-                    agent.call("hub_take", id=t)
+                    agent.call("hub_task", action="take", id=t)
                     with lock:
                         wins[t].append(agent.name)
                 except ToolError as e:

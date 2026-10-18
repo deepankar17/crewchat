@@ -31,7 +31,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 |---|---|---|---|---|---|---|
 | [P0](#p0) | Benchmark harness | Speed and efficiency | P1 | S | Done | none |
 | [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | Done | P0 |
-| [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | To do | P0 |
+| [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | Done | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | To do | P0 |
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | To do | P0 |
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
@@ -137,7 +137,7 @@ about 20 ms; numbers in the pull request.
 
 ### P2
 
-**Trim agent tool schemas and outputs** · P1 · effort M · To do
+**Trim agent tool schemas and outputs** · P1 · effort M · Done
 
 > **Decided:** Breaking change, no aliases (owner, 17 Oct).
 
@@ -172,6 +172,15 @@ about 20 ms; numbers in the pull request.
 **Depends on:** [P0](#p0)
 
 **Owner's note:** no need to maintain the backward compatibility. we can do the change
+
+**Status.** Done. The tools merged were `hub_tasks`, `hub_task_add`, `hub_take`, `hub_assign` and
+`hub_update` (the spec's "hub_task_view/add/take/assign/update"); `hub_ask` and `hub_answer` stay. The tool
+definitions went from 13,074 to 6,948 characters, with a description for every parameter and `readOnlyHint`
+on every tool (Glama's rating asks for both). Owner's choices (17 Oct): `hub_inbox` and `hub_history` give
+whole messages up to 6,000 characters, the rest unread with a "more" hint, never cutting one; the usage text
+went to the guide, and a few task lines to the MCP instructions (PROTOCOL, still under the 2,000 characters
+Claude Code keeps), so Gemini CLI, Qwen Code and Codex without an AGENTS.md keep them; the benchmark reports
+the tool definitions and a 50-message inbox.
 
 ### P3
 
