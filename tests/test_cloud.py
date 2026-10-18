@@ -191,6 +191,41 @@ class Sync(unittest.TestCase):
         for m in (self.a, self.b):
             m.stop()
 
+    def test_whichever_machine_is_on_holds_the_coordinators_lease(self):
+        # Roadmap Y1: a lease in meta/coordinator, renewed by its holder, taken over once it runs out.
+        now = [time.time()]
+        for m in (self.a, self.b):
+            m.sync.clock = lambda: now[0]
+        self.a.sync.renew_lease()
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        term = self.a.sync.coordinator()["term"]
+        self.b.sync.renew_lease()  # a live lease is left alone
+        self.assertEqual((self.b.sync.coordinator()["name"], self.b.sync.coordinator()["me"]), ("mac", False))
+        # The mac goes offline: its lease runs out, and the other machine takes it at its next renewal.
+        self.a.link.online = False
+        self.a.sync.renew_lease()  # cannot reach the cloud: nothing changes there
+        now[0] += cloud.LEASE_SECS + 1
+        self.b.sync.renew_lease()
+        self.assertEqual(self.b.sync.coordinator(), {"name": "windows", "me": True, "term": term + 1, "preferred": ""})
+        self.a.link.online = True
+        self.a.sync.renew_lease()
+        self.assertFalse(self.a.sync.coordinator()["me"])  # back, but the lease is someone else's now
+        # The owner prefers the mac: it takes the role back at its next renewal, and the other lets go.
+        self.assertEqual(self.b.sync.set_preferred("mac")["preferred"], "mac")
+        self.a.sync.renew_lease()
+        self.assertEqual(self.a.sync.coordinator()["term"], term + 2)
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.b.sync.renew_lease()
+        self.assertFalse(self.b.sync.coordinator()["me"])
+        # Stopping hands it on at once rather than after LEASE_SECS.
+        self.a.sync.release_lease()
+        self.b.sync.renew_lease()
+        self.assertTrue(self.b.sync.coordinator()["me"])
+        self.b.sync.set_preferred("none")
+        self.assertEqual(self.b.sync.coordinator()["preferred"], "")
+        with self.assertRaises(cloud.CloudError):
+            self.b.sync.set_preferred("nowhere")
+
     def test_messages_reach_the_other_machine_with_global_ids(self):
         msg = self.a.say("all", "hello from the mac")
         self.assertEqual(msg["id"], "A%d" % msg["seq"])
