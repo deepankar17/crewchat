@@ -498,9 +498,9 @@ class NewPage(Signed):
         c.until("Notification.permission === 'granted' && !$('bell').classList.contains('off')", what="the bell on")
         c.js("$('bell').open = false")
         tid = c.js("postJSON('/api/task', {op: 'add', title: 'Pick a colour for the login button'}).then(r => r.id)")
-        self.agent.call("hub_take", id=tid)
+        self.agent.call("hub_task", action="take", id=tid)
         c.js("Object.defineProperty(document, 'hidden', {value: true, configurable: true})")  # the page goes to the back
-        self.agent.call("hub_update", id=tid, status="blocked", note="Blue or green?")
+        self.agent.call("hub_task", action="update", id=tid, status="blocked", note="Blue or green?")
         c.until("!$('needs-you').hidden && $('needs-list').innerText.includes('Blue or green?')", what="the item")
         c.until("window.notes.some(n => n[0].includes('Needs you') && n[1].includes('Blue or green?'))", what="a notification")
         self.assertGreaterEqual(int(c.js("$('needs-count').textContent")), 1)
@@ -512,7 +512,7 @@ class NewPage(Signed):
         c.js("""(() => { const t = document.querySelector('#panel-body .needs-card textarea'); t.value = 'Green, please';
                   [...document.querySelectorAll('#panel-body .needs-card button')].find(b => b.textContent === 'Send').click(); })()""")
         self.assertIn("Re #%s: Green, please" % tid, eventually(self.agent.stop_hook, what="the agent to get the answer"))
-        self.agent.call("hub_update", id=tid, status="in_progress", note="Green it is")
+        self.agent.call("hub_task", action="update", id=tid, status="in_progress", note="Green it is")
         c.until("$('needs-you').hidden || !$('needs-list').innerText.includes('Blue or green?')", what="the item to go")
         # A message to you is unread until the page is in front, then read.
         self.agent.call("hub_send", to="Owner", text="Done with the button")
