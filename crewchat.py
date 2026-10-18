@@ -10945,9 +10945,10 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 980px) / 2)); }
 #tasks.board-on { padding: 16px 20px; }
 .tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
-.task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-.task-form input { flex: 1 1 120px; min-width: 0; font-size: 13.5px; }
-.task-form #t-title { flex: 3 1 260px; }
+.task-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)) auto; gap: 6px; margin-bottom: 14px; }
+.task-form input { min-width: 0; font-size: 13.5px; }
+.task-form #t-title { grid-column: 1 / 4; }
+.task-form #t-add { grid-column: 4; grid-row: 1; }
 #sheet { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 #sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
 #sheet td { padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -10958,7 +10959,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .st.doing, .st.review { background: var(--accent); color: var(--on-accent); }
 .st.done { background: var(--ok-strong); color: #fff; } .st.blocked { background: var(--err); color: var(--panel); }
 .acts { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-#sheet .acts { justify-content: flex-end; }
+#sheet .acts { justify-content: flex-start; flex-wrap: nowrap; }
 .acts button, .acts select { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--text); border: 1px solid var(--line); }
 .acts button.danger { color: var(--err); }
 #cmd-filter { width: 100%; font-size: 14px; margin-bottom: 12px; }
@@ -11102,7 +11103,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   --glass-hover: rgba(255, 255, 255, 0.7); --glass-filter: blur(22px) saturate(180%);
   --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.85), inset 0 0 0 1px rgba(255, 255, 255, 0.45);
   --glass-shadow: 0 1px 1px rgba(11, 31, 85, 0.05), 0 10px 30px rgba(11, 31, 85, 0.12);
-  --glass-line: rgba(11, 31, 85, 0.09);
+  --glass-line: rgba(11, 31, 85, 0.09); --menu: rgba(255, 255, 255, 0.96);
   --backdrop: radial-gradient(60% 55% at 0% 0%, #c7d7ff 0%, transparent 62%),
     radial-gradient(55% 50% at 100% 0%, #e7d6ff 0%, transparent 60%),
     radial-gradient(60% 55% at 85% 100%, #ffe1cc 0%, transparent 62%),
@@ -11114,7 +11115,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     --glass-hover: rgba(40, 56, 110, 0.6);
     --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
     --glass-shadow: 0 1px 1px rgba(0, 0, 0, 0.25), 0 12px 32px rgba(0, 0, 0, 0.35);
-    --glass-line: rgba(255, 255, 255, 0.08);
+    --glass-line: rgba(255, 255, 255, 0.08); --menu: rgba(22, 32, 70, 0.97);
     --backdrop: radial-gradient(60% 55% at 0% 0%, rgba(70, 105, 230, 0.35) 0%, transparent 62%),
       radial-gradient(55% 50% at 100% 0%, rgba(140, 80, 220, 0.28) 0%, transparent 60%),
       radial-gradient(60% 55% at 85% 100%, rgba(230, 120, 70, 0.18) 0%, transparent 62%),
@@ -11128,7 +11129,10 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
   box-shadow: var(--glass-rim), var(--glass-shadow);
 }
 /* What holds text to read gets the denser glass. */
-#needs-you, .menu-list, .mentions, #panel .card, dialog { background: var(--glass-strong); }
+#needs-you, #panel .card, dialog { background: var(--glass-strong); }
+/* Menus and the @ suggestions sit inside the header's or the message box's glass, which a browser does not blur
+   through again: nearly opaque, as a Mac's menus are, so what is behind never shows through their words. */
+.menu-list, .mentions { background: var(--menu); -webkit-backdrop-filter: none; backdrop-filter: none; }
 .menu-list, .mentions, dialog, #panel .card { border-color: var(--glass-line); }
 /* The project's space: a plate the thread sits on, the header and the message box floating on it. */
 #space { background: var(--plate); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
@@ -11143,6 +11147,11 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
 #space > #tasks { padding-top: calc(16px + var(--over)); }  /* the list and the board (#tasks.board-on) */
 #space > #analytics { padding-top: calc(16px + var(--over)); }  /* (its own styles come later) */
 #search-none { margin-top: var(--over); }
+/* The scroll edge (as Apple's): what scrolls fades out as it reaches the top, under the glass, so nothing shows
+   cut off in the gap above the header. */
+#log, #space > #tasks, #space > #analytics {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--over));
+  mask-image: linear-gradient(to bottom, transparent 0, #000 var(--over)); }
 .pillbox { border-color: var(--glass-line); border-radius: 999px; }
 .pillbox:focus-within { border-color: var(--accent-2); box-shadow: var(--glass-rim), var(--glass-shadow), 0 0 0 3px rgba(91, 140, 255, 0.22); }
 #search { border-radius: 999px; background: var(--glass-hover); border-color: var(--glass-line); }
@@ -11162,14 +11171,14 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
 .acts button:hover, .msg .reply:hover { background-color: var(--glass-hover); }
 /* Concentric corners: a card inside a panel, a little rounder than what it holds. */
 #panel .card { border-radius: 22px; }
-.col { border-radius: 22px; }
+.col { border-radius: 22px; box-shadow: var(--glass-rim); }
 .tcard { border-radius: 14px; }
 dialog { border-radius: 28px; border: 1px solid var(--glass-line); }
 dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 /* Solid again: the system asks for less transparency or more contrast, or the browser cannot blur. */
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint);
-    --glass-filter: none; --backdrop: none; --glass-line: var(--line); }
+    --glass-filter: none; --backdrop: none; --glass-line: var(--line); --menu: var(--panel); }
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
   :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint); --backdrop: none; }
@@ -11197,7 +11206,15 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
   .col { scroll-snap-align: start; }
   /* The task list on a phone: each task a block, its actions on a line of their own (no sideways scrolling). */
   #sheet thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-  #sheet tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  #sheet tr { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  #sheet td:first-child { padding-top: 2px; }
+  /* The add form on a phone: the task and Add; what it waits for and its files; its machine. */
+  .task-form { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+  .task-form #t-title { grid-column: 1 / 3; }
+  .task-form #t-add { grid-column: 3; }
+  .task-form #t-areas { grid-column: 2 / 4; }
+  .task-form #t-where { grid-column: 1 / -1; }
+  #sheet td:last-child .acts { flex-wrap: wrap; }
   #sheet td { border: 0; padding: 0; }
   #sheet td:nth-child(2) { flex: 1 1 calc(100% - 48px); min-width: 0; overflow-wrap: anywhere; }
   #sheet td:last-child { flex-basis: 100%; }
@@ -11207,8 +11224,15 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
 @media (max-width: 760px) {
   :root { --glass-filter: blur(14px) saturate(160%); }
   #space { border-radius: 0; background: var(--panel); -webkit-backdrop-filter: none; backdrop-filter: none; }
-  #space-head { margin: 6px 6px 0; }
-  #space { --over: 62px; }
+  #space { --over: 64px; }  /* the header's margin and height here */
+  #space-head { margin: 6px 6px calc(-1 * var(--over)); }
+  /* Search folds to a magnifier until tapped, so the project's line keeps its room. */
+  #search:not(:focus):placeholder-shown { width: 40px; padding: 0; cursor: pointer; color: transparent;
+    background: var(--glass-hover) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235d6a8f' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6.5'/%3E%3Cpath d='m16 16 4.5 4.5'/%3E%3C/svg%3E") center / 17px no-repeat; }
+  #search:not(:focus):placeholder-shown::placeholder { color: transparent; }
+  #search:focus { width: 150px; }
+  /* 16px in what you type into: smaller, and a phone zooms the page when you tap in. */
+  input[type=text], input[type=search], textarea, select, #text { font-size: 16px; }
   #rail { background: var(--glass-strong); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter); }
 }
 @media (prefers-reduced-motion: reduce) { #rail { transition: none; } }
@@ -11299,9 +11323,9 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
     </div>
     <form id="task-form" class="task-form">
       <input type="text" id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
-      <input type="text" id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
-      <input type="text" id="t-areas" placeholder="files (app/login/)" aria-label="Files">
-      <input type="text" id="t-where" placeholder="machine" aria-label="Machine">
+      <input type="text" id="t-depends" placeholder="Waits for (#12)" aria-label="Waits for">
+      <input type="text" id="t-areas" placeholder="Files (app/login/)" aria-label="Files">
+      <input type="text" id="t-where" placeholder="Machine" aria-label="Machine">
       <button id="t-add">Add</button>
     </form>
     <p id="tasks-note" class="meta" role="alert"></p>
@@ -11358,7 +11382,7 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
     <section class="card" id="edits-card"><h3>Files agents edit</h3>
       <p class="meta" id="edits-note">Loading…</p>
       <label for="edits-mode">Keep track of them</label>
-      <select id="edits-mode"><option value="auto">Auto: for a software team, not for other teams</option>
+      <select id="edits-mode"><option value="auto">Auto (software teams only)</option>
         <option value="on">On</option><option value="off">Off</option></select>
       <ul id="edits-files" class="meta"></ul>
     </section>
@@ -11778,7 +11802,14 @@ function showError(text) {
   ($("tasks").hidden ? $("error") : $("tasks-note")).textContent = text;
 }
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
+// Always in this order, from the left (the list lines them up): move, settle, give, take off.
 function taskActions(r, parent) {
+  const button = (label, title, body, cls) => { const b = actButton(parent, label, title, () => taskOp(body)); if (cls) b.classList.add(cls); };
+  button("↑", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
+  button("↓", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
+  if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
+  if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
+    button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
   if (r.status === "todo" || r.status === "waiting") {
     const pick = el("select");
     pick.setAttribute("aria-label", "Give task " + r.id + " to");
@@ -11786,12 +11817,6 @@ function taskActions(r, parent) {
     pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
     parent.append(pick);
   }
-  const button = (label, title, body, cls) => { const b = actButton(parent, label, title, () => taskOp(body)); if (cls) b.classList.add(cls); };
-  button("↑", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
-  button("↓", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
-  if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
-  if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
-    button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
   const off = actButton(parent, "×", "Take task " + r.id + " off the sheet", () => {
     // As every other action that cannot be undone here: asked first.
     if (confirm("Take task #" + r.id + " off the sheet? Nobody works on it any more; its messages stay in the chat."))
@@ -12965,6 +12990,11 @@ async function rolesOp(body, what, control) {
 function roleAvatar(r) {
   return avatar({ agent: r.label || r.name, client: r.tool || "", picture: r.picture, colour: r.colour || toolColour(r.tool || "agent") });
 }
+// A role's text as written (wrapped at 100 columns, a bullet's next lines indented), read as paragraphs: each
+// indented line joins the one before, so a sentence is not broken where the source happened to wrap.
+function flowed(text) {
+  return String(text || "").replace(/\n[ \t]+(?=\S)/g, " ");
+}
 function panelRoles() {
   const info = state.roleInfo;
   if (!info) return ["Roles", rolesLoading()];
@@ -13068,7 +13098,7 @@ function panelRole(name) {
     if (await rolesOp({ op: "delete", name: r.name }, "Not deleted", b)) openPanel("roles");
   });
   del.classList.add("danger");
-  const details = [field("Tool", tool ? tool.label : "Any"), el("h3", "", "What the agent is told"), el("div", "prompt-text", r.description)];
+  const details = [field("Tool", tool ? tool.label : "Any"), el("h3", "", "What the agent is told"), el("div", "prompt-text", flowed(r.description))];
   return [r.label, card("", head), card("", ...details), card("Agents with it", who), card("Actions", acts)];
 }
 // A role's fields as a form: a new role (r undefined), or changes to one.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A design pass over every page.** Menus are nearly opaque, so what is behind never shows through their words; the
+  thread fades out as it scrolls under the header instead of showing cut off above it; the board's columns lose a
+  clipped shadow band; the task list's buttons stay on one line in the same order in every row, so they line up;
+  the add form puts the task and Add on top and the optional fields below; a role's text reads as paragraphs; the
+  edit tracking menu fits its panel. On a phone the header sits right above the content, search folds to a
+  magnifier until tapped, and what you type into is 16px so the page does not zoom.
 - **Liquid Glass.** The chat page takes the look of macOS 26 and iOS 26: the tabs, the list of agents, the
   project's header, the message box, the side panel, menus and dialogs are glass, see-through and softly
   blurred over a colourful backdrop, with rounder, capsule-shaped controls. The chat, the board and the

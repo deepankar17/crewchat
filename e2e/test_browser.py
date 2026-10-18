@@ -1005,6 +1005,52 @@ class NewPage(Signed):
             c.js("showView('chat')")
             c.size(1280, 900)
 
+    def test_design_review_details(self):
+        # What a design review of the page found, kept: menus readable over glass, the scroll edge under the header,
+        # the board without a clipped shadow band, task actions on one line in a fixed order, the add form in two
+        # rows, a role's text as paragraphs, and on a phone the header's room and inputs that do not zoom the page.
+        c = self.chrome
+        try:
+            c.js("$('space-menu').open = true")
+            self.assertGreaterEqual(c.js("parseFloat((getComputedStyle(document.querySelector('#space-menu .menu-list'))"
+                                         ".backgroundColor.match(/[\\d.]+(?=\\)$)/) || [1])[0])"), 0.95)
+            c.js("$('space-menu').open = false")
+            self.assertIn("gradient", c.js("getComputedStyle($('log')).maskImage || getComputedStyle($('log')).webkitMaskImage"))
+            mid = self.m.owner.task("all", "A task for the design review")
+            self.m.owner.task("all", "One that waits on it, with a long enough title to need room in the list")
+            c.js("showView('tasks'); $('as-board').click()")
+            c.until("!!document.querySelector('#board .col')", what="the board")
+            self.assertNotIn("30px", c.js("getComputedStyle(document.querySelector('#board .col')).boxShadow"))
+            c.js("$('as-list').click(); openPanel('task', %s)" % json.dumps(mid))
+            c.until("!$('panel').hidden && $('sheet').querySelectorAll('tbody .acts').length > 1", what="the list beside the panel")
+            rows = c.js("[...$('sheet').querySelectorAll('tbody .acts')].map(a => [[...a.children].map(b => b.textContent || b.tagName),"
+                        " new Set([...a.children].map(b => Math.round(b.getBoundingClientRect().top))).size])")
+            for labels, lines in rows:
+                self.assertEqual(lines, 1, labels)  # one line, even beside the panel
+                self.assertEqual(labels[:2], ["↑", "↓"], labels)  # the same order in every row, so they line up
+            self.assertEqual(c.js("Math.round($('t-add').getBoundingClientRect().top)"),
+                             c.js("Math.round($('t-title').getBoundingClientRect().top)"))  # Add beside the task
+            c.js("openPanel('role', 'developer')")
+            c.until("!!document.querySelector('#panel .prompt-text')", what="the role's text")
+            self.assertNotRegex(c.js("document.querySelector('#panel .prompt-text').textContent"), r"\n[ \t]+\S")
+            self.assertLessEqual(c.js("Math.max(...[...$('edits-mode').options].map(o => o.text.length))"), 30)
+            c.js("closePanel(); showView('chat')")
+            # A phone.
+            c.size(375, 812, mobile=True)
+            c.open(self.m.url + "/")
+            c.until("!!%s" % self.card(), what="the page on a phone")
+            self.assertLessEqual(c.js("$('search').getBoundingClientRect().width"), 44)  # a magnifier until tapped
+            self.assertEqual(c.js("getComputedStyle($('text')).fontSize"), "16px")
+            c.js("showView('tasks')")
+            gap = c.js("$('tasks').firstElementChild.getBoundingClientRect().top - $('space-head').getBoundingClientRect().bottom")
+            self.assertTrue(0 <= gap < 30, gap)  # right under the header, not 80px below it
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("closePanel(); showView('chat')")
+            c.size(1280, 900)
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:
