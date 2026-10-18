@@ -340,6 +340,10 @@ class CodeMap:
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+        # Derived data, built again when lost (docs/storage.md): no waiting on the disk at each commit, which
+        # costs most of a one-file update on Windows.
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=OFF")
         self.db.executescript(SCHEMA)
         if self.meta("version") != MAP_VERSION:  # made by another version: build it again
             for table in ("nodes", "edges", "refs", "files", "signatures", "meta"):
