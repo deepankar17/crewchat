@@ -3879,6 +3879,98 @@ class Plugin(unittest.TestCase):
         self.assertIn("<!-- mcp-name: %s -->" % entry["name"], (ROOT / "README.md").read_text(encoding="utf-8"))
 
 
+class LogLoading(unittest.TestCase):
+    """Startup reads messages.jsonl from its end (roadmap P3): only the messages it keeps."""
+
+    @staticmethod
+    def old_load(path):
+        """The loader before P3, as the reference: every line, then the last KEEP_MESSAGES."""
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict) or "id" not in msg:
+                continue
+            if "seq" not in msg:
+                msg["seq"] = int(msg["id"])
+            msg["id"] = str(msg["id"])
+            msg.setdefault("kind", "msg")
+            out.append(msg)
+        return out[-crewchat.KEEP_MESSAGES:]
+
+    def project(self, lines, raw=b""):
+        root = Path(tempfile.mkdtemp(prefix="log-", dir=TMP))
+        crewchat.save_config({"project": "logs"}, root)
+        (root / "messages.jsonl").write_bytes(raw + b"".join(
+            (l if isinstance(l, bytes) else json.dumps(l).encode()) + b"\n" for l in lines))
+        return root
+
+    def test_the_same_messages_and_next_number_as_before(self):
+        msg = lambda seq, **kw: dict({"id": str(seq), "seq": seq, "ts": 1.0, "from": "Maya", "to": "all", "text": "m%d" % seq}, **kw)  # noqa: E731
+        n = crewchat.KEEP_MESSAGES
+        fixtures = {
+            "empty": [],
+            "a few": [msg(1), msg(2, kind="task"), msg(3)],
+            "damaged lines": [msg(1), b"not json", b"[1, 2]", b'{"no": "id"}', msg(2), b"", msg(3)],
+            "written by 0.2": [{"id": 1, "from": "a", "to": "all", "text": "x", "ts": 1}, {"id": 2, "from": "a", "to": "all", "text": "y", "ts": 2}],
+            "more than are kept": [msg(i) for i in range(1, n + 300)],
+            "damage among many": [msg(i) if i % 7 else b"{broken" for i in range(1, n + 50)],
+            "half a last line": [msg(1), msg(2)] + [b'{"id": "3", "seq": 3, "te'],
+        }
+        for name, lines in fixtures.items():
+            root = self.project(lines)
+            hub = crewchat.Hub(crewchat.Roster(root))
+            expected = self.old_load(root / "messages.jsonl")
+            self.assertEqual(hub.messages, expected, name)
+            self.assertEqual(hub.next_seq, expected[-1]["seq"] + 1 if expected else 1, name)
+            self.assertEqual(hub.ids, {m["id"]: m["seq"] for m in expected}, name)
+        # The last line half written by a crash, with no newline after it: skipped, as before.
+        root = self.project([msg(1)], raw=b"")
+        with open(root / "messages.jsonl", "ab") as f:
+            f.write(b'{"id": "2", "seq"')
+        self.assertEqual([m["seq"] for m in crewchat.Hub(crewchat.Roster(root)).messages], [1])
+
+    def test_lines_end_at_newlines_only(self):
+        # Windows writes \r\n; a message's text may hold U+2028, which splitlines() took for a line end.
+        text = "one\u2028two\u2029three\x85four"
+        root = self.project([], raw=b'{"id": "1", "seq": 1, "text": "a"}\r\n' + json.dumps(
+            {"id": "2", "seq": 2, "text": text}, ensure_ascii=False).encode() + b"\r\n")
+        hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual([m["text"] for m in hub.messages], ["a", text])
+
+    def test_only_the_end_of_a_long_log_is_read(self):
+        n = crewchat.KEEP_MESSAGES
+        lines = [json.dumps({"id": str(i), "seq": i, "text": "x" * 100}).encode() for i in range(1, 3 * n)]
+        root = self.project(lines, raw=b"\xff\xfe not UTF-8, never read\n" * 1000)  # the old loader stopped here
+        size = (root / "messages.jsonl").stat().st_size
+        read = []
+        real_open = open
+
+        def counting_open(path, mode="r", *a, **kw):
+            f = real_open(path, mode, *a, **kw)
+            if str(path).endswith("messages.jsonl"):
+                plain = f.read
+                f = mock.Mock(wraps=f)
+                f.read = lambda *ra: (lambda data: read.append(len(data)) or data)(plain(*ra))
+                f.__enter__ = lambda *x: f
+                f.__exit__ = lambda *x: False
+            return f
+        with mock.patch.object(crewchat, "open", counting_open, create=True):
+            hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(len(hub.messages), n)
+        self.assertEqual(hub.messages[-1]["seq"], 3 * n - 1)
+        self.assertLess(sum(read), size * 0.4 + 65536)  # about a third of the file: the messages it keeps
+
+    def test_read_back_across_blocks(self):
+        path = Path(tempfile.mkdtemp(prefix="back-", dir=TMP)) / "f"
+        for data in (b"", b"a", b"a\n", b"a\nbb\nccc", b"\n\n", b"x" * 50 + b"\n" + b"y" * 3 + b"\n"):
+            path.write_bytes(data)
+            for block in (1, 2, 3, 7, 1 << 16):
+                self.assertEqual(list(crewchat.read_back(path, block)), data.split(b"\n")[::-1], (data, block))
+
+
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
         session, name = self.agent()
