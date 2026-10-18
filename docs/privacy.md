@@ -30,6 +30,9 @@ What crewchat reads on your machine and keeps there:
   inside the project folder, never what it wrote and never a path outside the project, and it is kept
   on this machine in `events.sqlite`. Other machines only ever see what is worked out from it.
 
+- **When each agent was working, waiting for messages or idle,** for the timelines on the analytics
+  page: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept
+  while `crewchat setup --activity off` keeps what agents do off the page.
 - **Token counts.** At the end of each turn of a Claude Code agent, its hook reads how many tokens
   the turn used from the session's own transcript: the model and the numbers, never the
   conversation. They go to this machine's chat (or the one the folder is connected to), are added

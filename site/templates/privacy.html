@@ -30,6 +30,9 @@
         off for others; <code>crewchat edits on|off|auto</code>). The hook sends the path of each file an agent
         edits inside the project folder, never what it wrote and never a path outside the project, and it is
         kept on this machine. Other machines only ever see what is worked out from it.</li>
+      <li><b>When each agent was working, waiting for messages or idle,</b> for the timelines on the analytics
+        page: only those states and when they changed, kept on this machine. Not kept while
+        <code>crewchat setup --activity off</code> keeps what agents do off the page.</li>
       <li><b>Token counts.</b> At the end of each turn of a Claude Code agent, its hook reads how many tokens the
         turn used from the session's own transcript: the model and the numbers, never the conversation. They are
         added to the agent and the task it works on, and shown to you as totals with a cost estimate.

@@ -1258,6 +1258,7 @@ class Analytics:
             agent.update(activity=row.get("activity", ""), online=row.get("online", False), role=row.get("role", ""),
                          device=row.get("device", ""), seen=row.get("seen", 0))
         out["usage"] = hub.usage_report(days)
+        out["timelines"] = hub.events.timelines(now - days * 86400, now)  # [start, end, state] per agent
         out["built"] = now
         return out
 
@@ -1295,6 +1296,9 @@ class EventStore:
                             "path TEXT NOT NULL, task TEXT NOT NULL DEFAULT '')")
             self.db.execute("CREATE INDEX IF NOT EXISTS edits_ts ON edits (ts)")
             self.db.execute("CREATE INDEX IF NOT EXISTS edits_path ON edits (path)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS activity (ts REAL NOT NULL, agent TEXT NOT NULL, "
+                            "state TEXT NOT NULL)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts)")
             self.db.commit()
         return self.db
 
@@ -1315,6 +1319,44 @@ class EventStore:
         with self.lock:
             rows = self._conn().execute(sql + " ORDER BY ts LIMIT ?", args + [limit]).fetchall()
         return [{"ts": ts, "agent": a, "path": p, "task": t} for ts, a, p, t in rows]
+
+    def add_activity(self, agent, state, ts=None):
+        with self.lock:
+            db = self._conn()
+            db.execute("INSERT INTO activity (ts, agent, state) VALUES (?, ?, ?)",
+                       (time.time() if ts is None else ts, agent, state))
+            db.commit()
+
+    def timelines(self, since, until=None, grace=LISTEN_GRACE):
+        """Each agent's states from since to until (now), as [start, end, state] pieces: a state lasts until the
+        next one, and one that was listening with nothing after it for longer than grace became idle then (a
+        listening hook asks again within it). The state at since is the last one recorded before it."""
+        until = time.time() if until is None else until
+        with self.lock:
+            db = self._conn()
+            before = db.execute("SELECT agent, state, MAX(ts) FROM activity WHERE ts < ? GROUP BY agent", (since,)).fetchall()
+            rows = db.execute("SELECT ts, agent, state FROM activity WHERE ts >= ? AND ts <= ? ORDER BY ts",
+                              (since, until)).fetchall()
+        changes = {}
+        for agent, state, _ in before:
+            changes.setdefault(agent, []).append((since, state))
+        for ts, agent, state in rows:
+            changes.setdefault(agent, []).append((ts, state))
+        out = {}
+        for agent, points in changes.items():
+            pieces = []
+            for i, (start, state) in enumerate(points):
+                end = points[i + 1][0] if i + 1 < len(points) else until
+                if state == "listening" and i + 1 == len(points) and end - start > grace:
+                    pieces.append([start, start + grace, "listening"])
+                    start, state = start + grace, "idle"
+                if end > start:
+                    if pieces and pieces[-1][2] == state and pieces[-1][1] == start:
+                        pieces[-1][1] = end
+                    else:
+                        pieces.append([start, end, state])
+            out[agent] = pieces
+        return out
 
     def files(self, since=0.0, limit=200):
         """The files edited since then, most edited first: [{path, edits, agents, last}]."""
@@ -1426,6 +1468,7 @@ class Hub:
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
+        self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -1813,8 +1856,25 @@ class Hub:
                 if active:
                     agent["active"] = agent["seen"]
                     if not self.waiting.get(name) and self.activity.get(name, ("",))[0] != "working":
-                        self.activity[name] = ("working", agent["seen"])
+                        self._set_activity(name, "working", agent["seen"])
                         self._changed()
+
+    def _set_activity(self, name, state, ts):
+        """An agent's state now (working, listening, idle), and in its timeline. Caller holds the lock."""
+        self.activity[name] = (state, ts)
+        self._record_activity(name, state, ts)
+
+    def _record_activity(self, name, state, ts):
+        """A change of an agent's state, for its timeline on the analytics page (X1): in events.sqlite, as it
+        cannot be rebuilt from the chat; not while the owner keeps what agents do off the page. Caller holds
+        the lock."""
+        if self._recorded.get(name) == state or self.machine_config().get("activity") == "off":
+            return
+        self._recorded[name] = state
+        try:
+            self.events.add_activity(name, state, ts)
+        except Exception as e:  # a full disk or a locked file must not stop the chat
+            sys.stderr.write("%s could not record %s's activity: %s\n" % (now_iso(), name, e))
 
     def _activity(self, name, now):
         """What an agent is doing, as far as its hooks tell: working, listening (waiting for
@@ -1827,7 +1887,13 @@ class Hub:
         return state
 
     def _poke(self):
+        """After a listening hook's grace: the pages hear of it, and an agent that did not ask again is idle in
+        its timeline from then."""
         with self.lock:
+            now = time.time()
+            for name, (state, since) in list(self.activity.items()):
+                if state == "listening" and not self.waiting.get(name) and now - since > LISTEN_GRACE:
+                    self._record_activity(name, "idle", since + LISTEN_GRACE)
             self._changed()
 
     def link(self, sid, key):
@@ -3294,7 +3360,7 @@ class Hub:
                 return {"link": True, "again": True}
             agent["seen"] = now = time.time()
             if event == "prompt":
-                self.activity[name] = ("working", now)
+                self._set_activity(name, "working", now)
             if session:
                 self._keep_session(name, session)
             want = not session and self._wants_session(name, table)
@@ -3305,6 +3371,7 @@ class Hub:
                 wait_seconds = min(MAX_WAIT, listen)
             if wait_seconds:
                 self.waiting[name] = self.waiting.get(name, 0) + 1
+                self._record_activity(name, "listening", now)  # (shown so by _activity while it waits)
             self._changed()
         unread = []
         try:
@@ -3316,10 +3383,10 @@ class Hub:
                     if not self.waiting[name]:
                         del self.waiting[name]
                 if unread or event == "prompt":
-                    self.activity[name] = ("working", time.time())
+                    self._set_activity(name, "working", time.time())
                 elif not self.waiting.get(name):
                     # A listening hook asks again at once; if it does not, it has stopped.
-                    self.activity[name] = ("listening" if wait_seconds else "idle", time.time())
+                    self._set_activity(name, "listening" if wait_seconds else "idle", time.time())
                     if wait_seconds:
                         timer = threading.Timer(LISTEN_GRACE + 1, self._poke)
                         timer.daemon = True

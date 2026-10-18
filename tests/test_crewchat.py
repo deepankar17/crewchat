@@ -565,6 +565,20 @@ class EditPaths(unittest.TestCase):
         for bad in ("/abs.py", "C:/x.py", "a/../../b.py", "a\nb", "", "x" * 400, None, 3):
             self.assertEqual(crewchat.clean_edit_path(bad), "", bad)
 
+    def test_timelines_from_recorded_states(self):
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="timeline-", dir=TMP)) / "events.sqlite")
+        for ts, agent, state in ((50, "maya", "idle"), (100, "maya", "working"), (160, "maya", "listening"),
+                                 (400, "maya", "working"), (500, "maya", "listening"),
+                                 (120, "teo", "working"), (130, "teo", "working")):
+            store.add_activity(agent, state, ts)
+        lines = store.timelines(since=90, until=1000, grace=15)
+        self.assertEqual(lines["maya"], [[90, 100, "idle"],  # the state at 90: the last one before it
+                                         [100, 160, "working"], [160, 400, "listening"], [400, 500, "working"],
+                                         [500, 515, "listening"], [515, 1000, "idle"]])  # stopped asking: idle
+        self.assertEqual(lines["teo"], [[120, 1000, "working"]])  # one state again is one piece
+        self.assertEqual(store.timelines(since=2000, until=3000)["maya"], [[2000, 2015, "listening"],
+                                                                          [2015, 3000, "idle"]])
+
     def test_the_event_store(self):
         store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
         store.add_edit("maya", "app/a.kt", "12", ts=100)
@@ -3616,6 +3630,30 @@ class Hooks(Base):
         self.hub.roster.refresh(force=True)
         try:
             self.assertFalse(self.hub.edits_on())
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+    def test_an_agents_day_is_recorded_for_its_timeline(self):
+        # Roadmap X1: working while a turn runs, idle when it ends without listening.
+        session, name = self.linked("timeline-turn")
+        self.hook("claude", "prompt", {"session_id": "timeline-turn"})
+        self.hook("claude", "stop", {"session_id": "timeline-turn"}, listen="0")
+        states = [s for ts, s in [(r[0], r[2]) for r in self.hub.events._conn().execute(
+            "SELECT ts, agent, state FROM activity WHERE agent = ? ORDER BY ts", (name,))]]
+        self.assertEqual(states[-2:], ["working", "idle"])
+        line = self.hub.analytics.report(self.hub, 1)["timelines"][name]
+        self.assertEqual([piece[2] for piece in line][-2:], ["working", "idle"])
+        config = crewchat.load_config()
+        config["activity"] = "off"  # kept off the page: nothing recorded either
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            before = len(states)
+            self.hook("claude", "prompt", {"session_id": "timeline-turn"})
+            count = self.hub.events._conn().execute("SELECT COUNT(*) FROM activity WHERE agent = ?", (name,)).fetchone()[0]
+            self.assertEqual(count, before)
         finally:
             config.pop("activity")
             crewchat.save_config(config)
