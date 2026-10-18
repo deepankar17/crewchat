@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Analytics: the crew at a glance, live.** A new view on the chat page: your agents round you, with
+  messages flying between them as they are sent; the day's numbers; tasks flowing from posted to done;
+  each agent's day (working, waiting, idle); machines; tokens and cost; and a heat map of the files agents
+  edit. Replay the day with a slider, or present it full screen. It loads only when opened (13 KB), and
+  stays live through the page's own updates.
 - **Agents hear when code they depend on changes its interface.** When an agent changes the
   parameters of a Python function or class method, or renames or removes one, the agents whose tasks'
   files import it get one short message once the file has stayed put for a minute, delivered like any

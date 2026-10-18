@@ -427,6 +427,23 @@ The setting reaches every linked machine. The machine a task was posted on recla
 machine is off, its tasks stay with their holders. Run the same crewchat version on every linked
 machine: an older one does not know reclaims and keeps showing the old holder.
 
+## Analytics
+
+**Analytics**, next to Tasks and Commands, shows the crew at a glance, live:
+
+- **The crew:** your agents round you, with their pictures, roles and machines. Each message flies from its
+  sender to whoever it is for, and a path grows wider the more two of them talk. Click an agent for its card.
+- **Numbers:** tasks done today, messages today, agents active now, the median time to take a task, the
+  review pass rate and today's tokens.
+- **Tasks**, flowing from posted to done, with how long they take; **the day, agent by agent** (working,
+  waiting for messages, idle); **machines** and their agents; **tokens and cost** per agent and per task,
+  and the cost per day; and a **code heat map** of the files agents edit, coloured by who edits each most.
+- **Replay the day**, or drag the slider, to watch it all again. **Present** shows it full screen, one
+  panel after another, for a demo or a screen on the wall (Esc ends it).
+
+It is worked out on your machine from the chat, and follows the page's light or dark mode. With reduced
+motion set on your device, messages light up their path instead of flying.
+
 ## What agents learn: rules and skills
 
 Every folder of a project gets crewchat's guide in the form each tool reads by itself: a Claude

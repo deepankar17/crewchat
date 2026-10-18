@@ -586,8 +586,9 @@ class EditPaths(unittest.TestCase):
         store.add_edit("maya", "app/b.kt", "12", ts=300)
         self.assertEqual([e["path"] for e in store.edits(since=150)], ["app/a.kt", "app/b.kt"])
         self.assertEqual([e["ts"] for e in store.edits(task="12")], [100, 300])
-        self.assertEqual(store.files(), [{"path": "app/a.kt", "edits": 2, "agents": ["maya", "teo"], "last": 200},
-                                         {"path": "app/b.kt", "edits": 1, "agents": ["maya"], "last": 300}])
+        self.assertEqual(store.files(), [  # top: who edited it most (on a tie, last)
+            {"path": "app/a.kt", "edits": 2, "agents": ["maya", "teo"], "top": "teo", "last": 200},
+            {"path": "app/b.kt", "edits": 1, "agents": ["maya"], "top": "maya", "last": 300}])
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
@@ -2891,6 +2892,42 @@ class ChatPage(Base):
         self.assertEqual((status, headers["Location"]), (303, "/login"))
         self.assertEqual(json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1]) and
                          self.raw("/api/boot", opener=opener)[2]["Cache-Control"], "no-store")  # the chat's data never kept
+
+    def test_the_analytics_view_is_its_own_script_fetched_when_opened(self):
+        # Roadmap X2: the view's code is not in the page every phone loads; the page fetches it when it opens.
+        self.assertIn('id="view-analytics"', crewchat.CHAT_PAGE)
+        self.assertNotIn("window.crewAnalytics = {", crewchat.CHAT_PAGE)
+        self.assertIn("window.crewAnalytics = {", crewchat.ANALYTICS_JS)
+        self.assertEqual(self.raw("/analytics.js")[0], 401)  # signed out
+        self.assertEqual(self.raw("/analytics.js", headers={"Authorization": "Bearer " + self.token})[0], 401)  # an agent
+        opener, _ = self.owner_browser()
+        status, body, headers = self.raw("/analytics.js", headers={"Accept-Encoding": "gzip"}, opener=opener)
+        self.assertEqual((status, headers["Content-Type"], headers["Content-Encoding"]),
+                         (200, "text/javascript; charset=utf-8", "gzip"))
+        self.assertEqual(gzip.decompress(body), crewchat.ANALYTICS_BYTES)
+        self.assertEqual(headers["Content-Security-Policy"], crewchat.PAGE_HEADERS["Content-Security-Policy"])
+        status, body, _ = self.raw("/analytics.js", headers={"If-None-Match": headers["ETag"]}, opener=opener)
+        self.assertEqual((status, body), (304, b""))  # opened again: the browser's copy
+
+    def test_the_analytics_report_has_the_days_messages_and_the_files_edited(self):
+        session, name = self.agent()
+        task = self.say("all", "Polish the analytics", "task")
+        session.call("hub_task", action="take", id=task)
+        with self.hub.lock:
+            for path in ("app/a.kt", "app/a.kt", "app/b.kt"):
+                self.hub.events.add_edit(name, path, task)
+            self.hub.events.add_edit("someone-else", "app/b.kt", task)
+            self.hub.events.add_edit("someone-else", "app/b.kt", task)
+        report = crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 1})
+        rows = [r for r in report["stream"] if r[4] == task]
+        self.assertEqual([r[3] for r in rows[:2]], ["task", "take"])  # [ts, from, to, kind, task, status]
+        self.assertEqual(rows[0][1:3], ["Owner", "all"])
+        self.assertFalse(any(r[3] in ("event", "plan") for r in report["stream"]))
+        files = {f["path"]: f for f in report["edits"]}
+        self.assertEqual((files["app/a.kt"]["edits"], files["app/a.kt"]["top"]), (2, name))
+        self.assertEqual(files["app/b.kt"]["top"], "someone-else")  # who edited it most
+        with mock.patch.object(crewchat.Hub, "edits_on", lambda hub: False):
+            self.assertEqual(crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 1})["edits"], [])
 
     def test_chat_page_and_api(self):
         session, name = self.agent("cursor")

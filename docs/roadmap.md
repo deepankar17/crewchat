@@ -54,7 +54,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
-| [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | To do | X1 |
+| [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | Done | X1 |
 | [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | To do | X2 |
 
 ## Speed and efficiency
@@ -931,7 +931,7 @@ other machines (the spec's "can"), left for X1.
 
 ### X2
 
-**Analytics show-off page** · P1 · effort L · To do
+**Analytics show-off page** · P1 · effort L · Done
 
 **Goal.** A page that makes people say 'this is awesome': the crew working, live, at a glance.
 

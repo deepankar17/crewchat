@@ -769,6 +769,56 @@ class NewPage(Signed):
         c.until("$('project').textContent === 'Demo' && state.agents.length > 0", what="back to Demo")
         self.assertEqual(c.errors, [])
 
+    def test_the_analytics_view(self):
+        # Roadmap X2: the crew at a glance, live through the chat's own poll; light and dark, desktop and phone.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view and its numbers")
+            self.assertTrue(c.js("$('log').hidden && !$('analytics').hidden"))
+            self.assertGreaterEqual(c.js("$('ax-numbers').children.length"), 5)
+            for panel in ("ax-river", "ax-machines", "ax-lanes", "ax-tokens", "ax-heat"):
+                self.assertTrue(c.js("$('%s').children.length > 0" % panel), panel)
+            self.assertEqual(c.js("crewAnalytics.stats().nodes"), c.js("state.agents.length") + 1)  # and you
+            self.assertIn(self.agent.whoami(), c.js("$('ax-canvas').getAttribute('aria-label')"))
+            # Live: a message flies along its path, from the poll the page makes anyway.
+            sent = c.js("crewAnalytics.stats().sent")
+            self.agent.call("hub_send", to="all", text="For the analytics view")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the message to fly")
+            self.assertTrue(c.js("crewAnalytics.stats().animating"))
+            # 60 frames a second with 20 agents and messages in flight: a frame draws in well under 16 ms.
+            self.assertLess(c.js("crewAnalytics.bench(120, 20)"), 16)
+            # Replay: back to the start of the day, then live again.
+            c.js("crewAnalytics.replay(Number($('ax-scrub').min))")
+            self.assertTrue(c.js("$('ax-when').textContent.startsWith('Replay') && !$('ax-live').hidden"))
+            c.click("#ax-live")
+            self.assertEqual(c.js("[$('ax-when').textContent, crewAnalytics.stats().replay]"), ["Live", None])
+            # Presenting: one panel at a time, under the numbers; Esc ends it.
+            c.click("#ax-present")
+            self.assertEqual(c.js("document.querySelectorAll('#analytics .ax-current').length"), 1)
+            c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+            c.until("!document.body.classList.contains('ax-present')", what="the end of presenting")
+            # Reduced motion: a message lights its path for a moment; nothing flies.
+            c.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-reduced-motion", "value": "reduce"}])
+            c.until("crewAnalytics.stats().reduced", what="reduced motion")
+            sent = c.js("crewAnalytics.stats().sent")
+            self.agent.call("hub_send", to="all", text="Quietly, please")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the quiet message")
+            self.assertEqual(c.js("[crewAnalytics.stats().particles, crewAnalytics.stats().flashes > 0]"), [0, True])
+            # Dark, on a phone: the page's own colours, and nothing wider than the screen.
+            c.size(375, 812, mobile=True, dark=True)
+            c.until("innerWidth === 375 && crewAnalytics.stats().shown", what="a phone")
+            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
+            self.assertLessEqual(c.js("$('analytics').scrollWidth"), 375)
+            self.assertNotEqual(c.js("getComputedStyle(document.querySelector('.ax-card')).backgroundColor"),
+                                "rgb(255, 255, 255)")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.size(1280, 900)
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:

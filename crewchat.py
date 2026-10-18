@@ -1300,10 +1300,18 @@ class Analytics:
                          device=row.get("device", ""), seen=row.get("seen", 0))
         out["usage"] = hub.usage_report(days)
         out["timelines"] = hub.events.timelines(now - days * 86400, now)  # [start, end, state] per agent
+        out["stream"] = hub.stream(now - 86400)  # the last day's messages, for the analytics page's replay (X2)
+        try:
+            out["edits"] = hub.events.files(now - days * 86400, MAX_HEAT_FILES) if hub.edits_on() else []
+        except Exception as e:  # a locked or broken events.sqlite: the rest still shows
+            sys.stderr.write("%s could not read the files edited: %s\n" % (now_iso(), e))
+            out["edits"] = []
         out["built"] = now
         return out
 
 
+MAX_STREAM = 2000  # messages of the last day the analytics page can replay
+MAX_HEAT_FILES = 120  # files on the analytics page's code heat map
 EVENTS_FILE = "events.sqlite"  # in the project's crewchat folder: local records that cannot be rebuilt
 
 
@@ -1400,12 +1408,19 @@ class EventStore:
         return out
 
     def files(self, since=0.0, limit=200):
-        """The files edited since then, most edited first: [{path, edits, agents, last}]."""
+        """The files edited since then, most edited first: [{path, edits, agents, top, last}], top being the agent
+        that edited it most."""
         with self.lock:
-            rows = self._conn().execute(
+            db = self._conn()
+            rows = db.execute(
                 "SELECT path, COUNT(*), GROUP_CONCAT(DISTINCT agent), MAX(ts) FROM edits WHERE ts >= ? "
                 "GROUP BY path ORDER BY COUNT(*) DESC, MAX(ts) DESC LIMIT ?", (since, limit)).fetchall()
-        return [{"path": p, "edits": n, "agents": sorted((a or "").split(",")), "last": last} for p, n, a, last in rows]
+            top = {}
+            for path, agent, n in db.execute("SELECT path, agent, COUNT(*) FROM edits WHERE ts >= ? GROUP BY path, "
+                                             "agent ORDER BY COUNT(*), MAX(ts)", (since,)):
+                top[path] = agent  # the most edits come last
+        return [{"path": p, "edits": n, "agents": sorted((a or "").split(",")), "top": top.get(p, ""), "last": last}
+                for p, n, a, last in rows]
 
     def close(self):
         with self.lock:
@@ -3088,6 +3103,14 @@ class Hub:
             self.agents[name]["status"] = text
             self._save_soon()
             self._changed()
+
+    def stream(self, since):
+        """The messages since then, short, for the analytics page's replay: [ts, from, to, kind, task, status],
+        the task being the message's own id for a task posted. At most MAX_STREAM, the newest."""
+        with self.lock:
+            return [[round(m["ts"], 1), m["from"], m["to"], m["kind"], m["id"] if m["kind"] == "task" else
+                     m.get("task", ""), m.get("status", "")] for m in self.messages
+                    if m["ts"] >= since and m["kind"] not in ("event", "plan")][-MAX_STREAM:]
 
     def history(self, limit):
         with self.lock:
@@ -4996,10 +5019,13 @@ class Handler(BaseHTTPRequestHandler):
         """The chat page: the same for everyone (its data comes from the API), so the browser may keep it and
         ask whether it changed (ETag: 304, a few hundred bytes); compressed when the browser takes gzip.
         Only after the sign-in check, as before."""
-        headers = dict(PAGE_HEADERS, **{"Cache-Control": "private, no-cache", "ETag": PAGE_ETAG,
-                                        "Vary": "Accept-Encoding"})
+        self._kept(PAGE_BYTES, PAGE_GZIP, PAGE_ETAG, "text/html; charset=utf-8")
+
+    def _kept(self, body, packed, etag, ctype):
+        """A file the same for everyone that the browser keeps and asks about (ETag), gzipped when it may be."""
+        headers = dict(PAGE_HEADERS, **{"Cache-Control": "private, no-cache", "ETag": etag, "Vary": "Accept-Encoding"})
         asked = [t.strip() for t in self.headers.get("If-None-Match", "").split(",")]
-        if PAGE_ETAG in asked or "W/" + PAGE_ETAG in asked:
+        if etag in asked or "W/" + etag in asked:
             self.send_response(304)
             for k, v in headers.items():
                 self.send_header(k, v)
@@ -5007,9 +5033,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         if takes_gzip(self.headers.get("Accept-Encoding", "")):
             headers["Content-Encoding"] = "gzip"
-            self._reply(200, PAGE_GZIP, ctype="text/html; charset=utf-8", extra=headers)
+            self._reply(200, packed, ctype=ctype, extra=headers)
         else:
-            self._reply(200, PAGE_BYTES, ctype="text/html; charset=utf-8", extra=headers)
+            self._reply(200, body, ctype=ctype, extra=headers)
 
     def _html(self, code, html, extra=None):
         headers = dict(PAGE_HEADERS)
@@ -5161,6 +5187,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._chat_page()
             else:
                 self._reply(303, b"", extra={"Location": "/login"})
+        elif url.path == "/analytics.js":  # the analytics view (X2): fetched by the chat page when first opened
+            if self._owner_session():
+                self._kept(ANALYTICS_BYTES, ANALYTICS_GZIP, ANALYTICS_ETAG, "text/javascript; charset=utf-8")
+            else:
+                self._json(401, {"error": "sign in"})
         elif url.path == "/login":
             if "code" in query:
                 self._sign_in(query["code"][0], query.get("chat", [""])[0])
@@ -10574,6 +10605,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   <div class="rail-tools">
     <button type="button" class="icon" id="view-tasks" aria-pressed="false" title="The task board">Tasks <span id="tasks-count"></span></button>
     <button type="button" class="icon" id="view-commands" aria-pressed="false" title="Every crewchat command">Commands</button>
+    <button type="button" class="icon" id="view-analytics" aria-pressed="false" title="The crew at a glance">Analytics</button>
   </div>
   <section id="needs-you" hidden aria-label="Needs you">
     <h2 class="rail-head">Needs you <span id="needs-count"></span></h2>
@@ -10622,6 +10654,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
   <p id="search-none" class="none" role="status" hidden>No message here matches the search.</p>
   <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
+  <section id="analytics" hidden aria-label="Analytics"><p class="meta">Loading…</p></section>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
       <span id="board-count" class="meta"></span></div>
@@ -10942,8 +10975,13 @@ function showView(view) {
   if (!log.hidden && view !== "chat") state.pinned = atBottom();
   log.hidden = view !== "chat"; $("form").hidden = view !== "chat";
   $("tasks").hidden = view !== "tasks";
-  $("view-tasks").classList.toggle("on", view === "tasks");
-  $("view-tasks").setAttribute("aria-pressed", String(view === "tasks"));
+  $("analytics").hidden = view !== "analytics";
+  for (const [id, on] of [["view-tasks", view === "tasks"], ["view-analytics", view === "analytics"]]) {
+    $(id).classList.toggle("on", on);
+    $(id).setAttribute("aria-pressed", String(on));
+  }
+  if (view === "analytics") openAnalytics();
+  else if (window.crewAnalytics) crewAnalytics.hide();
   renderWorking();
   if (back && state.pinned !== false) log.scrollTop = log.scrollHeight;
   if (view === "chat") setTimeout(() => markRead(), 0);
@@ -10952,6 +10990,25 @@ function showView(view) {
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
 $("view-tasks").addEventListener("click", () => showView($("tasks").hidden ? "tasks" : "chat"));
+$("view-analytics").addEventListener("click", () => showView($("analytics").hidden ? "analytics" : "chat"));
+
+// The analytics view (X2) is a script of its own, fetched the first time it opens (the browser keeps it, and
+// asks whether it changed), then run as one of the page's.
+let analyticsCode = null;
+function openAnalytics() {
+  analyticsCode = analyticsCode || fetch("/analytics.js", { cache: "no-cache" }).then((res) => {
+    if (!res.ok) throw new Error("the host answered " + res.status);
+    return res.text();
+  }).then((code) => {
+    const script = document.createElement("script");
+    script.textContent = code;
+    document.head.append(script);
+  });
+  analyticsCode.then(() => { if (!$("analytics").hidden) crewAnalytics.show($("analytics")); }).catch((e) => {
+    analyticsCode = null;
+    $("analytics").replaceChildren(el("p", "meta", "Could not open the analytics: " + e.message + ". Try again."));
+  });
+}
 $("view-commands").addEventListener("click", () => (state.panel && state.panel.kind === "commands" ? closePanel() : openPanel("commands")));
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
@@ -11313,7 +11370,7 @@ $("task-form").addEventListener("submit", async (event) => {
   if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
     fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
 });
-try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks") showView(v); } catch (e) {}
+try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "analytics") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
 // Which files agents edit (C0): the project's setting, and the files edited lately. Read when the project panel is
@@ -12894,6 +12951,7 @@ async function loop() {
         if (!state.missed) document.title = state.title;
       }
       renderProjects(data.projects, data.chat);
+      state.link = data.link;
       renderLink(data.link);
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
@@ -12908,6 +12966,7 @@ async function loop() {
       renderAgents();
       renderWorking();
       addMessages(data.messages, first);
+      if (window.crewAnalytics) crewAnalytics.poll(data);  // the analytics view, live from this same poll
       // Roles changed (here or in another tab): what the roles panels show is read again.
       if (state.roleInfo && JSON.stringify(state.roles) !== state.rolesKey)
         loadRoles().then(() => renderPanel()).catch(() => {});
@@ -13115,6 +13174,843 @@ loop();
 """
 LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
+# The analytics view (X2): a script of its own, which the chat page fetches the first time the view opens, so the
+# page every phone loads stays the size it was.
+ANALYTICS_JS = r"""// crewchat's analytics view (roadmap X2): the crew working, live, at a glance. The chat page fetches this the
+// first time the view opens and runs it as one of its own scripts, so it uses the page's state and helpers
+// ($, el, state, avatar, postJSON, openPanel, showView). Live through the page's poll: no polling of its own.
+(() => {
+  "use strict";
+  const CSS = `
+#analytics { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(18px, calc((100% - 1120px) / 2)); }
+#analytics .view-head { flex-wrap: wrap; }
+.ax-tools { margin-left: auto; display: flex; gap: 6px; align-items: center; }
+.ax-tools button, .ax-replay button { font: inherit; font-size: 13px; border: 1px solid var(--line); background: var(--panel);
+  color: var(--ink); border-radius: 999px; padding: 5px 12px; cursor: pointer; }
+.ax-tools button:hover, .ax-replay button:hover { border-color: var(--accent); }
+.ax-numbers { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 12px; }
+.ax-num { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; min-width: 0; }
+.ax-num b { display: block; font-size: 28px; line-height: 1.15; color: var(--ink); font-variant-numeric: tabular-nums;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ax-num span { font-size: 12.5px; color: var(--muted); }
+.ax-card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px;
+  margin-bottom: 12px; min-width: 0; }
+.ax-card h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 8px; }
+.ax-card .meta { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; }
+.ax-hero { position: relative; }
+.ax-hero canvas { display: block; width: 100%; height: 380px; cursor: default; touch-action: pan-y; }
+.ax-replay { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; color: var(--muted); }
+.ax-replay input { flex: 1; min-width: 0; accent-color: var(--accent); }
+.ax-replay output { min-width: 92px; text-align: right; font-variant-numeric: tabular-nums; }
+.ax-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0 12px; }
+.ax-wide { grid-column: 1 / -1; }
+.ax-card svg { display: block; width: 100%; overflow: visible; }
+.ax-card svg text { fill: var(--text); font-size: 11px; font-family: inherit; }
+.ax-card svg text.ax-muted { fill: var(--muted); }
+.ax-card svg text.ax-big { font-size: 15px; font-weight: 600; fill: var(--ink); }
+.ax-flow { fill: none; stroke-dasharray: 5 9; animation: ax-flow 1.4s linear infinite; }
+@keyframes ax-flow { to { stroke-dashoffset: -28; } }
+.ax-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
+.ax-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; vertical-align: -1px; }
+.ax-machines { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 2px; }
+.ax-machine { flex: 0 0 auto; min-width: 180px; max-width: 260px; border: 1px solid var(--line); border-radius: 14px; padding: 8px 10px; }
+.ax-machine b { color: var(--ink); font-size: 13.5px; }
+.ax-machine .meta { margin: 2px 0 6px; }
+.ax-chip { display: flex; align-items: center; gap: 6px; font-size: 12.5px; margin: 3px 0; min-width: 0; }
+.ax-chip .avatar { width: 22px; height: 22px; flex: 0 0 22px; font-size: 9px; }
+.ax-chip span.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ax-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; background: var(--off); }
+.ax-dot.on { background: var(--ok); } .ax-dot.listen { background: var(--accent); }
+.ax-heat { display: flex; flex-direction: column; gap: 8px; }
+.ax-group h4 { margin: 0 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.ax-tiles { display: flex; flex-wrap: wrap; gap: 4px; }
+.ax-tile { flex: 1 1 auto; min-width: 70px; height: 42px; border-radius: 8px; padding: 4px 7px; font-size: 11.5px;
+  color: var(--ink); overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border: 1px solid var(--line); }
+.ax-tile small { display: block; color: var(--muted); font-size: 10.5px; }
+.ax-bars { display: grid; grid-template-columns: minmax(70px, max-content) minmax(0, 1fr) max-content; gap: 4px 8px;
+  align-items: center; font-size: 12.5px; }
+.ax-bars .bar { height: 10px; border-radius: 5px; background: var(--accent); min-width: 2px; }
+.ax-bars .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ax-bars .val { color: var(--muted); font-variant-numeric: tabular-nums; }
+.ax-empty { font-size: 13px; color: var(--muted); margin: 4px 0; }
+.ax-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 760px) {
+  .ax-grid { grid-template-columns: minmax(0, 1fr); }
+  .ax-hero canvas { height: 300px; }
+  .ax-num b { font-size: 22px; }
+  .ax-numbers { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (prefers-reduced-motion: reduce) { .ax-flow { animation: none; } }
+body.ax-present #analytics { position: fixed; inset: 0; z-index: 200; background: var(--bg); padding: 22px 32px; }
+body.ax-present .ax-grid { display: block; }
+body.ax-present .ax-panel:not(.ax-current) { display: none; }
+body.ax-present .ax-num b { font-size: 44px; }
+body.ax-present .ax-num span { font-size: 16px; }
+body.ax-present .ax-card h3 { font-size: 18px; }
+body.ax-present .ax-card svg text { font-size: 15px; }
+body.ax-present .ax-hero canvas { height: calc(100vh - 300px); }
+body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
+`;
+  const style = document.createElement("style");
+  style.id = "ax-style";
+  style.textContent = CSS;
+  document.head.append(style);
+
+  const DAY = 86400;
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)");
+  const dark = matchMedia("(prefers-color-scheme: dark)");
+  const STAGES = [["todo", "To do", "off"], ["doing", "Doing", "accent"], ["blocked", "Blocked", "err"],
+                  ["review", "Review", "warn"], ["done", "Done", "ok"]];
+  const LANES = [["working", "Working", "accent"], ["listening", "Waiting for messages", "ok"], ["idle", "Idle", "line"]];
+  const ax = { root: null, report: null, fetched: 0, fetching: null, shown: false, nodes: [], byName: new Map(),
+               edges: new Map(), live: new Map(), particles: [], flashes: [], raf: 0, size: { w: 0, h: 0 }, imgs: new Map(),
+               colors: null, replay: null, playing: false, last: 0, present: false, rotate: 0, panel: 0, sent: 0, fresh: 0, frames: 0,
+               crewKey: "" };
+  const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+  const svgNS = "http://www.w3.org/2000/svg";
+  const svg = (tag, attrs, text) => {
+    const e = document.createElementNS(svgNS, tag);
+    for (const [k, v] of Object.entries(attrs || {})) e.setAttribute(k, v);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const now = () => (ax.replay !== null ? ax.replay : state.now);
+
+  // Numbers and colours ---------------------------------------------------------------------------
+  function dur(s) {
+    if (s === null || s === undefined) return "—";
+    if (s < 90) return Math.round(s) + " s";
+    if (s < 5400) return Math.round(s / 60) + " min";
+    if (s < 2 * DAY) { const m = Math.round((s % 3600) / 60); return Math.floor(s / 3600) + " h" + (m ? " " + m + " min" : ""); }
+    return Math.round(s / DAY) + " d";
+  }
+  const count = (n) => (n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e4 ? Math.round(n / 1e3) + "k" : String(n));
+  const money = (c) => "~$" + (c >= 100 ? Math.round(c) : c >= 1 ? c.toFixed(1) : c.toFixed(2));
+  const clock = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  function readColors() {
+    const cs = getComputedStyle(document.documentElement), v = (k) => cs.getPropertyValue(k).trim();
+    ax.colors = { ink: v("--ink"), text: v("--text"), muted: v("--muted"), line: v("--line"), panel: v("--panel"),
+                  soft: v("--soft"), tint: v("--tint"), accent: v("--accent"), ok: v("--ok"), warn: v("--warn"),
+                  err: v("--err"), off: v("--off"), onAccent: v("--on-accent"), pal: [0, 1, 2, 3, 4, 5, 6, 7].map((i) => v("--a" + i)) };
+  }
+  function rgba(color, alpha) {
+    const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(color || "");
+    if (!m) return color;
+    return "rgba(" + parseInt(m[1], 16) + "," + parseInt(m[2], 16) + "," + parseInt(m[3], 16) + "," + alpha + ")";
+  }
+  function agentColor(name) {
+    const a = state.agents.find((x) => x.agent === name);
+    if (a && a.colour) return a.colour;
+    const i = state.agents.findIndex((x) => x.agent === name);
+    return i < 0 ? ax.colors.accent : ax.colors.pal[i % 8];
+  }
+  function roleColor(role) {
+    if (!role) return ax.colors.muted;
+    const i = (state.roles || []).findIndex((r) => r.name === role);
+    return ax.colors.pal[((i < 0 ? role.length : i) + 3) % 8];
+  }
+
+  // The view's frame ------------------------------------------------------------------------------
+  function build(root) {
+    root.replaceChildren();
+    const head = el("div", "view-head");
+    const back = el("button", "icon back", "←");
+    back.type = "button"; back.setAttribute("aria-label", "Back to the chat");
+    back.addEventListener("click", () => showView("chat"));
+    const tools = el("div", "ax-tools");
+    const show = el("button", "", "Present");
+    show.type = "button"; show.id = "ax-present"; show.title = "Full screen, large type, one panel after another (Esc ends it)";
+    show.addEventListener("click", () => present(!ax.present));
+    tools.append(show);
+    const meta = el("span", "meta", "");
+    meta.id = "ax-meta";
+    head.append(back, el("h2", "", "Analytics"), meta, tools);
+    const numbers = el("div", "ax-numbers");
+    numbers.id = "ax-numbers";
+    const hero = el("section", "ax-card ax-hero ax-panel");
+    hero.setAttribute("aria-label", "The crew, live");
+    const canvas = el("canvas");
+    canvas.id = "ax-canvas";
+    canvas.setAttribute("role", "img");
+    const list = el("ul", "ax-sr");
+    list.id = "ax-crew-list";
+    const replay = el("div", "ax-replay");
+    const play = el("button", "", "▶ Replay the day");
+    play.type = "button"; play.id = "ax-play";
+    play.addEventListener("click", () => (ax.playing ? stopPlay() : startPlay()));
+    const scrub = el("input");
+    scrub.type = "range"; scrub.id = "ax-scrub"; scrub.step = "60";
+    scrub.setAttribute("aria-label", "The time shown: drag to replay the day");
+    scrub.addEventListener("input", () => { stopPlay(); setReplay(Number(scrub.value)); });
+    const when = el("output", "", "Live");
+    when.id = "ax-when";
+    const live = el("button", "", "Live");
+    live.type = "button"; live.id = "ax-live"; live.hidden = true;
+    live.addEventListener("click", () => { stopPlay(); setReplay(null); });
+    replay.append(play, scrub, when, live);
+    hero.append(el("h3", "", "The crew, live"), canvas, list, replay);
+    const grid = el("div", "ax-grid");
+    const card = (id, title, wide) => {
+      const c = el("section", "ax-card ax-panel" + (wide ? " ax-wide" : ""));
+      c.setAttribute("aria-label", title);
+      const body = el("div");
+      body.id = id;
+      c.append(el("h3", "", title), body);
+      grid.append(c);
+      return body;
+    };
+    card("ax-river", "Tasks, from posted to done");
+    card("ax-machines", "Machines");
+    card("ax-lanes", "The day, agent by agent", true);
+    card("ax-tokens", "Tokens and cost");
+    card("ax-heat", "Code heat map");
+    root.append(head, numbers, hero, grid);
+    canvas.addEventListener("click", (e) => {
+      const hit = nodeAt(e);
+      if (hit && !hit.owner) openPanel("agent", hit.name);
+    });
+    canvas.addEventListener("mousemove", (e) => {
+      const hit = nodeAt(e);
+      canvas.title = hit ? (hit.owner ? "You" : hit.name + (hit.a.role ? " · " + hit.a.role : "") +
+        (hit.a.device ? " · " + hit.a.device : "")) : "";
+      canvas.style.cursor = hit && !hit.owner ? "pointer" : "default";
+    });
+    ax.ctx = canvas.getContext("2d");
+    new ResizeObserver(() => resize()).observe(canvas);
+  }
+
+  function resize() {
+    const canvas = $("ax-canvas");
+    if (!canvas || !ax.shown) return;
+    const w = canvas.clientWidth, h = canvas.clientHeight, dpr = Math.min(window.devicePixelRatio || 1, 2);
+    if (!w || !h) return;
+    canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+    ax.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ax.size = { w, h };
+    layout();
+    draw(performance.now());
+  }
+
+  // The constellation: agents round the owner, messages flying between them ---------------------------
+  function crew() {
+    const agents = state.agents.slice().sort((a, b) => (a.device || "").localeCompare(b.device || "") ||
+                                                      a.agent.localeCompare(b.agent));
+    return [{ agent: "Owner", owner: true }].concat(agents);
+  }
+  function layout(list) {
+    const { w, h } = ax.size;
+    list = list || crew();
+    const n = list.length - 1, cx = w / 2, cy = h / 2 - 6;
+    const r = n > 16 ? 14 : n > 10 ? 17 : n > 6 ? 20 : 24;
+    const rx = Math.max(60, w / 2 - r - 40), ry = Math.max(50, h / 2 - r - 26);
+    ax.nodes = list.map((a, i) => {
+      if (a.owner) return { a, name: "Owner", owner: true, x: cx, y: cy, r: r + 4, phase: 0, pulse: -1e9 };
+      const inner = n > 12 && i % 2 === 0;
+      const ang = -Math.PI / 2 + ((i - 1) / n) * Math.PI * 2;
+      const k = inner ? 0.62 : 1;
+      return { a, name: a.agent, x: cx + Math.cos(ang) * rx * k, y: cy + Math.sin(ang) * ry * k, r, ang,
+               phase: i * 1.7, pulse: -1e9 };
+    });
+    ax.byName = new Map(ax.nodes.map((nd) => [nd.name, nd]));
+    ax.crewKey = list.map((a) => a.agent + "|" + (a.picture || "") + "|" + (a.role || "")).join(",");
+  }
+  function nodeAt(e) {
+    const box = e.target.getBoundingClientRect(), x = e.clientX - box.left, y = e.clientY - box.top;
+    return ax.nodes.find((nd) => Math.hypot((nd.px || nd.x) - x, (nd.py || nd.y) - y) <= nd.r + 4) || null;
+  }
+  function picture(a) {
+    const [kind, id] = (a.picture || "").split(":");
+    if (kind === "preset" && own(state.presets, id)) return { emoji: state.presets[id] };
+    const src = kind === "art" && own(state.art, id) ? "/pictures/" + id + ".webp" : kind === "file" && id ? "/files/" + id : "";
+    if (!src) return null;
+    let img = ax.imgs.get(src);
+    if (!img) {
+      img = new Image();
+      img.onload = () => wake();
+      img.src = src;
+      ax.imgs.set(src, img);
+    }
+    return img.complete && img.naturalWidth ? { img } : null;
+  }
+  const key = (a, b) => (a < b ? a + "\n" + b : b + "\n" + a);
+  function bump(map, a, b, n) { if (a && b && a !== b) map.set(key(a, b), (map.get(key(a, b)) || 0) + (n || 1)); }
+  function edgesNow() {
+    if (ax.replay === null) {
+      const out = new Map(ax.edges);
+      for (const [k, n] of ax.live) out.set(k, (out.get(k) || 0) + n);
+      return out;
+    }
+    const out = new Map();
+    for (const [ts, from, to] of stream()) if (ts <= ax.replay && to !== "all") bump(out, from, to);
+    return out;
+  }
+  function curve(a, b) {
+    const mx = (a.px + b.px) / 2, my = (a.py + b.py) / 2, dx = b.px - a.px, dy = b.py - a.py;
+    return { x: mx - dy * 0.12, y: my + dx * 0.12 };
+  }
+  function along(a, c, b, t) {
+    const u = 1 - t;
+    return { x: u * u * a.px + 2 * u * t * c.x + t * t * b.px, y: u * u * a.py + 2 * u * t * c.y + t * t * b.py };
+  }
+  function draw(t) {
+    const c = ax.ctx, col = ax.colors;
+    if (!c || !col) return;
+    const { w, h } = ax.size;
+    c.clearRect(0, 0, w, h);
+    const moving = !reduce.matches;
+    if (!moving && ax.particles.length) ax.particles = [];  // reduced motion: nothing flies
+    for (const nd of ax.nodes) {
+      const d = moving && !nd.owner ? Math.sin(t / 1500 + nd.phase) * 3 : 0;
+      nd.px = nd.x + d * Math.cos(nd.phase); nd.py = nd.y + d * Math.sin(nd.phase * 1.3);
+    }
+    // Who writes to whom: wider for more messages.
+    const edges = edgesNow();
+    let max = 1;
+    for (const n of edges.values()) max = Math.max(max, n);
+    c.lineCap = "round";
+    for (const [k, n] of edges) {
+      const [p, q] = k.split("\n"), a = ax.byName.get(p), b = ax.byName.get(q);
+      if (!a || !b) continue;
+      const m = curve(a, b);
+      c.strokeStyle = rgba(col.accent, 0.16 + 0.3 * Math.sqrt(n / max));
+      c.lineWidth = 1 + 6 * Math.sqrt(n / max);
+      c.beginPath(); c.moveTo(a.px, a.py); c.quadraticCurveTo(m.x, m.y, b.px, b.py); c.stroke();
+    }
+    // With reduced motion a message lights its path for a moment instead of flying along it.
+    ax.flashes = ax.flashes.filter((f) => f.until > t);
+    for (const f of ax.flashes) {
+      const m = curve(f.a, f.b);
+      c.strokeStyle = rgba(f.color, 0.85); c.lineWidth = 3;
+      c.beginPath(); c.moveTo(f.a.px, f.a.py); c.quadraticCurveTo(m.x, m.y, f.b.px, f.b.py); c.stroke();
+    }
+    for (const p of ax.particles) {
+      const k = (t - p.start) / p.dur;
+      if (k < 0) continue;
+      if (k >= 1) { p.done = true; p.to.pulse = t; continue; }
+      const e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2, m = curve(p.from, p.to);
+      for (let i = 3; i >= 0; i--) {
+        const pt = along(p.from, m, p.to, Math.max(0, e - i * 0.035));
+        c.fillStyle = rgba(p.color, i ? 0.18 * (4 - i) : 1);
+        c.beginPath(); c.arc(pt.x, pt.y, i ? 3 : 4.5, 0, Math.PI * 2); c.fill();
+      }
+    }
+    if (ax.particles.some((p) => p.done)) ax.particles = ax.particles.filter((p) => !p.done);
+    const many = new Set(state.agents.map((a) => a.device)).size > 1;
+    c.textAlign = "center"; c.textBaseline = "middle";
+    for (const nd of ax.nodes) drawNode(c, nd, t, many);
+    if (!state.agents.length) {
+      c.fillStyle = col.muted; c.font = "13px system-ui, sans-serif";
+      c.fillText("No agents yet: they appear here as they join.", w / 2, h / 2 + 50);
+    }
+  }
+  function drawNode(c, nd, t, many) {
+    const col = ax.colors, { r } = nd, x = nd.px, y = nd.py;
+    const since = t - nd.pulse;
+    if (since < 700) {
+      const k = since / 700;
+      c.strokeStyle = rgba(nd.owner ? col.accent : agentColor(nd.name), 0.6 * (1 - k)); c.lineWidth = 3;
+      c.beginPath(); c.arc(x, y, r + 4 + 10 * k, 0, Math.PI * 2); c.stroke();
+    }
+    c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2);
+    if (nd.owner) {
+      c.fillStyle = col.accent; c.fill();
+      c.fillStyle = col.onAccent; c.font = "600 " + Math.round(r * 0.62) + "px system-ui, sans-serif";
+      c.fillText("You", x, y);
+      return;
+    }
+    const a = nd.a, pic = picture(a);
+    c.fillStyle = a.colour || col.tint; c.fill();
+    if (pic && pic.img) {
+      c.save(); c.beginPath(); c.arc(x, y, r - 2, 0, Math.PI * 2); c.clip();
+      c.drawImage(pic.img, x - r, y - r, r * 2, r * 2); c.restore();
+    } else if (pic && pic.emoji) {
+      c.font = Math.round(r * 1.05) + "px system-ui, sans-serif"; c.fillText(pic.emoji, x, y + 1);
+    } else {
+      c.fillStyle = agentColor(nd.name); c.font = "600 " + Math.round(r * 0.72) + "px system-ui, sans-serif";
+      c.fillText(initials(a.agent), x, y + 1);
+    }
+    c.strokeStyle = roleColor(a.role); c.lineWidth = 3;
+    c.beginPath(); c.arc(x, y, r, 0, Math.PI * 2); c.stroke();
+    const act = a.activity === "working" ? col.ok : a.activity === "listening" ? col.accent : a.online ? col.ok : col.off;
+    c.fillStyle = act; c.strokeStyle = col.panel; c.lineWidth = 2;
+    c.beginPath(); c.arc(x + r * 0.72, y + r * 0.72, 5, 0, Math.PI * 2); c.fill(); c.stroke();
+    c.fillStyle = col.text; c.font = "12px system-ui, sans-serif";
+    c.fillText(a.agent.length > 16 ? a.agent.slice(0, 15) + "…" : a.agent, x, y + r + 12);
+    if (many && a.device) { c.fillStyle = col.muted; c.font = "10.5px system-ui, sans-serif"; c.fillText(a.device, x, y + r + 25); }
+  }
+  function tick(t) {
+    ax.raf = 0;
+    if (!ax.shown || document.hidden) return;
+    if (ax.playing) advance(t);
+    draw(t);
+    ax.frames++;
+    if (ax.playing || !reduce.matches || ax.particles.length) ax.raf = requestAnimationFrame(tick);
+    else if (ax.flashes.length) setTimeout(wake, 300);
+  }
+  function wake() { if (!ax.raf && ax.shown) ax.raf = requestAnimationFrame(tick); }
+
+  function fly(from, to, at, color) {
+    if (reduce.matches) { ax.flashes.push({ a: from, b: to, until: performance.now() + 1500, color }); return; }
+    ax.particles.push({ from, to, start: at + Math.random() * 120, dur: 850 + Math.random() * 300, color });
+    if (ax.particles.length > 300) ax.particles.splice(0, ax.particles.length - 300);
+  }
+  // A message newer than the report: its path gets wider (until the next report counts it), and, while the view
+  // is open, it flies there.
+  function message(from, to, live) {
+    if (to !== "all") bump(ax.live, from, to);
+    ax.fresh++;
+    const a = ax.byName.get(from);
+    if (!live || !a || !ax.shown) return;
+    const targets = to === "all" ? ax.nodes.filter((n) => n !== a).slice(0, 24) : [ax.byName.get(to)].filter(Boolean);
+    const t = performance.now();
+    for (const b of targets) fly(a, b, t, a.owner ? ax.colors.accent : agentColor(from));
+    ax.sent++;
+    wake();
+  }
+
+  // Replay: the last 24 hours, scrubbed or played ------------------------------------------------------
+  function stream() { return (ax.report && ax.report.stream) || []; }
+  function setReplay(ts) {
+    const scrub = $("ax-scrub");
+    ax.replay = ts === null || ts >= Number(scrub.max) - 30 ? null : ts;
+    if (ax.replay === null) scrub.value = scrub.max;
+    $("ax-when").textContent = ax.replay === null ? "Live" : "Replay " + clock(ax.replay);
+    $("ax-live").hidden = ax.replay === null;
+    renderRiver(); renderLanes();
+    wake();
+  }
+  function startPlay() {
+    if (!ax.report) return;
+    const scrub = $("ax-scrub");
+    if (ax.replay === null) setReplay(Number(scrub.min));
+    ax.playing = true; ax.last = 0;
+    $("ax-play").textContent = "❚❚ Pause";
+    wake();
+  }
+  function stopPlay() {
+    if (!ax.playing) return;
+    ax.playing = false;
+    $("ax-play").textContent = "▶ Replay the day";
+  }
+  function advance(t) {  // what the scrubber spans (up to a day) in about 30 seconds
+    const scrub = $("ax-scrub"), span = Number(scrub.max) - Number(scrub.min);
+    const step = ax.last ? Math.min(100, t - ax.last) * (span / 30000) : 0;
+    ax.last = t;
+    const from = ax.replay, to = Math.min(Number(scrub.max), from + step);
+    let flown = 0;
+    for (const [ts, sender, recipient] of stream()) {
+      if (ts > from && ts <= to && flown++ < 30) {
+        const a = ax.byName.get(sender), targets = recipient === "all" ? ax.nodes.filter((n) => n !== a).slice(0, 12)
+          : [ax.byName.get(recipient)].filter(Boolean);
+        if (a) for (const b of targets) fly(a, b, t, a.owner ? ax.colors.accent : agentColor(sender));
+      }
+    }
+    scrub.value = String(to);
+    if (to >= Number(scrub.max)) { stopPlay(); setReplay(null); return; }
+    ax.replay = to;
+    $("ax-when").textContent = "Replay " + clock(to);
+    $("ax-live").hidden = false;
+    if (Math.floor(to / 600) !== Math.floor(from / 600)) { renderRiver(); renderLanes(); }
+  }
+
+  // Headline numbers ---------------------------------------------------------------------------------------
+  function renderNumbers() {
+    const box = $("ax-numbers"), r = ax.report;
+    if (!box) return;
+    const t = (r && r.tasks) || {};
+    const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
+    const today = stream().filter((m) => m[0] >= midnight / 1000).length + ax.fresh;
+    const active = state.agents.filter((a) => a.activity === "working" || a.activity === "listening" || a.online).length;
+    const usage = r && r.usage, tokens = usage && usage.on ?
+      Object.values(usage.agents || {}).reduce((s, a) => s + (a.today || 0), 0) : null;
+    const tiles = [
+      [String(t.done_today || 0), "tasks done today"],
+      [count(today), "messages today"],
+      [active + (state.agents.length ? " of " + state.agents.length : ""), "agents active now"],
+      [dur(t.time_to_take), "median time to take a task"],
+      [t.review_pass_rate === null || t.review_pass_rate === undefined ? "—" : Math.round(t.review_pass_rate * 100) + "%",
+       "review pass rate"],
+    ];
+    if (tokens !== null) tiles.push([count(tokens), "tokens today"]);
+    box.replaceChildren(...tiles.map(([n, label]) => {
+      const tile = el("div", "ax-num");
+      tile.append(el("b", "", n), el("span", "", label));
+      return tile;
+    }));
+  }
+
+  // The task river ----------------------------------------------------------------------------------------
+  function stageOf(status) {
+    return status === "in_progress" || status === "take" ? "doing" : status === "waiting" ? "todo" :
+      ["todo", "doing", "blocked", "review", "done"].includes(status) ? status : "todo";
+  }
+  function riverTasks() {
+    if (ax.replay === null) return state.sheet.map((r) => ({ id: r.id, title: r.title, stage: stageOf(r.status) }));
+    const tasks = new Map();
+    for (const [ts, , , kind, task, status] of stream()) {
+      if (ts > ax.replay || !task) continue;
+      if (kind === "task") tasks.set(task, "todo");
+      else if (kind === "take" || kind === "assign") tasks.set(task, "doing");
+      else if (kind === "update" && status) tasks.set(task, stageOf(status));
+    }
+    const titles = new Map(state.sheet.map((r) => [r.id, r.title]));
+    return [...tasks].map(([id, stage]) => ({ id, title: titles.get(id) || "", stage }));
+  }
+  function renderRiver() {
+    const box = $("ax-river");
+    if (!box) return;
+    const tasks = riverTasks(), col = ax.colors, W = Math.max(280, box.clientWidth || 480), H = 170;
+    const by = Object.fromEntries(STAGES.map(([s]) => [s, []]));
+    for (const t of tasks) by[t.stage].push(t);
+    const most = Math.max(1, ...STAGES.map(([s]) => by[s].length));
+    const gap = W / STAGES.length, mid = 92;
+    const g = svg("svg", { viewBox: "0 0 " + W + " " + H, height: H, role: "img",
+                           "aria-label": STAGES.map(([s, label]) => label + " " + by[s].length).join(", ") });
+    const pools = STAGES.map(([s, label, c], i) => {
+      const n = by[s].length, hgt = 22 + 70 * Math.sqrt(n / most);
+      return { s, label, color: col[c], n, x: gap * i + gap / 2, h: n ? hgt : 16 };
+    });
+    const w = Math.min(gap - 14, 64);
+    for (let i = 0; i + 1 < pools.length; i++) {  // the river between two stages: a band, and the flow along it
+      const a = pools[i], b = pools[i + 1], band = 4 + 0.3 * Math.min(a.h, b.h);
+      const path = "M" + (a.x + w / 2) + " " + mid + " L" + (b.x - w / 2) + " " + mid;
+      g.append(svg("path", { d: path, stroke: rgba(b.color, 0.2), "stroke-width": band, fill: "none" }));
+      if (b.n || a.n) g.append(svg("path", { d: path, stroke: rgba(b.color, 0.75), "stroke-width": 2, class: "ax-flow" }));
+    }
+    for (const p of pools) {
+      g.append(svg("rect", { x: p.x - w / 2, y: mid - p.h / 2, width: w, height: p.h, rx: 12,
+                             fill: rgba(p.color, 0.16), stroke: rgba(p.color, 0.9), "stroke-width": 1.5 }));
+      g.append(svg("text", { x: p.x, y: mid - p.h / 2 - 22, "text-anchor": "middle", class: "ax-big" }, String(p.n)));
+      g.append(svg("text", { x: p.x, y: mid - p.h / 2 - 8, "text-anchor": "middle", class: "ax-muted" }, p.label));
+      const shown = by[p.s].slice(0, 24), per = Math.max(1, Math.floor((w - 8) / 9));
+      shown.forEach((t, i) => {
+        const dot = svg("circle", { cx: p.x - ((Math.min(per, shown.length) - 1) * 9) / 2 + (i % per) * 9,
+                                    cy: mid - p.h / 2 + 10 + Math.floor(i / per) * 9, r: 3.2, fill: p.color });
+        dot.append(svg("title", {}, "#" + t.id + (t.title ? " " + t.title : "")));
+        g.append(dot);
+      });
+    }
+    const t = (ax.report && ax.report.tasks) || {};
+    const meta = el("p", "meta", "Median time to take a task " + dur(t.time_to_take) + " · from posted to done " +
+                    dur(t.cycle_time) + (t.time_blocked ? " · blocked for " + dur(t.time_blocked) : "") +
+                    (ax.replay !== null ? " · as at " + clock(ax.replay) : ""));
+    box.replaceChildren(g, meta);
+  }
+
+  // Swimlanes: each agent's day ----------------------------------------------------------------------------
+  function renderLanes() {
+    const box = $("ax-lanes"), r = ax.report;
+    if (!box) return;
+    const lines = (r && r.timelines) || {}, col = ax.colors, end = state.now;
+    const names = Object.keys(lines).filter((n) => lines[n].some((p) => p[1] > end - DAY)).sort();
+    // From the first thing recorded today (the last 20 minutes at least, the last day at most), so a crew
+    // that started an hour ago fills the width.
+    const first = Math.min(...names.map((n) => lines[n].find((p) => p[1] > end - DAY)[0]));
+    const start = Math.max(end - DAY, Math.min(end - 1200, first - (end - first) * 0.04));
+    const span = end - start, step = [300, 600, 1800, 3600, 7200, 10800].find((s) => span / s <= 8) || 10800;
+    if (!names.length) {
+      box.replaceChildren(el("p", "ax-empty", "No activity recorded yet: it fills in as agents work, wait and go idle."));
+      return;
+    }
+    const W = Math.max(300, box.clientWidth || 700), label = W < 520 ? 76 : 120, row = 22, top = 18;
+    const H = top + names.length * row + 4, x = (ts) => label + ((Math.max(start, Math.min(end, ts)) - start) / span) * (W - label - 4);
+    const g = svg("svg", { viewBox: "0 0 " + W + " " + H, height: H, role: "img",
+                           "aria-label": "What each agent did since " + clock(start) });
+    for (let h = Math.ceil(start / step) * step; h <= end; h += step) {
+      g.append(svg("line", { x1: x(h), x2: x(h), y1: top - 4, y2: H, stroke: col.line, "stroke-width": 1 }));
+      g.append(svg("text", { x: x(h), y: 10, "text-anchor": "middle", class: "ax-muted" }, clock(h)));
+    }
+    const colours = Object.fromEntries(LANES.map(([s, , c]) => [s, col[c]]));
+    names.forEach((name, i) => {
+      const y = top + i * row;
+      g.append(svg("text", { x: 0, y: y + row / 2 + 3 }, name.length > 15 ? name.slice(0, 14) + "…" : name));
+      g.append(svg("rect", { x: label, y: y + 4, width: W - label - 4, height: row - 8, rx: 4, fill: col.soft }));
+      for (const [s, e, st] of lines[name]) {
+        if (e <= start || !colours[st]) continue;
+        const seg = svg("rect", { x: x(s), y: y + 4, width: Math.max(1.5, x(e) - x(s)), height: row - 8, rx: 3,
+                                  fill: st === "idle" ? col.line : rgba(colours[st], 0.85) });
+        seg.append(svg("title", {}, name + ": " + st + " " + clock(s) + "–" + clock(e)));
+        g.append(seg);
+      }
+    });
+    const at = x(now());
+    g.append(svg("line", { x1: at, x2: at, y1: top - 6, y2: H, stroke: col.err, "stroke-width": 1.5 }));
+    const legend = el("div", "ax-legend");
+    for (const [, text, c] of LANES) {
+      const item = el("span");
+      const sw = el("i"); sw.style.background = col[c];
+      item.append(sw, text);
+      legend.append(item);
+    }
+    box.replaceChildren(g, legend);
+  }
+
+  // Machines -------------------------------------------------------------------------------------------------
+  function renderMachines() {
+    const box = $("ax-machines");
+    if (!box) return;
+    const link = state.link || { via: "none" }, groups = new Map();
+    for (const a of state.agents) {
+      const name = a.device || state.device || "this machine";
+      if (!groups.has(name)) groups.set(name, []);
+      groups.get(name).push(a);
+    }
+    if (!groups.size) groups.set(state.device || "this machine", []);
+    const mode = link.via === "tailscale" ? "linked over Tailscale" : link.via === "cloud" ? "cloud sync" :
+      link.via === "linked" ? "linked" : "this machine only";
+    const reach = new Map((link.machines || []).map((m) => [m.name, m.online]));
+    const strip = el("div", "ax-machines");
+    for (const [name, agents] of groups) {
+      const here = name === state.device || name === "this machine";
+      const online = here || reach.get(name) || agents.some((a) => a.online);
+      const card = el("div", "ax-machine");
+      const head = el("div", "ax-chip");
+      head.append(el("span", "ax-dot" + (online ? " on" : "")), el("b", "", name));
+      card.append(head, el("p", "meta", (here ? "this machine · " : "") + mode + " · " + agents.length + " agent" +
+                                       (agents.length === 1 ? "" : "s")));
+      for (const a of agents) {
+        const chip = el("div", "ax-chip");
+        chip.append(avatar(a), el("span", "n", a.agent),
+                    el("span", "ax-dot" + (a.activity === "working" ? " on" : a.activity === "listening" ? " listen" : "")));
+        chip.title = a.agent + ": " + (a.activity || (a.online ? "online" : "offline"));
+        card.append(chip);
+      }
+      strip.append(card);
+    }
+    box.replaceChildren(strip);
+  }
+
+  // Tokens and cost ------------------------------------------------------------------------------------------
+  function bars(rows) {
+    const most = Math.max(1, ...rows.map((r) => r[1]));
+    const grid = el("div", "ax-bars");
+    for (const [label, n, value, color] of rows) {
+      const bar = el("div", "bar");
+      bar.style.width = (100 * n) / most + "%";
+      if (color) bar.style.background = color;
+      const lbl = el("span", "lbl", label);
+      lbl.title = label;
+      grid.append(lbl, el("div", "", ""), el("span", "val", value));
+      grid.children[grid.children.length - 2].append(bar);
+    }
+    return grid;
+  }
+  function renderTokens() {
+    const box = $("ax-tokens"), usage = ax.report && ax.report.usage;
+    if (!box) return;
+    if (!usage || !usage.on) {
+      box.replaceChildren(el("p", "ax-empty", "Token counts are off for this project: crewchat usage on keeps them."));
+      return;
+    }
+    const agents = Object.entries(usage.agents || {}).filter(([, a]) => a.all).sort((p, q) => q[1].all - p[1].all).slice(0, 8);
+    if (!agents.length) {
+      box.replaceChildren(el("p", "ax-empty", "No tokens counted yet: Claude Code agents report theirs at the end of each turn."));
+      return;
+    }
+    const out = [el("p", "meta", "Per agent, all time (an estimate at API prices of " + usage.prices + ")"),
+                 bars(agents.map(([name, a]) => [name, a.all, count(a.all) + " · " + money(a.cost_all || 0), agentColor(name)]))];
+    const tasks = (usage.tasks || []).slice().sort((p, q) => q.tokens - p.tokens).slice(0, 5);
+    if (tasks.length) {
+      out.push(el("p", "meta", "The tasks that took the most"));
+      out.push(bars(tasks.map((t) => ["#" + t.id + " " + (t.title || ""), t.tokens, count(t.tokens) + " · " + money(t.cost || 0)])));
+    }
+    const done = new Set(state.sheet.filter((r) => r.status === "done").map((r) => r.id));
+    const finished = (usage.tasks || []).filter((t) => done.has(t.id));
+    if (finished.length)
+      out.push(el("p", "meta", "Tokens per task done: " + count(Math.round(finished.reduce((s, t) => s + t.tokens, 0) / finished.length))));
+    const days = usage.days || [];
+    if (days.length > 1) {
+      const W = Math.max(260, box.clientWidth || 420), H = 90, most = Math.max(0.01, ...days.map((d) => d.cost || 0));
+      const pt = (d, i) => [8 + (i * (W - 16)) / (days.length - 1), H - 18 - ((d.cost || 0) / most) * (H - 34)];
+      const g = svg("svg", { viewBox: "0 0 " + W + " " + H, height: H, role: "img", "aria-label": "Estimated cost per day" });
+      const pts = days.map(pt);
+      g.append(svg("polyline", { points: pts.map((p) => p.join(",")).join(" "), fill: "none", stroke: ax.colors.accent,
+                                 "stroke-width": 2, "stroke-linejoin": "round" }));
+      pts.forEach((p, i) => {
+        const dot = svg("circle", { cx: p[0], cy: p[1], r: 3, fill: ax.colors.accent });
+        dot.append(svg("title", {}, days[i].day + ": " + count(days[i].tokens) + " tokens, " + money(days[i].cost || 0)));
+        g.append(dot);
+      });
+      g.append(svg("text", { x: 8, y: H - 3, class: "ax-muted" }, days[0].day.slice(5)));
+      g.append(svg("text", { x: W - 8, y: H - 3, "text-anchor": "end", class: "ax-muted" }, days[days.length - 1].day.slice(5)));
+      out.push(el("p", "meta", "Estimated cost per day"), g);
+    }
+    box.replaceChildren(...out);
+  }
+
+  // Code heat map: the files agents edit, coloured by who edits each most -------------------------------------
+  function renderHeat() {
+    const box = $("ax-heat"), files = (ax.report && ax.report.edits) || [];
+    if (!box) return;
+    if (!files.length) {
+      box.replaceChildren(el("p", "ax-empty", "No edits recorded yet. With edit tracking on (crewchat edits), the files " +
+                                             "agents edit show here."));
+      return;
+    }
+    const most = Math.max(1, ...files.map((f) => f.edits)), groups = new Map();
+    for (const f of files.slice(0, 120)) {
+      const folder = f.path.includes("/") ? f.path.split("/")[0] + "/" : "(top)";
+      if (!groups.has(folder)) groups.set(folder, []);
+      groups.get(folder).push(f);
+    }
+    const heat = el("div", "ax-heat");
+    for (const [folder, list] of [...groups].sort((p, q) => q[1].length - p[1].length)) {
+      const group = el("div", "ax-group");
+      const tiles = el("div", "ax-tiles");
+      for (const f of list) {
+        const tile = el("div", "ax-tile");
+        const color = f.top ? agentColor(f.top) : ax.colors.accent;
+        tile.style.background = rgba(color, 0.1 + 0.45 * (f.edits / most));
+        tile.style.flexGrow = String(f.edits);
+        tile.title = f.path + ": " + f.edits + " edit" + (f.edits === 1 ? "" : "s") + (f.top ? ", most by " + f.top : "") +
+          (f.agents.length > 1 ? " (" + f.agents.join(", ") + ")" : "");
+        tile.append(f.path.split("/").pop(), el("small", "", f.edits + " · " + (f.top || "")));
+        tiles.append(tile);
+      }
+      group.append(el("h4", "", folder), tiles);
+      heat.append(group);
+    }
+    box.replaceChildren(heat);
+  }
+
+  // Putting it together ---------------------------------------------------------------------------------------
+  function renderCrewList() {
+    const list = $("ax-crew-list"), canvas = $("ax-canvas");
+    if (!list) return;
+    canvas.setAttribute("aria-label", "The crew: " + (state.agents.length ? state.agents.map((a) => a.agent + " " +
+      (a.activity || (a.online ? "online" : "offline"))).join(", ") : "no agents yet"));
+    list.replaceChildren(...state.agents.map((a) => el("li", "", a.agent + (a.role ? ", " + a.role : "") + ": " +
+                                                        (a.activity || (a.online ? "online" : "offline")))));
+  }
+  function renderLive() {
+    if (!ax.shown) return;
+    const key = crew().map((a) => a.agent + "|" + (a.picture || "") + "|" + (a.role || "")).join(",");
+    if (key !== ax.crewKey) layout();
+    renderNumbers(); renderMachines(); renderCrewList();
+    if (ax.replay === null) renderRiver();
+    wake();
+  }
+  function renderAll() {
+    if (!ax.shown) return;
+    const r = ax.report;
+    if (r) {
+      ax.edges = new Map();
+      for (const [a, b, n] of r.pairs || []) if (b !== "all") bump(ax.edges, a, b, n);
+      ax.live = new Map();
+      const scrub = $("ax-scrub");
+      const first = (r.stream || []).length ? r.stream[0][0] : r.built;  // from the day's first message (20 min at least)
+      scrub.min = String(Math.floor(Math.max(r.built - DAY, Math.min(r.built - 1200, first - 60))));
+      scrub.max = String(Math.ceil(r.built));
+      if (ax.replay === null) scrub.value = scrub.max;
+      $("ax-meta").textContent = count(r.messages || 0) + " messages in all · updated " + clock(r.built);
+    }
+    renderNumbers(); renderRiver(); renderLanes(); renderMachines(); renderTokens(); renderHeat(); renderCrewList();
+    wake();
+  }
+  function load() {
+    if (ax.fetching) return ax.fetching;
+    ax.fetching = postJSON("/api/analytics", { days: 7 }).then((r) => {
+      ax.report = r; ax.fetched = Date.now(); ax.fetching = null; ax.fresh = 0;
+      renderAll();
+    }).catch((e) => {
+      ax.fetching = null;
+      const meta = $("ax-meta");
+      if (meta) meta.textContent = "Could not load the numbers: " + e.message;
+    });
+    return ax.fetching;
+  }
+
+  // Presentation mode: full screen, large type, one panel after another -----------------------------------------
+  function panels() { return [...document.querySelectorAll("#analytics .ax-panel")]; }
+  function showPanel(i) {
+    const list = panels();
+    ax.panel = (i + list.length) % list.length;
+    list.forEach((p, j) => p.classList.toggle("ax-current", j === ax.panel));
+    resize(); renderAll();
+  }
+  function present(on) {
+    ax.present = on;
+    document.body.classList.toggle("ax-present", on);
+    $("ax-present").textContent = on ? "End" : "Present";
+    clearInterval(ax.rotate);
+    if (on) {
+      try { if (ax.root.requestFullscreen && !document.fullscreenElement) ax.root.requestFullscreen().catch(() => {}); } catch (e) {}
+      showPanel(0);
+      ax.rotate = setInterval(() => showPanel(ax.panel + 1), 12000);
+    } else {
+      panels().forEach((p) => p.classList.remove("ax-current"));
+      try { if (document.fullscreenElement) document.exitFullscreen().catch(() => {}); } catch (e) {}
+      setTimeout(() => { resize(); renderAll(); }, 0);
+    }
+  }
+  document.addEventListener("fullscreenchange", () => { if (!document.fullscreenElement && ax.present) present(false); });
+  document.addEventListener("keydown", (e) => {
+    if (!ax.present) return;
+    if (e.key === "Escape") present(false);
+    else if (e.key === "ArrowRight") showPanel(ax.panel + 1);
+    else if (e.key === "ArrowLeft") showPanel(ax.panel - 1);
+  });
+  for (const m of [reduce, dark]) m.addEventListener("change", () => {
+    if (reduce.matches) ax.particles = [];  // nothing flies any more, not even what was on its way
+    readColors(); renderAll(); draw(performance.now());
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
+
+  window.crewAnalytics = {
+    show(root) {
+      readColors();
+      if (ax.root !== root) { ax.root = root; build(root); }
+      ax.shown = true;
+      resize();
+      renderAll();
+      if (!ax.report || Date.now() - ax.fetched > 15000) load();
+    },
+    hide() {
+      ax.shown = false;
+      stopPlay();
+      if (ax.present) present(false);
+    },
+    // The page's poll, each time it answers: new messages fly, and the numbers follow (fetched again at most
+    // every 15 s, and only after something happened).
+    poll(data) {
+      const fresh = state.now - 120, after = ax.report ? ax.report.built : Infinity;  // older ones it counted
+      for (const m of data.messages || [])
+        if (m.kind !== "event" && m.kind !== "plan" && m.ts > after)
+          message(m.from, m.to, ax.shown && ax.replay === null && m.ts >= fresh);
+      if (!ax.shown) return;
+      renderLive();
+      if ((data.messages || []).length && Date.now() - ax.fetched > 15000) load();
+    },
+    // For tests: the time one frame takes to draw (ms), with a crew of n made up for it and messages in flight.
+    bench(frames, n) {
+      const saved = [ax.nodes, ax.byName, ax.particles, ax.crewKey];
+      const fake = [{ agent: "Owner", owner: true }];
+      for (let i = 0; i < (n || 20); i++) fake.push({ agent: "agent-" + i, role: i % 3 ? "developer" : "qa", online: true,
+                                                     activity: i % 2 ? "working" : "listening", device: "m" + (i % 3) });
+      layout(fake);
+      const t0 = performance.now();
+      ax.particles = [];
+      for (let i = 0; i < 60; i++) ax.particles.push({ from: ax.nodes[1 + (i % (fake.length - 1))], to: ax.nodes[(i * 7) % fake.length],
+                                                        start: t0 - (i % 10) * 80, dur: 1e9, color: ax.colors.accent });
+      for (let i = 0; i < (frames || 120); i++) draw(t0 + i * 16.7);
+      const ms = (performance.now() - t0) / (frames || 120);
+      [ax.nodes, ax.byName, ax.particles, ax.crewKey] = saved;
+      draw(performance.now());
+      return ms;
+    },
+    stats() {
+      return { shown: ax.shown, nodes: ax.nodes.length, particles: ax.particles.length, flashes: ax.flashes.length,
+               edges: edgesNow().size, reduced: reduce.matches, animating: !!ax.raf, sent: ax.sent, frames: ax.frames,
+               replay: ax.replay, present: ax.present, report: !!ax.report };
+    },
+    replay: setReplay,
+    present,
+  };
+})();
+"""
+ANALYTICS_BYTES = ANALYTICS_JS.encode("utf-8")
+ANALYTICS_GZIP = gzip.compress(ANALYTICS_BYTES, 9, mtime=0)
+ANALYTICS_ETAG = '"%s"' % hashlib.sha256(ANALYTICS_BYTES).hexdigest()[:20]
 # The chat page as served (Handler._chat_page): made once, compressed once, and named by its contents.
 PAGE_BYTES = CHAT_PAGE.encode("utf-8")
 PAGE_GZIP = gzip.compress(PAGE_BYTES, 9, mtime=0)
