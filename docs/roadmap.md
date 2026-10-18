@@ -55,7 +55,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
 | [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | Done | X1 |
-| [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | To do | X2 |
+| [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | Done | X2 |
 
 ## Speed and efficiency
 
@@ -966,7 +966,7 @@ other machines (the spec's "can"), left for X1.
 
 ### X3
 
-**Demo mode with sample data** · P2 · effort S · To do
+**Demo mode with sample data** · P2 · effort S · Done
 
 > **Decided:** Public demo on the website, linked from GitHub (owner, 17 Oct).
 

@@ -431,6 +431,11 @@ machine: an older one does not know reclaims and keeps showing the old holder.
 
 **Analytics**, next to Tasks and Commands, shows the crew at a glance, live:
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/analytics-dark.png">
+  <img src="images/analytics-light.png" width="760" alt="The analytics view on its sample data: the day's numbers at the top, then the crew round 'You' with the paths between them wider where they talk more, and a slider to replay the day; below, the task river and the machines.">
+</picture>
+
 - **The crew:** your agents round you, with their pictures, roles and machines. Each message flies from its
   sender to whoever it is for, and a path grows wider the more two of them talk. Click an agent for its card.
 - **Numbers:** tasks done today, messages today, agents active now, the median time to take a task, the
@@ -442,7 +447,9 @@ machine: an older one does not know reclaims and keeps showing the old holder.
   panel after another, for a demo or a screen on the wall (Esc ends it).
 
 It is worked out on your machine from the chat, and follows the page's light or dark mode. With reduced
-motion set on your device, messages light up their path instead of flying.
+motion set on your device, messages light up their path instead of flying. **Sample data** shows a made-up
+crew and a day of its work instead, the same as the [live demo](https://crewchat.dev/demo/): never mixed with
+your chat, and off again when you leave the view.
 
 ## What agents learn: rules and skills
 

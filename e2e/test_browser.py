@@ -819,6 +819,38 @@ class NewPage(Signed):
             c.open(self.m.url + "/")
             c.until("!!document.getElementById('log')")
 
+    def test_the_analytics_sample_data(self):
+        # Roadmap X3: the sample the public demo shows, in the app too; it never mixes with the chat.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view")
+            crew = c.js("crewAnalytics.stats().nodes")
+            name = self.agent.whoami()
+            c.click("#ax-sample")
+            self.assertEqual(c.js("[crewAnalytics.stats().demo, crewAnalytics.stats().nodes, $('ax-sample').ariaPressed]"),
+                             [True, 9, "true"])  # its crew of eight, and you
+            self.assertIn("Sample data: a made-up crew", c.js("$('ax-demo-note').textContent"))
+            self.assertFalse(c.js("$('ax-demo-note').hidden"))
+            sent = c.js("crewAnalytics.stats().sent")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
+            self.agent.call("hub_send", to="all", text="Not one for the sample")
+            c.until("$('log').textContent.includes('Not one for the sample')", what="the message in the chat")
+            self.assertNotIn(name, c.js("$('ax-canvas').getAttribute('aria-label')"))  # the chat stays out of it
+            c.click("#ax-sample")
+            c.until("!crewAnalytics.stats().demo && crewAnalytics.stats().nodes === %d" % crew, what="the chat's own crew")
+            self.assertIn(name, c.js("$('ax-canvas').getAttribute('aria-label')"))
+            self.assertTrue(c.js("$('ax-demo-note').hidden"))
+            c.click("#ax-sample")  # left on, then the view closed: off again when it reopens
+            c.click("#view-analytics")
+            c.click("#view-analytics")
+            c.until("crewAnalytics.stats().shown && !crewAnalytics.stats().demo", what="the view without the sample")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:
@@ -844,6 +876,51 @@ class NewPage(Signed):
             c.size(1280, 900)
             c.open(self.m.url + "/")
             c.until("!!document.getElementById('log')")
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class PublicDemo(unittest.TestCase):
+    """Roadmap X3: crewchat.dev/demo, the analytics view on its sample data with no crewchat server, served with the
+    headers firebase.json gives the site (a policy that allows no inline script or style)."""
+
+    def test_the_demo_runs_in_the_browser_under_the_sites_policy(self):
+        import functools
+        import http.server
+        sys.path.insert(0, str(H.ROOT / "site"))
+        import build
+        site = build.build(H.TMP / "site")
+        policy = json.loads((H.ROOT / "firebase.json").read_text())["hosting"]["headers"][0]["headers"]
+
+        class Site(http.server.SimpleHTTPRequestHandler):
+            def end_headers(self):
+                for header in policy:
+                    self.send_header(header["key"], header["value"])
+                super().end_headers()
+
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Site, directory=str(site)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        c = Chrome()
+        self.addCleanup(c.close)
+        c.size(1280, 900)
+        # Anything the policy refuses is noted before the page's own scripts run.
+        c.call("Page.addScriptToEvaluateOnNewDocument", source="window.refused = []; document.addEventListener("
+               "'securitypolicyviolation', (e) => window.refused.push(e.violatedDirective + ' ' + e.blockedURI));")
+        c.open("http://127.0.0.1:%d/demo/" % server.server_address[1])
+        c.until("window.crewAnalytics && crewAnalytics.stats().demo && crewAnalytics.stats().report", what="the demo")
+        self.assertEqual(c.js("crewAnalytics.stats().nodes"), 9)
+        self.assertIn("A demo: a made-up crew", c.js("$('ax-demo-note').textContent"))  # it says what it is
+        self.assertTrue(c.js("$('ax-sample').hidden"))  # nothing to switch to
+        self.assertGreater(c.js("$('ax-numbers').children.length"), 4)
+        self.assertGreater(c.js("document.querySelectorAll('#ax-heat .ax-tile').length"), 5)
+        self.assertTrue(c.js("[...document.querySelectorAll('#analytics .avatar img')].every((i) => i.complete && i.naturalWidth)"))
+        sent = c.js("crewAnalytics.stats().sent")
+        c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
+        self.assertEqual(c.js("getComputedStyle(document.querySelector('.ax-card')).borderRadius"), "18px")  # styled
+        self.assertEqual(c.js("window.refused"), [])
+        self.assertEqual(c.errors, [])
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")

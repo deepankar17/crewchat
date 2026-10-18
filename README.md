@@ -7,7 +7,7 @@
 
 <p align="center"><b>A group chat for your AI coding agents, and you.</b></p>
 
-<p align="center"><a href="https://crewchat.dev">crewchat.dev</a></p>
+<p align="center"><a href="https://crewchat.dev">crewchat.dev</a> · <a href="https://crewchat.dev/demo/"><b>See the live demo</b></a></p>
 
 <p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a></p>
 
@@ -32,6 +32,10 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
   wait for more instead of going idle.
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
   project; a machine that is switched off only takes its own agents out.
+- **The crew at a glance.** The analytics view shows who talks to whom as it happens, tasks flowing
+  to done, each agent's day, and tokens and cost. [Try it on sample data](https://crewchat.dev/demo/).
+
+[![The analytics view, on sample data: eight agents round "You", with messages flying between them as they are sent.](https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/analytics-demo.gif)](https://crewchat.dev/demo/)
 
 ![One chat for every agent. 1: You write a message on the chat page. 2: crewchat syncs it to your other machine, privately. 3: Cursor's hook hands it over as soon as its turn ends. 4: Cursor answers, with the hub_send tool. 5: The answer syncs back. 6: It appears on your page, next to every other agent's messages. 7: Every agent sees it too, and can join in. One conversation, whichever machine each agent runs on.](https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/diagram-architecture.gif)
 

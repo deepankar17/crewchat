@@ -13233,6 +13233,9 @@ ANALYTICS_JS = r"""// crewchat's analytics view (roadmap X2): the crew working, 
 .ax-bars .lbl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ax-bars .val { color: var(--muted); font-variant-numeric: tabular-nums; }
 .ax-empty { font-size: 13px; color: var(--muted); margin: 4px 0; }
+.ax-demo-note { margin: 0 0 12px; padding: 8px 12px; border-radius: 12px; background: var(--task); color: var(--task-ink);
+  border: 1px solid var(--task-line); font-size: 13.5px; }
+.ax-tools button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .ax-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 @media (max-width: 760px) {
   .ax-grid { grid-template-columns: minmax(0, 1fr); }
@@ -13251,10 +13254,12 @@ body.ax-present .ax-card svg text { font-size: 15px; }
 body.ax-present .ax-hero canvas { height: calc(100vh - 300px); }
 body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
 `;
-  const style = document.createElement("style");
-  style.id = "ax-style";
-  style.textContent = CSS;
-  document.head.append(style);
+  if (!document.getElementById("ax-style")) {  // the public demo links it as a file instead (its CSP)
+    const style = document.createElement("style");
+    style.id = "ax-style";
+    style.textContent = CSS;
+    document.head.append(style);
+  }
 
   const DAY = 86400;
   const reduce = matchMedia("(prefers-reduced-motion: reduce)");
@@ -13265,8 +13270,10 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   const ax = { root: null, report: null, fetched: 0, fetching: null, shown: false, nodes: [], byName: new Map(),
                edges: new Map(), live: new Map(), particles: [], flashes: [], raf: 0, size: { w: 0, h: 0 }, imgs: new Map(),
                colors: null, replay: null, playing: false, last: 0, present: false, rotate: 0, panel: 0, sent: 0, fresh: 0, frames: 0,
-               crewKey: "" };
+               crewKey: "", demo: false, world: null, real: null, ticker: 0 };
   const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
+  const PICTURES = window.crewPictures || "/pictures/";
+  const S = () => (ax.demo ? ax.world : state);  // the chat, or the sample crew: never both
   const svgNS = "http://www.w3.org/2000/svg";
   const svg = (tag, attrs, text) => {
     const e = document.createElementNS(svgNS, tag);
@@ -13274,7 +13281,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     if (text !== undefined) e.textContent = text;
     return e;
   };
-  const now = () => (ax.replay !== null ? ax.replay : state.now);
+  const now = () => (ax.replay !== null ? ax.replay : S().now);
 
   // Numbers and colours ---------------------------------------------------------------------------
   function dur(s) {
@@ -13299,14 +13306,14 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     return "rgba(" + parseInt(m[1], 16) + "," + parseInt(m[2], 16) + "," + parseInt(m[3], 16) + "," + alpha + ")";
   }
   function agentColor(name) {
-    const a = state.agents.find((x) => x.agent === name);
+    const a = S().agents.find((x) => x.agent === name);
     if (a && a.colour) return a.colour;
-    const i = state.agents.findIndex((x) => x.agent === name);
+    const i = S().agents.findIndex((x) => x.agent === name);
     return i < 0 ? ax.colors.accent : ax.colors.pal[i % 8];
   }
   function roleColor(role) {
     if (!role) return ax.colors.muted;
-    const i = (state.roles || []).findIndex((r) => r.name === role);
+    const i = (S().roles || []).findIndex((r) => r.name === role);
     return ax.colors.pal[((i < 0 ? role.length : i) + 3) % 8];
   }
 
@@ -13321,10 +13328,19 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     const show = el("button", "", "Present");
     show.type = "button"; show.id = "ax-present"; show.title = "Full screen, large type, one panel after another (Esc ends it)";
     show.addEventListener("click", () => present(!ax.present));
-    tools.append(show);
+    const sample = el("button", "", "Sample data");
+    sample.type = "button"; sample.id = "ax-sample"; sample.setAttribute("aria-pressed", "false");
+    sample.title = "Show a made-up crew and a day of its work, to see what this view does";
+    sample.hidden = !!window.crewDemoOnly;
+    sample.addEventListener("click", () => demo(!ax.demo));
+    tools.append(sample, show);
     const meta = el("span", "meta", "");
     meta.id = "ax-meta";
+    back.hidden = !!window.crewDemoOnly;
     head.append(back, el("h2", "", "Analytics"), meta, tools);
+    const note = el("p", "ax-demo-note");
+    note.id = "ax-demo-note"; note.hidden = true;
+    note.setAttribute("role", "status");
     const numbers = el("div", "ax-numbers");
     numbers.id = "ax-numbers";
     const hero = el("section", "ax-card ax-hero ax-panel");
@@ -13364,10 +13380,10 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     card("ax-lanes", "The day, agent by agent", true);
     card("ax-tokens", "Tokens and cost");
     card("ax-heat", "Code heat map");
-    root.append(head, numbers, hero, grid);
+    root.append(head, note, numbers, hero, grid);
     canvas.addEventListener("click", (e) => {
       const hit = nodeAt(e);
-      if (hit && !hit.owner) openPanel("agent", hit.name);
+      if (hit && !hit.owner && !ax.demo) openPanel("agent", hit.name);
     });
     canvas.addEventListener("mousemove", (e) => {
       const hit = nodeAt(e);
@@ -13393,7 +13409,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
 
   // The constellation: agents round the owner, messages flying between them ---------------------------
   function crew() {
-    const agents = state.agents.slice().sort((a, b) => (a.device || "").localeCompare(b.device || "") ||
+    const agents = S().agents.slice().sort((a, b) => (a.device || "").localeCompare(b.device || "") ||
                                                       a.agent.localeCompare(b.agent));
     return [{ agent: "Owner", owner: true }].concat(agents);
   }
@@ -13421,7 +13437,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   function picture(a) {
     const [kind, id] = (a.picture || "").split(":");
     if (kind === "preset" && own(state.presets, id)) return { emoji: state.presets[id] };
-    const src = kind === "art" && own(state.art, id) ? "/pictures/" + id + ".webp" : kind === "file" && id ? "/files/" + id : "";
+    const src = kind === "art" && own(state.art, id) ? PICTURES + id + ".webp" : kind === "file" && id ? "/files/" + id : "";
     if (!src) return null;
     let img = ax.imgs.get(src);
     if (!img) {
@@ -13495,10 +13511,10 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       }
     }
     if (ax.particles.some((p) => p.done)) ax.particles = ax.particles.filter((p) => !p.done);
-    const many = new Set(state.agents.map((a) => a.device)).size > 1;
+    const many = new Set(S().agents.map((a) => a.device)).size > 1;
     c.textAlign = "center"; c.textBaseline = "middle";
     for (const nd of ax.nodes) drawNode(c, nd, t, many);
-    if (!state.agents.length) {
+    if (!S().agents.length) {
       c.fillStyle = col.muted; c.font = "13px system-ui, sans-serif";
       c.fillText("No agents yet: they appear here as they join.", w / 2, h / 2 + 50);
     }
@@ -13620,13 +13636,13 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     const t = (r && r.tasks) || {};
     const midnight = new Date(); midnight.setHours(0, 0, 0, 0);
     const today = stream().filter((m) => m[0] >= midnight / 1000).length + ax.fresh;
-    const active = state.agents.filter((a) => a.activity === "working" || a.activity === "listening" || a.online).length;
+    const active = S().agents.filter((a) => a.activity === "working" || a.activity === "listening" || a.online).length;
     const usage = r && r.usage, tokens = usage && usage.on ?
       Object.values(usage.agents || {}).reduce((s, a) => s + (a.today || 0), 0) : null;
     const tiles = [
       [String(t.done_today || 0), "tasks done today"],
       [count(today), "messages today"],
-      [active + (state.agents.length ? " of " + state.agents.length : ""), "agents active now"],
+      [active + (S().agents.length ? " of " + S().agents.length : ""), "agents active now"],
       [dur(t.time_to_take), "median time to take a task"],
       [t.review_pass_rate === null || t.review_pass_rate === undefined ? "—" : Math.round(t.review_pass_rate * 100) + "%",
        "review pass rate"],
@@ -13645,7 +13661,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       ["todo", "doing", "blocked", "review", "done"].includes(status) ? status : "todo";
   }
   function riverTasks() {
-    if (ax.replay === null) return state.sheet.map((r) => ({ id: r.id, title: r.title, stage: stageOf(r.status) }));
+    if (ax.replay === null) return S().sheet.map((r) => ({ id: r.id, title: r.title, stage: stageOf(r.status) }));
     const tasks = new Map();
     for (const [ts, , , kind, task, status] of stream()) {
       if (ts > ax.replay || !task) continue;
@@ -13653,7 +13669,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       else if (kind === "take" || kind === "assign") tasks.set(task, "doing");
       else if (kind === "update" && status) tasks.set(task, stageOf(status));
     }
-    const titles = new Map(state.sheet.map((r) => [r.id, r.title]));
+    const titles = new Map(S().sheet.map((r) => [r.id, r.title]));
     return [...tasks].map(([id, stage]) => ({ id, title: titles.get(id) || "", stage }));
   }
   function renderRiver() {
@@ -13701,7 +13717,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   function renderLanes() {
     const box = $("ax-lanes"), r = ax.report;
     if (!box) return;
-    const lines = (r && r.timelines) || {}, col = ax.colors, end = state.now;
+    const lines = (r && r.timelines) || {}, col = ax.colors, end = S().now;
     const names = Object.keys(lines).filter((n) => lines[n].some((p) => p[1] > end - DAY)).sort();
     // From the first thing recorded today (the last 20 minutes at least, the last day at most), so a crew
     // that started an hour ago fills the width.
@@ -13749,19 +13765,19 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   function renderMachines() {
     const box = $("ax-machines");
     if (!box) return;
-    const link = state.link || { via: "none" }, groups = new Map();
-    for (const a of state.agents) {
-      const name = a.device || state.device || "this machine";
+    const link = S().link || { via: "none" }, groups = new Map();
+    for (const a of S().agents) {
+      const name = a.device || S().device || "this machine";
       if (!groups.has(name)) groups.set(name, []);
       groups.get(name).push(a);
     }
-    if (!groups.size) groups.set(state.device || "this machine", []);
+    if (!groups.size) groups.set(S().device || "this machine", []);
     const mode = link.via === "tailscale" ? "linked over Tailscale" : link.via === "cloud" ? "cloud sync" :
       link.via === "linked" ? "linked" : "this machine only";
     const reach = new Map((link.machines || []).map((m) => [m.name, m.online]));
     const strip = el("div", "ax-machines");
     for (const [name, agents] of groups) {
-      const here = name === state.device || name === "this machine";
+      const here = name === S().device || name === "this machine";
       const online = here || reach.get(name) || agents.some((a) => a.online);
       const card = el("div", "ax-machine");
       const head = el("div", "ax-chip");
@@ -13814,7 +13830,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       out.push(el("p", "meta", "The tasks that took the most"));
       out.push(bars(tasks.map((t) => ["#" + t.id + " " + (t.title || ""), t.tokens, count(t.tokens) + " · " + money(t.cost || 0)])));
     }
-    const done = new Set(state.sheet.filter((r) => r.status === "done").map((r) => r.id));
+    const done = new Set(S().sheet.filter((r) => r.status === "done").map((r) => r.id));
     const finished = (usage.tasks || []).filter((t) => done.has(t.id));
     if (finished.length)
       out.push(el("p", "meta", "Tokens per task done: " + count(Math.round(finished.reduce((s, t) => s + t.tokens, 0) / finished.length))));
@@ -13873,13 +13889,148 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     box.replaceChildren(heat);
   }
 
+  // Sample data (X3): a made-up crew and a day of its work, for the public demo and the Sample data switch. It
+  // never mixes with the chat: the view shows one or the other, and says so when it is the sample.
+  function seeded(seed) {  // the same day each time, so screenshots of it agree
+    return () => {
+      seed = (seed + 0x6d2b79f5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const SAMPLE_CREW = [["Ada", "lead", "office", "studio", "claude-code", "working"],
+    ["Bodhi", "developer", "coder", "studio", "claude-code", "working"], ["Chen", "developer", "technologist", "studio", "cursor", "listening"],
+    ["Dara", "qa", "scientist", "linux-box", "codex", "working"], ["Emre", "developer", "mechanic", "linux-box", "claude-code", "idle"],
+    ["Freya", "reviewer", "detective", "linux-box", "claude-code", "listening"], ["Gus", "docs", "teacher", "studio", "gemini", ""],
+    ["Hana", "developer", "artist", "studio", "cursor", "working"]];
+  const SAMPLE_TASKS = ["Sign in with a magic link", "Search as you type", "Offline mode for notes", "Export notes to Markdown",
+    "Fix the sync conflict on rename", "Dark theme for the editor", "Tests for the sync engine", "Speed up the first load",
+    "Share a note by link", "Tags and filters", "Docs: the sync protocol", "Crash when a note is empty", "Keyboard shortcuts",
+    "Onboarding tour"];
+  const SAMPLE_FILES = ["app/sync/engine.ts", "app/sync/conflicts.ts", "app/sync/queue.ts", "app/editor/Editor.tsx",
+    "app/editor/Toolbar.tsx", "app/search/index.ts", "app/search/SearchBox.tsx", "app/auth/magicLink.ts", "app/auth/session.ts",
+    "server/api/notes.py", "server/api/share.py", "server/db/models.py", "tests/sync.test.ts", "tests/search.test.ts",
+    "docs/sync-protocol.md", "README.md"];
+  function sampleWorld(now) {
+    const rand = seeded(17), pick = (list) => list[Math.floor(rand() * list.length)], start = now - 9.5 * 3600;
+    const agents = SAMPLE_CREW.map(([agent, role, picture, device, client, activity]) => ({
+      agent, role, picture: "art:" + picture, device, client, activity, online: activity !== "" }));
+    const names = agents.map((a) => a.agent), stream = [], sheet = [];
+    const fates = ["done", "done", "done", "done", "done", "done", "review", "review", "blocked", "doing", "doing", "todo", "todo", "todo"];
+    SAMPLE_TASKS.forEach((title, i) => {
+      const id = "S" + (101 + i), holder = names[1 + (i % 7)], fate = fates[i];
+      let t = start + i * 1700 + rand() * 600;
+      stream.push([t, "Owner", "all", "task", id, ""]);
+      if (fate !== "todo") {
+        t += 240 + rand() * 1500;
+        stream.push([t, holder, "all", "take", id, ""], [t + 60, holder, "Ada", "update", id, "in_progress"]);
+      }
+      if (fate === "blocked") stream.push([t + 2400, holder, "Ada", "update", id, "blocked"]);
+      if (fate === "review" || fate === "done") stream.push([t += 2400 + rand() * 5400, holder, "Ada", "update", id, "review"]);
+      if (fate === "done") stream.push([t += 600 + rand() * 1800, "Freya", "Ada", "update", id, "done"]);
+      sheet.push({ id, title, status: fate, holder: fate === "todo" ? "" : holder, from: "Owner", to: "all", areas: [], depends: [] });
+    });
+    for (let i = 0; i < 560; i++) {  // the talk: more between some than others, as in a real crew
+      const from = rand() < 0.25 ? "Ada" : pick(names);
+      let to = rand() < 0.12 ? "all" : rand() < 0.2 ? "Owner" : rand() < 0.4 ? "Ada" : pick(names);
+      if (to === from) to = from === "Ada" ? "Bodhi" : "Ada";
+      stream.push([start + rand() * (now - start - 30), from, to, "msg", "", ""]);
+    }
+    for (let i = 0; i < 40; i++) stream.push([start + rand() * (now - start), "Owner", pick(names), "msg", "", ""]);
+    stream.sort((p, q) => p[0] - q[0]);
+    const pairs = new Map();
+    for (const [, from, to] of stream) if (to !== "all") pairs.set(from + "\n" + to, (pairs.get(from + "\n" + to) || 0) + 1);
+    const timelines = {};
+    agents.forEach((a, i) => {
+      const line = [];
+      for (let t = start + i * 420 + rand() * 900; t < now;) {
+        const st = a.activity === "" && t > now - 5400 ? "idle" : rand() < 0.6 ? "working" : rand() < 0.75 ? "listening" : "idle";
+        const len = st === "working" ? 900 + rand() * 2700 : 240 + rand() * 1500;
+        line.push([t, Math.min(now, t + len), st]);
+        t += len;
+      }
+      timelines[a.agent] = line;
+    });
+    const price = 6e-6, usage = { on: true, prices: "2026-10-06", agents: {}, tasks: [], days: [] };
+    for (const a of agents) {
+      const all = Math.round(2e6 + rand() * 9e6), today = Math.round(all * (0.15 + rand() * 0.2));
+      usage.agents[a.agent] = { today, all, cost_today: today * price, cost_all: all * price, models: [], unpriced: [] };
+    }
+    usage.tasks = sheet.filter((t) => t.status !== "todo").map((t) => {
+      const tokens = Math.round(3e5 + rand() * 2.5e6);
+      return { id: t.id, title: t.title, tokens, cost: tokens * price };
+    });
+    for (let d = 6; d >= 0; d--) {
+      const tokens = Math.round(6e6 + rand() * 1.6e7);
+      usage.days.push({ day: new Date((now - d * DAY) * 1000).toISOString().slice(0, 10), tokens, cost: tokens * price });
+    }
+    const edits = SAMPLE_FILES.map((path) => {
+      const top = pick(names.slice(1)), n = 1 + Math.floor(rand() * rand() * 40);
+      return { path, edits: n, agents: [top], top, last: now - rand() * 20000 };
+    }).sort((p, q) => q.edits - p.edits);
+    const report = { messages: stream.length + 2350, pairs: [...pairs].map(([k, n]) => k.split("\n").concat([n])),
+      tasks: { posted: sheet.length, taken: 11, done: 6, in_review: 2, blocked_now: 1, time_to_take: 1260, cycle_time: 3.6 * 3600,
+               time_blocked: 2700, review_pass_rate: 0.83, done_today: 6 }, usage, timelines, stream, edits, built: now, agents: {} };
+    return { agents, sheet, report, now, device: "studio", link: { via: "tailscale", machines: [{ name: "linux-box", online: true }] },
+             roles: ["lead", "developer", "qa", "reviewer", "docs"].map((name) => ({ name })) };
+  }
+  // While the sample shows, its crew keeps talking, and now and then a task moves on.
+  function sampleTick() {
+    const w = ax.world, names = w.agents.map((a) => a.agent), rand = Math.random;
+    w.now = Date.now() / 1000;
+    const from = names[Math.floor(rand() * names.length)];
+    let to = rand() < 0.15 ? "all" : names[Math.floor(rand() * names.length)];
+    if (to === from) to = "Owner";
+    w.report.stream.push([w.now, from, to, "msg", "", ""]);
+    message(from, to, ax.shown && ax.replay === null);
+    if (rand() < 0.08) {
+      const next = { review: "done", doing: "review", todo: "doing" }, row = w.sheet.find((r) => next[r.status] && rand() < 0.5);
+      if (row) {
+        row.status = next[row.status];
+        if (!row.holder) row.holder = names[1 + Math.floor(rand() * (names.length - 1))];
+        if (row.status === "done") w.report.tasks.done_today++;
+      }
+    }
+    renderLive();
+    clearTimeout(ax.ticker);
+    ax.ticker = setTimeout(sampleTick, 700 + Math.random() * 1500);
+  }
+  function demo(on) {
+    if (on === ax.demo) return;
+    stopPlay();
+    ax.replay = null;
+    if (on) {
+      ax.real = ax.report;
+      ax.world = sampleWorld(Date.now() / 1000);
+      ax.demo = true;
+      ax.report = ax.world.report;
+      ax.ticker = setTimeout(sampleTick, 800);
+    } else {
+      clearTimeout(ax.ticker);
+      ax.demo = false;
+      ax.report = ax.real;
+      ax.world = null;
+      if (!ax.report) load();
+    }
+    ax.live = new Map(); ax.particles = []; ax.flashes = []; ax.fresh = 0;
+    const note = $("ax-demo-note"), button = $("ax-sample");
+    note.hidden = !on;
+    note.textContent = window.crewDemoOnly ? "A demo: a made-up crew and a day of its work, played live in your browser. " +
+      "Nothing here is anyone's real project." : "Sample data: a made-up crew and a day of its work, not this project. " +
+      "Switch Sample data off to see yours.";
+    button.setAttribute("aria-pressed", String(on));
+    layout();
+    renderAll();
+  }
+
   // Putting it together ---------------------------------------------------------------------------------------
   function renderCrewList() {
     const list = $("ax-crew-list"), canvas = $("ax-canvas");
     if (!list) return;
-    canvas.setAttribute("aria-label", "The crew: " + (state.agents.length ? state.agents.map((a) => a.agent + " " +
+    canvas.setAttribute("aria-label", "The crew: " + (S().agents.length ? S().agents.map((a) => a.agent + " " +
       (a.activity || (a.online ? "online" : "offline"))).join(", ") : "no agents yet"));
-    list.replaceChildren(...state.agents.map((a) => el("li", "", a.agent + (a.role ? ", " + a.role : "") + ": " +
+    list.replaceChildren(...S().agents.map((a) => el("li", "", a.agent + (a.role ? ", " + a.role : "") + ": " +
                                                         (a.activity || (a.online ? "online" : "offline")))));
   }
   function renderLive() {
@@ -13908,12 +14059,16 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     wake();
   }
   function load() {
+    if (ax.demo) { renderAll(); return Promise.resolve(); }
     if (ax.fetching) return ax.fetching;
     ax.fetching = postJSON("/api/analytics", { days: 7 }).then((r) => {
-      ax.report = r; ax.fetched = Date.now(); ax.fetching = null; ax.fresh = 0;
+      ax.fetching = null;
+      if (ax.demo) { ax.real = r; return; }  // kept for when the sample is switched off
+      ax.report = r; ax.fetched = Date.now(); ax.fresh = 0;
       renderAll();
     }).catch((e) => {
       ax.fetching = null;
+      if (ax.demo) return;  // the sample shows meanwhile
       const meta = $("ax-meta");
       if (meta) meta.textContent = "Could not load the numbers: " + e.message;
     });
@@ -13963,17 +14118,19 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       ax.shown = true;
       resize();
       renderAll();
-      if (!ax.report || Date.now() - ax.fetched > 15000) load();
+      if (!ax.demo && (!ax.report || Date.now() - ax.fetched > 15000)) load();
     },
     hide() {
       ax.shown = false;
+      if (ax.demo && !window.crewDemoOnly) demo(false);  // the sample is for a look, not left running
       stopPlay();
       if (ax.present) present(false);
     },
     // The page's poll, each time it answers: new messages fly, and the numbers follow (fetched again at most
     // every 15 s, and only after something happened).
     poll(data) {
-      const fresh = state.now - 120, after = ax.report ? ax.report.built : Infinity;  // older ones it counted
+      if (ax.demo) return;  // the chat's own messages never land in the sample
+      const fresh = S().now - 120, after = ax.report ? ax.report.built : Infinity;  // older ones it counted
       for (const m of data.messages || [])
         if (m.kind !== "event" && m.kind !== "plan" && m.ts > after)
           message(m.from, m.to, ax.shown && ax.replay === null && m.ts >= fresh);
@@ -14001,10 +14158,11 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     stats() {
       return { shown: ax.shown, nodes: ax.nodes.length, particles: ax.particles.length, flashes: ax.flashes.length,
                edges: edgesNow().size, reduced: reduce.matches, animating: !!ax.raf, sent: ax.sent, frames: ax.frames,
-               replay: ax.replay, present: ax.present, report: !!ax.report };
+               replay: ax.replay, present: ax.present, report: !!ax.report, demo: ax.demo };
     },
     replay: setReplay,
     present,
+    demo,
   };
 })();
 """

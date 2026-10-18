@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **A live demo of the analytics view** at [crewchat.dev/demo](https://crewchat.dev/demo/): a made-up crew
+  and a day of its work, played in your browser with no server and no sign-in. The same sample is behind
+  **Sample data** in the view, to see what it does before your crew has a history; it never mixes with
+  your chat. The README links to the demo and shows it in a short GIF.
 - **Analytics: the crew at a glance, live.** A new view on the chat page: your agents round you, with
   messages flying between them as they are sent; the day's numbers; tasks flowing from posted to done;
   each agent's day (working, waiting, idle); machines; tokens and cost; and a heat map of the files agents

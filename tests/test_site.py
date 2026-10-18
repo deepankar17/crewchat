@@ -109,6 +109,27 @@ class Website(unittest.TestCase):
         for point in points:
             self.assertIn("<b>%s</b>" % point, page, "docs/privacy.md lists it; the site's privacy page should too")
 
+    def test_the_demo_is_the_apps_own_view_on_its_sample(self):
+        # Roadmap X3: crewchat.dev/demo runs the analytics view from crewchat.py itself, as plain files (the site's
+        # policy allows no inline script or style), in the chat page's colours, with the pictures its sample crew
+        # wears; the page says it is a demo, and the home page links to it.
+        script, styles, pictures = build.chat_parts()
+        demo = self.out / "demo"
+        self.assertEqual((demo / "analytics.js").read_text(encoding="utf-8"), script)
+        self.assertIn("window.crewAnalytics = {", script)
+        css = (demo / "analytics.css").read_text(encoding="utf-8")
+        for needed in ("--a7:", "@media (prefers-color-scheme: dark)", ".ax-card", ".ax-demo-note"):
+            self.assertIn(needed, css)
+        worn = re.findall(r'\["\w+", "\w+", "(\w+)", "[\w-]+", "[\w-]+", "\w*"\]', script)
+        self.assertEqual(len(worn), 8)
+        for name in worn:
+            self.assertEqual((demo / "pictures" / (name + ".webp")).read_bytes()[:4], b"RIFF", name)
+        page = (demo / "index.html").read_text(encoding="utf-8")
+        self.assertIn("with sample data", page)
+        self.assertIn('id="ax-style"', page)  # so the view does not add its styles inline
+        self.assertIn('href="/demo/"', (self.out / "index.html").read_text(encoding="utf-8"))
+        self.assertIn("https://crewchat.dev/demo/", (self.out / "sitemap.xml").read_text(encoding="utf-8"))
+
     def test_the_error_page_is_not_indexed(self):
         self.assertIn('<meta name="robots" content="noindex">', (self.out / "404.html").read_text(encoding="utf-8"))
         self.assertNotIn("404", (self.out / "sitemap.xml").read_text(encoding="utf-8"))
