@@ -30,7 +30,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | ID | Task | Area | Priority | Effort | Status | Depends on |
 |---|---|---|---|---|---|---|
 | [P0](#p0) | Benchmark harness | Speed and efficiency | P1 | S | Done | none |
-| [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | To do | P0 |
+| [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | Done | P0 |
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | To do | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | To do | P0 |
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | To do | P0 |
@@ -96,7 +96,7 @@ while an installed crewchat (`CREWCHAT_BIN=...`) imports a cached `.pyc`. Baseli
 
 ### P1
 
-**Lightweight hook script** · P1 · effort M · To do
+**Lightweight hook script** · P1 · effort M · Done
 
 **Goal.** Stop paying a full crewchat.py import (about 150 ms measured) on every agent tool call.
 
@@ -126,6 +126,14 @@ while an installed crewchat (`CREWCHAT_BIN=...`) imports a cached `.pyc`. Baseli
 - Older installs must keep working until rejoined.
 
 **Depends on:** [P0](#p0)
+
+**Status.** Done, with the owner's choices (17 Oct): only the tool-call hook moved (prompt, stop and
+permission hooks fire once a turn and keep running crewchat); crewchat.py writes the script,
+`~/.crewchat/crewchat-hook.py`, from its own code (`hook_script`), so there is one copy of the logic and a
+crewchat.py copied alone still works; it posts to this machine's server over a plain socket (urllib only
+for a chat on another machine); all six tools use it (Codex and Gemini CLI ask once more to review the
+changed hook). Measured on macOS, not Linux: an installed crewchat's tool-call hook from about 78 ms to
+about 20 ms; numbers in the pull request.
 
 ### P2
 

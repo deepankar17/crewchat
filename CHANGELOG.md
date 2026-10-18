@@ -12,6 +12,11 @@
   lease that another machine takes over when it runs out; over Tailscale every machine picks the same one
   from those it can reach. `crewchat coordinator NAME` names the one you prefer whenever it is on; the
   page's connection line shows who coordinates now.
+- **The hook after each tool call is about four times faster.** It runs a small script crewchat writes
+  from its own code, `~/.crewchat/crewchat-hook.py`, instead of loading all of crewchat: about 20 ms
+  instead of 80 for an installed crewchat on a Mac. It talks to this machine's server over a plain socket
+  (urllib for a chat on another machine). The server points connected folders' hooks at it when it starts;
+  Codex and Gemini CLI ask once more to review crewchat's hooks. Other hooks are unchanged.
 - **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
   with its push service; when something new needs you and no page of the project is open, the
   server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the
