@@ -989,6 +989,60 @@ class CodeMap:
         return self.answer({"files": [p[cut:] for p in shown], "links": [[i, j, n] for (i, j), n in sorted(pairs.items())],
                             "more": len(paths) - len(shown)})
 
+    def overview(self, inside="", parts=8, used=8, entries=6):
+        """What a joining agent should know first (roadmap C6), for the files under a folder of the repository
+        (paths relative to it): its main parts (folders, by size), the files most others use (certain links) with
+        what they define, and where it starts (files that use others but nothing uses, conventional names first)."""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            files = dict(self.db.execute("SELECT path, lang FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\'",
+                                         (prefix,)).fetchall())
+            users, uses = {}, {}
+            for a, b in self.db.execute(
+                    "SELECT DISTINCT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1 AND s.path != d.path"):
+                if a in files and b in files:
+                    users.setdefault(b, set()).add(a)
+                    uses.setdefault(a, set()).add(b)
+            defined, methods = {}, {}
+            for path, kind, name in self.db.execute(
+                    "SELECT path, kind, name FROM nodes WHERE kind IN ('class', 'interface', 'object', 'component', "
+                    "'module', 'service', 'function', 'method') AND path LIKE ? ESCAPE '\\' ORDER BY line", (prefix,)):
+                if kind == "method":  # Python's Class.method: how much a class does
+                    methods[(path, name.split(".")[0])] = methods.get((path, name.split(".")[0]), 0) + 1
+                else:
+                    defined.setdefault(path, []).append((kind, name.split("|")[0]))
+        cut = len(inside)
+        rel = lambda p: p[cut:]  # noqa: E731
+        groups = {}
+        for path, lang in files.items():
+            short = rel(path)
+            folder = short.split("/")[0] + "/" if "/" in short else "(top)"
+            groups.setdefault(folder, []).append((path, lang))
+        main = []
+        for folder, members in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:parts]:
+            langs = {}
+            for _, lang in members:
+                langs[lang] = langs.get(lang, 0) + 1
+            top = sorted(members, key=lambda m: -len(users.get(m[0], ())))[:4]
+            main.append({"folder": folder, "files": len(members), "langs": sorted(langs, key=lambda l: -langs[l])[:2],
+                         "key": [rel(p).rsplit("/", 1)[-1] for p, _ in top]})
+        def names(path):  # its biggest classes first, else its functions in order
+            classes = sorted((n for k, n in defined.get(path, []) if k != "function"),
+                             key=lambda n: -methods.get((path, n), 0))
+            return (classes or [n for k, n in defined.get(path, [])])[:5]
+
+        def test(path):
+            return bool(re.search(r"(^|/)(tests?|spec|e2e|__tests__)/|(^|/)test_|[._-](test|spec)\.", path))
+        most = sorted((p for p in files if users.get(p)), key=lambda p: (-len(users[p]), p))[:used]
+        conventional = ("main.py", "__main__.py", "app.py", "manage.py", "index.ts", "index.js", "main.ts", "App.tsx",
+                        "App.jsx", "main.kt", "Main.kt", "Application.java", "Main.java", "MainActivity.kt", "server.py")
+        starts = sorted((p for p in files if uses.get(p) and not users.get(p)),
+                        key=lambda p: (test(rel(p)), p.rsplit("/", 1)[-1] not in conventional, -len(uses[p]), p))[:entries]
+        return self.answer({"files": len(files), "parts": main,
+                            "used": [{"path": rel(p), "by": len(users[p]), "defines": names(p)} for p in most],
+                            "starts": [{"path": rel(p), "uses": len(uses[p])} for p in starts]})
+
     def definitions(self, path):
         with self.lock:
             rows = self.db.execute("SELECT kind, name, line FROM nodes WHERE path = ? AND kind NOT IN ('file', "

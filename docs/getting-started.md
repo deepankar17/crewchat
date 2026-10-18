@@ -475,6 +475,12 @@ carries two things you set per project:
   PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out everywhere. A
   skill of your own by the same name is never touched.
 
+With edit tracking on, each folder also gets **the code at a glance**, for agents that join: a skill
+(`.claude/skills/crewchat-brief/`) and a Cursor rule its agent reads when it wants, made from the code
+map. They list the main parts, the files most others use, where the code starts, and who works on what
+now, under about 1,500 tokens, stamped with the commit they were made at. They are rewritten when the
+code or the sheet moves on; `AGENTS.md` only gets a line pointing to them.
+
 ## Upgrade and uninstall
 
 **Upgrade:** `crewchat update` installs the latest release and starts the server again on it.

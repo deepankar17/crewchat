@@ -493,6 +493,42 @@ class Repositories(unittest.TestCase):
         self.assertEqual(crewchat_map.clean_remote("ssh://git@host:2222/a/b.git"), "host:2222/a/b")
 
 
+class Brief(unittest.TestCase):
+    """C6: the brief for joining agents stays under about 1,500 tokens."""
+
+    def test_the_crewchat_repositorys_brief_is_short(self):
+        import crewchat
+        out = Path(tempfile.mkdtemp(prefix="crewchat-brief-"))
+        try:
+            maps = crewchat_map.Maps(out)
+            maps.check([ROOT])
+            cmap, _ = maps.for_folder(ROOT)
+            overview = cmap.overview()
+            tasks = [{"id": "A%d" % i, "title": "A task with a long enough title to matter %d" % i, "holder": "agent%d" % i,
+                      "status": "in progress", "areas": ["app/part%d/" % i]} for i in range(12)]
+            text = crewchat.project_brief("crewchat", overview, tasks, 7)
+            self.assertLessEqual(len(text), crewchat.MAX_BRIEF)  # about 1,500 tokens at most
+            self.assertIn("at commit `%s`" % (overview["commit"][:10] or "none"), text)
+            self.assertIn("- `crewchat.py`: used by", text)
+            maps.close()
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
+
+    def test_a_big_project_is_cut_to_fit(self):
+        import crewchat
+        overview = {"commit": "abc", "files": 9000,
+                    "parts": [{"folder": "part%d/" % i, "files": 100, "langs": ["java"], "key": ["A%d.java" % j for j in range(4)]}
+                              for i in range(8)],
+                    "used": [{"path": "core/very/long/path/name/Thing%d.java" % i, "by": 50, "defines": ["Thing", "Other", "More"]}
+                             for i in range(8)],
+                    "starts": [{"path": "apps/entry%d/Main.java" % i, "uses": 3} for i in range(6)]}
+        tasks = [{"id": "B%d" % i, "title": "x" * 200, "holder": "h", "status": "in progress", "areas": ["a/" * 20]}
+                 for i in range(10)]
+        text = crewchat.project_brief("big", overview, tasks)
+        self.assertLessEqual(len(text), crewchat.MAX_BRIEF)
+        self.assertIn("## Who works on what now", text)
+
+
 class Speed(unittest.TestCase):
     def test_the_crewchat_repository_maps_in_under_two_seconds(self):
         out = Path(tempfile.mkdtemp(prefix="crewchat-map-speed-"))

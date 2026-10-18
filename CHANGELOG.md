@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Agents that join get the code at a glance.** With edit tracking on, each project folder gets a skill
+  (and a Cursor rule) made from the code map: the main parts, the files most others use, where the code
+  starts, and who works on what now, stamped with the commit. Under about 1,500 tokens, read when an
+  agent joins rather than every turn.
 - **Exact parsing for Java, Kotlin, JavaScript and TypeScript in the code map**, for those who add the
   `map` extra (`uv tool install "crewchat[cloud,map]"`, with tree-sitter): calls are linked to what they
   call, a class of the same package is known for a type, and interface-change notices cover these

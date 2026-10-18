@@ -971,6 +971,40 @@ class TaskAreas(Base):
         self.hub._maps = None
         self.assertEqual(self.hub.blast_radius(b_name, cart), "")  # no map: no note
 
+    def test_joining_agents_get_a_brief_of_the_code(self):
+        # Roadmap C6: a skill (and a Cursor rule) made from the code map and the sheet, stamped with the commit;
+        # AGENTS.md only points to it (owner, 18 Oct: not every turn's cost).
+        code = Path(tempfile.mkdtemp(prefix="brief-", dir=TMP)).resolve()
+        for rel, text in {"brieflib/core.py": "class Engine:\n    def run(self):\n        pass\n", "brieflib/__init__.py": "",
+                          "briefapp/main.py": "from brieflib.core import Engine\n", "AGENTS.md": "# Our notes\n"}.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        import crewchat_map
+        self.hub._maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="brief-maps-", dir=TMP)))
+        self.addCleanup(self.hub._maps.close)
+        (a, a_name), _ = self.crew
+        mid = self.task("Speed up the engine", "brieflib/")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.update_map()
+        brief = (code / crewchat.BRIEF_SKILL).read_text()
+        self.assertTrue(brief.startswith("---\nname: crewchat-brief\n"))
+        self.assertIn("at commit `none`", brief)  # not a git folder: stamped as such
+        self.assertIn("- `brieflib/core.py`: used by 1; defines Engine", brief)
+        self.assertIn("- `briefapp/main.py`", brief)  # where it starts
+        self.assertIn("- #%s Speed up the engine: %s, in progress; files brieflib/" % (mid, a_name), brief)
+        self.assertIn("alwaysApply: false", (code / crewchat.BRIEF_RULE).read_text())
+        self.assertIn("read %s when you join" % crewchat.BRIEF_SKILL, (code / "AGENTS.md").read_text())
+        self.assertNotIn("used by 1", (code / "AGENTS.md").read_text())  # a pointer, not the brief
+        self.assertEqual(self.hub.write_briefs(self.hub._maps), [])  # nothing new: nothing written
+        a.text("hub_task", action="update", id=mid, status="done", note="faster")
+        self.assertEqual(self.hub.write_briefs(self.hub._maps), [str(code)])  # the sheet moved: written again
+        self.assertNotIn("#%s Speed up the engine" % mid, (code / crewchat.BRIEF_SKILL).read_text())
+        crewchat.remove_guides(code)
+        self.assertFalse((code / crewchat.BRIEF_SKILL).exists() or (code / crewchat.BRIEF_RULE).exists())
+
     def test_suggested_areas_travel_as_a_message_field(self):
         mid = self.task("From another machine")
         self.assertTrue(self.hub.ingest({"id": "far-%s" % mid, "ts": time.time(), "from": crewchat.SERVER_NAME,

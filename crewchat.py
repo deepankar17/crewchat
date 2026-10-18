@@ -2387,7 +2387,30 @@ class Hub:
         edited, self._map_edited = self._map_edited, set()
         done = maps.check(self.project_folders(), bool(edited), sorted(edited))
         self.interface_notices(maps)
+        self.write_briefs(maps)
         return done
+
+    def write_briefs(self, maps):
+        """Each folder's brief for joining agents (C6), from its code map and the task sheet: written when it changed
+        (a new commit, another holder). Returns the folders written."""
+        with self.lock:
+            rows = [r for r in self.sheet_rows() if r["status"] in ("doing", "review", "blocked") and r["holder"]]
+            tasks = [{"id": r["id"], "title": r["title"], "holder": r["holder"], "areas": r["areas"],
+                      "status": STATUSES.get(r["status"], r["status"]) if r["status"] != "doing" else "in progress"}
+                     for r in rows]
+            waiting = sum(1 for r in self.sheet_rows() if r["status"] in ("todo", "waiting"))
+        written = []
+        for folder, (cmap, inside) in list(maps.tops.items()):
+            try:
+                text = project_brief(self.roster.project, cmap.overview(inside), tasks, waiting)
+                new = not (Path(folder) / BRIEF_SKILL).exists()
+                if write_brief(folder, self.roster.project, text):
+                    written.append(folder)
+                    if new:  # its AGENTS.md, if it has one, now points to it
+                        write_guides(folder, self.roster.root)
+            except Exception as e:  # a folder that cannot be written now: the next update tries again
+                sys.stderr.write("%s could not write the project brief in %s: %s\n" % (now_iso(), folder, e))
+        return written
 
     # Interface-change notices (C3) ------------------------------------------------------------------
     def interface_notices(self, maps, now=None):
@@ -10029,7 +10052,9 @@ def write_guides(folder, root):
     agents = folder / "AGENTS.md"
     if agents.is_file():  # only one the folder already has
         text = agents.read_text(encoding="utf-8")
-        block = "%s\n%s\n%s" % (GUIDE_BEGIN, guide.strip(), GUIDE_END)
+        pointer = ("\n\nThe code at a glance (its main parts, the files most others use, who works on what): read "
+                   "%s when you join." % BRIEF_SKILL) if (folder / BRIEF_SKILL).exists() else ""  # C6, a line only
+        block = "%s\n%s%s\n%s" % (GUIDE_BEGIN, guide.strip(), pointer, GUIDE_END)
         if GUIDE_BEGIN in text and GUIDE_END in text:
             new = text[:text.index(GUIDE_BEGIN)] + block + text[text.index(GUIDE_END) + len(GUIDE_END):]
         else:
@@ -10063,10 +10088,66 @@ def write_guides(folder, root):
     return changed
 
 
+BRIEF_SKILL = ".claude/skills/crewchat-brief/SKILL.md"  # the project's code at a glance (C6), as a skill
+BRIEF_RULE = ".cursor/rules/crewchat-brief.mdc"  # and as a Cursor rule its agent reads when it wants
+MAX_BRIEF = 6000  # characters of the brief: about 1,500 tokens
+
+
+def project_brief(project, overview, tasks, waiting=0):
+    """The project's code at a glance (roadmap C6), in Markdown: its main parts, the files most others use, where
+    it starts, and who works on what now, stamped with the commit the code map read. Kept under MAX_BRIEF
+    characters by listing fewer of each, the longest list first."""
+    limits = {"parts": 8, "used": 8, "starts": 6, "tasks": 10}
+    while True:
+        commit, branch = str(overview.get("commit") or ""), str(overview.get("branch") or "")
+        lines = ["# %s: the code at a glance" % project, "",
+                 "Made by crewchat from its code map at commit `%s`%s (%d files). The code may have moved on since: "
+                 "check what you change." % (commit[:10] or "none", " on " + branch if branch else "", overview.get("files", 0)),
+                 "", "## Main parts", ""]
+        lines += ["- `%s`: %d file%s (%s): %s" % (p["folder"], p["files"], "" if p["files"] == 1 else "s",
+                                                  ", ".join(p["langs"]), ", ".join(p["key"]))
+                  for p in overview.get("parts", [])[:limits["parts"]]]
+        if overview.get("used"):
+            lines += ["", "## The files most others use", ""]
+            lines += ["- `%s`: used by %d; defines %s" % (u["path"], u["by"], ", ".join(u["defines"]) or "nothing named")
+                      for u in overview["used"][:limits["used"]]]
+        if overview.get("starts"):
+            lines += ["", "## Where it starts", "", "Files that use others but that nothing uses: entry points, scripts, "
+                      "tests.", ""]
+            lines += ["- `%s`" % e["path"] for e in overview["starts"][:limits["starts"]]]
+        lines += ["", "## Who works on what now", ""]
+        lines += ["- #%s %s: %s, %s; files %s" % (t["id"], t["title"][:90], t["holder"], t["status"],
+                                                 ", ".join(t["areas"]) or "not given")
+                  for t in tasks[:limits["tasks"]]] or ["- Nobody holds a task now."]
+        if waiting:
+            lines.append("- %d more wait%s on the task sheet: hub_task view." % (waiting, "s" if waiting == 1 else ""))
+        text = "\n".join(lines) + "\n"
+        if len(text) <= MAX_BRIEF or not any(limits.values()):
+            return text
+        longest = max(limits, key=lambda k: min(limits[k], len(overview.get(k, tasks if k == "tasks" else []))))
+        limits[longest] = max(0, min(limits[longest], len(overview.get(longest, tasks if longest == "tasks" else []))) - 1)
+
+
+def write_brief(folder, project, text):
+    """The brief into a folder: a Claude Code skill and a Cursor rule its agents read when they want (owner, 18
+    Oct: not in AGENTS.md, where it would cost every turn). Returns whether it changed."""
+    folder = Path(folder)
+    skill = ("---\nname: crewchat-brief\ndescription: The code of the project %s at a glance, made by crewchat from its "
+             "code map: its main parts, the files most others use, where it starts, and who works on what now. Read it "
+             "when you join the project, before exploring its code.\n---\n\n" % project) + text
+    rule = ("---\ndescription: The code of the project %s at a glance (main parts, the files most others use, who works "
+            "on what): read it when you join, before exploring the code\nalwaysApply: false\n---\n\n" % project) + text
+    changed = _write_if_changed(folder / BRIEF_SKILL, skill)
+    changed = _write_if_changed(folder / BRIEF_RULE, rule) or changed
+    if changed:
+        git_exclude(folder, [".claude/skills/crewchat-brief/", BRIEF_RULE])
+    return changed
+
+
 def remove_guides(folder):
     """Take the guide and the skills crewchat installed out of a folder (uninstall)."""
     folder, removed = Path(folder), []
-    for rel in (".claude/skills/crewchat", GUIDE_RULE):
+    for rel in (".claude/skills/crewchat", GUIDE_RULE, ".claude/skills/crewchat-brief", BRIEF_RULE):
         path = folder / rel
         if path.is_dir():
             shutil.rmtree(path, ignore_errors=True)

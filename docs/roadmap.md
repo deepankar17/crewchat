@@ -45,7 +45,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
 | [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | Done | C1, C2 |
 | [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
-| [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | To do | C1 |
+| [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | Done | C1 |
 | [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | To do | C1 |
 | [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | Done | C1, X1 |
 | [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | In progress | none |
@@ -631,7 +631,9 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C6
 
-**Project brief for joining agents** · P2 · effort S · To do
+**Project brief for joining agents** · P2 · effort S · Done
+
+> **Decided:** A generated skill (and a Cursor rule read on demand), not a block in AGENTS.md (owner, 18 Oct).
 
 **Goal.** A new agent starts with a short map of the project instead of exploring from scratch.
 
