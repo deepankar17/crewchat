@@ -318,6 +318,252 @@ def read_html(rel, text):
     return [], [("uses", ["tag", tag], 1) for tag in sorted(set(TAG.findall(text)))]
 
 
+# --------------------------------------------------------------------------------------------
+# Accurate readers (roadmap C9): with `pip install "crewchat[map]"` (tree-sitter and its grammars), Java, Kotlin,
+# JavaScript and TypeScript are read with real parsers. Same tables; more of their links certain (a call is linked
+# to what it calls, a class of the same package to its file), and every function's parameters kept, so C3's notices
+# work for them too. Without the extra, the regular expressions above.
+# --------------------------------------------------------------------------------------------
+_PARSERS = None
+
+
+def parsers():
+    """{"java", "kotlin", "js", "ts", "tsx": tree_sitter.Parser}, or {} without the extra."""
+    global _PARSERS
+    if _PARSERS is None:
+        try:
+            import tree_sitter
+            import tree_sitter_java
+            import tree_sitter_javascript
+            import tree_sitter_kotlin
+            import tree_sitter_typescript
+
+            def make(capsule):
+                language = tree_sitter.Language(capsule)
+                try:
+                    return tree_sitter.Parser(language)
+                except TypeError:  # tree-sitter before 0.22
+                    parser = tree_sitter.Parser()
+                    parser.set_language(language)
+                    return parser
+            _PARSERS = {"java": make(tree_sitter_java.language()), "kotlin": make(tree_sitter_kotlin.language()),
+                        "js": make(tree_sitter_javascript.language()),
+                        "ts": make(tree_sitter_typescript.language_typescript()),
+                        "tsx": make(tree_sitter_typescript.language_tsx())}
+        except Exception:  # not installed, or a grammar this platform has no wheel for
+            _PARSERS = {}
+    return _PARSERS
+
+
+def parser_name():
+    return "tree-sitter" if parsers() else "regex"
+
+
+def _nodes(node):
+    """Every node under this one, depth first."""
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.children))
+
+
+def _child(node, *types):
+    return next((c for c in node.children if c.type in types), None)
+
+
+def read_jvm_accurately(rel, src, lang):
+    """Java or Kotlin with tree-sitter: (definitions, references, signatures), as read_jvm gives the first two."""
+    text = lambda n: src[n.start_byte:n.end_byte].decode("utf-8", "replace")  # noqa: E731
+    root = parsers()[lang].parse(src).root_node
+    defs, refs, sigs = [], [], {}
+    package, imported, members, names = "", {}, {}, set()
+    for node in root.children:
+        if node.type in ("package_declaration", "package_header"):
+            name = _child(node, "scoped_identifier", "identifier", "qualified_identifier")
+            package = text(name) if name else ""
+        elif node.type in ("import_declaration", "import"):
+            name = _child(node, "scoped_identifier", "identifier", "qualified_identifier")
+            if name is None:
+                continue
+            full = text(name)
+            star = _child(node, "asterisk", "*") is not None
+            static = _child(node, "static") is not None
+            alias = node.children[-1] if node.children and node.children[-2:-1] and node.children[-2].type == "as" else None
+            if static and not star:  # import static a.b.C.member: the class, and the member it brings
+                cls, member = full.rsplit(".", 1)
+                refs.append(("imports", ["jvm", cls, False], 1))
+                members[member] = (cls, member)
+            elif star:
+                refs.append(("imports", ["jvm", full, not static], 1))
+            else:
+                refs.append(("imports", ["jvm", full, False], 1))
+                imported[text(alias) if alias is not None else full.rsplit(".", 1)[-1]] = full
+    defs.append(("package", package, 0))
+    kinds = {"class_declaration": "class", "interface_declaration": "interface", "enum_declaration": "class",
+             "record_declaration": "class", "annotation_type_declaration": "class", "object_declaration": "object"}
+
+    def private(node):
+        mods = _child(node, "modifiers")
+        return mods is not None and any(w in text(mods).split() for w in ("private", "internal"))
+
+    def walk(node, owner):
+        for child in node.children:
+            kind = kinds.get(child.type)
+            if child.type == "class_declaration" and _child(child, "interface") is not None:
+                kind = "interface"
+            if kind:
+                name = child.child_by_field_name("name") or _child(child, "identifier", "type_identifier")
+                if name is not None:
+                    defs.append((kind, text(name), child.start_point[0] + 1))
+                    if not private(child):
+                        sigs[(owner + "." if owner else "") + text(name)] = "class"
+                    walk(child, (owner + "." if owner else "") + text(name))
+                continue
+            if child.type in ("method_declaration", "constructor_declaration", "function_declaration"):
+                name = child.child_by_field_name("name") or _child(child, "identifier")
+                params = child.child_by_field_name("parameters") or _child(child, "function_value_parameters")
+                if name is not None:
+                    defs.append(("function", text(name), child.start_point[0] + 1))
+                    if not private(child) and params is not None:
+                        returns = child.child_by_field_name("type") if lang == "java" else _child(child, "user_type")
+                        written = (" -> " if lang == "java" else ": ") + text(returns) if returns is not None else ""
+                        sigs[(owner + "." if owner else "") + text(name)] = " ".join(text(params).split()) + written
+                walk(child, owner)
+                continue
+            walk(child, owner)
+    walk(root, "")
+    for node in _nodes(root):
+        if node.type == "method_invocation":  # Java: Cls.m() for an imported Cls, or m() imported static
+            obj, name = node.child_by_field_name("object"), node.child_by_field_name("name")
+            if name is None:
+                continue
+            if obj is not None and obj.type == "identifier" and text(obj) in imported:
+                refs.append(("calls", ["member", imported[text(obj)], text(name)], 1))
+            elif obj is None and text(name) in members:
+                refs.append(("calls", ["member"] + list(members[text(name)]), 1))
+        elif node.type == "call_expression" and lang == "kotlin":  # f() imported, or Obj.m() for an imported Obj
+            head = node.children[0] if node.children else None
+            if head is not None and head.type == "identifier" and text(head) in imported:
+                refs.append(("calls", ["jvm", imported[text(head)], False], 1))
+            elif head is not None and head.type == "navigation_expression" and head.children:
+                obj, last = head.children[0], head.children[-1]
+                if obj.type == "identifier" and text(obj) in imported and last.type == "identifier":
+                    refs.append(("calls", ["member", imported[text(obj)], text(last)], 1))
+        elif node.type in ("type_identifier", "user_type", "identifier") and node.parent is not None and \
+                node.parent.type not in ("import_declaration", "import", "scoped_identifier", "qualified_identifier",
+                                         "package_declaration", "package_header"):
+            word = text(node).split("<")[0].split(".")[-1]
+            if word[:1].isupper() and word.isidentifier():
+                names.add(word)
+    # Classes of its own package, named in its code: certain now that they are known to be types or calls.
+    refs.append(("uses", ["names", sorted(names)], 1))
+    return defs, refs, sigs
+
+
+def read_js_accurately(rel, src, flavour):
+    """JavaScript or TypeScript with tree-sitter: (definitions, references, signatures, angular)."""
+    text = lambda n: src[n.start_byte:n.end_byte].decode("utf-8", "replace")  # noqa: E731
+    root = parsers()[flavour].parse(src).root_node
+    defs, refs, sigs, names, spaces = [], [], {}, {}, {}
+
+    def spec_of(node):
+        string = node.child_by_field_name("source") or _child(node, "string")
+        frag = _child(string, "string_fragment") if string is not None else None
+        return text(frag) if frag is not None else ""
+    for node in _nodes(root):
+        if node.type == "import_statement":
+            spec = spec_of(node)
+            if not spec:
+                continue
+            refs.append(("imports", ["js", spec], 1))
+            clause = _child(node, "import_clause")
+            for part in (clause.children if clause is not None else []):
+                if part.type == "identifier":
+                    names[text(part)] = (spec, "default")
+                elif part.type == "namespace_import":
+                    alias = _child(part, "identifier")
+                    if alias is not None:
+                        spaces[text(alias)] = spec
+                elif part.type == "named_imports":
+                    for item in part.children:
+                        if item.type == "import_specifier":
+                            name, alias = item.child_by_field_name("name"), item.child_by_field_name("alias")
+                            if name is not None:
+                                names[text(alias if alias is not None else name)] = (spec, text(name))
+        elif node.type == "export_statement" and (node.child_by_field_name("source") or _child(node, "string")):
+            spec = spec_of(node)
+            if spec:
+                refs.append(("imports", ["js", spec], 1))
+        elif node.type == "call_expression":
+            fn, args = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+            if fn is None:
+                continue
+            if fn.type in ("identifier", "import") and text(fn) in ("require", "import") and args is not None:
+                first = _child(args, "string")
+                frag = _child(first, "string_fragment") if first is not None else None
+                if frag is not None:
+                    refs.append(("imports", ["js", text(frag)], 1))
+            elif fn.type == "identifier" and text(fn) in names:
+                refs.append(("calls", ["jsname"] + list(names[text(fn)]), 1))
+            elif fn.type == "member_expression":
+                obj, prop = fn.child_by_field_name("object"), fn.child_by_field_name("property")
+                if obj is not None and prop is not None and obj.type == "identifier" and text(obj) in spaces:
+                    refs.append(("calls", ["jsname", spaces[text(obj)], text(prop)], 1))
+    for node in root.children:  # what it exports: functions, classes and constants, their parameters kept
+        if node.type != "export_statement":
+            continue
+        decl = node.child_by_field_name("declaration")
+        if decl is None:
+            continue
+        if decl.type in ("function_declaration", "generator_function_declaration", "class_declaration",
+                         "abstract_class_declaration", "interface_declaration", "type_alias_declaration",
+                         "enum_declaration"):
+            name = decl.child_by_field_name("name")
+            if name is None:
+                continue
+            word, line = text(name), decl.start_point[0] + 1
+            if "class" in decl.type:
+                defs.append(("component" if word[:1].isupper() else "class", word, line))
+                sigs[word] = "class"
+                body = decl.child_by_field_name("body")
+                for member in (body.children if body is not None else []):
+                    if member.type == "method_definition":
+                        mname, params = member.child_by_field_name("name"), member.child_by_field_name("parameters")
+                        if mname is not None and params is not None and not text(mname).startswith("#"):
+                            sigs[word + "." + text(mname)] = " ".join(text(params).split())
+            elif decl.type in ("interface_declaration", "type_alias_declaration", "enum_declaration"):
+                defs.append(("class", word, line))
+            else:
+                defs.append(("component" if word[:1].isupper() else "function", word, line))
+                params, returns = decl.child_by_field_name("parameters"), decl.child_by_field_name("return_type")
+                if params is not None:
+                    sigs[word] = " ".join(text(params).split()) + (" ".join(text(returns).split()) if returns else "")
+        elif decl.type in ("lexical_declaration", "variable_declaration"):
+            for item in decl.children:
+                if item.type != "variable_declarator":
+                    continue
+                name, value = item.child_by_field_name("name"), item.child_by_field_name("value")
+                if name is None or name.type != "identifier":
+                    continue
+                word = text(name)
+                callable_ = value is not None and value.type in ("arrow_function", "function_expression", "function")
+                defs.append(("component" if word[:1].isupper() and callable_ else "function", word, item.start_point[0] + 1))
+                params = value.child_by_field_name("parameters") if callable_ else None
+                if params is None and callable_:
+                    params = value.child_by_field_name("parameter")
+                if params is not None:
+                    sigs[word] = " ".join(text(params).split())
+    # Angular's decorators and templates: the regular expressions read those well; their findings join these.
+    text_all = src.decode("utf-8", "replace")
+    rx_defs, rx_refs, angular = read_js(rel, text_all)
+    if angular:
+        decorated = {d[1].split("|")[0] for d in rx_defs if d[0] in ("component", "module", "service", "directive", "pipe")}
+        defs = [d for d in defs if d[1] not in decorated] + [d for d in rx_defs if d[1].split("|")[0] in decorated]
+        refs += [r for r in rx_refs if r[0] in ("uses", "injects")]
+    return defs, refs, sigs, angular
+
+
 def norm(path):
     """A relative path with forward slashes and no ./ or ..; a folder keeps its trailing /."""
     text = str(path).replace("\\", "/")
@@ -347,10 +593,12 @@ class CodeMap:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=OFF")
         self.db.executescript(SCHEMA)
-        if self.meta("version") != MAP_VERSION:  # made by another version: build it again
+        if self.meta("version") != MAP_VERSION or self.meta("parser", parser_name()) != parser_name():
+            # Made by another version, or with other readers (the map extra came or went): build it again.
             for table in ("nodes", "edges", "refs", "files", "signatures", "meta"):
                 self.db.execute("DELETE FROM %s" % table)
             self._set_meta("version", MAP_VERSION)
+            self._set_meta("parser", parser_name())
             self.db.commit()
         self.base_url, self.aliases = self._ts_paths()
         self._linked = {}  # (a, b) -> linked(a, b), until the next update changes something
@@ -484,13 +732,24 @@ class CodeMap:
             text = (self.top / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
-        sigs = {}
-        if lang == "python":
+        sigs, accurate = {}, None
+        if parsers() and lang in ("java", "kotlin", "react"):
+            try:
+                if lang == "react":
+                    flavour = {".ts": "ts", ".tsx": "tsx"}.get(os.path.splitext(rel)[1].lower(), "js")
+                    defs, refs, sigs, angular = read_js_accurately(rel, text.encode("utf-8"), flavour)
+                    lang = "angular" if angular else lang
+                else:
+                    defs, refs, sigs = read_jvm_accurately(rel, text.encode("utf-8"), lang)
+                accurate = True
+            except Exception:  # whatever a grammar trips on: the regular expressions read it instead
+                sigs = {}
+        if accurate:
+            pass
+        elif lang == "python":
             defs, refs, sigs = read_python(rel, text)
             if sigs is None:  # does not parse now: keep what it had
                 sigs = old
-            elif known and sigs != old:
-                self.changes.append((rel, old, sigs))
         elif lang in ("java", "kotlin"):
             defs, refs = read_jvm(rel, text, lang)
         elif lang == "html":
@@ -498,6 +757,8 @@ class CodeMap:
         else:
             defs, refs, angular = read_js(rel, text)
             lang = "angular" if angular else lang
+        if known and sigs != old and (sigs or old):  # an interface changed (C3)
+            self.changes.append((rel, old, sigs))
         self.db.execute("INSERT INTO nodes (kind, path, name, line, lang) VALUES ('file', ?, ?, 0, ?)", (rel, rel, lang))
         self.db.executemany("INSERT INTO nodes (kind, path, name, line, lang) VALUES (?, ?, ?, ?, ?)",
                             [(kind, rel, name, line, lang) for kind, name, line in defs])
@@ -603,16 +864,29 @@ class CodeMap:
             parent, _, last = name.rpartition(".")  # import a.b.topLevelFunction (Kotlin)
             hits = [p for p in ix["packages"].get(parent, []) if last in ix["defs"].get(p, {})]
             return [(ix["defs"][p][last], True) for p in hits[:MAX_GUESSES]]
-        if kind == "names":  # capitalised names a JVM file mentions: classes of its own package
-            package = ix["package_of"].get(path)
+        if kind == "names":  # capitalised names a JVM file mentions: classes of its own package (a guess unless a
+            package = ix["package_of"].get(path)  # parser said they are types: the reference's own certainty)
             if package is None:
                 return []
             out = []
             for word in target[1]:
                 found = ix["types"].get((package + "." if package else "") + word)
                 if found and found != path:
-                    out.append((files[found], False))
+                    out.append((files[found], True))
             return out
+        if kind == "member":  # a call to Cls.member, Cls imported: the member in the file that defines Cls (C9)
+            found = self._resolve(path, ["jvm", target[1], False], ix)
+            if not found:
+                return []
+            where = next((p for p, i in files.items() if i == found[0][0]), None)
+            member = ix["defs"].get(where, {}).get(target[2]) if where else None
+            return [(member or found[0][0], True)]
+        if kind == "jsname":  # a call to a name imported from a file: that name's definition in it (C9)
+            found = self._js_target(path, target[1], files)
+            if not found:
+                return []
+            defined = ix["defs"].get(found, {}).get(target[2]) if target[2] != "default" else None
+            return [(defined or files[found], True)]
         if kind == "js":
             found = self._js_target(path, target[1], files)
             return [(files[found], True)] if found else []
@@ -727,6 +1001,7 @@ class CodeMap:
             langs = dict(self.db.execute("SELECT lang, COUNT(*) FROM nodes WHERE kind = 'file' GROUP BY lang"))
             edges = self.db.execute("SELECT COUNT(*), COALESCE(SUM(certain), 0) FROM edges").fetchone()
             return self.answer({"files": sum(langs.values()), "langs": langs, "links": edges[0], "certain": edges[1],
+                                "parser": self.meta("parser", parser_name()),
                                 "built": float(self.meta("built") or 0), "took": float(self.meta("took") or 0),
                                 "folder": str(self.top)})
 

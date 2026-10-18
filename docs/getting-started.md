@@ -394,7 +394,8 @@ A message you post as a task also goes on the sheet.
 
 **A task's files.** `--areas` says which files a task changes, as path prefixes. Two tasks over the
 same files never run at once, and in a project with edit tracking on (`crewchat edits`), neither
-do two tasks where one's code imports the other's: crewchat's code map knows (`crewchat map`). An
+do two tasks where one's code imports the other's: crewchat's code map knows (`crewchat map`; for exact
+parsing of Java, Kotlin, JavaScript and TypeScript, add the `map` extra: `uv tool install "crewchat[cloud,map]"`). An
 agent often changes more than its task said. When it marks the task ready for review or done,
 crewchat suggests the folders it changed outside the task's areas (at most five, grouped by folder)
 to the lead, or to you. Accept them with **Accept files** in the task's panel, or:

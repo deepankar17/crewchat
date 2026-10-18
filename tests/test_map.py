@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 import crewchat_map  # noqa: E402
 
 HAS_GIT = shutil.which("git") is not None
+ACCURATE = bool(crewchat_map.parsers())  # the map extra (C9): tree-sitter reads Java, Kotlin, JS and TS
 
 
 def write(top, files):
@@ -122,22 +123,25 @@ class JavaRepo(Sample):
             "app/src/main/java/com/shop/cart/Cart.java": {
                 "app/src/main/java/com/shop/model/Item.java",  # a class
                 "app/src/main/java/com/shop/util/Money.java",  # a wildcard: the package's files, and a static import
-                "app/src/main/java/com/shop/util/Tax.java"},
+                "app/src/main/java/com/shop/util/Tax.java"} | (  # and, read by a parser, Pricing: a type it names
+                {"app/src/main/java/com/shop/cart/Pricing.java"} if ACCURATE else set()),
             "app/src/main/java/com/shop/Main.java": {"app/src/main/java/com/shop/model/Item.java"},  # a nested class
         })
 
     def test_the_same_package_is_only_a_hint(self):
+        # A guess from a capitalised name with the regular expressions; certain when a parser says it is a type.
         links = self.map.imports("app/src/main/java/com/shop/cart/Cart.java")["files"]
         pricing = [f for f in links if f["path"].endswith("Pricing.java")]
-        self.assertEqual([(f["kind"], f["certain"]) for f in pricing], [("uses", False)])
-        self.assertFalse(self.map.linked("app/src/main/java/com/shop/cart/Cart.java",
-                                         "app/src/main/java/com/shop/cart/Pricing.java"))
+        self.assertEqual([(f["kind"], f["certain"]) for f in pricing], [("uses", ACCURATE)])
+        self.assertEqual(self.map.linked("app/src/main/java/com/shop/cart/Cart.java",
+                                         "app/src/main/java/com/shop/cart/Pricing.java"), ACCURATE)
 
     def test_how_two_areas_are_linked(self):
         # C4: certain links (an import), guesses (a class of the same package, by name), or none.
         base = "app/src/main/java/com/shop/"
         self.assertEqual(self.map.link(base + "cart/Cart.java", base + "model/"), crewchat_map.CERTAIN)
-        self.assertEqual(self.map.link(base + "cart/Pricing.java", base + "cart/Cart.java"), crewchat_map.GUESS)
+        self.assertEqual(self.map.link(base + "cart/Pricing.java", base + "cart/Cart.java"),
+                         crewchat_map.CERTAIN if ACCURATE else crewchat_map.GUESS)
         self.assertEqual(self.map.link(base + "model/", base + "util/Money.java"), 0)
 
     def test_definitions(self):
@@ -373,6 +377,72 @@ class Signatures(Sample):
         self.assertEqual((len(lines), lines[-1]), (6, "and 3 more"))
         self.assertEqual(crewchat_map.signature_changes({"Store.__init__": "(self)"}, {"Store.__init__": "(self, x)"}),
                          ["Store.__init__(self) is now Store.__init__(self, x)"])  # a constructor is public
+
+
+class Packaging(unittest.TestCase):
+    def test_the_core_needs_no_library_and_the_parsers_are_an_extra(self):
+        text = (ROOT / "pyproject.toml").read_text()
+        project = text.split("[project]", 1)[1].split("\n[", 1)[0]
+        self.assertNotRegex(project, r"(?m)^dependencies\s*=\s*\[\s*\S")  # none, or an empty list
+        self.assertRegex(text, r'(?m)^map = \["tree-sitter[^"]*", "tree-sitter-java", "tree-sitter-kotlin", '
+                               r'"tree-sitter-javascript", "tree-sitter-typescript"\]')
+        self.assertIn(crewchat_map.parser_name(), ("tree-sitter", "regex"))
+
+
+@unittest.skipUnless(ACCURATE, "needs the map extra: pip install \"crewchat[map]\"")
+class AccurateReaders(Sample):
+    """C9: with tree-sitter, calls link to what they call, and every function keeps its parameters (for C3)."""
+
+    FILES = {
+        "src/main/java/shop/util/Money.java":
+            "package shop.util;\n\npublic class Money {\n  public static int round(int cents, String mode) { return cents; }\n"
+            "  private static int secret() { return 0; }\n}\n",
+        "src/main/java/shop/Billing.java":
+            "package shop;\n\nimport shop.util.Money;\n\nclass Billing {\n  int total() { return Money.round(5, \"up\"); }\n}\n",
+        "src/main/kotlin/shop/net/Calls.kt": "package shop.net\n\nfun fetch(url: String, retries: Int = 3): String = url\n",
+        "src/main/kotlin/shop/Repo.kt":
+            "package shop\n\nimport shop.net.fetch\n\nclass Repo { fun load() = fetch(\"x\") }\n",
+        "web/lib/api.ts": "export function get(path: string, tries = 1): Promise<string> { return fetch(path) as any; }\n"
+                          "export class Store { save(key: string) {} }\n",
+        "web/App.tsx": "import { get } from './lib/api';\nimport * as api from './lib/api';\n"
+                       "export default function App() { get('/'); api.get('/x'); return null; }\n",
+    }
+
+    def kinds(self, path):
+        return {(f["path"].rsplit("/", 1)[-1], f["kind"]) for f in self.map.imports(path, certain_only=True)["files"]}
+
+    def test_calls_link_to_what_they_call(self):
+        self.assertIn(("Money.java", "calls"), self.kinds("src/main/java/shop/Billing.java"))
+        self.assertIn(("Calls.kt", "calls"), self.kinds("src/main/kotlin/shop/Repo.kt"))
+        self.assertIn(("api.ts", "calls"), self.kinds("web/App.tsx"))  # a named import and a namespace both
+
+    def test_signatures_for_interface_change_notices(self):
+        self.assertEqual(self.map.signatures("src/main/java/shop/util/Money.java"),
+                         {"Money": "class", "Money.round": "(int cents, String mode) -> int"})  # not the private one
+        self.assertEqual(self.map.signatures("src/main/kotlin/shop/net/Calls.kt"),
+                         {"fetch": "(url: String, retries: Int = 3): String"})
+        self.assertEqual(self.map.signatures("web/lib/api.ts"),
+                         {"get": "(path: string, tries = 1): Promise<string>", "Store": "class",
+                          "Store.save": "(key: string)"})
+        # A parameter renamed in Java: C3 hears of it, as it does for Python.
+        path = self.top / "src/main/java/shop/util/Money.java"
+        path.write_text(path.read_text().replace("int cents", "int amount"))
+        os.utime(path, (time.time() + 10, time.time() + 10))
+        self.map.update()
+        [(rel, before, after)] = self.map.pop_changes()
+        self.assertEqual(crewchat_map.signature_changes(before, after),
+                         ["Money.round(int cents, String mode) -> int is now Money.round(int amount, String mode) -> int"])
+
+    def test_a_map_made_by_the_other_readers_is_built_again(self):
+        self.map.db.execute("UPDATE meta SET value = 'regex' WHERE key = 'parser'")
+        self.map.db.commit()
+        path = self.map.path
+        self.maps.close()
+        cmap = crewchat_map.CodeMap(path, self.top)
+        try:
+            self.assertEqual(cmap.status()["files"], 0)  # emptied, to be read again with the parsers
+        finally:
+            cmap.close()
 
 
 @unittest.skipUnless(HAS_GIT, "needs git")

@@ -10162,9 +10162,10 @@ def cmd_map(args):
         return
     if op == "status":
         for m in out["maps"]:
-            print("%s (%s) at %s: %d files, %d links (%d certain), read in %.2f s" % (
+            print("%s (%s) at %s: %d files, %d links (%d certain), read in %.2f s%s" % (
                 m["repo"], m["branch"] or "no branch", (m["commit"] or "no commit")[:10], m["files"], m["links"],
-                m["certain"], m["took"]))
+                m["certain"], m["took"], "" if m.get("parser") == "tree-sitter" else
+                "; exact parsers for Java, Kotlin, JS and TS: pip install \"crewchat[map]\""))
         if not out["maps"]:
             print("No folder of this project on this machine has code to map.")
         return

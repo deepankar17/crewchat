@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Exact parsing for Java, Kotlin, JavaScript and TypeScript in the code map**, for those who add the
+  `map` extra (`uv tool install "crewchat[cloud,map]"`, with tree-sitter): calls are linked to what they
+  call, a class of the same package is known for a type, and interface-change notices cover these
+  languages too. Without it, nothing changes: the core still needs no library at all.
 - **The code, by who holds it**, in the analytics view: the project's files in their folders, each coloured
   by the agent whose task covers it, with the imports between them; past 500 files, folders that open with
   a click. The live demo has it too.

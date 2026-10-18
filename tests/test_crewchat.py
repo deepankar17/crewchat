@@ -938,10 +938,13 @@ class TaskAreas(Base):
         # Roadmap C4: a note naming the other task and its holder, firm on certain links, a hint on guesses;
         # never in the way.
         code = Path(tempfile.mkdtemp(prefix="blast-", dir=TMP)).resolve()
+        # The guess: a service injected by a name two files define (a guess with either readers, C9's too).
         files = {"blastlib/parse.py": "def read():\n    pass\n", "blastlib/__init__.py": "",
                  "blastapp/main.py": "from blastlib.parse import read\n",
-                 "blastjava/p/Cart.java": "package p;\n\nclass Cart { Pricing pricing; }\n",
-                 "blastjava/p/Pricing.java": "package p;\n\nclass Pricing {}\n", "blastdocs/notes.py": ""}
+                 "blastng/cart.component.ts": "@Component({ selector: 'app-cart', template: `<p></p>` })\n"
+                                              "export class CartComponent { constructor(private prices: PriceService) {} }\n",
+                 "blastng/a/price.service.ts": "@Injectable()\nexport class PriceService {}\n",
+                 "blastng/b/price.service.ts": "@Injectable()\nexport class PriceService {}\n", "blastdocs/notes.py": ""}
         for rel, text in files.items():
             (code / rel).parent.mkdir(parents=True, exist_ok=True)
             (code / rel).write_text(text)
@@ -951,10 +954,10 @@ class TaskAreas(Base):
         maps.check([code])
         self.hub._maps = maps
         (a, a_name), (b, b_name) = self.crew
-        pricing, cart = self.task("Pricing rules", "blastjava/p/Pricing.java"), self.task("The cart", "blastjava/p/Cart.java")
+        pricing, cart = self.task("Pricing rules", "blastng/a/"), self.task("The cart", "blastng/cart.component.ts")
         lib, app, docs = self.task("The parser", "blastlib/"), self.task("The app", "blastapp/"), self.task("Notes", "blastdocs/")
         a.call("hub_task", action="take", id=pricing)
-        out = b.text("hub_task", action="take", id=cart)  # a guess only (a name in the same package): taken, with a hint
+        out = b.text("hub_task", action="take", id=cart)  # a guess only (a name defined twice): taken, with a hint
         self.assertIn("Task #%s is yours" % cart, out)
         self.assertIn("Heads up: #%s (%s) may touch code this task uses (a guess from names)" % (pricing, a_name), out)
         a.call("hub_task", action="take", id=lib)

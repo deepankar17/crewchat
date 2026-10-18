@@ -20,6 +20,8 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 cloud = ["cryptography>=41", "google-cloud-firestore>=2.16"]
+# Accurate readers for the code map (roadmap C9): Java, Kotlin, JavaScript and TypeScript parsed exactly.
+map = ["tree-sitter>=0.22", "tree-sitter-java", "tree-sitter-kotlin", "tree-sitter-javascript", "tree-sitter-typescript"]
 
 [project.urls]
 Homepage = "https://github.com/deepankar17/crewchat"

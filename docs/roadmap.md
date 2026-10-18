@@ -40,7 +40,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
-| [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
+| [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | Done | C1 |
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
 | [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | Done | C1, C2 |
@@ -478,7 +478,7 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C9
 
-**Accurate parsers as an optional extra** · P3 · effort M · To do
+**Accurate parsers as an optional extra** · P3 · effort M · Done
 
 **Goal.** Exact parsing for Java, Kotlin, TS/JS and Angular for users who opt in, without adding dependencies to the core.
 

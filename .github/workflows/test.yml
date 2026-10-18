@@ -19,6 +19,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install cryptography
+      # The code map's accurate readers (C9) on the newer Python of each system; 3.9 keeps the regular expressions.
+      - if: matrix.python != '3.9'
+        run: python -m pip install tree-sitter tree-sitter-java tree-sitter-kotlin tree-sitter-javascript tree-sitter-typescript
       - run: python -m unittest discover -s tests -v
 
   installers:

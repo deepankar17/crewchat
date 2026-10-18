@@ -34,7 +34,9 @@ its core.
 python3 -m unittest discover -s tests -v
 ```
 
-The cloud-sync tests need `pip install cryptography`; they are skipped without it.
+The cloud-sync tests need `pip install cryptography`; they are skipped without it. The code map's
+accurate readers (C9) are tested with `pip install tree-sitter tree-sitter-java tree-sitter-kotlin
+tree-sitter-javascript tree-sitter-typescript`, and the regular-expression readers without them.
 
 Before a release, run the end-to-end tests too. They start real servers in a throwaway folder
 with the `crewchat` command, and drive them as agents and the owner would:
