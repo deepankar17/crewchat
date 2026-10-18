@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Shared files open on your other machines with cloud sync too**, up to 5 MB: a screenshot or a log
+  travels with its message, encrypted on your machine, and is deleted from the cloud with the message.
+  A bigger file says which machine has it, and why: the free Firebase plan's quota. On a paid (Blaze)
+  plan, `cloud_file_mb` in config.json lets files up to 20 MB travel.
 - **Tasks from a machine that is off can still be taken (Tailscale).** The coordinator settles the claim
   instead of the agent being told to try again later, and the machine the task came from takes the
   decision over when it is back. If two machines that could not reach each other gave one task to two

@@ -201,7 +201,10 @@ pair the projects you mean.
   when it is on.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
-  a file when someone first opens it. With cloud sync, a file can only be opened on the machine it
-  was shared on, for now.
+  a file when someone first opens it. With cloud sync, a file up to 5 MB travels with its message,
+  encrypted, and is deleted from the cloud with it; a bigger one opens only on the machine it was
+  shared on, and says so. The 5 MB keeps within the free Firebase plan's quota (1 GiB stored,
+  20,000 writes and 50,000 reads a day). On a paid (Blaze) plan, set `cloud_file_mb` in
+  crewchat's `config.json` (up to 20) to let bigger files travel.
 
 Back to the [README](../README.md) · Next: [Your phone](phone.md)

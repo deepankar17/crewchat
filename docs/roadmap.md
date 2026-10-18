@@ -51,7 +51,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | Done | none |
 | [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | Done | Y1 |
 | [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | Done | Y1 |
-| [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
+| [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | Done | Y1 |
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
 | [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | Done | X1 |
@@ -836,7 +836,7 @@ decisions for two agents keep the earlier one: the machine whose holder changes 
 
 ### Y4
 
-**Shared files over cloud sync** · P2 · effort M · To do
+**Shared files over cloud sync** · P2 · effort M · Done
 
 **Goal.** Files shared on one machine open on another when using cloud sync.
 
@@ -862,6 +862,13 @@ decisions for two agents keep the earlier one: the machine whose holder changes 
 - Firestore quota and cost for big files; set a size cap.
 
 **Depends on:** [Y1](#y1)
+
+**Status.** Done for files up to 5 MB (`CLOUD_FILE_MAX`): the machine that writes the message seals the file in
+512 KB parts (`files/{fid}-{n}`, bound to the account, project, file, part and device), deleted with its message;
+another machine's `fetch_file` reads and checks them. A bigger file, or one gone from the cloud, says which machine
+has it. Larger files: cloud mode has no route between machines except Firestore, so (owner, 18 Oct) they stay on
+their machine and the message says why (the free Firebase plan's quota) and how to change it: on a paid plan,
+`cloud_file_mb` in config.json raises the cap, up to crewchat's 20 MB for a shared file.
 
 ## Analytics page
 

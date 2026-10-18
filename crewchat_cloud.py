@@ -23,11 +23,12 @@ Firestore layout, all under users/{uid}/ (the security rules confine an account 
   messages/{msgid}  {dev, key_id, nonce, ct, created}  one chat message, encrypted
   state/{id}        {dev, key_id, nonce, ct, updated}  one machine's agents, encrypted
   tasks/{msgid}     {dev, key_id, nonce, ct, created}  who took a task: the first create wins
+  files/{fid}-{n}   {dev, key_id, nonce, ct, created, parts}  part n of a shared file (5 MB at most), encrypted
   catchups/{id}     {since, after, state, parts, more, by}  a machine back after more than the TTL asks (Y3)
   catchup_parts/{id}-{n}  {for, dev, key_id, nonce, ct, created}  the messages it missed, sealed by the
                                                      coordinator, deleted once it has read them
   spaces/{space}    {created}                          a project besides the first, shared by name:
-    messages/, state/, tasks/, catchups/, catchup_parts/  as above, for that project only
+    messages/, state/, tasks/, files/, catchups/, catchup_parts/  as above, for that project only
     marks/{id}        {seen, synced_to}                how far each machine has read it
 The first projects of all machines use the top-level collections, whatever their names. Another
 project's space is a hash of its name (space_id), so the name itself never reaches the cloud.
@@ -71,8 +72,16 @@ class CloudError(Exception):
     pass
 
 
-COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts")  # the layout above, but meta, spaces
-SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts")  # in each spaces/{space}
+COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts", "files")  # the layout above, but meta, spaces
+SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts", "files")  # in each spaces/{space}
+CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (config cloud_file_mb)
+# Why the cap: the free (Spark) plan of a Firebase project allows 1 GiB stored, 20,000 writes and 50,000 reads a
+# day, and 10 GiB a month downloaded; a file is a write per 512 KB part on the way in and a read per part for
+# each machine that opens it. On a paid (Blaze) plan the owner can raise it, up to crewchat's 20 MB for a file.
+QUOTA_NOTE = ("files over %s stay on the machine they were shared on, to keep within the free Firebase plan's "
+              "quota (1 GiB stored, 20,000 writes a day); on a paid (Blaze) plan, raise cloud_file_mb in crewchat's "
+              "config.json (up to 20)")
+FILE_PART = 512 * 1024  # bytes of a file in one document: sealed and in base64 twice, under Firestore's 1 MB
 NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
                  "or: pip install \"crewchat[cloud]\"")
 
@@ -777,13 +786,14 @@ class CloudSync(crewchat.ProjectLink):
     space, under the same account key: projects with the same name on the machines are one chat,
     and a project one machine lacks stays on the other."""
 
-    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None):
+    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None, file_max=CLOUD_FILE_MAX):
         self._init_projects(hub, chat)
         self.store = store
         self.device = device
         self.account = Account(store, device)
         self.device_id = device.id
         self.ttl = ttl_hours * 3600
+        self.file_max = max(1, min(int(file_max), crewchat.MAX_UPLOAD))  # bytes of a shared file that travel
         self.log = log or (lambda text: sys.stderr.write("%s cloud %s\n" % (crewchat.now_iso(), text)))
         self.space = space_id(self._root(), chat) if chat is not None else None
         self.base = "spaces/%s/" % self.space if chat is not None else ""  # where its collections are
@@ -923,7 +933,8 @@ class CloudSync(crewchat.ProjectLink):
         return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
 
     def _project_link(self, hub, name):
-        link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
+        link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name,
+                         file_max=self.file_max)
         link.machine = self
         return link
 
@@ -977,9 +988,54 @@ class CloudSync(crewchat.ProjectLink):
         doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._scope(), msg["id"], self.device_id), payload)
         doc["created"] = SERVER_TIME
         self.store.set(self.base + "messages/" + msg["id"], doc)
+        for info in msg.get("files") or []:
+            self._send_file(info)
         if msg["seq"] > int(self.marks.get("published", 0)):
             self.marks["published"] = msg["seq"]
             self._save_marks()
+
+    # Shared files (roadmap Y4) ----------------------------------------------------------------
+    def _file_aad(self, fid, part):
+        return "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, part, self.device_id)
+
+    def _send_file(self, info):
+        """A file shared with a message written here, into the cloud beside it: encrypted, in FILE_PART pieces,
+        deleted with the messages. Only files up to CLOUD_FILE_MAX; a bigger one stays on this machine."""
+        fid = str(info.get("id") or "")
+        meta, path = self.hub.file(fid)
+        if meta is None or meta["size"] > self.file_max:
+            return
+        data = path.read_bytes()
+        parts = max(1, -(-len(data) // FILE_PART))
+        for n in range(parts):
+            doc = self._seal(self._file_aad(fid, n), {"data": b64(data[n * FILE_PART:(n + 1) * FILE_PART])})
+            doc.update(created=SERVER_TIME, parts=parts)
+            self.store.set(self.base + "files/%s-%d" % (fid, n), doc)
+
+    def fetch_file(self, origin, fid):
+        """The bytes of a file shared on another machine (Hub.open_file), from the cloud: what that machine
+        sealed with the message. A file too big to travel, or gone (delivered and deleted, or past the
+        retention), is on that machine only."""
+        name = next((d.get("name") for i, d in self.store.list("devices") if i == origin), "") or "another machine"
+        first = self.store.get(self.base + "files/%s-0" % fid)
+        if not first or first.get("dev") != origin:
+            raise crewchat.HubError("that file is on %s only: open it there. With cloud sync, %s; and the cloud keeps "
+                                    "files %d hours" % (name, QUOTA_NOTE % crewchat.human_size(self.file_max),
+                                                        self.ttl // 3600))
+        pieces = []
+        try:
+            parts = int(first.get("parts") or 1)
+            if parts > -(-crewchat.MAX_UPLOAD // FILE_PART):
+                raise ValueError("too many parts")
+            for n in range(parts):
+                doc = first if n == 0 else self.store.get(self.base + "files/%s-%d" % (fid, n))
+                if not doc or doc.get("dev") != origin:
+                    raise ValueError("part %d is missing" % n)
+                aad = "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, n, origin)
+                pieces.append(unb64(self._open(aad, doc)["data"]))
+        except Exception as e:  # missing, tampered with, or sealed with a key this machine lacks
+            raise crewchat.HubError("cannot fetch that file from the cloud (%s); open it on %s" % (e, name))
+        return b"".join(pieces)
 
     def _send_state(self):
         rows = self.hub.local_state()
@@ -1067,6 +1123,10 @@ class CloudSync(crewchat.ProjectLink):
         for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
             if now - float(doc.get("created") or now) > self.ttl:
                 self.store.delete(self.base + "tasks/" + doc_id)
+        for doc_id, doc in self.store.list(self.base + "files", where=("dev", self.device_id)):
+            created = float(doc.get("created") or now)
+            if created <= everyone_has or now - created > self.ttl:  # as its message is
+                self.store.delete(self.base + "files/" + doc_id)
         # Catch-ups: answer any waiting (the coordinator may have changed), read this machine's own, and drop
         # parts nobody read within the TTL.
         self.serve_catch_ups()
@@ -1455,7 +1515,11 @@ def start(hub, root=None, ttl_hours=None):
         raise CloudError("this machine has no cloud identity; run `crewchat cloud login`")
     config = crewchat.load_config(root)
     ttl = ttl_hours or float(config.get("cloud_ttl_hours", TTL_HOURS))
-    sync = CloudSync(hub, store, device, ttl_hours=ttl)
+    try:
+        file_max = int(float(config.get("cloud_file_mb", CLOUD_FILE_MAX / 1048576)) * 1048576)
+    except (TypeError, ValueError):
+        file_max = CLOUD_FILE_MAX
+    sync = CloudSync(hub, store, device, ttl_hours=ttl, file_max=file_max)
     sync.start()
     sys.stderr.write("%s cloud sync on as %s (device %s, tag %s), account %s\n" % (
         crewchat.now_iso(), auth.email, device.name, device.tag, "ready" if device.ready else "waiting for approval"))
