@@ -857,12 +857,15 @@ class NewPage(Signed):
             self.assertFalse(c.js("$('ax-demo-note').hidden"))
             sent = c.js("crewAnalytics.stats().sent")
             c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
+            sample = c.js("$('ax-canvas').getAttribute('aria-label')")
             self.agent.call("hub_send", to="all", text="Not one for the sample")
             c.until("$('log').textContent.includes('Not one for the sample')", what="the message in the chat")
-            self.assertNotIn(name, c.js("$('ax-canvas').getAttribute('aria-label')"))  # the chat stays out of it
+            # The chat stays out of it (its agent may share a name with one of the sample's: the crew is the same).
+            self.assertEqual((c.js("$('ax-canvas').getAttribute('aria-label')"), c.js("crewAnalytics.stats().nodes")), (sample, 9))
             c.click("#ax-sample")
             c.until("!crewAnalytics.stats().demo && crewAnalytics.stats().nodes === %d" % crew, what="the chat's own crew")
             self.assertIn(name, c.js("$('ax-canvas').getAttribute('aria-label')"))
+            self.assertNotEqual(c.js("$('ax-canvas').getAttribute('aria-label')"), sample)
             self.assertTrue(c.js("$('ax-demo-note').hidden"))
             c.click("#ax-sample")  # left on, then the view closed: off again when it reopens
             c.click("#view-analytics")
