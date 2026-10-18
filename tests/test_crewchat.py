@@ -1,5 +1,6 @@
 """End-to-end tests: a real server on a free port, a throwaway home folder, real HTTP."""
 import argparse
+import ast
 import base64
 import contextlib
 import http.cookiejar
@@ -7,6 +8,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -3274,6 +3276,84 @@ class Hooks(Base):
         agent(op="listen", agent=name, mode="default")
         self.assertEqual(self.hub.agents[name]["listen"], "")
 
+    def light_hook(self, client, payload, env_extra=None):
+        """The tool-call hook as the client runs it now: Python and the light hook script, nothing of crewchat."""
+        command = crewchat.hook_command(client, "tool")
+        self.assertNotIn("crewchat.py", command)
+        env = dict(os.environ, CREWCHAT_PROJECT=str(self.folder), TMPDIR=self.state, TEMP=self.state, TMP=self.state,
+                   **(env_extra or {}))
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        out = subprocess.run(shlex.split(command), input=json.dumps(payload), capture_output=True, text=True,
+                             env=env, timeout=60, cwd=str(TMP))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+
+    def test_the_light_hook_script_after_each_tool_call(self):
+        text = crewchat.hook_script()
+        self.assertEqual(text, crewchat.hook_script())  # the same crewchat writes the same file
+        tree = ast.parse(text)
+        imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertEqual(imported, {"hashlib", "json", "os", "re", "shlex", "socket", "sys", "tempfile", "time",
+                                    "pathlib", "urllib.request"})  # standard library only, crewchat not loaded
+        path = crewchat.home() / crewchat.HOOK_SCRIPT_FILE
+        self.assertIn(path.as_posix(), crewchat.hook_command("claude", "tool"))
+        self.assertEqual(path.read_text(), text)
+        self.assertIn(" hook claude stop", crewchat.hook_command("claude", "stop"))  # the other events: crewchat itself
+        self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "tool")))
+        # It does what `crewchat hook claude tool` does: a sign of life, and what the call was.
+        session, name = self.linked("light-turn")
+        self.hub.agents[name]["seen"] = 0
+        self.light_hook("claude", {"session_id": "light-turn", "tool_name": "Bash",
+                                   "tool_input": {"command": "FOO=1 npm test -- --watch"}})
+        self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)
+        self.assertEqual(self.hub.agents[name]["doing"], "Running npm test")
+        self.hub.agents[name]["seen"] = 0
+        self.light_hook("claude", {"session_id": "light-turn", "tool_name": "Bash", "tool_input": {"command": "npm test"}})
+        self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute, nothing new: no call to the server
+        self.light_hook("claude", {"session_id": "never-linked", "tool_name": "Read"})  # quiet
+        self.assertFalse((Path(self.state) / "crewchat-hooks" / ("claude-" + crewchat.sha("never-linked")[:16])).exists())
+        self.light_hook("claude", "not an object")  # a payload it cannot read: quiet too
+        # A Cursor agent started from the page links with its start key at its first tool call.
+        key = self.hub.new_start()
+        cursor = Session(self.base, self.token, "cursor")
+        cursor.call("hub_link", key=key)
+        self.hub.agents[cursor.me]["seen"] = 0
+        self.light_hook("cursor", {"conversation_id": "light-first", "command": "ls"}, env_extra={"CREWCHAT_LINK_KEY": key})
+        self.assertGreater(self.hub.agents[cursor.me]["seen"], time.time() - 30)
+
+    def test_the_light_hook_reaches_another_machines_chat_through_urllib(self):
+        sent = {}
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout):
+            sent.update(url=req.full_url, auth=req.get_header("Authorization"), body=json.loads(req.data))
+            return Answer(b"{}")
+        with mock.patch.object(urllib.request, "urlopen", urlopen):
+            crewchat.hook_post("https://computer.tailnet.ts.net/api/hook", "tok", {"event": "tool"})
+        self.assertEqual(sent, {"url": "https://computer.tailnet.ts.net/api/hook", "auth": "Bearer tok",
+                                "body": {"event": "tool"}})
+        with mock.patch.object(urllib.request, "urlopen", side_effect=AssertionError("not for this machine's server")):
+            crewchat.hook_post(self.base + "/api/hook", self.token, {"key": "x" * 12, "event": "tool"})  # a plain socket
+
+    def test_tool_hooks_run_crewchat_when_the_script_cannot_be_written(self):
+        with mock.patch.object(crewchat, "write_hook_script", return_value=None):
+            self.assertTrue(crewchat.hook_command("claude", "tool").endswith(" hook claude tool"))
+        folder = Path(tempfile.mkdtemp(prefix="old-tool-hook-", dir=TMP))
+        (folder / ".claude").mkdir()
+        (folder / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"hooks": [{"type": "command", "command": "python3 crewchat.py hook claude tool"}]}]}}))
+        crewchat.update_hooks(folder)  # an older crewchat's tool hook gives way to the light script's
+        tool = [h["command"] for g in json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
+                ["PostToolUse"] for h in g["hooks"]]
+        self.assertEqual(len(tool), 1)
+        self.assertIn(crewchat.HOOK_SCRIPT_FILE, tool[0])
+
     def test_a_launched_cursor_agent_is_alive_before_its_first_turn_ends(self):
         key = self.hub.new_start()
         session = Session(self.base, self.token, "cursor")
@@ -3337,7 +3417,7 @@ class Hooks(Base):
         self.assertGreater(asks[0]["timeout"], crewchat.PERMISSION_WAIT)  # the hook outlives its wait
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
         self.assertEqual((len(tool), tool[0]), (2, "echo mine"))
-        self.assertTrue(tool[1].endswith(" hook claude tool"))
+        self.assertTrue(tool[1].endswith("/%s claude tool" % crewchat.HOOK_SCRIPT_FILE))  # the light hook script
         cursor = json.loads((folder / ".cursor" / "hooks.json").read_text())["hooks"]
         self.assertEqual(sorted(cursor), ["afterFileEdit", "afterMCPExecution", "afterShellExecution", "stop"])
         self.assertEqual(crewchat.update_hooks(folder), [])  # up to date: nothing written
