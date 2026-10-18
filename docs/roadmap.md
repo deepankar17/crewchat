@@ -44,9 +44,9 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
 | [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | Done | C1, C2 |
-| [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
+| [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | Done | C0, S1 |
 | [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | Done | C1 |
-| [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | To do | C1 |
+| [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | Done | C1 |
 | [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | Done | C1, X1 |
 | [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | In progress | none |
 | [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
@@ -603,7 +603,10 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C5
 
-**Collaboration history links** · P2 · effort M · To do
+**Collaboration history links** · P2 · effort M · Done
+
+> **Decided:** A tool only the lead and the advisor get (`hub_code`); every other agent's tool list stays as it
+> was (owner, 18 Oct).
 
 **Goal.** Answer 'who changed this file, for which task, and what was said about it'.
 
@@ -659,7 +662,10 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C7
 
-**Lead split suggestions** · P3 · effort M · To do
+**Lead split suggestions** · P3 · effort M · Done
+
+> **Decided:** A tool only the lead and the advisor get (`hub_code`); every other agent's tool list stays as it
+> was (owner, 18 Oct).
 
 **Goal.** Help the lead hand each agent a module that hangs together.
 

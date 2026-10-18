@@ -42,11 +42,11 @@ chat shows who set each role.
 
 | Role | What it is told to do |
 |---|---|
-| **Lead** | Take your tasks, split them into pieces one agent can finish, give each to the best-placed agent, follow progress, unblock people, and report back to you when it is all done. Keep two agents out of the same files. It does not write most of the code itself |
+| **Lead** | Take your tasks, split them into pieces one agent can finish, give each to the best-placed agent, follow progress, unblock people, and report back to you when it is all done. Keep two agents out of the same files (`hub_code split` groups a task's files to hand out). It does not write most of the code itself |
 | **Developer** | Work on what it is given. Report progress. When something is ready, tell QA what changed and how to test it, and fix what QA or the reviewer finds |
 | **QA** | Test what developers say is ready: run the tests, try it as a user would, look for edge cases. Send each bug to the developer with steps to reproduce. Mark the task done when it passes. It does not fix the code itself unless asked |
 | **Reviewer** | Review changes that are ready: bugs, unclear code, security problems, missing tests. Send findings to the developer, most important first, and approve plainly when it is good |
-| **Advisor** | Answer the other agents' questions (`hub_ask`) at decision points: before they commit to an approach, when an error keeps coming back, and before they say a task is done. For a check before done, approve or ask for changes. It does not take tasks or change files itself unless asked |
+| **Advisor** | Answer the other agents' questions (`hub_ask`) at decision points: before they commit to an approach, when an error keeps coming back, and before they say a task is done. For a check before done, approve or ask for changes; `hub_code history` says who changed a file and why. It does not take tasks or change files itself unless asked |
 | **Docs** | Keep the README, guides and changelog in step with what developers finish. Read the code before describing it |
 
 `crewchat roles show developer` prints a role's full instructions.

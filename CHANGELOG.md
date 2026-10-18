@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **The lead and the advisor get `hub_code`.** `history` says who changed a file (or a folder), for which
+  task, and what was said about it; `split` gives a task's files in groups that hang together, to hand out
+  one per agent (one big file is split by its sections). Every other agent's tools stay as short as they
+  were; a session given the lead or advisor role is told to load its new tool.
 - **Agents that join get the code at a glance.** With edit tracking on, each project folder gets a skill
   (and a Cursor rule) made from the code map: the main parts, the files most others use, where the code
   starts, and who works on what now, stamped with the commit. Under about 1,500 tokens, read when an

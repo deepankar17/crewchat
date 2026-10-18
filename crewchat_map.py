@@ -572,6 +572,11 @@ def norm(path):
     return out + "/" if text.endswith("/") and out and not out.endswith("/") else out
 
 
+def folder_of(path):
+    """A file's folder, as an area: "app/sync/", or "" at the top."""
+    return path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+
+
 def like_prefix(folder):
     """A LIKE pattern (escape \\) for every path under folder."""
     folder = folder.rstrip("/")
@@ -1042,6 +1047,97 @@ class CodeMap:
         return self.answer({"files": len(files), "parts": main,
                             "used": [{"path": rel(p), "by": len(users[p]), "defines": names(p)} for p in most],
                             "starts": [{"path": rel(p), "uses": len(uses[p])} for p in starts]})
+
+    def groups(self, inside="", areas=(), most=6):
+        """Roadmap C7: the files under these areas (paths relative to a folder of the repository; all of them
+        with none), in groups that hang together, for a lead to give one to each agent. Files joined by certain
+        imports go together; a file alone joins its folder's group; past `most`, the smallest groups join the
+        one they link to most, else their folder's. One big file alone is split by its classes and functions
+        instead. [{files: [path], folder, inside: links within, out: {group: links}, parts: [names]}]"""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            cut = len(inside)
+            wanted = [a.strip("/").lower() for a in areas if a.strip("/")]
+            files = [p for (p,) in self.db.execute(
+                "SELECT path FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\' ORDER BY path", (prefix,))
+                if not wanted or any(p[cut:].lower() == a or p[cut:].lower().startswith(a + "/") for a in wanted)]
+            index = {p: i for i, p in enumerate(files)}
+            links = {}
+            for a, b in self.db.execute(
+                    "SELECT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1 AND s.path != d.path"):
+                if a in index and b in index:
+                    key = (min(index[a], index[b]), max(index[a], index[b]))
+                    links[key] = links.get(key, 0) + 1
+            defs = {}
+            if len(files) == 1:
+                defs = self.db.execute("SELECT kind, name, line FROM nodes WHERE path = ? AND kind IN ('class', "
+                                       "'interface', 'object', 'component', 'service', 'function') ORDER BY line",
+                                       (files[0],)).fetchall()
+        if not files:
+            return []
+        rel = [p[cut:] for p in files]
+        if len(files) == 1:  # one file: its classes and functions, in up to `most` runs of about the same size
+            size = max(1, -(-len(defs) // most))
+            runs = [defs[i:i + size] for i in range(0, len(defs), size)]
+            return [{"files": rel, "folder": folder_of(rel[0]), "inside": 0, "out": {},
+                     "parts": {"from": run[0][2], "to": run[-1][2], "count": len(run),
+                               "names": [n.split("|")[0] for _, n, _ in run[:6]]}} for run in runs] or \
+                [{"files": rel, "folder": folder_of(rel[0]), "inside": 0, "out": {}, "parts": {}}]
+        parent = list(range(len(files)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        # A file most of the others use (a core module) is shared ground, not what holds a group together: its
+        # links do not join groups, or one core file would make the whole project one group.
+        used = {}
+        for (i, j) in links:
+            used[i], used[j] = used.get(i, 0) + 1, used.get(j, 0) + 1
+        core = {i for i, n in used.items() if n >= max(4, len(files) // 5)}
+        for (i, j) in links:
+            if i not in core and j not in core:
+                parent[find(i)] = find(j)
+        groups = {}
+        for i in range(len(files)):
+            groups.setdefault(find(i), []).append(i)
+        by_folder = {}
+        for root, members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            by_folder.setdefault(folder_of(rel[members[0]]), root)
+        for root, members in list(groups.items()):  # a file alone joins its folder's group
+            if len(members) == 1 and root in groups:
+                home = by_folder.get(folder_of(rel[members[0]]))
+                if home is not None and home != root and home in groups:
+                    groups[home] += groups.pop(root)
+
+        def weight(a, b):
+            sa, sb = set(groups[a]), set(groups[b])
+            return sum(n for (i, j), n in links.items() if (i in sa and j in sb) or (i in sb and j in sa))
+        while len(groups) > most:  # the smallest joins the group it links to most, else its folder's, else the next
+            small = min(groups, key=lambda g: (len(groups[g]), folder_of(rel[groups[g][0]])))
+            others = [g for g in groups if g != small]
+            target = max(others, key=lambda g: (weight(small, g), folder_of(rel[groups[g][0]]) ==
+                                                folder_of(rel[groups[small][0]]), -len(groups[g])))
+            groups[target] += groups.pop(small)
+        order = sorted(groups, key=lambda g: -len(groups[g]))
+        number = {g: n + 1 for n, g in enumerate(order)}
+        out = []
+        for g in order:
+            members = set(groups[g])
+            inside_links = sum(n for (i, j), n in links.items() if i in members and j in members)
+            outside = {}
+            for (i, j), n in links.items():
+                if (i in members) != (j in members):
+                    other = next(h for h in order if (j if i in members else i) in groups[h])
+                    outside[number[other]] = outside.get(number[other], 0) + n
+            folders = {}
+            for i in members:
+                folders[folder_of(rel[i])] = folders.get(folder_of(rel[i]), 0) + 1
+            out.append({"files": sorted(rel[i] for i in members), "folder": max(folders, key=folders.get),
+                        "inside": inside_links, "out": outside, "parts": {}})
+        return out
 
     def definitions(self, path):
         with self.lock:

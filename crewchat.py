@@ -129,6 +129,8 @@ You are the team lead. Your job is to plan and coordinate, not to write most of 
   project's plan. Nobody should sit idle while there is work. If nothing is left, tell Owner.
 - When every piece is done (and tested, if there is QA), check the result and report to Owner
   with hub_send: what was done, what is left, anything the owner must decide.
+- Splitting code work: hub_code split id=<task> gives groups of files that hang together, one per agent;
+  hub_code history path=<file> says who changed it, for which task, and what was said about it.
 - Tell Owner early if something is unclear or risky. Do not invent requirements."""),
     "developer": ("Developer", """\
 You are a developer.
@@ -159,6 +161,7 @@ keeps coming back, and before they say a task is done.
   answer rather than guessing; read the files it names if they are on your machine.
 - A question about a task (it names one) is a check before done: set verdict approve when the
   work is ready, or changes with what is missing. Be honest; a wrong approve costs more than a delay.
+- hub_code history path=<file> says who changed a file, for which task, and what was said about it.
 - Do not take tasks or change files yourself unless Owner asks."""),
     "docs": ("Docs", """\
 You write and keep up the project's documentation: README, guides, code comments where they
@@ -1313,6 +1316,66 @@ class Analytics:
 MAX_STREAM = 2000  # messages of the last day the analytics page can replay
 MAX_HEAT_FILES = 120  # files on the analytics page's code heat map
 EVENTS_FILE = "events.sqlite"  # in the project's crewchat folder: local records that cannot be rebuilt
+HISTORY_FILE = "history.sqlite"  # derived from messages.jsonl, for C5's file history: built again when missing
+HISTORY_KINDS = ("task", "take", "assign", "update", "ask", "answer", "msg")  # what is worth telling about a file
+MAX_HISTORY = 30  # messages a file's history shows at most
+
+
+class History:
+    """The chat's messages, short, in SQLite for lookups by task and by words (roadmap C5): what was said about a
+    file. Derived (docs/storage.md): read from messages.jsonl on demand, from where it got to (log_from), so it
+    costs nothing until asked; delete it and it is built again."""
+
+    def __init__(self, path, log):
+        self.path, self.log = Path(path), Path(log)
+        self.lock = threading.Lock()
+        self.db = None
+
+    def _conn(self):
+        if self.db is None:
+            import sqlite3
+            self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=OFF")  # derived: built again if lost
+            self.db.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, seq INTEGER, ts REAL, sender TEXT, "
+                            "recipient TEXT, kind TEXT, task TEXT, status TEXT, text TEXT)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS messages_task ON messages (task)")
+            self.db.commit()
+        return self.db
+
+    def catch_up(self):
+        """Read the log from the last message stored."""
+        with self.lock:
+            db = self._conn()
+            last = db.execute("SELECT COALESCE(MAX(seq), 0) FROM messages").fetchone()[0]
+            rows = [(m["id"], m["seq"], float(m.get("ts") or 0), str(m.get("from") or ""), str(m.get("to") or ""),
+                     m.get("kind", "msg"), m["id"] if m.get("kind") == "task" else str(m.get("task") or ""),
+                     str(m.get("status") or ""), " ".join(str(m.get("text") or "").split())[:240])
+                    for m in log_from(self.log, last) if m.get("kind") in HISTORY_KINDS]
+            db.executemany("INSERT OR IGNORE INTO messages VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+            db.commit()
+
+    def about(self, tasks, word="", limit=MAX_HISTORY):
+        """The messages of these tasks, and those that name the word (a file's name), newest first."""
+        self.catch_up()
+        with self.lock:
+            marks = ",".join("?" * len(tasks))
+            sql = "SELECT id, ts, sender, recipient, kind, status, text FROM messages WHERE " + " OR ".join(
+                (["task IN (%s)" % marks] if tasks else []) + (["text LIKE ? ESCAPE '\\'"] if word else [])) + \
+                " ORDER BY seq DESC LIMIT ?"
+            if not tasks and not word:
+                return []
+            args = list(tasks) + (["%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"]
+                                  if word else []) + [limit]
+            rows = self._conn().execute(sql, args).fetchall()
+        return [{"id": i, "ts": ts, "sender": f, "recipient": t, "kind": k, "status": st, "text": tx}
+                for i, ts, f, t, k, st, tx in rows]
+
+    def close(self):
+        with self.lock:
+            if self.db is not None:
+                self.db.close()
+                self.db = None
 
 
 def clean_edit_path(path):
@@ -1406,6 +1469,14 @@ class EventStore:
                         pieces.append([start, end, state])
             out[agent] = pieces
         return out
+
+    def edits_under(self, path):
+        """[(agent, task, edits)] for a file, or every file under a folder."""
+        folder = path.rstrip("/").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
+        with self.lock:
+            return self._conn().execute(
+                "SELECT agent, task, COUNT(*) FROM edits WHERE path = ? OR path LIKE ? ESCAPE '\\' GROUP BY agent, task",
+                (path.rstrip("/"), folder)).fetchall()
 
     def files(self, since=0.0, limit=200):
         """The files edited since then, most edited first: [{path, edits, agents, top, last}], top being the agent
@@ -1570,6 +1641,7 @@ class Hub:
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
+        self.chat_index = History(roster.root / HISTORY_FILE, roster.root / "messages.jsonl")  # derived, for C5
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
         self._map_edited = set()  # the files agents edited since the maps were last brought up to date
@@ -3047,6 +3119,99 @@ class Hub:
             self._changed()
             return msg, to
 
+    # The lead's and the advisor's tool (C5, C7) ------------------------------------------------------
+    def tool_kind(self, sid):
+        """Which tool list a session should have: "lead" for the lead and the advisor, else "base"."""
+        with self.lock:
+            name = (self.sessions.get(sid) or {}).get("agent") if sid else None
+            return "lead" if name and (self.agents.get(name) or {}).get("role") in LEAD_ROLES else "base"
+
+    def listed(self, sid, kind):
+        with self.lock:
+            if sid in self.sessions:
+                self.sessions[sid]["tools"] = kind
+
+    def tools_changed(self, sid):
+        """Has this session's tool list changed since it last asked (a role given or taken)? Once per change: it
+        is told, and asks again."""
+        kind = self.tool_kind(sid)
+        with self.lock:
+            row = self.sessions.get(sid)
+            if row is None or "tools" not in row or row["tools"] == kind:
+                return False
+            row["tools"] = kind
+            return True
+
+    def file_history(self, path):
+        """Roadmap C5: who changed a file (or a folder's files), for which task, and what was said about it: the
+        edit records (C0) for the who and the tasks, the chat's history (History) for the words. Whole lines,
+        under MAX_TOOL_OUTPUT."""
+        path = clean_edit_path(str(path or "").strip().rstrip("/"))
+        if not path:
+            raise HubError("give a file or folder in the project, as tasks name them: app/login/Form.kt")
+        rows = self.events.edits_under(path)
+        agents, tasks = {}, {}
+        for agent, task, n in rows:
+            agents[agent] = agents.get(agent, 0) + n
+            if task:
+                tasks[task] = tasks.get(task, 0) + n
+        with self.lock:
+            titles = {t: (self.sheet[t]["title"], self._row_status(t), self.taken.get(t) or "")
+                      for t in tasks if t in self.sheet}
+        lines = ["%s: %s" % (path, "edited %d time%s, by %s." % (
+            sum(agents.values()), "" if sum(agents.values()) == 1 else "s",
+            ", ".join("%s (%d)" % kv for kv in sorted(agents.items(), key=lambda kv: -kv[1])))
+            if agents else "no edits recorded (edits are kept while edit tracking is on).")]
+        if tasks:
+            lines.append("Tasks: " + "; ".join(
+                "#%s %s (%s%s)" % (t, titles[t][0][:70], titles[t][1], ", " + titles[t][2] if titles[t][2] else "")
+                if t in titles else "#%s" % t for t in sorted(tasks, key=lambda t: -tasks[t])) + ".")
+        said = self.chat_index.about(sorted(tasks), path.rsplit("/", 1)[-1] if "." in path.rsplit("/", 1)[-1] else "")
+        if said:
+            lines.append("What was said (newest first):")
+            lines += ["[#%s %s] %s -> %s: %s%s" % (m["id"], time.strftime("%m-%d %H:%M", time.gmtime(m["ts"])),
+                                                  m["sender"], m["recipient"], "[%s] " % m["status"].upper()
+                                                  if m["status"] else "", m["text"]) for m in said]
+        return "\n".join(whole_lines(lines))
+
+    def split_task(self, mid, count=None):
+        """Roadmap C7: a task's files (its areas; the whole project's without) in groups that hang together, for
+        the lead to give one to each agent."""
+        maps = self._maps
+        if maps is None or not maps.tops:
+            raise HubError("no code map yet: it is kept while edit tracking is on (crewchat edits on)")
+        areas, title = [], "the whole project"
+        if mid not in (None, ""):
+            mid = self._id(mid)
+            with self.lock:
+                row = self.sheet.get(mid)
+                if row is None:
+                    raise HubError("#%s is not on the task sheet" % mid)
+                areas, title = row["areas"], "task #%s" % mid
+        with self.lock:
+            agents = len([a for a in self.agents.values() if a.get("role") not in LEAD_ROLES]) or 4
+        cmap, inside = next(iter(maps.tops.values()))
+        groups = cmap.groups(inside, areas, count or max(2, min(8, agents)))
+        if not groups:
+            raise HubError("no mapped files in %s" % (", ".join(areas) or "the project"))
+        lines = ["Files of %s%s in %d group%s that hang together (by imports, then folders), one per agent:" % (
+            title, " (%s)" % ", ".join(areas) if areas else "", len(groups), "" if len(groups) == 1 else "s")]
+        for n, g in enumerate(groups, 1):
+            if g["parts"]:
+                p = g["parts"]
+                lines.append("%d. %s, lines %d-%d: %s%s" % (n, g["files"][0], p["from"], p["to"], ", ".join(p["names"]),
+                                                           " and %d more" % (p["count"] - len(p["names"]))
+                                                           if p["count"] > len(p["names"]) else ""))
+                continue
+            shown = ", ".join(f.rsplit("/", 1)[-1] for f in g["files"][:8])
+            lines.append("%d. %s (%d file%s): %s%s; %d import%s inside%s" % (
+                n, g["folder"] or "top", len(g["files"]), "" if len(g["files"]) == 1 else "s", shown,
+                " and %d more" % (len(g["files"]) - 8) if len(g["files"]) > 8 else "", g["inside"],
+                "" if g["inside"] == 1 else "s", "; linked to " + ", ".join("%d (%d)" % kv for kv in sorted(g["out"].items()))
+                if g["out"] else ""))
+        lines.append("Give each its own task with hub_task assign, areas set to its folder or files.")
+        return "\n".join(whole_lines(lines))
+
     def blast_radius(self, agent, mid):
         """Roadmap C4: the other agents' tasks in progress whose files this task's files import, or are imported by
         (C1's links, direct ones). Never stops anyone: a note for whoever takes or is given the task, naming each
@@ -4249,7 +4414,26 @@ TOOLS = [
     _tool("hub_link", "Link this session with the key a crewchat hook gave you, once.", SETTING,
           {"key": {"type": "string", "description": "Exactly as given."}}, ("key",)),
 ]
-HUB_TOOL_NAMES = frozenset(t["name"] for t in TOOLS)
+# Only the lead and the advisor get these (owner, 18 Oct): the others' tool list stays as short as it is.
+LEAD_TOOLS = [
+    _tool("hub_code", "Lead and advisor: who changed a file and why (history), or files to hand out together (split).",
+          READ, {
+              "action": {"type": "string", "enum": ["history", "split"], "description": "What to do."},
+              "path": {"type": "string", "description": "history: a file or folder."},
+              "id": {"type": ["string", "integer"], "description": "split: the task whose files to group."},
+              "count": {"type": "integer", "minimum": 2, "maximum": 8, "description": "split: groups at most."}},
+          ("action",)),
+]
+LEAD_ROLES = ("lead", "advisor")
+HUB_TOOL_NAMES = frozenset(t["name"] for t in TOOLS + LEAD_TOOLS)
+
+
+def tools_for(hub, sid, owner=False):
+    """The tools a session gets: the lead's and the advisor's have hub_code too; the owner's has everything.
+    Remembered, so the session can be told when its role changes what it should have."""
+    kind = "lead" if owner else hub.tool_kind(sid)
+    hub.listed(sid, kind)
+    return TOOLS + LEAD_TOOLS if kind == "lead" else TOOLS
 
 
 def int_arg(args, key, default, low, high):
@@ -4424,6 +4608,18 @@ def call_tool(hub, sid, name, args, owner=False):
             raise HubError("role must be a string")
         msg = hub.set_role(me, me, role.strip().lower())
         return msg["text"]
+    if name == "hub_code":
+        if not owner and hub.tool_kind(sid) != "lead":
+            raise HubError("hub_code is for the lead and the advisor")
+        action = args.get("action")
+        if action == "history":
+            return hub.file_history(args.get("path"))
+        if action == "split":
+            count = args.get("count")
+            if count is not None:
+                count = int_arg(args, "count", 4, 2, 8)
+            return hub.split_task(args.get("id"), count)
+        raise HubError("action is history or split")
     if name == "task:areas":
         mid, areas = hub.set_areas(me, args.get("id"), args.get("areas", ""), args.get("accept") is True)
         return "Task #%s's files: %s." % (mid, ", ".join(areas))
@@ -4575,7 +4771,7 @@ def handle_rpc(hub, sid, req, owner=False):
         return ok(
             {
                 "protocolVersion": wanted if wanted in PROTOCOLS else PROTOCOLS[0],
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {"listChanged": True}},  # a lead's or an advisor's list grows (C5, C7)
                 "serverInfo": {"name": SERVER_NAME, "version": __version__},
                 "instructions": PROTOCOL.format(project=hub.roster.project, trust=TRUST_NOTE),
             }
@@ -4583,7 +4779,7 @@ def handle_rpc(hub, sid, req, owner=False):
     if method == "ping":
         return ok({})
     if method == "tools/list":
-        return ok({"tools": TOOLS})
+        return ok({"tools": tools_for(hub, sid, owner)})
     if method == "tools/call":
         if not isinstance(params, dict) or not isinstance(params.get("name"), str):
             return err(-32602, "Invalid params")
@@ -5847,6 +6043,9 @@ class Handler(BaseHTTPRequestHandler):
                 info = params.get("clientInfo") if isinstance(params, dict) else None
                 sid = self.hub.open_session(place, client_kind(info))
                 extra["Mcp-Session-Id"] = sid
+                version = params.get("protocolVersion") if isinstance(params, dict) else None
+                with self.hub.lock:  # whether it may be told things with an answer (streamable HTTP, 2025-03-26 on)
+                    self.hub.sessions[sid]["streams"] = str(version or "") >= "2025-03-26"
             elif sid:
                 if self.hub.session(sid, place) is None:
                     self._json(404, {"jsonrpc": "2.0", "id": None,
@@ -5867,6 +6066,13 @@ class Handler(BaseHTTPRequestHandler):
             out = handle_rpc(self.hub, sid, payload, owner)
         if out is None:
             self._reply(202, b"", extra=extra)
+        elif sid and not owner and "text/event-stream" in self.headers.get("Accept", "") and \
+                (self.hub.sessions.get(sid) or {}).get("streams") and self.hub.tools_changed(sid):
+            # The session became the lead or the advisor (or stopped being one): its tool list changed. Said with
+            # this answer, as an event stream, so the client asks for the list again (MCP's list_changed).
+            notice = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+            body = "".join("event: message\ndata: %s\n\n" % json.dumps(m) for m in [notice, out])
+            self._reply(200, body.encode("utf-8"), ctype="text/event-stream", extra=dict(extra, **{"Cache-Control": "no-store"}))
         else:
             self._json(200, out, extra=extra)
 
@@ -6005,7 +6211,19 @@ def make_server(port, root=None):
 # --------------------------------------------------------------------------------------------
 # HTTP client helpers (commands and hooks)
 # --------------------------------------------------------------------------------------------
-def post_json(url, token, body, timeout=60, headers=None, want_headers=False):
+def sse_messages(raw):
+    """The JSON messages of an event stream (an MCP answer that brings notifications along)."""
+    out = []
+    for event in raw.replace("\r\n", "\n").split("\n\n"):
+        data = "\n".join(line[5:].lstrip() for line in event.split("\n") if line.startswith("data:"))
+        if data:
+            out.append(json.loads(data))
+    return out
+
+
+def post_json(url, token, body, timeout=60, headers=None, want_headers=False, stream=False):
+    """POST JSON and read the JSON answer. An MCP server may answer with an event stream instead: then the
+    answer is its last message (the response), or with stream, the list of every message in it."""
     send = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     if token:
         send["Authorization"] = "Bearer %s" % token
@@ -6013,7 +6231,12 @@ def post_json(url, token, body, timeout=60, headers=None, want_headers=False):
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers=send)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         raw = resp.read().decode("utf-8")
-        data = json.loads(raw) if raw else None
+        if "text/event-stream" in resp.headers.get("Content-Type", ""):
+            messages = sse_messages(raw)
+            data = messages if stream else (messages[-1] if messages else None)
+        else:
+            data = json.loads(raw) if raw else None
+            data = [data] if stream and data is not None and not isinstance(data, list) else data
         return (data, resp.headers) if want_headers else data
 
 
@@ -8696,11 +8919,14 @@ class StdioRelay:
             sys.stdout.buffer.flush()
 
     def post(self, payload):
+        """The server's answer to a payload: a list of messages to pass on (notifications it sent along first)."""
         headers = {"Mcp-Session-Id": self.session} if self.session else None
         data, answer = post_json(self.url, self.token, payload, timeout=MAX_WAIT + 30, headers=headers,
-                                 want_headers=True)
+                                 want_headers=True, stream=True)
         if answer.get("Mcp-Session-Id"):
             self.session = answer["Mcp-Session-Id"]
+        if data and isinstance(payload, list) and "text/event-stream" not in answer.get("Content-Type", ""):
+            return [data[0] if len(data) == 1 and isinstance(data[0], list) else data]  # a batch's answer, whole
         return data
 
     def fail(self, payload, message):
@@ -8731,8 +8957,8 @@ class StdioRelay:
             except (urllib.error.URLError, OSError, ValueError) as e:
                 return self.fail(payload, "cannot reach the crewchat server at %s (%s). Is it running? "
                                           "`crewchat start` starts it." % (self.url, getattr(e, "reason", e)))
-            if data is not None:
-                self.write(data)
+            for message in data or []:
+                self.write(message)
             return
 
     def run(self):

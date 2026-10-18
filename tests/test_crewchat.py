@@ -149,7 +149,7 @@ class Protocol(Base):
     def test_initialize_starts_a_session_and_explains_the_chat(self):
         session = Session(self.base, self.token)
         self.assertTrue(session.sid)
-        self.assertEqual(session.hello["capabilities"], {"tools": {}})
+        self.assertEqual(session.hello["capabilities"], {"tools": {"listChanged": True}})  # a lead's list grows
         self.assertIn("crewchat for Demo", session.hello["instructions"])
         self.assertIn("hub_link", session.hello["instructions"])
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
@@ -1037,6 +1037,112 @@ class TaskAreas(Base):
                       b.text("hub_task", action="take", id=second))
         a.text("hub_task", action="update", id=first, status="done", note="done")
         self.assertIn(second, free())  # the parser is done: the app task may start
+
+
+class LeadTools(Base):
+    """Owner, 18 Oct: the lead and the advisor get hub_code (C5 history, C7 split); every other agent's tools stay
+    as short as they are. A session whose role changes is told its tool list changed (MCP list_changed)."""
+
+    def role(self, name, role):
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": role})
+
+    def tools(self, session):
+        return [t["name"] for t in crewchat.rpc(session.mcp, self.token, "tools/list", {}, session=session.sid)["result"]["tools"]]
+
+    def call_stream(self, session, tool, **arguments):
+        """A tool call, every message of the answer: notifications first, the result last."""
+        body = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+        return crewchat.post_json(session.mcp, self.token, body, headers={"Mcp-Session-Id": session.sid}, stream=True)
+
+    def test_only_the_lead_and_the_advisor_have_hub_code(self):
+        self.assertLessEqual(len(json.dumps(crewchat.TOOLS)), 7000)  # everyone's, as P2 left it
+        self.assertLessEqual(len(json.dumps(crewchat.TOOLS + crewchat.LEAD_TOOLS)), 7700)
+        self.assertTrue(Session(self.base, self.token).hello["capabilities"]["tools"]["listChanged"])
+        session, name = self.agent()
+        self.assertNotIn("hub_code", self.tools(session))
+        self.assertIn("is for the lead and the advisor", session.text("hub_code", action="history", path="app/x.py"))
+        self.assertEqual([m.get("method") for m in self.call_stream(session, "hub_agents")], [None])  # nothing new
+        self.role(name, "lead")
+        told = self.call_stream(session, "hub_agents")  # its next answer says its tools changed
+        self.assertEqual(told[0], {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        self.assertIn("result", told[-1])
+        self.assertIn("hub_code", self.tools(session))
+        self.assertEqual(len(self.call_stream(session, "hub_agents")), 1)  # told once
+        self.assertIn("hub_code split", session.text("hub_role"))  # the lead's instructions say how
+        self.role(name, "none")
+        self.assertEqual(self.call_stream(session, "hub_agents")[0].get("method"), "notifications/tools/list_changed")
+        self.assertNotIn("hub_code", self.tools(session))
+        # A client on the 2024-11-05 protocol, which knew no answers as event streams, is not told: plain JSON.
+        old = Session(self.base, self.token)
+        old_name = old.me
+        with self.hub.lock:
+            self.hub.sessions[old.sid]["streams"] = False
+        self.tools(old)
+        self.role(old_name, "advisor")
+        self.assertEqual([m.get("method") for m in self.call_stream(old, "hub_agents")], [None])
+        self.assertIn("hub_code", self.tools(old))  # it gets the tool when it asks again (a new session)
+        self.role(old_name, "none")
+
+    def test_a_files_history_says_who_for_which_task_and_what_was_said(self):
+        # Roadmap C5.
+        (lead, lead_name), (dev, dev_name) = self.agent(), self.agent()
+        self.role(lead_name, "advisor")
+        task = self.say("all", "Fix the sync of history/engine.py", "task")
+        dev.call("hub_task", action="take", id=task)
+        with self.hub.lock:
+            for _ in range(3):
+                self.hub.events.add_edit(dev_name, "history/engine.py", task)
+            self.hub.events.add_edit(lead_name, "history/engine.py", "")
+            self.hub.events.add_edit(dev_name, "history/other.py", task)
+        dev.call("hub_task", action="update", id=task, status="review", note="engine.py retries now")
+        dev.call("hub_send", to="all", text="heads up: engine.py changed its retry loop")
+        out = lead.text("hub_code", action="history", path="history/engine.py")
+        self.assertIn("history/engine.py: edited 4 times, by %s (3), %s (1)." % (dev_name, lead_name), out)
+        self.assertIn("Tasks: #%s Fix the sync of history/engine.py (review, %s)." % (task, dev_name), out)
+        self.assertIn("[REVIEW] engine.py retries now", out)
+        self.assertIn("heads up: engine.py changed its retry loop", out)  # named in a message
+        self.assertIn("edited 5 times", lead.text("hub_code", action="history", path="history/"))  # a folder
+        self.assertIn("no edits recorded", lead.text("hub_code", action="history", path="nowhere/x.py"))
+        self.hub.chat_index.close()
+        (self.hub.home / crewchat.HISTORY_FILE).unlink()  # derived: deleted, it is built again
+        self.assertIn("[REVIEW] engine.py retries now", lead.text("hub_code", action="history", path="history/engine.py"))
+
+    def test_a_task_split_into_groups_that_hang_together(self):
+        # Roadmap C7: groups by imports, then folders.
+        code = Path(tempfile.mkdtemp(prefix="split-", dir=TMP)).resolve()
+        files = {"splitapp/sync/engine.py": "from splitapp.sync import queue\n", "splitapp/sync/queue.py": "",
+                 "splitapp/sync/__init__.py": "", "splitapp/ui/view.py": "from splitapp.ui import theme\n",
+                 "splitapp/ui/theme.py": "", "splitapp/ui/__init__.py": "", "splitapp/__init__.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="split-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        saved, self.hub._maps = self.hub._maps, maps
+        self.addCleanup(setattr, self.hub, "_maps", saved)
+        lead, lead_name = self.agent()
+        self.role(lead_name, "lead")
+        self.addCleanup(self.role, lead_name, "none")
+        task = crewchat.post_json(self.base + "/api/task", self.owner, {"op": "add", "title": "The app", "areas": "splitapp/"})["id"]
+        out = lead.text("hub_code", action="split", id=task, count=2)
+        self.assertIn("Files of task #%s (splitapp/) in 2 groups" % task, out)
+        self.assertRegex(out, r"(?m)^1\. splitapp/(sync|ui)/ \(\d files\): ")
+        self.assertRegex(out, r"(?m)^2\. splitapp/(sync|ui)/ ")
+        self.assertIn("is not on the task sheet", lead.text("hub_code", action="split", id="999999"))
+
+    def test_the_stdio_relay_passes_the_notice_on(self):
+        session, name = self.agent()
+        relay = crewchat.StdioRelay(self.base + "/mcp", self.token)
+        relay.session = session.sid
+        out = io.BytesIO()
+        with mock.patch.object(sys, "stdout", mock.Mock(buffer=out)):
+            relay.send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            self.role(name, "advisor")
+            relay.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hub_agents", "arguments": {}}})
+        lines = [json.loads(l) for l in out.getvalue().decode().splitlines()]
+        self.assertEqual([l.get("id", l.get("method")) for l in lines], [1, "notifications/tools/list_changed", 2])
 
 
 class Teams(Base):
