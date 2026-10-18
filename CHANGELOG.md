@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Tasks from a machine that is off can still be taken (Tailscale).** The coordinator settles the claim
+  instead of the agent being told to try again later, and the machine the task came from takes the
+  decision over when it is back. If two machines that could not reach each other gave one task to two
+  agents, the earlier claim stands when they meet again, and the other agent is told to stop.
 - **The lead and the advisor get `hub_code`.** `history` says who changed a file (or a folder), for which
   task, and what was said about it; `split` gives a task's files in groups that hang together, to hand out
   one per agent (one big file is split by its sections). Every other agent's tools stay as short as they

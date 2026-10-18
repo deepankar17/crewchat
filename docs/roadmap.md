@@ -48,8 +48,8 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | Done | C1 |
 | [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | Done | C1 |
 | [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | Done | C1, X1 |
-| [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | In progress | none |
-| [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
+| [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | Done | none |
+| [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | Done | Y1 |
 | [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | Done | Y1 |
 | [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
@@ -721,7 +721,7 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 ### Y1
 
-**Automatic coordinator (no fixed machine)** · P2 · effort S · In progress
+**Automatic coordinator (no fixed machine)** · P2 · effort S · Done
 
 > **Decided:** No always-on machine assumed. Whichever machine is online takes over as coordinator for the session (owner, 17 Oct).
 
@@ -764,14 +764,14 @@ account. Tailscale: the preferred machine if reachable, else the lowest reachabl
 travels in pull answers (newest wins). `crewchat coordinator [NAME|none]`, `/api/coordinator`, and the
 page's connection line. Tested: takeover when the coordinator goes off (Tailscale within a minute in the
 test; cloud at the next renewal after the lease runs out, so under 2 minutes), the preferred machine taking
-the role back. The two "Done when" checks about claims (none stuck; one holder after a split) need Y2,
-where the coordinator settles them.
+the role back. The two "Done when" checks about claims (none stuck; one holder after a split) came with
+Y2, which marked Y1 Done.
 
 **Owner's note:** no, users may not have an always on machine. it is possible that they will try to keep a machine always on, but it is possible that his one of the devices will be off due to some personal reasons. in that case whichever device is on, we need to make that as primary device for that session
 
 ### Y2
 
-**Claims when the posting machine is off** · P2 · effort M · To do
+**Claims when the posting machine is off** · P2 · effort M · Done
 
 **Goal.** Over Tailscale, tasks posted on a machine that is off can still be taken.
 
@@ -796,6 +796,13 @@ where the coordinator settles them.
 - Split decisions during network partitions.
 
 **Depends on:** [Y1](#y1)
+
+**Status.** Done. `claim_task` asks the posting machine; if it cannot be reached, the coordinator (Y1, chosen
+without that machine) settles it under its term, in `Mesh.claim` with the origin recorded. Every decision
+carries a Lamport clock and the deciding machine's tag; pull answers carry the decisions (the newest 500), a
+claim decided only elsewhere is adopted (the posting machine, back, takes over the coordinator's), and two
+decisions for two agents keep the earlier one: the machine whose holder changes posts a take with
+`settled` (a new EXTRA_FIELDS entry, so every machine fixes its holder) and tells the other agent to stop.
 
 ### Y3
 

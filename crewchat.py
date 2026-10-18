@@ -111,7 +111,7 @@ SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app doe
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed", "settled")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -1841,7 +1841,9 @@ class Hub:
                 self._save()
         if kind in ("take", "assign") and msg.get("task") in self.sheet:
             self.sheet[msg["task"]]["held_seq"] = msg["seq"]  # what its holder works on now (edits and tokens)
-        if kind == "take" and msg.get("task") and msg["task"] not in self.taken:
+        if kind == "take" and msg.get("task") and (msg["task"] not in self.taken or msg.get("settled")):
+            # (settled: two machines each gave it to someone while they could not reach each other; this
+            # names the one whose claim came first, so every machine ends up with the same holder.)
             self.taken[msg["task"]] = msg["from"]
             self._save()
         elif kind == "role" and msg["to"] in self.agents:
@@ -3291,6 +3293,18 @@ class Hub:
         summary = " ".join(task["text"].split())
         self._append(agent, "all", "I am taking task #%s: %s" % (mid, summary[:120]), "take", task=mid)
         self._changed()
+
+    def settle_claim(self, mid, winner, loser):
+        """Two machines gave task #mid to two agents while they could not reach each other (roadmap Y2): the
+        earlier claim stands. Every machine is told who holds it, and the other agent to stop."""
+        with self.lock:
+            self._append(winner, "all", "Task #%s is mine: my claim came first while our machines could not reach "
+                         "each other." % mid, "take", task=mid, settled="1")
+            if loser in self.agents or loser in self._remote_names():
+                self._append(SERVER_NAME, loser, "Task #%s went to %s, whose claim came first while your machines could "
+                             "not reach each other. Stop work on it and tell %s what you did so far." % (mid, winner, winner),
+                             "msg", task=mid)
+            self._changed()
 
     def take(self, agent, mid):
         mid = self._id(mid)
