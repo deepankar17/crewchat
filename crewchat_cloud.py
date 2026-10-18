@@ -69,7 +69,13 @@ class CloudError(Exception):
 
 COLLECTIONS = ("messages", "tasks", "state", "devices", "files")  # the layout above, besides meta and spaces
 SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "files")  # in each spaces/{space}
-CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (Firestore's quota)
+CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (config cloud_file_mb)
+# Why the cap: the free (Spark) plan of a Firebase project allows 1 GiB stored, 20,000 writes and 50,000 reads a
+# day, and 10 GiB a month downloaded; a file is a write per 512 KB part on the way in and a read per part for
+# each machine that opens it. On a paid (Blaze) plan the owner can raise it, up to crewchat's 20 MB for a file.
+QUOTA_NOTE = ("files over %s stay on the machine they were shared on, to keep within the free Firebase plan's "
+              "quota (1 GiB stored, 20,000 writes a day); on a paid (Blaze) plan, raise cloud_file_mb in crewchat's "
+              "config.json (up to 20)")
 FILE_PART = 512 * 1024  # bytes of a file in one document: sealed and in base64 twice, under Firestore's 1 MB
 NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
                  "or: pip install \"crewchat[cloud]\"")
@@ -775,13 +781,14 @@ class CloudSync(crewchat.ProjectLink):
     space, under the same account key: projects with the same name on the machines are one chat,
     and a project one machine lacks stays on the other."""
 
-    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None):
+    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None, file_max=CLOUD_FILE_MAX):
         self._init_projects(hub, chat)
         self.store = store
         self.device = device
         self.account = Account(store, device)
         self.device_id = device.id
         self.ttl = ttl_hours * 3600
+        self.file_max = max(1, min(int(file_max), crewchat.MAX_UPLOAD))  # bytes of a shared file that travel
         self.log = log or (lambda text: sys.stderr.write("%s cloud %s\n" % (crewchat.now_iso(), text)))
         self.space = space_id(self._root(), chat) if chat is not None else None
         self.base = "spaces/%s/" % self.space if chat is not None else ""  # where its collections are
@@ -915,7 +922,8 @@ class CloudSync(crewchat.ProjectLink):
         return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
 
     def _project_link(self, hub, name):
-        return CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
+        return CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name,
+                         file_max=self.file_max)
 
     def _drop(self, device_id):
         """Another machine is gone from this project (left it, removed, or no longer trusted)."""
@@ -982,7 +990,7 @@ class CloudSync(crewchat.ProjectLink):
         deleted with the messages. Only files up to CLOUD_FILE_MAX; a bigger one stays on this machine."""
         fid = str(info.get("id") or "")
         meta, path = self.hub.file(fid)
-        if meta is None or meta["size"] > CLOUD_FILE_MAX:
+        if meta is None or meta["size"] > self.file_max:
             return
         data = path.read_bytes()
         parts = max(1, -(-len(data) // FILE_PART))
@@ -998,9 +1006,9 @@ class CloudSync(crewchat.ProjectLink):
         name = next((d.get("name") for i, d in self.store.list("devices") if i == origin), "") or "another machine"
         first = self.store.get(self.base + "files/%s-0" % fid)
         if not first or first.get("dev") != origin:
-            raise crewchat.HubError("that file is on %s only (files over %s stay on their machine, and the cloud keeps "
-                                    "them %d hours): open it there" % (name, crewchat.human_size(CLOUD_FILE_MAX),
-                                                                     self.ttl // 3600))
+            raise crewchat.HubError("that file is on %s only: open it there. With cloud sync, %s; and the cloud keeps "
+                                    "files %d hours" % (name, QUOTA_NOTE % crewchat.human_size(self.file_max),
+                                                        self.ttl // 3600))
         pieces = []
         try:
             parts = int(first.get("parts") or 1)
@@ -1374,7 +1382,11 @@ def start(hub, root=None, ttl_hours=None):
         raise CloudError("this machine has no cloud identity; run `crewchat cloud login`")
     config = crewchat.load_config(root)
     ttl = ttl_hours or float(config.get("cloud_ttl_hours", TTL_HOURS))
-    sync = CloudSync(hub, store, device, ttl_hours=ttl)
+    try:
+        file_max = int(float(config.get("cloud_file_mb", CLOUD_FILE_MAX / 1048576)) * 1048576)
+    except (TypeError, ValueError):
+        file_max = CLOUD_FILE_MAX
+    sync = CloudSync(hub, store, device, ttl_hours=ttl, file_max=file_max)
     sync.start()
     sys.stderr.write("%s cloud sync on as %s (device %s, tag %s), account %s\n" % (
         crewchat.now_iso(), auth.email, device.name, device.tag, "ready" if device.ready else "waiting for approval"))

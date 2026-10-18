@@ -786,9 +786,9 @@ where the coordinator settles them.
 **Status.** Done for files up to 5 MB (`CLOUD_FILE_MAX`): the machine that writes the message seals the file in
 512 KB parts (`files/{fid}-{n}`, bound to the account, project, file, part and device), deleted with its message;
 another machine's `fetch_file` reads and checks them. A bigger file, or one gone from the cloud, says which machine
-has it. **Waiting on the owner:** "larger files: fetch from the machine that shared them, or the coordinator" has
-no route in cloud mode, where machines only meet in Firestore: a request written there and answered by a machine
-holding the file (uploading it on demand) would work, but costs quota for big files.
+has it. Larger files: cloud mode has no route between machines except Firestore, so (owner, 18 Oct) they stay on
+their machine and the message says why (the free Firebase plan's quota) and how to change it: on a paid plan,
+`cloud_file_mb` in config.json raises the cap, up to crewchat's 20 MB for a shared file.
 
 ## Analytics page
 

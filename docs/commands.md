@@ -204,6 +204,7 @@ Other settings in `~/.crewchat/config.json`:
 |---|---|
 | `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
 | `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24) |
+| `cloud_file_mb` | Cloud sync: the largest shared file that travels to your other machines, in MB (default 5, at most 20). The default keeps within the free Firebase plan's quota (1 GiB stored, 20,000 writes and 50,000 reads a day); raise it on a paid (Blaze) plan |
 | `roles` | The project's own roles (`crewchat roles add` writes them) |
 | `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
 | `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |

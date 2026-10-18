@@ -215,6 +215,7 @@ class Sync(unittest.TestCase):
         with self.assertRaises(crewchat.HubError) as e:
             self.b.hub.open_file(big["id"])
         self.assertIn("on mac only", str(e.exception))
+        self.assertIn("paid (Blaze) plan, raise cloud_file_mb", str(e.exception))  # why, and what the owner can do
         self.assertIsNone(self.store.get("files/%s-0" % big["id"]))
         # A piece changed in the cloud does not open.
         small = self.a.hub.add_file("notes.txt", b"tamper with me", "text/plain")
@@ -233,6 +234,18 @@ class Sync(unittest.TestCase):
         self.a.sync.housekeeping()
         self.assertFalse([k for k in self.store.docs if k.startswith("files/")])
         self.assertTrue(msg)
+
+    def test_on_a_paid_plan_the_owner_can_let_bigger_files_travel(self):
+        for m in (self.a, self.b):
+            m.sync.file_max = 7 * 1024 * 1024  # cloud_file_mb = 7
+        data = os.urandom(6 * 1024 * 1024)
+        meta = self.a.hub.add_file("recording.mov", data, "video/quicktime")
+        self.a.hub.send(crewchat.OWNER, "all", "the recording", files=[meta])
+        wait_until(lambda: self.b.has("the recording"), message="the message")
+        wait_until(lambda: self.store.get("files/%s-11" % meta["id"]), message="the last piece")
+        self.assertEqual(self.b.hub.open_file(meta["id"])[1].read_bytes(), data)
+        self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
+                         crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file
 
     def test_whichever_machine_is_on_holds_the_coordinators_lease(self):
         # Roadmap Y1: a lease in meta/coordinator, renewed by its holder, taken over once it runs out.

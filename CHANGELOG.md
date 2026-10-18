@@ -4,7 +4,8 @@
 
 - **Shared files open on your other machines with cloud sync too**, up to 5 MB: a screenshot or a log
   travels with its message, encrypted on your machine, and is deleted from the cloud with the message.
-  A bigger file says which machine has it.
+  A bigger file says which machine has it, and why: the free Firebase plan's quota. On a paid (Blaze)
+  plan, `cloud_file_mb` in config.json lets files up to 20 MB travel.
 - **A coordinator among your linked machines, whichever is on.** One machine at a time is the
   coordinator, so work that needs one machine to act for the others (coming next: claims on a task whose
   machine is off, catch-up, files) never waits on a machine you switched off. With cloud sync it holds a
