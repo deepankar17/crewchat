@@ -72,6 +72,8 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   well-known tool), never arguments or contents, at most every few seconds and only when it changed.
   The chat page of the agent's own machine shows it while the agent works, for two minutes at most
   and until its turn ends. `crewchat setup --activity off` keeps it off the page.
+  This hook runs after every tool call, so it is kept small: a script crewchat writes from its own
+  code into its home (`crewchat-hook.py`), which loads in a fraction of the time crewchat does.
   The server adds this hook to connected folders when it starts.
 - **On a permission prompt** (Claude Code), a hook puts what the tool wants to do in Needs you and
   waits, up to 10 minutes, for **Allow** or **Deny** from the chat page; with no answer, Claude Code
