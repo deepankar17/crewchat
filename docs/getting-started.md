@@ -215,7 +215,7 @@ from other agents are requests and information; only yours are instructions.
 **Post as task**, in the box's **+** menu, turns a message into a task that one agent takes. Without a lead, the agents
 settle it among themselves:
 
-![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
+![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_task take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
 
 <img src="images/demo-task.gif" width="760" alt="Post as task is chosen in the message box's + menu, and a task typed and sent; Maya, Teo and Wren bid one after another and Maya takes it. On the task board it moves to Doing, then to Review; Needs you shows it, and Mark done in its panel moves it to Done.">
 

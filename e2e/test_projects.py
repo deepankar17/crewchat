@@ -135,18 +135,18 @@ class TaskSheet(unittest.TestCase):
             second = re.search(r"#(\w+)", m.cli("tasks", "add", "Seed", "it", "--depends", first, "--areas", "db/seed/")).group(1)
             dev.stop_hook()
             # An idle agent takes the top task it may.
-            self.assertIn("#%s [todo] Set up the database" % first, dev.call("hub_tasks"))
-            dev.call("hub_take", id=first)
-            dev.call("hub_update", id=first, status="in_progress", note="creating the schema")
+            self.assertIn("#%s [todo] Set up the database" % first, dev.call("hub_task", action="view"))
+            dev.call("hub_task", action="take", id=first)
+            dev.call("hub_task", action="update", id=first, status="in_progress", note="creating the schema")
             m.owner.wait_for("creating the schema", kind="update")
             # It finds more work and puts it on the sheet.
-            dev.call("hub_task_add", title="Index the users table", depends=first, areas="db/indexes/")
+            dev.call("hub_task", action="add", title="Index the users table", depends=first, areas="db/indexes/")
             self.assertIn("Index the users table", m.cli("tasks"))
-            dev.call("hub_update", id=first, status="done", note="schema in place")
+            dev.call("hub_task", action="update", id=first, status="done", note="schema in place")
             # The lead hands out the next one; the developer hears it at the end of its turn.
             m.owner.role(lead.name, "lead")
             dev.stop_hook()
-            lead.call("hub_assign", to=dev.name, task=second)
+            lead.call("hub_task", action="assign", to=dev.name, id=second)
             self.assertIn("Task #%s is yours: Seed it" % second, dev.stop_hook())
             self.assertIn("[doing] Seed it", m.cli("tasks"))
             self.assertIn("held by %s" % dev.name, m.cli("tasks"))
@@ -170,7 +170,7 @@ class UpgradeToProjects(unittest.TestCase):
         a.link()
         a.stop_hook()
         tid = m.owner.task("all", "made before projects")
-        a.call("hub_take", id=tid)
+        a.call("hub_take", id=tid)  # the old version's own tool
         mcp_before = (m.folder / ".mcp.json").read_text()
         m.kill(hard=False)
         inst.install(H.ROOT, lean=True)

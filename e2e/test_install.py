@@ -89,7 +89,7 @@ class Install(unittest.TestCase):
             a.link()
             m.owner.role(a.name, "developer")
             tid = m.owner.task("all", "made before the upgrade")
-            a.call("hub_take", id=tid)
+            a.call("hub_take", id=tid)  # the old version's own tool
             a.stop_hook()
             m.kill(hard=False)  # the installer on Windows stops it; here the owner restarts after
             self.install(H.ROOT)
@@ -104,7 +104,7 @@ class Install(unittest.TestCase):
             # The same session, still running from before, carries on with its old hook commands.
             m.owner.send(a.name, "after the upgrade")
             self.assertIn("after the upgrade", a.stop_hook())
-            a.call("hub_update", id=tid, status="in_progress", note="still mine")
+            a.call("hub_task", action="update", id=tid, status="in_progress", note="still mine")
             m.owner.wait_for("still mine", kind="update")
             m.stop()
         finally:

@@ -10,6 +10,7 @@ It measures, as the agents and the page see them:
   the server, one the hook skips (it told the server a moment ago), a prompt, and the end of a turn;
 - one /api/poll round trip of the chat page, opening the chat and catching up on one new message,
   and how big each answer is;
+- what every agent loads (the tool definitions) and reads (an inbox of 50 messages), in characters;
 - server startup with that messages.jsonl, until /health answers.
 Timings are noisy (more so on CI runners): compare medians, on the same machine.
 """
@@ -130,6 +131,14 @@ def measure(agents=5, messages=5000, runs=9, say=print):
     a.call("hub_send", to="all", text="one more")
     numbers["poll: one new message (s)"] = timed(lambda: poll(last), runs)
     numbers["poll: one new message (bytes)"] = sizes[-1]
+
+    # What every agent loads, and what reading a full inbox costs it, in characters (the model's tokens).
+    numbers["tools/list (chars)"] = len(json.dumps(a._rpc("tools/list", {})["tools"]))
+    reader = m.agent()
+    reader.link()
+    for i in range(50):
+        a.call("hub_send", to="all", text="Message %d: the login screen is done, tests pass, see LoginViewModel.kt" % i)
+    numbers["hub_inbox, 50 unread (chars)"] = len(reader.call("hub_inbox"))
 
     numbers["server startup (s)"] = startup(m, runs)
     m.stop()
