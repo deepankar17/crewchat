@@ -934,6 +934,40 @@ class TaskAreas(Base):
         edit("def read(source):\n    return source.lower()\n")  # a body only
         self.assertEqual(self.hub.interface_notices(self.hub._maps, now=start + 10000), [])
 
+    def test_taking_or_giving_a_task_warns_of_the_code_others_work_on(self):
+        # Roadmap C4: a note naming the other task and its holder, firm on certain links, a hint on guesses;
+        # never in the way.
+        code = Path(tempfile.mkdtemp(prefix="blast-", dir=TMP)).resolve()
+        files = {"blastlib/parse.py": "def read():\n    pass\n", "blastlib/__init__.py": "",
+                 "blastapp/main.py": "from blastlib.parse import read\n",
+                 "blastjava/p/Cart.java": "package p;\n\nclass Cart { Pricing pricing; }\n",
+                 "blastjava/p/Pricing.java": "package p;\n\nclass Pricing {}\n", "blastdocs/notes.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="blast-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        self.hub._maps = maps
+        (a, a_name), (b, b_name) = self.crew
+        pricing, cart = self.task("Pricing rules", "blastjava/p/Pricing.java"), self.task("The cart", "blastjava/p/Cart.java")
+        lib, app, docs = self.task("The parser", "blastlib/"), self.task("The app", "blastapp/"), self.task("Notes", "blastdocs/")
+        a.call("hub_task", action="take", id=pricing)
+        out = b.text("hub_task", action="take", id=cart)  # a guess only (a name in the same package): taken, with a hint
+        self.assertIn("Task #%s is yours" % cart, out)
+        self.assertIn("Heads up: #%s (%s) may touch code this task uses (a guess from names)" % (pricing, a_name), out)
+        a.call("hub_task", action="take", id=lib)
+        # The owner gives the app to b: certain, so a firm note, in the message b gets; nothing stopped.
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "assign", "task": app, "agent": b_name})
+        self.assertEqual(self.hub.taken[app], b_name)
+        inbox = b.text("hub_inbox")
+        self.assertIn("Heads up: #%s (%s) works on code that this task's files import or are imported by" % (lib, a_name), inbox)
+        self.assertIn("agree any change to what they share with %s first" % a_name, inbox)
+        self.assertNotIn("Heads up", a.text("hub_task", action="take", id=docs))  # nothing it shares: nothing said
+        self.hub._maps = None
+        self.assertEqual(self.hub.blast_radius(b_name, cart), "")  # no map: no note
+
     def test_suggested_areas_travel_as_a_message_field(self):
         mid = self.task("From another machine")
         self.assertTrue(self.hub.ingest({"id": "far-%s" % mid, "ts": time.time(), "from": crewchat.SERVER_NAME,

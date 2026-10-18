@@ -43,7 +43,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
-| [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | To do | C1, C2 |
+| [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | Done | C1, C2 |
 | [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
 | [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | To do | C1 |
 | [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | To do | C1 |
@@ -572,7 +572,11 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C4
 
-**Blast-radius warnings** · P2 · effort S · To do
+**Blast-radius warnings** · P2 · effort S · Done
+
+> Built after C2, which already keeps two tasks over certainly linked code from running at once: so a firm
+> note mostly comes with a task given by the lead or the owner (which C2 does not stop), and taking one
+> brings the hints on guessed links.
 
 **Goal.** Warn, not block, when a task is taken that touches code another agent's task depends on.
 

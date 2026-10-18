@@ -406,6 +406,11 @@ crewchat tasks areas A12 app/login/,docs/ # or set them yourself
 
 A lead accepts them with `hub_task` action `areas`.
 
+When an agent takes a task, or the lead or you give it one, and another agent's task in progress works on
+code this one's files import or are imported by, the agent is told which task and whose, so they agree any
+change to what they share. A guess (a class of the same package, found by name) is only a hint. It never
+stops anyone taking the task.
+
 **When an agent goes silent.** A crashed session would keep its task until someone gave it back,
 so crewchat reclaims it: a task whose holder has shown no sign of life for 60 minutes (no tool
 call, no hook; a hook waiting for messages counts as alive) goes back on the sheet,

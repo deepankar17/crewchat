@@ -30,6 +30,7 @@ from pathlib import Path
 MAX_FILES = 20000  # read at most this many source files of one repository
 MAX_FILE_BYTES = 1024 * 1024  # bigger source files are skipped (generated, minified)
 MAX_GUESSES = 3  # a name defined in more files than this is not linked at all
+CERTAIN, GUESS = 2, 1  # how two areas are linked (CodeMap.link)
 SKIP_DIRS = {".git", "node_modules", "build", "dist", "out", "target", ".gradle", ".idea", "__pycache__", ".venv",
              "venv", ".tox", ".mypy_cache", ".pytest_cache", "coverage", ".next", ".angular", "Pods", "obj",
              "generated", ".dart_tool", "vendor", "site-packages"}
@@ -668,11 +669,16 @@ class CodeMap:
         """Is there a certain link, either way, between a and b? Each is an area as tasks give them: a path
         prefix, a file or every file under a folder. For C2's check of whether two tasks' areas overlap.
         wait=False never waits for an update in progress: it answers from what it knew."""
+        return self.link(a, b, wait) == CERTAIN
+
+    def link(self, a, b, wait=True):
+        """How a and b are linked, either way: CERTAIN, GUESS (only links the readers guessed, C4's soft hint) or
+        0. Cached until the next update changes something."""
         a, b = norm(a).rstrip("/"), norm(b).rstrip("/")
         if not wait and (a, b) in self._linked:
             return self._linked[(a, b)]
         if not self.lock.acquire(blocking=wait):  # being updated: what it said before, else no link
-            return self._linked.get((a, b), False)
+            return self._linked.get((a, b), 0)
         try:
             if (a, b) not in self._linked:
                 under = "(%s = ? OR %s LIKE ? ESCAPE '\\')"
@@ -680,9 +686,10 @@ class CodeMap:
                     under % ("s.path", "s.path"), under % ("d.path", "d.path")
                 va, vb = [a, like_prefix(a)], [b, like_prefix(b)]
                 row = self.db.execute(
-                    "SELECT 1 FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst WHERE e.certain = 1 "
-                    "AND ((%s AND %s) OR (%s AND %s)) LIMIT 1" % (sa, db, sb, da), va + vb + vb + va).fetchone()
-                self._linked[(a, b)] = self._linked[(b, a)] = row is not None
+                    "SELECT MAX(e.certain) FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE (%s AND %s) OR (%s AND %s)" % (sa, db, sb, da), va + vb + vb + va).fetchone()
+                how = 0 if row is None or row[0] is None else CERTAIN if row[0] else GUESS
+                self._linked[(a, b)] = self._linked[(b, a)] = how
             return self._linked[(a, b)]
         finally:
             self.lock.release()
@@ -783,15 +790,21 @@ class Maps:
     def linked(self, a, b):
         """Is there a certain link between two areas (paths relative to a project folder) in any folder's map?
         Only maps already built are asked, and no git is run: cheap enough for every look at the task sheet."""
+        return self.link(a, b) == CERTAIN
+
+    def link(self, a, b):
+        """The strongest link between two areas in any folder's map: CERTAIN, GUESS or 0 (as linked, no git)."""
         with self.lock:
             tops = list(self.tops.values())
+        best = 0
         for cmap, inside in tops:
             try:
-                if cmap.linked(inside + a, inside + b, wait=False):
-                    return True
+                best = max(best, cmap.link(inside + a, inside + b, wait=False))
             except sqlite3.Error:  # a map being built again (its file was deleted)
                 continue
-        return False
+            if best == CERTAIN:
+                break
+        return best
 
     def insides(self, cmap):
         """Where the project's folders that use this map are in its repository: "" or "app/" each."""

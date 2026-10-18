@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Agents are told whose work theirs touches.** Taking a task, or being given one, now says which other
+  agents' tasks in progress work on code this task's files import or are imported by, so they agree any
+  change to what they share. Never in the way: a note, not a block.
 - **A machine that was off for days gets every message when it is back.** Over Tailscale, a linked
   machine now serves what was missed from its log, not only the newest 2,000 in memory, and the
   messages of a machine that is off by then come from the coordinator. With cloud sync, a machine

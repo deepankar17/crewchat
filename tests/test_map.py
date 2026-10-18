@@ -122,6 +122,13 @@ class JavaRepo(Sample):
         self.assertFalse(self.map.linked("app/src/main/java/com/shop/cart/Cart.java",
                                          "app/src/main/java/com/shop/cart/Pricing.java"))
 
+    def test_how_two_areas_are_linked(self):
+        # C4: certain links (an import), guesses (a class of the same package, by name), or none.
+        base = "app/src/main/java/com/shop/"
+        self.assertEqual(self.map.link(base + "cart/Cart.java", base + "model/"), crewchat_map.CERTAIN)
+        self.assertEqual(self.map.link(base + "cart/Pricing.java", base + "cart/Cart.java"), crewchat_map.GUESS)
+        self.assertEqual(self.map.link(base + "model/", base + "util/Money.java"), 0)
+
     def test_definitions(self):
         names = {(d["kind"], d["name"]) for d in self.map.definitions("app/src/main/java/com/shop/cart/Cart.java")["definitions"]}
         self.assertEqual(names, {("class", "Cart"), ("function", "items")})

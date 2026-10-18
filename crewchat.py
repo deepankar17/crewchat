@@ -3018,6 +3018,35 @@ class Hub:
             self._changed()
             return msg, to
 
+    def blast_radius(self, agent, mid):
+        """Roadmap C4: the other agents' tasks in progress whose files this task's files import, or are imported by
+        (C1's links, direct ones). Never stops anyone: a note for whoever takes or is given the task, naming each
+        task and its holder; firm on certain links, a hint on guessed ones. "" when there is nothing to say."""
+        maps = self._maps
+        with self.lock:
+            row = self.sheet.get(mid)
+            if maps is None or row is None or not row["areas"]:
+                return ""
+            others = [(other, holder, self.sheet[other]["areas"]) for other, holder in self.taken.items()
+                      if other != mid and holder != agent and other in self.sheet and self.sheet[other]["areas"]
+                      and self._row_status(other) in ("doing", "review")]
+        firm, maybe = [], []
+        for other, holder, areas in others:
+            how = max((maps.link(x, y) for x in row["areas"] for y in areas), default=0)
+            if how == 2 or areas_overlap(row["areas"], areas):
+                firm.append("#%s (%s)" % (other, holder))
+            elif how == 1:
+                maybe.append("#%s (%s)" % (other, holder))
+        notes = []
+        if firm:
+            notes.append("%s works on code that this task's files import or are imported by: agree any change to "
+                         "what they share with %s first." % (", ".join(firm), "them" if len(firm) > 1 else
+                                                              firm[0].split("(")[1].rstrip(")")))
+        if maybe:
+            notes.append("%s may touch code this task uses (a guess from names): worth a word before changing it."
+                         % ", ".join(maybe))
+        return " ".join(notes)
+
     def _suggest_areas(self, mid):
         """C2: when a task goes to review or done, the folders its holder edited while holding it (C0) that its
         areas do not cover, grouped, as a suggestion for its areas that the lead or the owner can accept. Works
@@ -3403,8 +3432,11 @@ class Hub:
                     self._save()
                     self._changed()
                 raise HubError("task #%s was just taken by %s" % (mid, settled))
+        radius = self.blast_radius(to, mid)
         with self.lock:
-            msg = self._append(lead, to, "Task #%s is yours: %s" % (mid, self.sheet[mid]["title"]), "assign", task=mid)
+            msg = self._append(lead, to, "Task #%s is yours: %s%s" % (mid, self.sheet[mid]["title"],
+                                                                    "\nHeads up: " + radius if radius else ""),
+                               "assign", task=mid)
             self._changed()
             return msg
 
@@ -4287,8 +4319,10 @@ def call_tool(hub, sid, name, args, owner=False):
             raise HubError("the owner posts tasks; agents take them")
         mid = clean_id(args.get("id"))
         hub.take(me, mid)
+        radius = hub.blast_radius(me, mid)
         return ("Task #%s is yours and everyone has been told. Before any other work, send hub_task "
-                "action=update id=%s status=in_progress with one line on your plan; then start.%s" % (mid, mid, hub.reclaim_note(mid)))
+                "action=update id=%s status=in_progress with one line on your plan; then start.%s%s"
+                % (mid, mid, hub.reclaim_note(mid), "\nHeads up: " + radius if radius else ""))
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -4303,7 +4337,9 @@ def call_tool(hub, sid, name, args, owner=False):
         to, text = args.get("to"), args.get("text")
         if not text and args.get("task"):
             hub.assign_row(me, to, args.get("task"))
-            return "Gave task #%s to %s. They report back to you with hub_task update." % (clean_id(args["task"]), to)
+            radius = hub.blast_radius(to, clean_id(args["task"]))
+            return "Gave task #%s to %s. They report back to you with hub_task update.%s" % (
+                clean_id(args["task"]), to, "\nHeads up: " + radius if radius else "")
         msg = hub.assign(me, to, clean_text(to, text, me), args.get("task"))
         return "Assigned task #%s to %s. They report back to you with hub_task update." % (msg["id"], to)
     if name == "task:view":
@@ -4322,8 +4358,10 @@ def call_tool(hub, sid, name, args, owner=False):
         msg = hub.add_row(me, args.get("title"), args.get("depends", ""), args.get("areas", ""), args.get("where", ""))
         if args.get("take") and not owner:
             hub.take(me, msg["id"])
+            radius = hub.blast_radius(me, msg["id"])
             return ("Task #%s is on the sheet and yours. Send hub_task action=update id=%s status=in_progress with your plan, "
-                    "then start.%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"])))
+                    "then start.%s%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"]),
+                                         "\nHeads up: " + radius if radius else ""))
         return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if name == "hub_answer":
         msg = hub.answer(me, args.get("id"), args.get("text"), args.get("verdict") or "")
