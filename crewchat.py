@@ -1511,7 +1511,7 @@ class Hub:
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
-        self._map_edited = False  # an agent edited a file since the maps were last brought up to date
+        self._map_edited = set()  # the files agents edited since the maps were last brought up to date
         self._editors = {}  # a path in the project -> the agent that edited it last (memory only)
         self._iface = {}  # (map, path) -> a Python file's interface change not told yet (C3): before, after, when
         self._iface_told = {}  # (map, path) -> when agents were last told of a change to it
@@ -2314,7 +2314,7 @@ class Hub:
         the lock."""
         self.events.add_edit(name, path, self._usage_task(name))
         self._editors[path] = name
-        self._map_edited = True
+        self._map_edited.add(path)  # the code map reads it again (C1)
         MAP_WAKE.set()
 
     def update_map(self):
@@ -2323,8 +2323,8 @@ class Hub:
         maps = self.code_maps()
         if maps is None:
             return {}
-        edited, self._map_edited = self._map_edited, False
-        done = maps.check(self.project_folders(), edited)
+        edited, self._map_edited = self._map_edited, set()
+        done = maps.check(self.project_folders(), bool(edited), sorted(edited))
         self.interface_notices(maps)
         return done
 

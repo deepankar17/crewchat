@@ -287,6 +287,20 @@ class Updates(Sample):
         finally:
             maps.close()
 
+    def test_an_edit_alone_is_read_without_looking_at_the_rest(self):
+        write(self.top, {"c.py": "import b\n", "new.py": "import c\n"})  # c.py edited; new.py and d.md as well
+        later = time.time() + 20
+        for rel in ("c.py", "new.py"):
+            os.utime(self.top / rel, (later, later))
+        os.utime(self.top / "a.py", (later, later))  # changed too, but not said: left for the next full look
+        self.assertEqual(self.map.update(paths=["c.py", "./new.py", "notes.md"]), ["c.py", "new.py"])
+        self.assertTrue(self.map.linked("new.py", "c.py"))
+        self.assertIsNone(self.map.update(paths=["elsewhere/x.py"]))  # not this folder's file: look at all
+        self.assertEqual(self.maps.check([self.top], edited=True, paths=["elsewhere/x.py"]), {str(self.top): ["a.py"]})
+        (self.top / "c.py").unlink()
+        self.assertEqual(self.maps.check([self.top], edited=True, paths=["c.py"]), {str(self.top): []})
+        self.assertFalse(self.map.linked("new.py", "c.py"))  # gone
+
     def test_a_check_reads_nothing_while_nothing_moved(self):
         self.assertEqual(self.maps.check([self.top]), {})
         self.assertEqual(list(self.maps.check([self.top], edited=True)), [str(self.top)])
@@ -408,7 +422,7 @@ class Speed(unittest.TestCase):
             st = (ROOT / rel).stat()
             cmap.db.execute("UPDATE files SET mtime = ? WHERE path = ?", (st.st_mtime - 1, rel))  # as if it changed
             started = time.time()
-            self.assertEqual(cmap.update(), [rel])
+            self.assertEqual(cmap.update(paths=[rel]), [rel])  # the file an agent edited, as the server passes it
             self.assertLess(time.time() - started, 0.1)
             maps.close()
         finally:

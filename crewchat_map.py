@@ -115,11 +115,16 @@ def source_files(top):
     out = []
     for rel in paths:
         rel = rel.replace("\\", "/")
-        if os.path.splitext(rel)[1].lower() in LANGS and not SKIP_DIRS.intersection(rel.split("/")[:-1]):
+        if wanted(rel):
             out.append(rel)
             if len(out) >= MAX_FILES:
                 break
     return out
+
+
+def wanted(rel):
+    """Is this path (relative, forward slashes) a source file the map reads?"""
+    return os.path.splitext(rel)[1].lower() in LANGS and not SKIP_DIRS.intersection(rel.split("/")[:-1])
 
 
 def line_of(text, index):
@@ -376,13 +381,25 @@ class CodeMap:
         return "", {}
 
     # Building ----------------------------------------------------------------------------
-    def update(self, commit=""):
+    def update(self, commit="", paths=None):
         """Read the files that are new or changed since the last update, forget the ones gone, and link again
-        what that touches. Returns the paths read."""
+        what that touches. With paths (files agents edited), only those are looked at: no git, so an edit is
+        read at once. Returns the paths read, or None when a path is neither here nor known (it is another
+        folder's): then the caller looks at everything."""
         started = time.time()
         with self.lock:
-            files = source_files(self.top)
-            known = {p: (m, s) for p, m, s in self.db.execute("SELECT path, mtime, size FROM files")}
+            if paths is None:
+                files = source_files(self.top)
+                known = {p: (m, s) for p, m, s in self.db.execute("SELECT path, mtime, size FROM files")}
+            else:
+                files = sorted({norm(p) for p in paths if wanted(norm(p))})
+                known = {}
+                for rel in files:
+                    row = self.db.execute("SELECT mtime, size FROM files WHERE path = ?", (rel,)).fetchone()
+                    if row:
+                        known[rel] = tuple(row)
+                    elif not (self.top / rel).is_file():
+                        return None
             changed = []
             for rel in files:
                 try:
@@ -693,8 +710,9 @@ class Maps:
     def __init__(self, root):
         self.dir = Path(root) / "maps"
         self.maps = {}  # key -> CodeMap
-        self.seen = {}  # folder -> the (branch, commit) its map was last brought up to date at, and the map's file
-        self.tops = {}  # folder -> (its map, the folder's path inside the repository: "" or "app/")
+        self.seen = {}  # folder -> (the (branch, commit) its map was last brought up to date at, the map, where
+        # the folder is in its repository: "" or "app/")
+        self.tops = {}  # folder -> (its map, where the folder is in its repository), for linked()
         self.lock = threading.Lock()
 
     def for_folder(self, folder):
@@ -710,20 +728,28 @@ class Maps:
                 cmap = self.maps[key] = CodeMap(self.dir / ("%s.sqlite" % key), top, repo, branch)
         return cmap, commit
 
-    def check(self, folders, edited=False):
+    def check(self, folders, edited=False, paths=()):
         """Bring up to date the map of each folder whose files were edited, whose HEAD moved (a commit, a pull,
-        another branch), or that has none yet. Returns {folder: paths read, or why it could not}."""
+        another branch), or that has none yet. paths: the files edited, relative to the folders, read alone
+        when nothing else moved. Returns {folder: paths read, or why it could not}."""
         done = {}
         for folder in folders:
             folder = str(folder)
             head = head_of(folder)
-            if not edited and folder in self.seen and self.seen[folder][0] == head and self.seen[folder][1].exists():
-                continue
+            seen = self.seen.get(folder)
             try:
+                if seen and seen[0] == head and seen[1].path.exists():
+                    if not edited:
+                        continue
+                    if paths:
+                        read = seen[1].update(head[1], [seen[2] + p for p in paths])
+                        if read is not None:
+                            done[folder] = read
+                            continue
                 cmap, commit = self.for_folder(folder)
                 done[folder] = cmap.update(commit)
-                self.seen[folder] = (head, cmap.path)
                 inside = git(folder, "rev-parse", "--show-prefix")  # where the folder is in its repository
+                self.seen[folder] = (head, cmap, inside)
                 with self.lock:
                     self.tops[folder] = (cmap, inside)
             except (OSError, sqlite3.Error) as e:
