@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **The chat page, tried end to end, and what it turned up fixed.**
+  - A task you take off the sheet now asks first, as removing an agent or a role does, and its card in the chat
+    says "Off the sheet" instead of "Open".
+  - Searching from the task board or the analytics view shows the chat, where the matches are (it filtered a
+    hidden chat before).
+  - Your answer to a blocked task shows in the task's history.
+  - An agent's settings in the list have room: each value under its name, so the menus are no longer cut off
+    ("As its folder s…"). The number on an agent's card says, on hover, that it counts messages it has not read.
+  - On a phone, the task list puts each task's buttons on a line of their own instead of off the screen.
+  - Adding a task: with no title it says what is missing; an error says "Task not added"; after adding, the
+    cursor is back in the title for the next one.
+  - Analytics: the review pass rate no longer counts a task still in review as failed (it showed 0%), and the
+    machine card no longer says "this machine" twice.
 - **Fixed: the Tasks button beside Commands and Analytics wrapped onto two lines** once the board had
   open tasks. The three stay on one line.
 - **The docs' pictures show crewchat as it is now:** every screenshot, demo and diagram made again, with

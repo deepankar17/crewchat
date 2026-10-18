@@ -1279,7 +1279,9 @@ class Analytics:
             day_rows = [{"day": d, **v} for d, v in sorted(self.days.items())][-days:]
             posted = [t for t in self.tasks.values() if "posted" in t]
             done = [t for t in posted if "done" in t]
-            reviewed = [t for t in self.tasks.values() if "review" in t["history"]]
+            # A review counts once it has an outcome (what came next): a task still waiting in review has not failed it.
+            reviewed = [t for t in self.tasks.values()
+                        if "review" in t["history"] and t["history"][t["history"].index("review") + 1:]]
             passed = [t for t in reviewed if t["history"][t["history"].index("review") + 1:][:1] == ["done"]]
             out = {
                 "messages": self.total, "kinds": dict(self.kinds), "files": self.files, "reclaims": self.reclaims,
@@ -3831,6 +3833,7 @@ class Hub:
                 "more": len(batch) < len(new) and after >= 0,
                 "taken": dict(self.taken),
                 "progress": dict(self.progress),
+                "removed": [mid for mid, row in self.sheet.items() if row.get("removed")],  # taken off the sheet
                 "agents": self._rows(),
                 "pack": self.roster.pack,
                 "crew": self.roster.crew,
@@ -10870,6 +10873,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg.task .body { background: var(--task); color: var(--text); border: 1px solid var(--task-line); border-radius: 16px; justify-self: stretch; }
 .msg.task .label { display: flex; gap: 8px; align-items: center; font-size: 12px; font-weight: 700; color: var(--task-ink); margin-bottom: 4px; letter-spacing: 0.03em; }
 .msg.task .state { margin-left: auto; font-weight: 600; letter-spacing: 0; }
+.msg.task .state.off { color: var(--muted); font-weight: 500; }
 .msg .receipt { font-size: 11.5px; color: var(--muted); margin-top: 3px; text-align: right; }
 .msg.update .body { background: transparent; border: 1px dashed var(--line); }
 .mention { background: var(--tint); color: var(--deep); border-radius: 99px; padding: 0 6px; font-weight: 600; white-space: nowrap; }
@@ -10988,7 +10992,8 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #panel { grid-area: panel; overflow-y: auto; padding: 12px 14px 20px; min-width: 0; }
 #agent-pane { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); }
 #agent-pane .card { padding: 10px 12px; }
-#agent-pane .field { grid-template-columns: 82px minmax(0, 1fr); }
+/* The rail is narrow: each setting's name above it, so a value (a menu, what the agent last said) has the width. */
+#agent-pane .field { grid-template-columns: minmax(0, 1fr); gap: 2px; margin: 8px 0; }
 .panel-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
 .panel-head h2 { font-size: 15px; margin: 0; flex: 1; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card { background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow); padding: 12px 14px; margin-bottom: 10px; }
@@ -11091,6 +11096,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   .msg { max-width: 96%; }
   #board { grid-template-columns: repeat(5, 86%); scroll-snap-type: x mandatory; }
   .col { scroll-snap-align: start; }
+  /* The task list on a phone: each task a block, its actions on a line of their own (no sideways scrolling). */
+  #sheet thead { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  #sheet tr { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; padding: 8px 0; border-bottom: 1px solid var(--line); }
+  #sheet td { border: 0; padding: 0; }
+  #sheet td:nth-child(2) { flex: 1 1 calc(100% - 48px); min-width: 0; overflow-wrap: anywhere; }
+  #sheet td:last-child { flex-basis: 100%; }
+  #sheet td:last-child .acts { justify-content: flex-start; }
 }
 @media (prefers-reduced-motion: reduce) { #rail { transition: none; } }
 </style>
@@ -11650,7 +11662,8 @@ $("cmd-filter").addEventListener("input", filterCommands);
 
 // The task sheet: every task of the project, in order, with who holds it. A task opens in the panel.
 function taskOp(body) {
-  return postAction("/api/task", body, "Task not changed");
+  const not = { add: "Task not added", remove: "Task not taken off the sheet" }[body.op] || "Task not changed";
+  return postAction("/api/task", body, not);
 }
 // Where an action's error is shown: the panel, the task board, or under the message box.
 function showError(text) {
@@ -11672,7 +11685,12 @@ function taskActions(r, parent) {
   if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
   if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
     button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
-  button("×", "Take task " + r.id + " off the sheet", { op: "remove", task: r.id }, "danger");
+  const off = actButton(parent, "×", "Take task " + r.id + " off the sheet", () => {
+    // As every other action that cannot be undone here: asked first.
+    if (confirm("Take task #" + r.id + " off the sheet? Nobody works on it any more; its messages stay in the chat."))
+      taskOp({ op: "remove", task: r.id });
+  });
+  off.classList.add("danger");
 }
 function taskMeta(r) {
   const meta = [];
@@ -11876,10 +11894,15 @@ showBoard(!asList);
 $("task-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const title = $("t-title").value.trim();
-  if (!title) return;
+  if (!title) {
+    $("tasks-note").textContent = "Write the task first: the work, and what done looks like.";
+    return $("t-title").focus();
+  }
   const fields = ["t-title", "t-depends", "t-areas", "t-where"], sent = fields.map((id) => $(id).value);
-  if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] }))
+  if (await taskOp({ op: "add", title, depends: sent[1], areas: sent[2], where: sent[3] })) {
     fields.forEach((id, i) => { if ($(id).value === sent[i]) $(id).value = ""; });  // not what was typed since
+    $("t-title").focus();  // ready for the next one
+  }
 });
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "analytics") showView(v); } catch (e) {}
 
@@ -12376,7 +12399,12 @@ function renderAgents(force) {
     const dot = el("span", "dot" + (working ? " working" : age < 90 ? " on" : age < 900 ? " recent" : ""));
     dot.title = doing(a) + " · " + ago(a.seen, state.now);
     const right = el("span", "inline");
-    if (a.unread) right.append(el("span", "count", String(a.unread)), el("span", "sr", " unread"));
+    if (a.unread) {
+      // Messages the agent has not read yet (not the owner's): said on hover, and to a screen reader.
+      const n = el("span", "count", String(a.unread));
+      n.title = a.unread + " message" + (a.unread === 1 ? "" : "s") + " " + a.agent + " has not read yet";
+      right.append(n, el("span", "sr", " messages it has not read"));
+    }
     right.append(dot, el("span", "sr", dot.title));
     const task = heldTask(a.agent);
     const holds = el("span", "holds");
@@ -13121,9 +13149,10 @@ function refreshDynamic() {
       const who = state.taken[m.id];
       const p = state.progress[m.id];
       const st = node.querySelector(".state");
-      st.textContent = (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
+      const off = state.removed && state.removed.has(m.id);  // the owner took it off the sheet
+      st.textContent = off ? "Off the sheet" : (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
         + (p ? " · " + (state.statuses[p.status] || p.status) : "");
-      st.className = "state" + (who ? " " + colour(who) : "");
+      st.className = "state" + (off ? " off" : who ? " " + colour(who) : "");
     }
   }
 }
@@ -13131,7 +13160,10 @@ function refreshDynamic() {
 // What the panels show of the past: each agent's last word, and each task's last dozen messages.
 function remember(m) {
   if (m.text && m.from !== "Owner" && m.kind !== "event") state.lastSaid[m.from] = m;
-  const task = m.task || (m.kind === "task" ? m.id : "");
+  // A task's own messages; and the owner's answers from its panel ("Re #12: ...", as the server reads them too), so
+  // its history shows them.
+  const re = m.from === "Owner" && !m.task && /^Re #([A-Za-z]*\d+): /.exec(m.text || "");
+  const task = m.task || (m.kind === "task" ? m.id : "") || (re ? re[1] : "");
   if (task) state.byTask[task] = (state.byTask[task] || []).concat([m]).slice(-12);
 }
 
@@ -13157,7 +13189,10 @@ function applySearch() {
 function searchNote() {
   $("search-none").hidden = !searchWant() || [...$("log").children].some((n) => !n.hidden && n.id !== "empty");
 }
-$("search").addEventListener("input", applySearch);
+$("search").addEventListener("input", () => {
+  if (searchWant() && $("log").hidden) showView("chat");  // it searches the chat: show it, from the board or analytics
+  applySearch();
+});
 
 // An empty chat: what to do first.
 function welcome() {
@@ -13449,7 +13484,7 @@ async function loop() {
       const first = state.version < 0;
       state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
       state.more = !!data.more;
-      state.progress = data.progress || {};
+      state.progress = data.progress || {}; state.removed = new Set(data.removed || []);
       state.sheet = data.sheet || []; state.device = data.device || ""; state.crew = data.crew || "software";
       state.held = {};
       for (const r of state.sheet) if (r.holder && r.status !== "done") state.held[r.holder] = r;
@@ -14287,7 +14322,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     }
     if (!groups.size) groups.set(S().device || "this machine", []);
     const mode = link.via === "tailscale" ? "linked over Tailscale" : link.via === "cloud" ? "cloud sync" :
-      link.via === "linked" ? "linked" : "this machine only";
+      link.via === "linked" ? "linked" : "not linked to other machines";
     const reach = new Map((link.machines || []).map((m) => [m.name, m.online]));
     const strip = el("div", "ax-machines");
     for (const [name, agents] of groups) {
@@ -14296,7 +14331,9 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       const card = el("div", "ax-machine");
       const head = el("div", "ax-chip");
       head.append(el("span", "ax-dot" + (online ? " on" : "")), el("b", "", name));
-      card.append(head, el("p", "meta", (here ? "this machine · " : "") + mode + " · " + agents.length + " agent" +
+      // ("this machine" again under a card already named so says nothing new.)
+      card.append(head, el("p", "meta", (here && name !== "this machine" ? "this machine · " : "") + mode + " · " +
+                                       agents.length + " agent" +
                                        (agents.length === 1 ? "" : "s")));
       for (const a of agents) {
         const chip = el("div", "ax-chip");

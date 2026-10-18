@@ -321,7 +321,7 @@ class NewPage(Signed):
         c.type_into("#t-title", "Waits for a task that isn't there")
         c.type_into("#t-depends", "#9999")
         c.js("$('task-form').requestSubmit()")
-        c.until("$('tasks-note').textContent.includes('Task not changed')", what="the error on the board")
+        c.until("$('tasks-note').textContent.includes('Task not added')", what="the error on the board")
         self.assertEqual(c.js("$('t-title').value"), "Waits for a task that isn't there")  # kept to fix and retry
         c.js("for (const id of ['t-title', 't-depends']) $(id).value = ''")
         self.assertEqual(c.errors, [])
@@ -423,6 +423,77 @@ class NewPage(Signed):
         c.until("$('panel-title').textContent === 'Roles' && !$('panel-body').innerText.includes('Designer')",
                 what="the role gone")
         c.until("!state.roles.some(r => r.name === 'designer')", what="the page's list to follow (the poll's boot tag)")
+        self.assertEqual(c.errors, [])
+
+    def test_adding_and_taking_off_tasks_on_the_sheet(self):
+        c = self.chrome
+        c.click("#view-tasks")
+        c.js("$('as-list').click()")
+        self.addCleanup(c.js, "$('as-board').click(); showView('chat'); window.confirm = () => true")
+        # Add with no title says what is missing, and puts the cursor there.
+        c.js("$('t-title').value = ''; $('task-form').requestSubmit()")
+        self.assertIn("Write the task first", c.js("$('tasks-note').textContent"))
+        self.assertEqual(c.js("document.activeElement.id"), "t-title")
+        # An error on adding says it was not added (not "not changed").
+        c.type_into("#t-title", "Write the release notes")
+        c.type_into("#t-depends", "#99999")
+        c.js("$('task-form').requestSubmit()")
+        c.until("$('tasks-note').textContent.startsWith('Task not added')", what="the error on adding")
+        # Added: the form is cleared and ready for the next one.
+        c.js("$('t-depends').value = ''")
+        c.js("$('task-form').requestSubmit()")
+        c.until("$('sheet').innerText.includes('Write the release notes')", what="the new task")
+        self.assertEqual(c.js("[$('t-title').value, document.activeElement.id]"), ["", "t-title"])
+        mid = c.js("state.sheet.find(r => r.title === 'Write the release notes').id")
+        off = "[...document.querySelectorAll('#sheet button')].find(b => b.title === 'Take task %s off the sheet')" % mid
+        # × asks first, as every action that cannot be undone here does.
+        c.js("window.asked = ''; window.confirm = (q) => { window.asked = q; return false; }")
+        c.js(off + ".click()")
+        self.assertIn("off the sheet?", c.js("window.asked"))
+        self.assertTrue(c.js("state.sheet.some(r => r.id === %s)" % json.dumps(mid)))  # said no: still there
+        c.js("window.confirm = () => true")
+        c.js(off + ".click()")
+        c.until("!state.sheet.some(r => r.id === %s)" % json.dumps(mid), what="the task off the sheet")
+        # Its card in the chat says so, instead of "Open".
+        card = "state.nodes.get(%s)[1].querySelector('.state').textContent" % json.dumps(mid)
+        c.until("%s === 'Off the sheet'" % card, what="the card to say it is off the sheet")
+        self.assertEqual(c.errors, [])
+
+    def test_searching_from_the_board_shows_the_chat(self):
+        c = self.chrome
+        self.addCleanup(c.js, "$('search').value = ''; applySearch(); showView('chat')")
+        c.click("#view-tasks")
+        self.assertTrue(c.js("$('log').hidden"))
+        c.type_into("#search", "anything")
+        self.assertFalse(c.js("$('log').hidden"))  # the search is of the chat: it shows, with what matches
+        self.assertTrue(c.js("$('tasks').hidden"))
+        self.assertEqual(c.errors, [])
+
+    def test_a_blocked_tasks_answer_shows_in_its_history(self):
+        c = self.chrome
+        mid = self.m.owner.task("all", "Pick the default theme")
+        self.agent.call("hub_task", action="take", id=mid)
+        self.agent.call("hub_task", action="update", id=mid, status="blocked", note="Light or dark by default?")
+        c.until("state.needs.some(n => n.task === %s)" % json.dumps(mid), what="Needs you")
+        c.js("openPanel('task', %s)" % json.dumps(mid))
+        c.until("!!document.querySelector('#panel .needs-card textarea')", what="the answer box")
+        c.js("const t = document.querySelector('#panel .needs-card textarea'); t.value = 'Follow the system setting.'")
+        c.js("[...document.querySelectorAll('#panel .needs-card button')].find(b => b.textContent === 'Send').click()")
+        c.until("$('panel-body').innerText.includes('You: Re #%s: Follow the system setting.')" % mid,
+                what="the answer in the task's history")
+        self.assertEqual(c.errors, [])
+
+    def test_the_agent_settings_have_room_and_its_count_says_what_it_is(self):
+        c = self.chrome
+        for i in range(2):
+            self.m.owner.send(self.agent.name, "Unread %d" % i)
+        c.until("(state.agents.find(a => a.agent === %s) || {}).unread > 0" % json.dumps(self.agent.name), what="unread")
+        c.until("!!%s.querySelector('.count')" % self.card(), what="the count on its card")
+        self.assertIn("has not read yet", c.js("%s.querySelector('.count').title" % self.card()))
+        c.js(self.card() + ".click()")
+        c.until("!$('agent-pane').hidden", what="the agent's settings")
+        widths = c.js("[...$('agent-pane').querySelectorAll('.field select')].map(s => s.getBoundingClientRect().width)")
+        self.assertTrue(widths and min(widths) >= 180, widths)  # the menus had 120 px, "As its folder s…"
         self.assertEqual(c.errors, [])
 
     def test_the_task_board_and_a_task_in_the_panel(self):
@@ -792,6 +863,9 @@ class NewPage(Signed):
             self.assertGreaterEqual(c.js("$('ax-numbers').children.length"), 5)
             for panel in ("ax-river", "ax-machines", "ax-lanes", "ax-tokens", "ax-heat"):
                 self.assertTrue(c.js("$('%s').children.length > 0" % panel), panel)
+            machines = c.js("$('ax-machines').innerText")
+            self.assertIn("not linked to other machines", machines)
+            self.assertNotIn("this machine only", machines)  # it read "this machine · this machine only"
             self.assertEqual(c.js("crewAnalytics.stats().nodes"), c.js("state.agents.length") + 1)  # and you
             self.assertIn(self.agent.whoami(), c.js("$('ax-canvas').getAttribute('aria-label')"))
             # Live: a message flies along its path, from the poll the page makes anyway.
@@ -906,6 +980,15 @@ class NewPage(Signed):
             c.until("!$('agent-pane').hidden", what="the agent's settings")
             self.assertTrue(c.js("document.body.classList.contains('rail-open')"))  # in the drawer, under the crew
             self.assertLessEqual(c.js("$('agent-pane').getBoundingClientRect().right"), 375)
+            # The task list on a phone: every action on screen, nothing to scroll sideways for.
+            mid = self.m.owner.task("all", "Add the dark colour scheme to app/src/main/ui/theme/Color.kt")  # long words
+            self.agent.call("hub_task", action="take", id=mid)
+            c.js("showView('tasks'); $('as-list').click()")
+            c.until("state.sheet.some(r => r.id === %s && r.status === 'doing') && "
+                    "$('sheet').querySelectorAll('tbody button').length > 0" % json.dumps(mid), what="the task list")
+            right = c.js("Math.max(...[...$('sheet').querySelectorAll('button, select')].map(b => b.getBoundingClientRect().right))")
+            self.assertLessEqual(right, 375)
+            c.js("$('as-board').click(); showView('chat')")
             c.click("#view-commands")
             c.until("!$('panel').hidden", what="the panel")
             self.assertEqual(c.js("[$('panel').getBoundingClientRect().width, document.body.classList.contains('rail-open')]"),

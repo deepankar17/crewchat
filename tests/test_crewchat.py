@@ -639,6 +639,17 @@ class AnalyticsTotals(unittest.TestCase):
             hub._append("Maya", "all", "and one more", "msg")
         self.assertEqual(hub.analytics.report(hub)["messages"], 16)
 
+    def test_a_task_still_in_review_has_not_failed_it(self):
+        t0 = time.time() - 3600
+        msg = lambda seq, sender, kind, **kw: dict({"id": str(seq), "seq": seq, "ts": t0 + seq * 60, "from": sender,  # noqa: E731
+                                                    "to": "all", "kind": kind, "text": "x"}, **kw)
+        hub = self.hub([msg(1, "Owner", "task"), msg(2, "Maya", "take", task="1"),
+                        msg(3, "Maya", "update", task="1", status="review")])
+        self.assertIsNone(hub.analytics.report(hub)["tasks"]["review_pass_rate"])  # no review has ended yet: no rate
+        with hub.lock:
+            hub._append("Maya", "all", "x", "update", task="1", status="done")
+        self.assertEqual(hub.analytics.report(hub)["tasks"]["review_pass_rate"], 1.0)
+
     def test_the_whole_log_counts_not_only_what_is_in_memory(self):
         n = crewchat.KEEP_MESSAGES + 500
         hub = self.hub([{"id": str(i), "seq": i, "ts": 1.0 + i, "from": "Maya", "to": "all", "kind": "msg", "text": "x"}
@@ -1737,6 +1748,12 @@ class NeedsYou(Base):
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "blocked"})
         self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
+
+    def test_the_page_hears_which_tasks_were_taken_off_the_sheet(self):
+        mid = self.add("Write the release notes")
+        self.assertNotIn(mid, self.hub.poll(-1, -1, 0)["removed"])
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
+        self.assertIn(mid, self.hub.poll(-1, -1, 0)["removed"])  # its card in the chat says so, not "Open"
 
     def test_a_long_chain_of_tasks_is_counted_without_recursion(self):
         first = prev = self.add("Step 0")
