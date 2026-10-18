@@ -1470,7 +1470,7 @@ class Hub:
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
-        self._map_edited = False  # an agent edited a file since the maps were last brought up to date
+        self._map_edited = set()  # the files agents edited since the maps were last brought up to date
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -2262,8 +2262,8 @@ class Hub:
         maps = self.code_maps()
         if maps is None:
             return {}
-        edited, self._map_edited = self._map_edited, False
-        return maps.check(self.project_folders(), edited)
+        edited, self._map_edited = self._map_edited, set()
+        return maps.check(self.project_folders(), bool(edited), sorted(edited))
 
     # Token usage (X4) ---------------------------------------------------------------------------
     def usage_on(self):
@@ -3368,7 +3368,7 @@ class Hub:
                 clean = clean_edit_path(path) if tracking and path else ""
                 if clean:  # a file it edited, inside its project (C0): kept on this machine only
                     self.events.add_edit(name, clean, self._usage_task(name))
-                    self._map_edited = True  # the code map reads it again (C1)
+                    self._map_edited.add(clean)  # the code map reads it again (C1)
                     MAP_WAKE.set()
                 return {"edits": tracking}  # the hook sends edited paths only while this is true
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
