@@ -207,10 +207,16 @@ def terminal(browser, name, title, runs):
 
 
 def run(args, home, cwd, ports=()):
-    """Run a crewchat command for real; its output, with throwaway paths and ports made readable."""
+    """Run a crewchat command for real; its output, with throwaway paths and ports made readable. It gets a
+    throwaway home folder too, so this machine's own agent settings (~/.claude.json, ~/.cursor) stay out of it."""
+    user = home.parent / (home.name + "-user")
+    user.mkdir(exist_ok=True)
+    env = dict(os.environ, CREWCHAT_HOME=str(home), HOME=str(user))
+    env.pop("CLAUDE_CONFIG_DIR", None)
     out = subprocess.run([sys.executable, str(ROOT / "crewchat.py")] + args, cwd=str(cwd), capture_output=True,
-                         text=True, env=dict(os.environ, CREWCHAT_HOME=str(home)))
+                         text=True, env=env)
     text = (out.stdout + out.stderr).replace(str(cwd), "~/code/notes-app").replace(str(home), "~/.crewchat")
+    text = text.replace(str(user), "~")
     for port in ports:
         text = text.replace("127.0.0.1:%s" % port, "127.0.0.1:8765")
     return text
@@ -285,6 +291,8 @@ def scene_team(b):
     chat.hub.take(lead_name, blocked)
     chat.hub.update(lead_name, blocked, "blocked", "Should the default follow the system setting, or always be light?")
     time.sleep(1.5)
+    # The agent's settings close again, and the rail goes back to its top: Needs you, then the crew.
+    b.js("closeAgent(); for (let e = $('agents'); e; e = e.parentElement) e.scrollTop = 0")
     b.js("openPanel('task', %s)" % json.dumps(blocked))
     time.sleep(0.6)
     b.shoot("needs-you")
