@@ -9,7 +9,11 @@ import bench
 
 class Bench(unittest.TestCase):
     def test_a_small_run_measures_everything(self):
-        numbers = bench.measure(agents=2, messages=30, runs=2, say=lambda *a: None)
+        numbers = bench.measure(agents=2, messages=30, runs=2, say=lambda *a: None, log_mb=2)
+        self.assertGreater(numbers.pop("messages.jsonl bytes, grown"), 2 * 1024 * 1024 * 0.9)
+        self.assertTrue(numbers.pop("server startup, 2 MB log (s)"))
+        for k in ("server memory after startup (MB)", "server memory, 2 MB log (MB)"):
+            self.assertGreater(numbers.pop(k, 1), 0, k)  # where ps can read it
         self.assertEqual(set(numbers), {
             "messages.jsonl bytes", "hook: tool call, tells the server (s)", "hook: tool call, skipped (s)",
             "hook: prompt (s)", "hook: end of turn, nothing new (s)", "poll: open the chat (s)",

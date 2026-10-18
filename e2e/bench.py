@@ -11,7 +11,8 @@ It measures, as the agents and the page see them:
 - one /api/poll round trip of the chat page, opening the chat and catching up on one new message,
   and how big each answer is;
 - what every agent loads (the tool definitions) and reads (an inbox of 50 messages), in characters;
-- server startup with that messages.jsonl, until /health answers.
+- server startup with that messages.jsonl, until /health answers, and its memory then; with --log-mb, again
+  with the log grown to that size.
 Timings are noisy (more so on CI runners): compare medians, on the same machine.
 """
 import argparse
@@ -67,8 +68,38 @@ def forget_alive(agent):
     path.write_text(json.dumps(state))
 
 
-def startup(machine, runs):
-    """Seconds from starting `crewchat serve` to its /health answering, with the chat as it is."""
+def rss_mb(pid):
+    """A process's resident memory in MB (ps: macOS and Linux), or 0 where that cannot be read."""
+    try:
+        out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
+        return int(out.stdout.strip()) / 1024
+    except (OSError, ValueError):
+        return 0
+
+
+def grow_log(machine, mb):
+    """Put older messages in front of the chat's own until messages.jsonl is about mb MB: copies of its
+    lines with ids of their own and numbers below the chat's (so the chat itself is unchanged)."""
+    log = machine.home / "messages.jsonl"
+    lines = [l for l in log.read_bytes().split(b"\n") if l.strip()]
+    want, size, filler = mb * 1024 * 1024 - log.stat().st_size, 0, []
+    while size < want:
+        msg = json.loads(lines[len(filler) % len(lines)])
+        filler.append(msg)
+        size += len(lines[len(filler) % len(lines)]) + 12
+    grown = log.with_name("messages.grown")
+    with open(grown, "wb") as f:
+        for i, msg in enumerate(filler):
+            msg.update(id="f%d" % i, seq=i - len(filler))
+            f.write(json.dumps(msg, ensure_ascii=False).encode() + b"\n")
+        f.write(log.read_bytes())
+    grown.replace(log)
+    return log.stat().st_size
+
+
+def startup(machine, runs, memory=None):
+    """Seconds from starting `crewchat serve` to its /health answering, with the chat as it is (and, in
+    memory, the server's resident MB then)."""
     machine.kill(hard=False)
     out = []
     for _ in range(runs):
@@ -83,6 +114,8 @@ def startup(machine, runs):
                     raise AssertionError("the server stopped while starting; see %s" % (machine.dir / "bench-serve.log"))
                 time.sleep(0.005)
             out.append(time.perf_counter() - start)
+            if memory is not None:
+                memory.append(rss_mb(proc.pid))
         finally:
             proc.terminate()
             proc.wait(20)
@@ -91,7 +124,7 @@ def startup(machine, runs):
     return out
 
 
-def measure(agents=5, messages=5000, runs=9, say=print):
+def measure(agents=5, messages=5000, runs=9, say=print, log_mb=0):
     m = H.Machine("bench")
     m.start(client="claude")
     crew = [m.agent() for _ in range(agents)]
@@ -140,7 +173,17 @@ def measure(agents=5, messages=5000, runs=9, say=print):
         a.call("hub_send", to="all", text="Message %d: the login screen is done, tests pass, see LoginViewModel.kt" % i)
     numbers["hub_inbox, 50 unread (chars)"] = len(reader.call("hub_inbox"))
 
-    numbers["server startup (s)"] = startup(m, runs)
+    memory = []
+    numbers["server startup (s)"] = startup(m, runs, memory)
+    if any(memory):
+        numbers["server memory after startup (MB)"] = statistics.median(memory)
+    if log_mb:
+        say("Growing messages.jsonl to %d MB..." % log_mb)
+        numbers["messages.jsonl bytes, grown"] = grow_log(m, log_mb)
+        memory = []
+        numbers["server startup, %d MB log (s)" % log_mb] = startup(m, runs, memory)
+        if any(memory):
+            numbers["server memory, %d MB log (MB)" % log_mb] = statistics.median(memory)
     m.stop()
     return numbers
 
@@ -156,7 +199,7 @@ def table(numbers):
             rows.append((k, "%.1f ms" % (statistics.median(v) * 1000),
                          "%.1f-%.1f ms" % (min(v) * 1000, max(v) * 1000), str(len(v))))
         else:
-            rows.append((k, "{:,}".format(v), "", ""))
+            rows.append((k, "{:,}".format(round(v, 1)) if isinstance(v, float) else "{:,}".format(v), "", ""))
     head = ("measure", "median", "range", "runs")
     width = [max(len(r[i]) for r in rows + [head]) for i in range(4)]
     line = lambda r: "  ".join(c.ljust(width[i]) if i == 0 else c.rjust(width[i]) for i, c in enumerate(r))  # noqa: E731
@@ -173,10 +216,12 @@ def main(argv=None):
     p.add_argument("--agents", type=int, default=5)
     p.add_argument("--messages", type=int, default=5000)
     p.add_argument("--runs", type=int, default=9, help="runs of each timing; the median is what counts")
+    p.add_argument("--log-mb", type=int, default=0, metavar="MB", help="also time startup with messages.jsonl grown "
+                   "to about MB megabytes (older messages put in front of the chat's)")
     p.add_argument("--json", metavar="FILE", help="also write the medians to FILE")
     p.add_argument("--compare", metavar="FILE", help="exit 1 if a median is over 20%% worse than FILE's")
     args = p.parse_args(argv)
-    numbers = measure(args.agents, args.messages, args.runs)
+    numbers = measure(args.agents, args.messages, args.runs, log_mb=args.log_mb)
     print()
     print("Python %s, crewchat run as: %s" % (sys.version.split()[0], " ".join(H.crewchat_command())))
     print(table(numbers))

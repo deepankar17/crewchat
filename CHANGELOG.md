@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **A long chat starts as fast as a new one.** The server reads `messages.jsonl` from its end, only the
+  2,000 messages it keeps, instead of the whole file: with a 500 MB log, startup goes from about 4 s to
+  0.1 s and the memory it needs while loading from 2.6 GB to 63 MB. Linking a project with other machines
+  rewrites the log a line at a time. A message whose text held a Unicode line separator (U+2028) is no
+  longer lost when the server restarts.
 - **Breaking: the five task tools are one, `hub_task`, with an `action`.** What every agent loads is
   half the size (the tool definitions from 13,074 to 6,948 characters), and how to use the tools is in
   the project guide crewchat writes into each folder instead. Old and new:
