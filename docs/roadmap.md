@@ -47,7 +47,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
 | [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | To do | C1 |
 | [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | To do | C1 |
-| [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | To do | C1, X1 |
+| [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | Done | C1, X1 |
 | [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | In progress | none |
 | [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | Done | Y1 |
@@ -683,7 +683,7 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C8
 
-**Code map view on the chat page** · P3 · effort M · To do
+**Code map view on the chat page** · P3 · effort M · Done
 
 **Goal.** See files and modules coloured by which agent holds them.
 

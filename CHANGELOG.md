@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The code, by who holds it**, in the analytics view: the project's files in their folders, each coloured
+  by the agent whose task covers it, with the imports between them; past 500 files, folders that open with
+  a click. The live demo has it too.
 - **Agents are told whose work theirs touches.** Taking a task, or being given one, now says which other
   agents' tasks in progress work on code this task's files import or are imported by, so they agree any
   change to what they share. Never in the way: a note, not a block.

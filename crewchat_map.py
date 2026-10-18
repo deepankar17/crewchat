@@ -31,6 +31,7 @@ MAX_FILES = 20000  # read at most this many source files of one repository
 MAX_FILE_BYTES = 1024 * 1024  # bigger source files are skipped (generated, minified)
 MAX_GUESSES = 3  # a name defined in more files than this is not linked at all
 CERTAIN, GUESS = 2, 1  # how two areas are linked (CodeMap.link)
+MAX_GRAPH_FILES = 3000  # files C8's view is sent at most
 SKIP_DIRS = {".git", "node_modules", "build", "dist", "out", "target", ".gradle", ".idea", "__pycache__", ".venv",
              "venv", ".tox", ".mypy_cache", ".pytest_cache", "coverage", ".next", ".angular", "Pods", "obj",
              "generated", ".dart_tool", "vendor", "site-packages"}
@@ -693,6 +694,26 @@ class CodeMap:
             return self._linked[(a, b)]
         finally:
             self.lock.release()
+
+    def graph(self, inside="", limit=MAX_GRAPH_FILES):
+        """The files under a folder of the repository (paths relative to it) and the certain links between them,
+        each pair once: {files: [path], links: [[i, j, count]], more: files left out}. For C8's view."""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            paths = [p for (p,) in self.db.execute(
+                "SELECT path FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\' ORDER BY path", (prefix,))]
+            shown = paths[:limit]
+            index = {p: i for i, p in enumerate(shown)}
+            pairs = {}
+            for a, b in self.db.execute(
+                    "SELECT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1"):
+                if a in index and b in index and a != b:
+                    key = (min(index[a], index[b]), max(index[a], index[b]))
+                    pairs[key] = pairs.get(key, 0) + 1
+        cut = len(inside)
+        return self.answer({"files": [p[cut:] for p in shown], "links": [[i, j, n] for (i, j), n in sorted(pairs.items())],
+                            "more": len(paths) - len(shown)})
 
     def definitions(self, path):
         with self.lock:

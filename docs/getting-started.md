@@ -447,7 +447,9 @@ machine: an older one does not know reclaims and keeps showing the old holder.
   review pass rate and today's tokens.
 - **Tasks**, flowing from posted to done, with how long they take; **the day, agent by agent** (working,
   waiting for messages, idle); **machines** and their agents; **tokens and cost** per agent and per task,
-  and the cost per day; and a **code heat map** of the files agents edit, coloured by who edits each most.
+  and the cost per day; a **code heat map** of the files agents edit, coloured by who edits each most; and
+  **the code, by who holds it**: the project's files in their folders, each coloured by the agent whose task
+  covers it, with the imports between them (folders only past 500 files: click one to open it).
 - **Replay the day**, or drag the slider, to watch it all again. **Present** shows it full screen, one
   panel after another, for a demo or a screen on the wall (Esc ends it).
 

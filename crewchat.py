@@ -5554,8 +5554,8 @@ class Handler(BaseHTTPRequestHandler):
         """The code map (C1): op status (default), or imports, importers or defs of a path in the project's code.
         Every answer says the commit it was built from."""
         op = data.get("op") or "status"
-        if op not in ("status", "imports", "importers", "defs"):
-            raise HubError("op is status, imports, importers or defs")
+        if op not in ("status", "imports", "importers", "defs", "graph"):
+            raise HubError("op is status, imports, importers, defs or graph")
         maps = self.hub.code_maps()
         if maps is None:
             return {"on": False, "edits_on": self.hub.edits_on()}
@@ -5563,6 +5563,14 @@ class Handler(BaseHTTPRequestHandler):
         if op == "status":
             maps.check(folders)
             return {"on": True, "maps": [m.status() for m in maps.all()]}
+        if op == "graph":  # the first folder's code, as the analytics view draws it (C8), paths as tasks name them
+            cmap, _ = maps.find(folders)
+            if cmap is None:
+                return {"on": True, "files": [], "links": [], "more": 0}
+            if not cmap.meta("built"):
+                maps.check(folders)
+            inside = (maps.insides(cmap) or [""])[0]
+            return dict(cmap.graph(inside), on=True)
         path = str(data.get("path") or "").strip()
         if not path:
             raise HubError("give a path")
@@ -13411,6 +13419,7 @@ ANALYTICS_JS = r"""// crewchat's analytics view (roadmap X2): the crew working, 
 .ax-demo-note { margin: 0 0 12px; padding: 8px 12px; border-radius: 12px; background: var(--task); color: var(--task-ink);
   border: 1px solid var(--task-line); font-size: 13.5px; }
 .ax-tools button[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.ax-code canvas, #ax-code canvas { display: block; width: 100%; cursor: default; }
 .ax-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 @media (max-width: 760px) {
   .ax-grid { grid-template-columns: minmax(0, 1fr); }
@@ -13445,7 +13454,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   const ax = { root: null, report: null, fetched: 0, fetching: null, shown: false, nodes: [], byName: new Map(),
                edges: new Map(), live: new Map(), particles: [], flashes: [], raf: 0, size: { w: 0, h: 0 }, imgs: new Map(),
                colors: null, replay: null, playing: false, last: 0, present: false, rotate: 0, panel: 0, sent: 0, fresh: 0, frames: 0,
-               crewKey: "", demo: false, world: null, real: null, ticker: 0 };
+               crewKey: "", demo: false, world: null, real: null, ticker: 0, graph: null, graphAt: 0, open: new Set(),
+               spots: [] };
   const own = (o, k) => !!o && Object.prototype.hasOwnProperty.call(o, k);
   const PICTURES = window.crewPictures || "/pictures/";
   const S = () => (ax.demo ? ax.world : state);  // the chat, or the sample crew: never both
@@ -13555,6 +13565,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     card("ax-lanes", "The day, agent by agent", true);
     card("ax-tokens", "Tokens and cost");
     card("ax-heat", "Code heat map");
+    card("ax-code", "The code, by who holds it", true);
     root.append(head, note, numbers, hero, grid);
     canvas.addEventListener("click", (e) => {
       const hit = nodeAt(e);
@@ -14064,6 +14075,156 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     box.replaceChildren(heat);
   }
 
+  // The code, by who holds it (roadmap C8): the project's files from the code map (C1), in their folders, each
+  // coloured by the agent whose task in progress covers it, and the imports between them. Up to 500 files each
+  // shows; beyond that, folders, and a click opens one.
+  const MAX_SHOWN = 500;
+  function holders() {
+    return S().sheet.filter((r) => r.holder && (r.status === "doing" || r.status === "review") && (r.areas || []).length)
+      .map((r) => ({ holder: r.holder, areas: r.areas.map((a) => a.replace(/^\/+|\/+$/g, "").toLowerCase()) }));
+  }
+  function holderOf(path, held) {
+    const p = path.toLowerCase();
+    const hit = held.find((h) => h.areas.some((a) => p === a || p.startsWith(a + "/")));
+    return hit ? hit.holder : "";
+  }
+  function modules(files) {  // folders deep enough to say something, at most about 24 of them
+    let best = null;
+    for (let depth = 1; depth <= 4; depth++) {
+      const groups = new Map();
+      files.forEach((f, i) => {
+        const parts = f.split("/"), key = parts.length > 1 ? parts.slice(0, Math.min(depth, parts.length - 1)).join("/") + "/" : "(top)";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(i);
+      });
+      if (best && groups.size > 24) break;
+      best = groups;
+      if (groups.size >= 8) break;
+    }
+    return [...(best || new Map())].map(([name, ids]) => ({ name, ids })).sort((a, b) => b.ids.length - a.ids.length);
+  }
+  function renderCode() {
+    const box = $("ax-code");
+    if (!box) return;
+    const g = ax.graph;
+    if (!g || !g.on || !(g.files || []).length) {
+      box.replaceChildren(el("p", "ax-empty", g && g.on === false ? "The code map is kept while edit tracking is on " +
+        "(crewchat edits on)." : "No code mapped yet: it shows once the code map has read the project's folder."));
+      return;
+    }
+    const col = ax.colors, held = holders(), files = g.files, many = files.length > MAX_SHOWN;
+    const owner = files.map((f) => holderOf(f, held)), mods = modules(files);
+    const W = Math.max(300, box.clientWidth || 700), pad = 18;
+    // Each folder a circle: its files in a sunflower inside it when they show, else one disc sized to them. A
+    // small project gets roomier circles and bigger dots.
+    const unit = files.length <= 60 ? 10 : files.length <= 200 ? 6.5 : 5, dot = files.length <= 60 ? 5 : files.length <= 200 ? 4 : 3;
+    const spots = [], radius = (m) => (many && !ax.open.has(m.name) ? 14 + 3.2 * Math.sqrt(m.ids.length) :
+                                         12 + unit * Math.sqrt(m.ids.length));
+    const canvas = el("canvas"), dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const c = canvas.getContext("2d");
+    c.font = "11.5px system-ui, sans-serif";
+    const label = (m) => m.name + " · " + m.ids.length + (many ? (ax.open.has(m.name) ? " ▾" : " ▸") : "");
+    let x = pad, y = pad + 14, rowH = 0;
+    for (const m of mods) {
+      const r = radius(m), w = Math.max(2 * r, c.measureText(label(m)).width + 4);
+      if (x + w > W - pad && x > pad) { x = pad; y += rowH + 32; rowH = 0; }
+      m.cx = x + w / 2; m.cy = y + r; m.r = r;
+      x += w + 22; rowH = Math.max(rowH, 2 * r);
+    }
+    const H = y + rowH + pad + 10;
+    canvas.width = Math.round(W * dpr); canvas.height = Math.round(H * dpr);
+    canvas.style.height = H + "px";
+    canvas.setAttribute("role", "img");
+    c.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const where = new Array(files.length);
+    for (const m of mods) {
+      const shown = !many || ax.open.has(m.name);
+      m.ids.forEach((id, k) => {
+        if (!shown) { where[id] = [m.cx, m.cy, m]; return; }
+        const t = k * 2.39996, d = (m.r - dot - 3) * Math.sqrt((k + 0.5) / m.ids.length);  // the golden angle
+        where[id] = [m.cx + d * Math.cos(t), m.cy + d * Math.sin(t), m];
+        spots.push({ x: where[id][0], y: where[id][1], r: dot, file: files[id], holder: owner[id] });
+      });
+      if (!shown) spots.push({ x: m.cx, y: m.cy, r: m.r, module: m });
+    }
+    // The imports: between files when both show, else between their folders (wider for more).
+    const between = new Map();
+    for (const [i, j, n] of g.links || []) {
+      const a = where[i], b = where[j];
+      if (!a || !b) continue;
+      if (a[2] === b[2] && !(many && !ax.open.has(a[2].name))) {
+        c.strokeStyle = rgba(col.accent, 0.25); c.lineWidth = 1;
+        c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.stroke();
+        continue;
+      }
+      const key = a[2].name < b[2].name ? a[2].name + "\n" + b[2].name : b[2].name + "\n" + a[2].name;
+      between.set(key, (between.get(key) || 0) + n);
+    }
+    const most = Math.max(1, ...between.values());
+    const byName = new Map(mods.map((m) => [m.name, m]));
+    for (const [k, n] of between) {
+      const [p, q] = k.split("\n"), a = byName.get(p), b = byName.get(q);
+      c.strokeStyle = rgba(col.accent, 0.12 + 0.3 * (n / most)); c.lineWidth = 1 + 5 * Math.sqrt(n / most);
+      const lift = Math.min(80, Math.hypot(b.cx - a.cx, b.cy - a.cy) * 0.25);  // an arc, so links in a row part
+      c.beginPath(); c.moveTo(a.cx, a.cy); c.quadraticCurveTo((a.cx + b.cx) / 2, (a.cy + b.cy) / 2 - lift, b.cx, b.cy); c.stroke();
+    }
+    const tally = new Map();
+    for (const m of mods) {
+      const shown = !many || ax.open.has(m.name);
+      const counts = new Map();
+      for (const id of m.ids) if (owner[id]) counts.set(owner[id], (counts.get(owner[id]) || 0) + 1);
+      for (const [who, n] of counts) tally.set(who, (tally.get(who) || 0) + n);
+      const top = [...counts].sort((p, q) => q[1] - p[1])[0];
+      c.beginPath(); c.arc(m.cx, m.cy, m.r, 0, Math.PI * 2);
+      c.fillStyle = top && !shown ? rgba(agentColor(top[0]), 0.2 + 0.6 * (top[1] / m.ids.length)) : rgba(col.soft, 1);
+      c.fill();
+      c.strokeStyle = col.line; c.lineWidth = 1; c.stroke();
+      c.fillStyle = col.muted; c.font = "11.5px system-ui, sans-serif"; c.textAlign = "center"; c.textBaseline = "bottom";
+      c.fillText(label(m), m.cx, m.cy - m.r - 3);
+    }
+    for (const sp of spots) {
+      if (sp.module) continue;
+      c.beginPath(); c.arc(sp.x, sp.y, sp.r, 0, Math.PI * 2);
+      c.fillStyle = sp.holder ? agentColor(sp.holder) : col.off;
+      c.globalAlpha = sp.holder ? 1 : 0.45; c.fill(); c.globalAlpha = 1;
+    }
+    ax.spots = spots;
+    const at = (e) => {
+      const b = canvas.getBoundingClientRect(), px = e.clientX - b.left, py = e.clientY - b.top;
+      return spots.find((sp) => Math.hypot(sp.x - px, sp.y - py) <= sp.r + 2) || null;
+    };
+    canvas.addEventListener("mousemove", (e) => {
+      const sp = at(e);
+      canvas.title = !sp ? "" : sp.module ? sp.module.name + ": " + sp.module.ids.length + " files (click to open)" :
+        sp.file + (sp.holder ? " · " + sp.holder + "'s task" : "");
+      canvas.style.cursor = sp && sp.module ? "pointer" : "default";
+    });
+    canvas.addEventListener("click", (e) => {
+      const sp = at(e) || mods.map((m) => ({ module: m })).find((x) => ax.open.has(x.module.name) &&
+        Math.hypot(x.module.cx - (e.clientX - canvas.getBoundingClientRect().left),
+                   x.module.cy - (e.clientY - canvas.getBoundingClientRect().top)) <= x.module.r);
+      if (!sp || !sp.module || !many) return;
+      if (ax.open.has(sp.module.name)) ax.open.delete(sp.module.name); else ax.open.add(sp.module.name);
+      renderCode();
+    });
+    canvas.setAttribute("aria-label", files.length + " files in " + mods.length + " folders" + (tally.size ? "; held: " +
+      [...tally].map(([who, n]) => who + " " + n).join(", ") : ""));
+    const legend = el("div", "ax-legend");
+    for (const [who, n] of [...tally].sort((p, q) => q[1] - p[1])) {
+      const item = el("span"), sw = el("i");
+      sw.style.background = agentColor(who);
+      item.append(sw, who + " (" + n + ")");
+      legend.append(item);
+    }
+    const free = el("span"), sw = el("i");
+    sw.style.background = col.off;
+    free.append(sw, "nobody's task");
+    legend.append(free);
+    const meta = el("p", "meta", files.length + " files" + (g.more ? " (and " + g.more + " more not shown)" : "") +
+                    (many ? " · folders: click one to open it" : "") + (g.commit ? " · at " + String(g.commit).slice(0, 10) : ""));
+    box.replaceChildren(canvas, legend, meta);
+  }
+
   // Sample data (X3): a made-up crew and a day of its work, for the public demo and the Sample data switch. It
   // never mixes with the chat: the view shows one or the other, and says so when it is the sample.
   function seeded(seed) {  // the same day each time, so screenshots of it agree
@@ -14087,6 +14248,23 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     "app/editor/Toolbar.tsx", "app/search/index.ts", "app/search/SearchBox.tsx", "app/auth/magicLink.ts", "app/auth/session.ts",
     "server/api/notes.py", "server/api/share.py", "server/db/models.py", "tests/sync.test.ts", "tests/search.test.ts",
     "docs/sync-protocol.md", "README.md"];
+  const SAMPLE_AREAS = ["app/auth/", "app/search/", "app/sync/queue.ts", "", "app/sync/conflicts.ts", "app/editor/",
+    "tests/", "app/editor/Toolbar.tsx", "server/api/share.py", "app/search/index.ts", "docs/"];
+  function sampleGraph(rand) {  // the sample's code: its files and more, with imports that hang together
+    const files = SAMPLE_FILES.slice();
+    for (const [folder, names] of [["app/sync/", ["merge.ts", "clock.ts", "store.ts"]], ["app/editor/", ["Cursor.tsx", "Blocks.tsx"]],
+                                   ["app/search/", ["rank.ts"]], ["server/db/", ["migrations.py", "pool.py"]],
+                                   ["app/ui/", ["Button.tsx", "Dialog.tsx", "Menu.tsx", "theme.ts"]]])
+      for (const n of names) files.push(folder + n);
+    files.sort();
+    const links = [];
+    files.forEach((f, i) => files.forEach((g, j) => {
+      if (j <= i) return;
+      const same = f.split("/").slice(0, -1).join("/") === g.split("/").slice(0, -1).join("/");
+      if (rand() < (same ? 0.35 : 0.03)) links.push([i, j, 1]);
+    }));
+    return { on: true, files, links, more: 0, commit: "sample" };
+  }
   function sampleWorld(now) {
     const rand = seeded(17), pick = (list) => list[Math.floor(rand() * list.length)], start = now - 9.5 * 3600;
     const agents = SAMPLE_CREW.map(([agent, role, picture, device, client, activity]) => ({
@@ -14104,7 +14282,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       if (fate === "blocked") stream.push([t + 2400, holder, "Ada", "update", id, "blocked"]);
       if (fate === "review" || fate === "done") stream.push([t += 2400 + rand() * 5400, holder, "Ada", "update", id, "review"]);
       if (fate === "done") stream.push([t += 600 + rand() * 1800, "Freya", "Ada", "update", id, "done"]);
-      sheet.push({ id, title, status: fate, holder: fate === "todo" ? "" : holder, from: "Owner", to: "all", areas: [], depends: [] });
+      sheet.push({ id, title, status: fate, holder: fate === "todo" ? "" : holder, from: "Owner", to: "all",
+                   areas: SAMPLE_AREAS[i] ? [SAMPLE_AREAS[i]] : [], depends: [] });
     });
     for (let i = 0; i < 560; i++) {  // the talk: more between some than others, as in a real crew
       const from = rand() < 0.25 ? "Ada" : pick(names);
@@ -14147,6 +14326,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     const report = { messages: stream.length + 2350, pairs: [...pairs].map(([k, n]) => k.split("\n").concat([n])),
       tasks: { posted: sheet.length, taken: 11, done: 6, in_review: 2, blocked_now: 1, time_to_take: 1260, cycle_time: 3.6 * 3600,
                time_blocked: 2700, review_pass_rate: 0.83, done_today: 6 }, usage, timelines, stream, edits, built: now, agents: {} };
+    ax.graph = sampleGraph(rand);
     return { agents, sheet, report, now, device: "studio", link: { via: "tailscale", machines: [{ name: "linux-box", online: true }] },
              roles: ["lead", "developer", "qa", "reviewer", "docs"].map((name) => ({ name })) };
   }
@@ -14186,7 +14366,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       ax.demo = false;
       ax.report = ax.real;
       ax.world = null;
-      if (!ax.report) load();
+      ax.graph = null; ax.graphAt = 0;
+      load();
     }
     ax.live = new Map(); ax.particles = []; ax.flashes = []; ax.fresh = 0;
     const note = $("ax-demo-note"), button = $("ax-sample");
@@ -14214,6 +14395,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     if (key !== ax.crewKey) layout();
     renderNumbers(); renderMachines(); renderCrewList();
     if (ax.replay === null) renderRiver();
+    const code = JSON.stringify(holders()) + (ax.graph ? ax.graph.files.length + ":" + ax.graph.commit : "");
+    if (code !== ax.codeKey) { ax.codeKey = code; renderCode(); }  // only when who holds what changed
     wake();
   }
   function renderAll() {
@@ -14230,10 +14413,16 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       if (ax.replay === null) scrub.value = scrub.max;
       $("ax-meta").textContent = count(r.messages || 0) + " messages in all · updated " + clock(r.built);
     }
-    renderNumbers(); renderRiver(); renderLanes(); renderMachines(); renderTokens(); renderHeat(); renderCrewList();
+    renderNumbers(); renderRiver(); renderLanes(); renderMachines(); renderTokens(); renderHeat(); renderCode(); renderCrewList();
     wake();
   }
+  function loadGraph() {
+    if (ax.demo || Date.now() - ax.graphAt < 60000) return;
+    ax.graphAt = Date.now();
+    postJSON("/api/map", { op: "graph" }).then((g) => { ax.graph = g; renderCode(); }).catch(() => { ax.graphAt = 0; });
+  }
   function load() {
+    loadGraph();
     if (ax.demo) { renderAll(); return Promise.resolve(); }
     if (ax.fetching) return ax.fetching;
     ax.fetching = postJSON("/api/analytics", { days: 7 }).then((r) => {
@@ -14338,6 +14527,13 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     replay: setReplay,
     present,
     demo,
+    // For tests: draw a code map given here, and say what shows (files as dots, folders as discs).
+    code(graph) {
+      if (graph) { ax.graph = graph; ax.graphAt = Date.now(); ax.open.clear(); renderCode(); }
+      const folder = ax.spots.find((sp) => sp.module);
+      return { files: ax.spots.filter((sp) => sp.file).length, folders: ax.spots.filter((sp) => sp.module).length,
+               held: ax.spots.filter((sp) => sp.holder).length, first: folder ? [folder.x, folder.y] : null };
+    },
   };
 })();
 """

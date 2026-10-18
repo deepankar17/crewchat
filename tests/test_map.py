@@ -83,6 +83,17 @@ class PythonRepo(Sample):
         self.assertIn(("app/views.py", "calls"), {(f["path"], f["kind"]) for f in self.map.importers("app/models.py")["files"]})
         self.assertEqual(self.map.definitions("broken.py")["definitions"], [])  # a file it cannot parse: no harm
 
+    def test_the_graph_for_the_view(self):
+        # C8: the files under a folder, relative to it, and each certain link once.
+        g = self.map.graph("app/")
+        self.assertIn("models.py", g["files"])
+        self.assertTrue(all(not f.startswith("app/") and not f.startswith("main") for f in g["files"]))
+        index = {f: i for i, f in enumerate(g["files"])}
+        pairs = {(g["files"][i], g["files"][j]) for i, j, n in g["links"]}
+        self.assertIn(tuple(sorted(("views.py", "models.py"), key=index.get)), pairs)
+        self.assertEqual(len(pairs), len(g["links"]))  # once each
+        self.assertEqual(self.map.graph(limit=3)["more"], len(self.FILES) - 3)  # every file, broken.py too
+
     def test_folders_are_linked_through_their_files(self):
         self.assertTrue(self.map.linked("app/api/", "app/views.py"))
         self.assertTrue(self.map.linked("app/models.py", "main.py"))  # either way round

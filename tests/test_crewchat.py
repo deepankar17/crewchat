@@ -3906,6 +3906,8 @@ class Hooks(Base):
         self.assertIn("shop.py", cli("map", "cart.py"))
         self.assertIn("pay", cli("map", "shop.py", "--defs"))
         self.assertIn("2 files", cli("map"))
+        graph = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "graph"})  # for the analytics view (C8)
+        self.assertEqual((sorted(graph["files"]), graph["links"]), (["cart.py", "shop.py"], [[0, 1, 2]]))
         with self.assertRaises(urllib.error.HTTPError):
             crewchat.post_json(self.base + "/api/map", self.token, {})  # the owner's, not an agent's
         crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "off"})  # no edit tracking: no map

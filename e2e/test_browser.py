@@ -819,6 +819,29 @@ class NewPage(Signed):
             c.open(self.m.url + "/")
             c.until("!!document.getElementById('log')")
 
+    def test_the_code_by_who_holds_it(self):
+        # Roadmap C8: up to 500 files, each shows; beyond that, folders, opened with a click.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view")
+            graph = lambda n: json.dumps({"on": True, "commit": "abc", "more": 0, "links": [[0, 1, 1], [1, n - 1, 2]],  # noqa: E731
+                                          "files": ["mod%d/sub/f%d.py" % (i % 9, i) for i in range(n)]})
+            self.assertEqual(c.js("crewAnalytics.code(%s)" % graph(480))["files"], 480)
+            shown = c.js("crewAnalytics.code(%s)" % graph(1500))
+            self.assertEqual((shown["files"], shown["folders"]), (0, 9))
+            x, y = shown["first"]
+            c.js("(() => { const cv = $('ax-code').querySelector('canvas'), b = cv.getBoundingClientRect();"
+                 " cv.dispatchEvent(new MouseEvent('click', {clientX: b.left + %f, clientY: b.top + %f})); })()" % (x, y))
+            opened = c.js("crewAnalytics.code()")
+            self.assertEqual((opened["folders"], opened["files"] > 100), (8, True))  # that folder's files show
+            self.assertIn("1500 files", c.js("$('ax-code').innerText"))
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
     def test_the_analytics_sample_data(self):
         # Roadmap X3: the sample the public demo shows, in the app too; it never mixes with the chat.
         c = self.chrome
@@ -915,6 +938,8 @@ class PublicDemo(unittest.TestCase):
         self.assertTrue(c.js("$('ax-sample').hidden"))  # nothing to switch to
         self.assertGreater(c.js("$('ax-numbers').children.length"), 4)
         self.assertGreater(c.js("document.querySelectorAll('#ax-heat .ax-tile').length"), 5)
+        code = c.js("crewAnalytics.code()")
+        self.assertEqual((code["files"], code["folders"], code["held"] > 0), (28, 0, True))  # coloured by holder
         self.assertTrue(c.js("[...document.querySelectorAll('#analytics .avatar img')].every((i) => i.complete && i.naturalWidth)"))
         sent = c.js("crewAnalytics.stats().sent")
         c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
