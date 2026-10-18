@@ -1042,6 +1042,39 @@ class Projects:
 # --------------------------------------------------------------------------------------------
 # State
 # --------------------------------------------------------------------------------------------
+def read_back(path, block=1 << 16):
+    """A file's lines, last first, read from its end a block at a time (bytes, without the newline; a
+    Windows line keeps its \\r). The first one yielded is what follows the last newline: empty, or a line a
+    crash left half written."""
+    with open(path, "rb") as f:
+        pos = f.seek(0, os.SEEK_END)
+        rest = b""
+        while pos > 0:
+            step = min(block, pos)
+            pos -= step
+            f.seek(pos)
+            lines = (f.read(step) + rest).split(b"\n")
+            rest = lines.pop(0)  # it may go on in the block before
+            yield from reversed(lines)
+        yield rest
+
+
+def log_message(line):
+    """One line of messages.jsonl as a message, or None for a line that is not one (half written,
+    damaged). Lines end at newlines only: a message's text may hold other line separators."""
+    try:
+        msg = json.loads(line.rstrip(b"\r").decode("utf-8"))
+    except ValueError:  # UnicodeDecodeError too
+        return None
+    if not isinstance(msg, dict) or "id" not in msg:
+        return None
+    if "seq" not in msg:  # written by 0.2: the id was the running number
+        msg["seq"] = int(msg["id"])
+    msg["id"] = str(msg["id"])
+    msg.setdefault("kind", "msg")
+    return msg
+
+
 class Hub:
     """Messages, the live roster of agents, and how sessions map to agents.
 
@@ -1105,19 +1138,15 @@ class Hub:
     def _load(self):
         log = self.home / "messages.jsonl"
         if log.exists():
-            for line in log.read_text(encoding="utf-8").splitlines():
-                try:
-                    msg = json.loads(line)
-                except ValueError:
-                    continue
-                if not isinstance(msg, dict) or "id" not in msg:
-                    continue
-                if "seq" not in msg:  # written by 0.2: the id was the running number
-                    msg["seq"] = int(msg["id"])
-                msg["id"] = str(msg["id"])
-                msg.setdefault("kind", "msg")
-                self.messages.append(msg)
-            self.messages = self.messages[-KEEP_MESSAGES:]
+            # Only the last KEEP_MESSAGES are kept in memory: read from the end until they are in, so a
+            # log of years starts as fast as a new one.
+            for line in read_back(log):
+                msg = log_message(line)
+                if msg is not None:
+                    self.messages.append(msg)
+                    if len(self.messages) == KEEP_MESSAGES:
+                        break
+            self.messages.reverse()
             if self.messages:
                 self.next_seq = self.messages[-1]["seq"] + 1
             self.ids = {m["id"]: m["seq"] for m in self.messages}
@@ -2100,20 +2129,22 @@ class Hub:
     def _rewrite_log(self, rename, moved):
         """messages.jsonl after adopt_open_tasks: references renamed, the moved messages at the end."""
         log = self.home / "messages.jsonl"
-        kept = []
-        for line in (log.read_text(encoding="utf-8").splitlines() if log.exists() else []):
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(msg, dict) or str(msg.get("id")) in rename:
-                continue
-            if msg.get("task") in rename:
-                msg["task"] = rename[msg["task"]]
-            kept.append(json.dumps(msg, ensure_ascii=False))
-        kept += [json.dumps(m, ensure_ascii=False) for m in moved.values()]
         temp = log.with_name(log.name + ".new")
-        temp.write_text("".join(line + "\n" for line in kept), encoding="utf-8")
+        with open(temp, "w", encoding="utf-8") as out:  # a line at a time: a long log is never all in memory
+            if log.exists():
+                with open(log, "rb") as f:
+                    for raw in f:
+                        try:
+                            msg = json.loads(raw.rstrip(b"\r\n").decode("utf-8"))
+                        except ValueError:  # UnicodeDecodeError too
+                            continue
+                        if not isinstance(msg, dict) or str(msg.get("id")) in rename:
+                            continue
+                        if msg.get("task") in rename:
+                            msg["task"] = rename[msg["task"]]
+                        out.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            for m in moved.values():
+                out.write(json.dumps(m, ensure_ascii=False) + "\n")
         os.replace(str(temp), str(log))
 
     def _task(self, mid):

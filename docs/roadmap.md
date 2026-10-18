@@ -32,7 +32,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P0](#p0) | Benchmark harness | Speed and efficiency | P1 | S | Done | none |
 | [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | Done | P0 |
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | Done | P0 |
-| [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | To do | P0 |
+| [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | Done | P0 |
 | [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | To do | P0 |
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
@@ -184,7 +184,7 @@ the tool definitions and a 50-message inbox.
 
 ### P3
 
-**Fast startup from the message log** · P2 · effort S · To do
+**Fast startup from the message log** · P2 · effort S · Done
 
 **Goal.** Startup time and memory stay flat however long messages.jsonl grows.
 
@@ -209,6 +209,11 @@ the tool definitions and a 50-message inbox.
 - next_seq must still come from the true last message.
 
 **Depends on:** [P0](#p0)
+
+**Status.** Done: `_load` reads messages.jsonl from its end (`read_back`) until it has KEEP_MESSAGES, and
+`_rewrite_log` streams the file. Archives were left out (optional, and no N was given). Lines now end at `\n`
+only (a trailing `\r` dropped): the old `splitlines()` also split on U+2028 and the like, losing a message
+whose text held one. `bench.py --log-mb 500` times startup with a grown log; numbers in the pull request.
 
 ### P4
 
