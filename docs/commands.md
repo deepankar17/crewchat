@@ -114,6 +114,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
 | `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
 | `crewchat tasks` | The task sheet |
+| `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
 | `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
 | `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
 | `crewchat tasks assign ID AGENT` | Give a task to an agent |

@@ -38,7 +38,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | Done | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | Done | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
-| [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | To do | P1 |
+| [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | To do | S1 |
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | To do | C0 |
@@ -385,7 +385,7 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C0
 
-**Opt-in full-path edit events** · P1 · effort S · To do
+**Opt-in full-path edit events** · P1 · effort S · Done
 
 > **Decided:** On by default for the Software team pack, off for every other pack (owner, 17 Oct).
 
@@ -423,6 +423,15 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 **Depends on:** [P1](#p1)
 
 **Owner's note:** we can on it of coding projects and keep it off for other project types
+
+**Status.** Done. Owner's choice (18 Oct): the events go in a local SQLite file, `events.sqlite` per project,
+written by the server only and never synced (docs/storage.md now says so). The light tool-call hook works out
+the edited file's path relative to the project (`edited_path`: Claude Code's Edit, MultiEdit, Write and
+NotebookEdit, Cursor's afterFileEdit, the other tools' own names; nothing outside the folder) and sends it only
+while the server's last answer said edits are kept; the server checks it again (`clean_edit_path`) and keeps
+it with the agent and the task it works on. `edit_tracking` per project: auto (on for the software pack),
+on, off; always off with activity off. Shown and set in the project panel ("Files agents edit"), by
+`crewchat edits` and `/api/edits`. Codex's apply_patch names no single file, so its edits are not seen yet.
 
 ### C1
 

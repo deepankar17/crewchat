@@ -25,6 +25,11 @@ What crewchat connects to, and only these:
 
 What crewchat reads on your machine and keeps there:
 
+- **Which files agents edit,** in a project whose team edits code (on by default for a software team,
+  off for others; `crewchat edits on|off|auto`). The hook sends the path of each file an agent edits
+  inside the project folder, never what it wrote and never a path outside the project, and it is kept
+  on this machine in `events.sqlite`. Other machines only ever see what is worked out from it.
+
 - **Token counts.** At the end of each turn of a Claude Code agent, its hook reads how many tokens
   the turn used from the session's own transcript: the model and the numbers, never the
   conversation. They go to this machine's chat (or the one the folder is connected to), are added

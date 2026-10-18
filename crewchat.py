@@ -843,6 +843,7 @@ class Roster:
                             "tool": r["tool"], "source": r["source"]} for n, r in self.role_rows.items()]
         self.project = str(config["project"])
         self.usage = "off" if config.get("usage") == "off" else "on"  # agents' token counts kept (X4)
+        self.edit_tracking = config.get("edit_tracking") if config.get("edit_tracking") in ("on", "off") else "auto"
         try:
             self.forget = max(1.0, float(config["forget_hours"])) * 3600
         except (TypeError, ValueError):
@@ -1261,6 +1262,75 @@ class Analytics:
         return out
 
 
+EVENTS_FILE = "events.sqlite"  # in the project's crewchat folder: local records that cannot be rebuilt
+
+
+def clean_edit_path(path):
+    """A project-relative path a hook sent, as kept: forward slashes, no way out of the folder, or ""."""
+    if not isinstance(path, str):
+        return ""
+    path = path.strip().replace("\\", "/")
+    parts = [p for p in path.split("/") if p not in ("", ".")]
+    if not parts or len(path) > 300 or path.startswith("/") or re.match(r"^[A-Za-z]:", path) or ".." in parts \
+            or any(ord(c) < 32 for c in path):
+        return ""
+    return "/".join(parts)
+
+
+class EventStore:
+    """What happened on this machine that the message log does not hold, and so cannot be rebuilt from it
+    (docs/storage.md): the files agents edit (C0). One SQLite file per project, in its crewchat folder, written
+    by the server only, never synced: other machines get only what is derived from it, as message fields."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.lock = threading.Lock()
+        self.db = None
+
+    def _conn(self):
+        if self.db is None:
+            import sqlite3
+            self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+            self.db.execute("CREATE TABLE IF NOT EXISTS edits (ts REAL NOT NULL, agent TEXT NOT NULL, "
+                            "path TEXT NOT NULL, task TEXT NOT NULL DEFAULT '')")
+            self.db.execute("CREATE INDEX IF NOT EXISTS edits_ts ON edits (ts)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS edits_path ON edits (path)")
+            self.db.commit()
+        return self.db
+
+    def add_edit(self, agent, path, task="", ts=None):
+        with self.lock:
+            db = self._conn()
+            db.execute("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)",
+                       (time.time() if ts is None else ts, agent, path, task or ""))
+            db.commit()
+
+    def edits(self, since=0.0, agent=None, task=None, limit=5000):
+        """[{ts, agent, path, task}], oldest first."""
+        sql, args = "SELECT ts, agent, path, task FROM edits WHERE ts >= ?", [since]
+        if agent:
+            sql, args = sql + " AND agent = ?", args + [agent]
+        if task:
+            sql, args = sql + " AND task = ?", args + [task]
+        with self.lock:
+            rows = self._conn().execute(sql + " ORDER BY ts LIMIT ?", args + [limit]).fetchall()
+        return [{"ts": ts, "agent": a, "path": p, "task": t} for ts, a, p, t in rows]
+
+    def files(self, since=0.0, limit=200):
+        """The files edited since then, most edited first: [{path, edits, agents, last}]."""
+        with self.lock:
+            rows = self._conn().execute(
+                "SELECT path, COUNT(*), GROUP_CONCAT(DISTINCT agent), MAX(ts) FROM edits WHERE ts >= ? "
+                "GROUP BY path ORDER BY COUNT(*) DESC, MAX(ts) DESC LIMIT ?", (since, limit)).fetchall()
+        return [{"path": p, "edits": n, "agents": sorted((a or "").split(",")), "last": last} for p, n, a, last in rows]
+
+    def close(self):
+        with self.lock:
+            if self.db is not None:
+                self.db.close()
+                self.db = None
+
+
 def read_back(path, block=1 << 16):
     """A file's lines, last first, read from its end a block at a time (bytes, without the newline; a
     Windows line keeps its \\r). The first one yielded is what follows the last newline: empty, or a line a
@@ -1355,6 +1425,7 @@ class Hub:
         self._dirty = False  # state.json is behind memory, by what _save_soon let wait
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
+        self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -2094,6 +2165,15 @@ class Hub:
         for ask in list(self.permissions.values()):
             if ask["agent"] == name and not ask["answer"]:
                 del self.permissions[ask["id"]]
+
+    # Edit events (C0) ---------------------------------------------------------------------------
+    def edits_on(self):
+        """Are the files agents edit recorded? The owner's setting (edit_tracking: on, off, or auto: on for the
+        software team pack, off for the others), and never while what agents do is kept off the page."""
+        if self.machine_config().get("activity") == "off":
+            return False
+        setting = self.roster.edit_tracking
+        return setting == "on" or setting == "auto" and self.roster.pack == DEFAULT_PACK
 
     # Token usage (X4) ---------------------------------------------------------------------------
     def usage_on(self):
@@ -3169,7 +3249,7 @@ class Hub:
         self._boot = (roles, data)
         return data
 
-    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing=""):
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing="", path=None):
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
         only a sign of life, or the session report it was asked for)."""
@@ -3194,7 +3274,11 @@ class Hub:
                     agent["doing"], agent["doing_at"] = doing, now
                 if session:  # the report it was asked for (wants_session)
                     self._keep_session(name, session)
-                return {}
+                tracking = self.edits_on()
+                clean = clean_edit_path(path) if tracking and path else ""
+                if clean:  # a file it edited, inside its project (C0): kept on this machine only
+                    self.events.add_edit(name, clean, self._usage_task(name))
+                return {"edits": tracking}  # the hook sends edited paths only while this is true
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
             self._drop_permissions(name)
@@ -4161,6 +4245,9 @@ COMMANDS = [
         ("tasks reclaim [MINUTES|off|default] [ID]",
          "Put a task back on the sheet when its holder is silent this long (no tool calls, no hooks): for the "
          "project (60 min unless set), or one task (default: as the project). With no value, shows it.", None),
+        ("edits [show|auto|on|off] [--days N]",
+         "Which files this project's agents edit (paths inside the project only, kept on this machine): auto keeps "
+         "them for a software team and not for other teams; on or off for any. With show, the files edited lately.", None),
         ("usage [show|on|off] [--days N]",
          "The tokens this project's agents used (Claude Code, counted at the end of each turn) per agent, day and "
          "task, and roughly what they would cost at API prices. on or off: keep counting them, or not.", None),
@@ -4366,7 +4453,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4991,6 +5078,28 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _edits(self, data):
+        """Which files the project's agents edit (C0): the setting (show, or set auto, on or off) and the files
+        edited in the last days. Only paths inside the project, kept on this machine."""
+        op = data.get("op") or "show"
+        if op in ("auto", "on", "off"):
+            config = load_config(self.roster.root)
+            if op == "auto":
+                config.pop("edit_tracking", None)
+            else:
+                config["edit_tracking"] = op
+            save_config(config, self.roster.root)
+            self.roster.refresh(force=True)
+        elif op != "show":
+            raise HubError("op is show, auto, on or off")
+        try:
+            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
+        except (TypeError, ValueError):
+            raise HubError("days is a number")
+        return {"setting": self.roster.edit_tracking, "on": self.hub.edits_on(), "pack": self.roster.pack,
+                "activity_off": self.hub.machine_config().get("activity") == "off",
+                "files": self.hub.events.files(time.time() - days * 86400)}
+
     def _analytics(self, data):
         """Everything the analytics page shows, worked out here from the chat (X1): nothing leaves the machine."""
         try:
@@ -5284,7 +5393,7 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
                          "/api/push": self._push, "/api/usage": self._usage,
-                         "/api/analytics": self._analytics}
+                         "/api/analytics": self._analytics, "/api/edits": self._edits}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -5322,7 +5431,8 @@ class Handler(BaseHTTPRequestHandler):
                 session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
-                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session, data.get("doing"))
+                out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session, data.get("doing"),
+                                    data.get("path"))
                 out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
@@ -7664,6 +7774,9 @@ def permission_text(data):
     return name, (json.dumps(args, ensure_ascii=False) if args else "")[:MAX_PERMISSION_TEXT]
 
 
+EDIT_TOOLS = ("Edit", "MultiEdit", "Write", "NotebookEdit")  # tool calls that change a file (C0's edit events)
+
+
 def tool_summary(client, data):
     """What an agent's tool call was, in a few safe words for the chat page: a file's name, a command's
     program (and a well-known tool's subcommand), never their arguments or what was read or written."""
@@ -7741,19 +7854,54 @@ def tool_hook(client, data):
         state["key"] = launched
     doing = tool_summary(client, data)
     now = time.time()
+    # The file an edit changed, inside the project, when the server keeps them (C0; it said so last time).
+    project = find_project(client) if state.get("edits") else None
+    edit = edited_path(client, data, project) if project else ""
     if now - float(state.get("alive") or 0) < ALIVE_EVERY and (
-            not doing or doing == state.get("doing") or now - float(state.get("doing_at") or 0) < DOING_EVERY):
+            not doing or doing == state.get("doing") or now - float(state.get("doing_at") or 0) < DOING_EVERY) and (
+            not edit or edit == state.get("edit") and now - float(state.get("edit_at") or 0) < ALIVE_EVERY):
         return  # told the server under a minute ago, and nothing new to say
-    project = find_project(client)
+    project = project or find_project(client)
     config = client_config(project, client) if project else None
     if config is None or hooks_off(project):
         return  # this project is not connected to a crewchat, or its hooks are switched off
     state["alive"] = now
     if doing:
         state["doing"], state["doing_at"] = doing, now
+    if edit:
+        state["edit"], state["edit_at"] = edit, now
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps(state))
-    hook_post(config[0] + "/api/hook", config[1], {"key": state["key"], "event": "tool", "doing": doing})
+    body = {"key": state["key"], "event": "tool", "doing": doing}
+    if edit:
+        body["path"] = edit
+    answer = hook_post(config[0] + "/api/hook", config[1], body)
+    if bool(answer.get("edits")) != bool(state.get("edits")):  # the owner turned edit tracking on or off
+        state["edits"] = bool(answer.get("edits"))
+        state_file.write_text(json.dumps(state))
+
+
+def edited_path(client, data, project):
+    """The file an edit tool call changed, relative to the project folder (Claude Code's Edit, Write and the like,
+    Cursor's afterFileEdit, the other tools' own names), or "": for any other call, and for a file outside the
+    project, which is never sent. Only the path: never what was written."""
+    name = str(data.get("tool_name") or "")
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    path = args.get("file_path") or args.get("notebook_path")
+    if name in OTHER_TOOL_NAMES:
+        name = OTHER_TOOL_NAMES[name]
+        path = args.get("file_path") or args.get("filePath") or args.get("absolute_path") or args.get("path")
+    if client == "cursor" and not name and data.get("file_path"):
+        name, path = "Edit", data["file_path"]
+    if name not in EDIT_TOOLS or not isinstance(path, str) or not path.strip():
+        return ""
+    root = Path(project).resolve()
+    full = Path(path) if os.path.isabs(path) else root / path
+    try:
+        relative = full.resolve().relative_to(root)
+    except (ValueError, OSError):
+        return ""  # outside the project folder
+    return relative.as_posix()[:300] if relative.parts else ""
 
 
 def hook_post(url, token, body, timeout=5):
@@ -7767,14 +7915,24 @@ def hook_post(url, token, body, timeout=5):
         req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json",
                                                               "Authorization": "Bearer %s" % token})
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            resp.read()
-        return
-    with socket.create_connection(("127.0.0.1", int(local.group(2))), timeout=timeout) as conn:
-        conn.sendall(("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Bearer %s\r\n"
-                      "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
-                      % (local.group(3), local.group(2), token, len(data))).encode("ascii") + data)
-        while conn.recv(4096):  # the whole answer, so the server is done with it
-            pass
+            raw = resp.read()
+    else:
+        chunks = []
+        with socket.create_connection(("127.0.0.1", int(local.group(2))), timeout=timeout) as conn:
+            conn.sendall(("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Bearer %s\r\n"
+                          "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                          % (local.group(3), local.group(2), token, len(data))).encode("ascii") + data)
+            while True:  # the whole answer, so the server is done with it
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        raw = b"".join(chunks).partition(b"\r\n\r\n")[2]
+    try:
+        answer = json.loads(raw.decode("utf-8"))
+    except ValueError:
+        return {}
+    return answer if isinstance(answer, dict) else {}
 
 
 HOOK_SCRIPT_FILE = "crewchat-hook.py"  # in the crewchat home: the light hook script (hook_script)
@@ -7787,10 +7945,10 @@ def hook_script():
 
     def value(v):  # sets in a fixed order, so the same crewchat writes the same file
         return "frozenset(%r)" % sorted(v) if isinstance(v, (set, frozenset)) else repr(v)
-    names = ("SERVER_NAME", "KEY_RE", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
+    names = ("SERVER_NAME", "KEY_RE", "EDIT_TOOLS", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
              "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS")
     functions = (sha, find_project, connection_entry, client_config, hooks_off, claim_launch_key, tool_summary,
-                 hook_post, tool_hook)
+                 edited_path, hook_post, tool_hook)
     return ('"""crewchat %s\'s hook after each tool call, written by crewchat from its own code (`crewchat hooks\n'
             'refresh` writes it again). Edits are not kept."""\n'
             "import hashlib\nimport json\nimport os\nimport re\nimport shlex\nimport socket\nimport sys\n"
@@ -9439,6 +9597,23 @@ def cmd_rules(args):
                                                        out["folders"]))
 
 
+def cmd_edits(args):
+    out = owner_call("/api/edits", {"op": args.mode, "days": args.days})
+    why = ("on" if out["setting"] == "on" else "off" if out["setting"] == "off" else
+           "auto, so %s for the %s team" % ("on" if out["pack"] == DEFAULT_PACK else "off", out["pack"]))
+    print("Edit tracking: %s. %s" % (why, "Kept: the path of each file an agent edits inside the project, on this "
+                                     "machine only." if out["on"] else "Not kept%s." % (
+                                         " (this machine keeps what agents do off the page)" if out["activity_off"] else "")))
+    if args.mode != "show":
+        return
+    if not out["files"]:
+        print("No edits in the last %d days." % args.days)
+        return
+    print("Edited in the last %d days, most first:" % args.days)
+    for f in out["files"]:
+        print("  %-50s %4d  %s" % (f["path"][:50], f["edits"], ", ".join(f["agents"])))
+
+
 def cmd_usage(args):
     report = owner_call("/api/usage", {"op": "view" if args.mode == "show" else args.mode, "days": args.days})
     if args.mode != "show":
@@ -10158,6 +10333,13 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
       <ul id="skills-list"></ul>
     </section>
+    <section class="card" id="edits-card"><h3>Files agents edit</h3>
+      <p class="meta" id="edits-note">Loading…</p>
+      <label for="edits-mode">Keep track of them</label>
+      <select id="edits-mode"><option value="auto">Auto: for a software team, not for other teams</option>
+        <option value="on">On</option><option value="off">Off</option></select>
+      <ul id="edits-files" class="meta"></ul>
+    </section>
     <section class="card"><h3>How it works</h3>
       <p class="meta"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent is the lead, it takes your tasks and hands out the work instead.</p>
       <p class="meta">Agents appear by themselves when a session starts in a connected folder, and drop off after a day of silence. One <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types.</p>
@@ -10773,6 +10955,26 @@ $("task-form").addEventListener("submit", async (event) => {
 try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks") showView(v); } catch (e) {}
 
 // The project's rules and shared skills: what its agents learn by themselves.
+// Which files agents edit (C0): the project's setting, and the files edited lately. Read when the project panel is
+// open, at most every 10 seconds; a change of the setting is sent at once.
+async function loadEdits(op) {
+  if (!op && Date.now() - (state.editsAt || 0) < 10000) return;
+  state.editsAt = Date.now();
+  try {
+    const r = await postJSON("/api/edits", { op: op || "show" });
+    $("edits-mode").value = r.setting;
+    $("edits-note").textContent = r.on
+      ? "Kept: the path of each file an agent edits inside the project (never what it wrote), on this machine only."
+      : r.activity_off ? "Not kept: this machine keeps what agents do off the page (crewchat setup --activity)."
+      : "Not kept.";
+    $("edits-files").replaceChildren(...(r.files || []).slice(0, 10).map((f) =>
+      el("li", "", f.path + " · " + f.edits + " edit" + (f.edits > 1 ? "s" : "") + " · " + f.agents.join(", "))));
+  } catch (e) {
+    $("edits-note").textContent = e.message;
+  }
+}
+$("edits-mode").addEventListener("change", () => loadEdits($("edits-mode").value));
+
 function renderSetup(rules, skills) {
   const text = $("rules-text");
   text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
@@ -11474,7 +11676,8 @@ function renderPanel(force) {
   const body = $("panel-body");
   $("pane-project").hidden = p.kind !== "project";
   $("commands").hidden = p.kind !== "commands";
-  const draw = { task: panelTask, roles: panelRoles, role: panelRole, project: () => ["Rules, skills and machines"],
+  const draw = { task: panelTask, roles: panelRoles, role: panelRole,
+                 project: () => { loadEdits(); return ["Rules, skills and machines"]; },
                  commands: () => ["Commands"] }[p.kind];
   const [title, ...cards] = draw(p.id);
   $("panel-title").textContent = title;
@@ -12778,6 +12981,12 @@ def build_parser():
                    help="only a folder connected to this machine's own chat (registered for every folder)")
     p.set_defaults(fn=cmd_stdio)
 
+    p = sub.add_parser("edits", help="which files this project's agents edit: the setting (auto: kept for a "
+                                     "software team) and the files edited lately")
+    p.add_argument("mode", nargs="?", default="show", choices=["show", "auto", "on", "off"])
+    p.add_argument("--days", type=int, default=7, help="days shown (default 7)")
+    p.set_defaults(fn=cmd_edits)
+
     p = sub.add_parser("usage", help="the tokens this project's agents used, and roughly what that would cost at "
                                      "API prices; or turn keeping them on or off")
     p.add_argument("mode", nargs="?", default="show", choices=["show", "on", "off"])
@@ -12788,7 +12997,7 @@ def build_parser():
     p.set_defaults(fn=cmd_projects)
 
     for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
-                 "rules", "skills", "tasks", "usage"):
+                 "rules", "skills", "tasks", "usage", "edits"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "

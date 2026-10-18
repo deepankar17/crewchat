@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **crewchat knows which files your agents edit**, in a project whose team edits code: the path of each
+  file an agent edits inside the project (never what it wrote), kept on your machine in `events.sqlite`.
+  On by default for a software team and off for others; the project panel's "Files agents edit" and
+  `crewchat edits` show it and turn it on or off. The next roadmap tasks use it to suggest a task's files
+  and warn about overlaps.
 - **`/api/analytics`, the numbers behind the coming analytics page** (owner only). Worked out on this
   machine from the whole chat, not only the 2,000 messages in memory: messages by hour, day, agent, kind and
   machine; who writes to whom; tasks posted, taken and done with the median time to take one, cycle time,

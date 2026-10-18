@@ -370,6 +370,18 @@ class NewPage(Signed):
         self.assertIn("Runs on laptop", out["far"]["text"])
         self.assertEqual(c.errors, [])
 
+    def test_edit_tracking_in_the_project_panel(self):
+        c = self.chrome
+        c.js("openPanel('project')")
+        c.until("$('edits-note').textContent.startsWith('Kept')", what="edit tracking on (a software team)")
+        self.assertEqual(c.js("$('edits-mode').value"), "auto")
+        c.js("$('edits-mode').value = 'off'; $('edits-mode').dispatchEvent(new Event('change'))")
+        c.until("$('edits-note').textContent === 'Not kept.'", what="edit tracking off")
+        self.assertIn("Edit tracking: off", self.m.cli("edits"))
+        c.js("$('edits-mode').value = 'auto'; $('edits-mode').dispatchEvent(new Event('change'))")
+        c.until("$('edits-note').textContent.startsWith('Kept')", what="back to auto")
+        self.assertEqual(c.errors, [])
+
     def test_roles_in_the_panel(self):
         c = self.chrome
         c.js("openPanel('roles')")

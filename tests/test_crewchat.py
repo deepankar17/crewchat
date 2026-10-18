@@ -546,6 +546,38 @@ class PollAfter(unittest.TestCase):
                                  (seqs[:5], after))
 
 
+class EditPaths(unittest.TestCase):
+    def test_only_paths_inside_the_project_are_sent_and_kept(self):
+        root = Path(tempfile.mkdtemp(prefix="edits-", dir=TMP))
+        (root / "src").mkdir()
+        call = lambda tool, **args: {"tool_name": tool, "tool_input": args}  # noqa: E731
+        self.assertEqual(crewchat.edited_path("claude", call("Edit", file_path=str(root / "src" / "a.py")), root), "src/a.py")
+        self.assertEqual(crewchat.edited_path("claude", call("Write", file_path="src/new.py"), root), "src/new.py")
+        self.assertEqual(crewchat.edited_path("claude", call("NotebookEdit", notebook_path=str(root / "n.ipynb")), root), "n.ipynb")
+        self.assertEqual(crewchat.edited_path("gemini", call("replace", file_path=str(root / "b.py")), root), "b.py")
+        self.assertEqual(crewchat.edited_path("cursor", {"file_path": str(root / "c.ts")}, root), "c.ts")
+        for outside in ("/etc/hosts", str(root / ".." / "elsewhere.py"), "../up.py", str(root)):
+            self.assertEqual(crewchat.edited_path("claude", call("Edit", file_path=outside), root), "", outside)
+        self.assertEqual(crewchat.edited_path("claude", call("Read", file_path=str(root / "a.py")), root), "")
+        self.assertEqual(crewchat.edited_path("claude", call("Bash", command="rm -rf /"), root), "")
+        self.assertEqual(crewchat.clean_edit_path("src\\win\\path.cs"), "src/win/path.cs")
+        self.assertEqual(crewchat.clean_edit_path("./a//b.py"), "a/b.py")
+        for bad in ("/abs.py", "C:/x.py", "a/../../b.py", "a\nb", "", "x" * 400, None, 3):
+            self.assertEqual(crewchat.clean_edit_path(bad), "", bad)
+
+    def test_the_event_store(self):
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", "12", ts=100)
+        store.add_edit("teo", "app/a.kt", "", ts=200)
+        store.add_edit("maya", "app/b.kt", "12", ts=300)
+        self.assertEqual([e["path"] for e in store.edits(since=150)], ["app/a.kt", "app/b.kt"])
+        self.assertEqual([e["ts"] for e in store.edits(task="12")], [100, 300])
+        self.assertEqual(store.files(), [{"path": "app/a.kt", "edits": 2, "agents": ["maya", "teo"], "last": 200},
+                                         {"path": "app/b.kt", "edits": 1, "agents": ["maya"], "last": 300}])
+        store.close()
+        self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
+
+
 class AnalyticsTotals(unittest.TestCase):
     """/api/analytics' numbers, worked out from the whole message log (roadmap X1)."""
 
@@ -3545,6 +3577,49 @@ class Hooks(Base):
         self.hub.agents[cursor.me]["seen"] = 0
         self.light_hook("cursor", {"conversation_id": "light-first", "command": "ls"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[cursor.me]["seen"], time.time() - 30)
+
+    def test_edited_files_are_kept_for_a_software_team_paths_only(self):
+        # Roadmap C0: the path of each file an agent edits, inside its project, while edit tracking is on.
+        session, name = self.linked("edits-turn")
+        inside = str(self.folder / "app" / "Login.kt")
+        edit = lambda path, sid="edits-turn", tool="Edit": self.light_hook("claude", {  # noqa: E731
+            "session_id": sid, "tool_name": tool, "tool_input": {"file_path": path, "old_string": "secret code"}})
+        before = len(self.hub.events.edits())
+        edit(inside)  # the first call learns that edits are kept here (a software team: auto is on)
+        state = json.loads((Path(self.state) / "crewchat-hooks" / ("claude-" + crewchat.sha("edits-turn")[:16])).read_text())
+        self.assertTrue(state["edits"])
+        edit(str(self.folder / "app" / "Main.kt"))
+        edit("/etc/passwd")  # outside the project: never sent
+        edit(str(self.folder / "notes.md"), tool="Read")  # not an edit
+        rows = self.hub.events.edits()[before:]
+        self.assertEqual([r["path"] for r in rows], ["app/Main.kt"])
+        self.assertEqual(rows[0]["agent"], name)
+        self.assertNotIn("secret code", (self.hub.home / crewchat.EVENTS_FILE).read_bytes().decode("latin-1"))
+        # A YouTube team: auto is off, the hook hears it at its next call, and the server keeps nothing anyway.
+        crewchat.post_json(self.base + "/api/roles", self.owner, {"op": "pack", "pack": "youtube"})
+        try:
+            self.hub.agents[name].pop("doing", None)
+            edit(str(self.folder / "app" / "Again.kt"))
+            self.assertEqual(len(self.hub.events.edits()), before + 1)
+            self.assertFalse(self.hub.edits_on())
+            out = crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "on"})  # the owner turns it on
+            self.assertEqual((out["setting"], out["on"]), ("on", True))
+            self.assertIn("app/Main.kt", [f["path"] for f in out["files"]])
+            self.assertIn("Edit tracking: on", cli("edits"))
+        finally:
+            crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "auto"})
+            crewchat.post_json(self.base + "/api/roles", self.owner, {"op": "pack", "pack": "software"})
+        self.assertTrue(self.hub.edits_on())
+        config = crewchat.load_config()
+        config["activity"] = "off"  # what agents do kept off the page: edits too, whatever the setting
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            self.assertFalse(self.hub.edits_on())
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
 
     def test_the_light_hook_reaches_another_machines_chat_through_urllib(self):
         sent = {}
