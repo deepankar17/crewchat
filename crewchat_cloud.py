@@ -1083,7 +1083,7 @@ class CloudSync(crewchat.ProjectLink):
     def ask_catch_up(self, since):
         try:
             start = since - crewchat.CATCHUP_MARGIN  # machines' clocks differ; what it has already is dropped by id
-            self.store.set(self.base + "catchups/" + self.device_id, {"since": since, "after": [start, ""], "state": "asked",
+            self.store.set(self.base + "catchups/" + self.device_id, {"since": since, "after": [start, "", 0], "state": "asked",
                                                                        "parts": 0, "asked": SERVER_TIME})
             self.log("away for longer than the cloud keeps messages: asking the coordinator for the ones missed")
         except Exception as e:  # offline: the next start asks again
@@ -1103,10 +1103,10 @@ class CloudSync(crewchat.ProjectLink):
                 if device_id == self.device_id or doc.get("state") not in ("asked", "read") or \
                         not self.device.trusted(device_id):
                     continue
-                after = doc.get("after") or [float(doc.get("since") or 0) - crewchat.CATCHUP_MARGIN, ""]
-                point = (float(after[0] or 0), str(after[1] or ""))
+                after = list(doc.get("after") or [float(doc.get("since") or 0) - crewchat.CATCHUP_MARGIN]) + ["", 0]
+                point = (float(after[0] or 0), str(after[1] or ""), int(after[2] or 0))
                 missed = [m for m in self.hub.messages_since(float(doc.get("since") or 0), skip=device_id)
-                          if (float(m.get("ts") or 0), m["id"]) > point]
+                          if crewchat.catchup_order(m) > point]
                 parts, part, size = [], [], 0
                 for msg in missed:
                     payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind", "origin") if k in msg}
@@ -1129,7 +1129,7 @@ class CloudSync(crewchat.ProjectLink):
                 last = parts[-1][-1] if parts else None
                 self.store.set(self.base + "catchups/" + device_id, {
                     "state": "ready", "parts": len(parts), "more": served < len(missed), "by": self.device_id,
-                    "after": [last["ts"], last["id"]] if last else after}, merge=True)
+                    "after": list(crewchat.catchup_order(last)) if last else after[:3]}, merge=True)
                 sent += served
         except Exception as e:  # offline, or a part refused: the machine asks on, and this tries again
             self.log("could not send the messages missed (%s)" % e)

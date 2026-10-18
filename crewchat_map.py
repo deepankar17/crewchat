@@ -150,8 +150,11 @@ def read_python(rel, text):
     else:
         package = rel.rsplit("/", 1)[0].replace("/", ".") if "/" in rel else ""
     names = {}  # a name this file imported -> (module, name or "") it came from
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
+    calls = []
+    for node in ast.walk(tree):  # once over the tree: imports, and the calls to look at once all imports are known
+        if isinstance(node, ast.Call):
+            calls.append(node.func)
+        elif isinstance(node, ast.Import):
             for alias in node.names:
                 refs.append(("imports", ["py", alias.name, ""], 1))
                 names[alias.asname or alias.name.split(".")[0]] = (alias.name if alias.asname
@@ -179,10 +182,7 @@ def read_python(rel, text):
                     sigs["%s.%s" % (node.name, item.name)] = parameters(item)
     # Calls that can be resolved: f() for an f imported by name, m.f() for a module m imported.
     called = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        func = node.func
+    for func in calls:
         if isinstance(func, ast.Name) and func.id in names and names[func.id][1]:
             called.add(names[func.id])
         elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in names:
