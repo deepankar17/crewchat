@@ -886,6 +886,53 @@ class TaskAreas(Base):
         a.text("hub_task", action="update", id=mid, status="review", note="ready")  # tracking on: suggested now
         self.assertEqual(self.sheet(mid)["suggested"], ["elsewhere/"])
 
+    def test_a_changed_interface_is_told_to_the_tasks_that_import_it(self):
+        # Roadmap C3, done when: renaming a parameter of a function another agent's area imports sends exactly
+        # one notice; a change to a body alone sends none.
+        code = Path(tempfile.mkdtemp(prefix="iface-", dir=TMP)).resolve()
+        files = {"paylib/parse.py": "def read(path):\n    return path\n", "paylib/__init__.py": "",
+                 "payapp/main.py": "from paylib.parse import read\nread('x')\n", "paydocs/notes.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        import crewchat_map
+        self.hub._maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="iface-maps-", dir=TMP)))
+        self.addCleanup(self.hub._maps.close)
+        self.hub.update_map()
+        (a, a_name), (b, b_name) = self.crew
+        c, c_name = self.agent()
+        # A works on scripts and changes the parser on the way; B's task is on the app, which imports it.
+        mine, theirs, docs = self.task("The scripts", "payscripts/"), self.task("The app", "payapp/"), \
+            self.task("Notes", "paydocs/")
+        for agent, mid in ((a, mine), (b, theirs), (c, docs)):
+            self.assertNotIn("Error", agent.text("hub_task", action="take", id=mid))
+        for agent in (a, b, c):
+            agent.text("hub_inbox")
+
+        def edit(text):
+            (code / "paylib/parse.py").write_text(text)
+            later = time.time() + 30 + len(self.hub.messages)
+            os.utime(code / "paylib/parse.py", (later, later))
+            with self.hub.lock:
+                self.hub._edited(a_name, "paylib/parse.py")
+            self.hub.update_map()
+
+        start = time.time()
+        edit("def read(source):\n    return source\n")
+        edit("def read(source):\n    return source.strip()\n")  # still at it: one notice, when it settles
+        self.assertEqual(self.hub.interface_notices(self.hub._maps, now=start + 10), [])  # not settled yet
+        [notice] = self.hub.interface_notices(self.hub._maps, now=start + crewchat.NOTICE_SETTLE + 5)
+        self.assertEqual((notice["to"], notice["task"], notice["changed"]), (b_name, theirs, "paylib/parse.py"))
+        inbox = b.text("hub_inbox")
+        self.assertIn("%s changed paylib/parse.py, which your task #%s uses: read(path) is now read(source)" % (
+            a_name, theirs), inbox)
+        self.assertNotIn("paylib/parse.py", a.text("hub_inbox") + c.text("hub_inbox"))  # not its editor, nor others
+        edit("def read(source):\n    return source.lower()\n")  # a body only
+        self.assertEqual(self.hub.interface_notices(self.hub._maps, now=start + 10000), [])
+
     def test_suggested_areas_travel_as_a_message_field(self):
         mid = self.task("From another machine")
         self.assertTrue(self.hub.ingest({"id": "far-%s" % mid, "ts": time.time(), "from": crewchat.SERVER_NAME,

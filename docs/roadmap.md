@@ -42,7 +42,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
-| [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | To do | C0, C1 |
+| [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
 | [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | To do | C1, C2 |
 | [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
 | [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | To do | C1 |
@@ -541,7 +541,7 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C3
 
-**Interface-change notices** · P1 · effort M · To do
+**Interface-change notices** · P1 · effort M · Done
 
 **Goal.** When an agent changes a function or class signature, agents whose tasks depend on it hear about it at once.
 

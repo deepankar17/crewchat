@@ -9,6 +9,7 @@ data (docs/storage.md): delete it and the server builds it again from the code.
   edges(src, dst, kind, certain)            imports, calls, uses (a template using a component), injects
   refs(path, kind, target, certain)         what each file points at, kept to link again when files change
   files(path, mtime, size)                  what was read, to read again only what changed
+  signatures(path, name, signature)         each Python function's parameters, for interface-change notices (C3)
   meta(key, value)                          the repository, branch and commit the map was built from
 
 Python is read with the ast module. Java, Kotlin, React (JS, JSX, TS, TSX) and Angular are read with regular
@@ -49,8 +50,11 @@ CREATE TABLE IF NOT EXISTS refs (path TEXT NOT NULL, kind TEXT NOT NULL, target 
                                  certain INTEGER NOT NULL DEFAULT 1);
 CREATE INDEX IF NOT EXISTS refs_path ON refs (path);
 CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS signatures (path TEXT NOT NULL, name TEXT NOT NULL, signature TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS signatures_path ON signatures (path);
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 """
+MAP_VERSION = "2"  # what the tables hold; a map of another version is built again
 
 
 # --------------------------------------------------------------------------------------------
@@ -128,11 +132,13 @@ def line_of(text, index):
 #   references   [(kind, target, certain)]   target is a list for _resolve: ["py", module, name], ["jvm", ...]
 # --------------------------------------------------------------------------------------------
 def read_python(rel, text):
+    """(definitions, references, signatures): signatures is None for a file that does not parse (someone is in
+    the middle of an edit), so what it had stays."""
     try:
         tree = ast.parse(text)
     except (SyntaxError, ValueError):
-        return [], []
-    defs, refs = [], []
+        return [], [], None
+    defs, refs, sigs = [], [], {}
     if rel.endswith("/__init__.py") or rel == "__init__.py":
         package = rel[:-len("__init__.py")].rstrip("/").replace("/", ".")
     else:
@@ -157,11 +163,14 @@ def read_python(rel, text):
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             defs.append(("function", node.name, node.lineno))
+            sigs[node.name] = parameters(node)
         elif isinstance(node, ast.ClassDef):
             defs.append(("class", node.name, node.lineno))
+            sigs[node.name] = "class"
             for item in node.body:
                 if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     defs.append(("method", "%s.%s" % (node.name, item.name), item.lineno))
+                    sigs["%s.%s" % (node.name, item.name)] = parameters(item)
     # Calls that can be resolved: f() for an f imported by name, m.f() for a module m imported.
     called = set()
     for node in ast.walk(tree):
@@ -174,7 +183,42 @@ def read_python(rel, text):
             module, name = names[func.value.id]
             called.add(((module + "." + name) if name else module, func.attr))
     refs += [("calls", ["py", module, name], 1) for module, name in sorted(called)]
-    return defs, refs
+    return defs, refs, sigs
+
+
+def parameters(fn):
+    """A function's parameters as written, (a, b=1, *, c), and its return annotation."""
+    returns = " -> %s" % ast.unparse(fn.returns) if fn.returns is not None else ""
+    return "(%s)%s" % (ast.unparse(fn.args), returns)
+
+
+def public(name):
+    """A name other code may use: none of its parts starts with _, except dunders such as __init__."""
+    return not any(part.startswith("_") and not (part.startswith("__") and part.endswith("__"))
+                   for part in name.split("."))
+
+
+def signature_changes(old, new, limit=5):
+    """What changed in a file's interface, as short lines: parameters changed, public names renamed or removed.
+    New names are not a change to anyone using the file; a body changed alone is none at all."""
+    def shown(name, sig):
+        return "class %s" % name if sig == "class" else name + sig
+    out = []
+    for name in sorted(old):
+        if public(name) and name in new and old[name] != new[name]:
+            out.append("%s is now %s" % (shown(name, old[name]), shown(name, new[name])))
+    added = [n for n in new if n not in old and public(n)]
+    for name in sorted(n for n in old if n not in new and public(n)):
+        scope = name.rpartition(".")[0]
+        twins = [a for a in added if new[a] == old[name] and a.rpartition(".")[0] == scope]
+        if len(twins) == 1:  # the same parameters under a new name, in the same class: renamed
+            out.append("%s was renamed %s" % (shown(name, old[name]), twins[0]))
+            added.remove(twins[0])
+        else:
+            out.append("%s was removed" % shown(name, old[name]))
+    if len(out) > limit:
+        out = out[:limit] + ["and %d more" % (len(out) - limit)]
+    return out
 
 
 JVM_PACKAGE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
@@ -292,8 +336,14 @@ class CodeMap:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.executescript(SCHEMA)
+        if self.meta("version") != MAP_VERSION:  # made by another version: build it again
+            for table in ("nodes", "edges", "refs", "files", "signatures", "meta"):
+                self.db.execute("DELETE FROM %s" % table)
+            self._set_meta("version", MAP_VERSION)
+            self.db.commit()
         self.base_url, self.aliases = self._ts_paths()
         self._linked = {}  # (a, b) -> linked(a, b), until the next update changes something
+        self.changes = []  # [(path, signatures before, after)] since pop_changes, for C3's notices
 
     def close(self):
         with self.lock:
@@ -367,6 +417,9 @@ class CodeMap:
                 "SELECT DISTINCT s.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
                 "WHERE d.path IN (%s)" % ",".join("?" * len(chunk)), chunk)}
         for rel in gone:
+            old = self.signatures(rel)
+            if old:
+                self.changes.append((rel, old, {}))
             self._forget(rel)
         new = [rel for rel in changed if not self._exists(rel)]
         for rel in changed:
@@ -387,18 +440,34 @@ class CodeMap:
             chunk = ids[start:start + 400]
             marks = ",".join("?" * len(chunk))
             self.db.execute("DELETE FROM edges WHERE src IN (%s) OR dst IN (%s)" % (marks, marks), chunk + chunk)
-        for table in ("nodes", "refs", "files"):
+        for table in ("nodes", "refs", "files", "signatures"):
             self.db.execute("DELETE FROM %s WHERE path = ?" % table, (rel,))
 
+    def signatures(self, rel):
+        """name -> parameters of each function, method and class of a Python file, as last read."""
+        return dict(self.db.execute("SELECT name, signature FROM signatures WHERE path = ?", (rel,)).fetchall())
+
+    def pop_changes(self):
+        """The signature changes found since the last call: [(path, before, after)]."""
+        with self.lock:
+            out, self.changes = self.changes, []
+        return out
+
     def _read(self, rel, st):
+        known, old = self._exists(rel), self.signatures(rel)
         self._forget(rel)
         lang = LANGS[os.path.splitext(rel)[1].lower()]
         try:
             text = (self.top / rel).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return
+        sigs = {}
         if lang == "python":
-            defs, refs = read_python(rel, text)
+            defs, refs, sigs = read_python(rel, text)
+            if sigs is None:  # does not parse now: keep what it had
+                sigs = old
+            elif known and sigs != old:
+                self.changes.append((rel, old, sigs))
         elif lang in ("java", "kotlin"):
             defs, refs = read_jvm(rel, text, lang)
         elif lang == "html":
@@ -411,6 +480,8 @@ class CodeMap:
                             [(kind, rel, name, line, lang) for kind, name, line in defs])
         self.db.executemany("INSERT INTO refs (path, kind, target, certain) VALUES (?, ?, ?, ?)",
                             [(rel, kind, json.dumps(target), int(certain)) for kind, target, certain in refs])
+        self.db.executemany("INSERT INTO signatures (path, name, signature) VALUES (?, ?, ?)",
+                            [(rel, name, sig) for name, sig in sorted(sigs.items())])
         self.db.execute("INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
                         (rel, float(st.st_mtime), st.st_size))
 
@@ -691,6 +762,11 @@ class Maps:
             except sqlite3.Error:  # a map being built again (its file was deleted)
                 continue
         return False
+
+    def insides(self, cmap):
+        """Where the project's folders that use this map are in its repository: "" or "app/" each."""
+        with self.lock:
+            return sorted({inside for m, inside in self.tops.values() if m is cmap})
 
     def all(self):
         with self.lock:

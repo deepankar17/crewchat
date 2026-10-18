@@ -257,6 +257,19 @@ class Updates(Sample):
         self.assertFalse(self.map.linked("d.py", "pkg/e.py"))
         self.assertEqual(self.map.definitions("pkg/e.py")["definitions"], [])
 
+    def test_a_map_of_another_version_is_built_again(self):
+        self.map.db.execute("UPDATE meta SET value = '1' WHERE key = 'version'")
+        self.map.db.commit()
+        path = self.map.path
+        self.maps.close()
+        cmap = crewchat_map.CodeMap(path, self.top)
+        try:
+            self.assertEqual(cmap.status()["files"], 0)  # emptied, to be read again
+            cmap.update()
+            self.assertTrue(cmap.linked("a.py", "b.py"))
+        finally:
+            cmap.close()
+
     def test_deleting_the_map_builds_it_again(self):
         path = self.map.path
         self.maps.close()
@@ -277,6 +290,57 @@ class Updates(Sample):
     def test_a_check_reads_nothing_while_nothing_moved(self):
         self.assertEqual(self.maps.check([self.top]), {})
         self.assertEqual(list(self.maps.check([self.top], edited=True)), [str(self.top)])
+
+
+class Signatures(Sample):
+    """C3: a Python file's interface (functions, methods, classes and their parameters), and what changed in it."""
+
+    FILES = {"api.py": "class Store:\n    def get(self, key, default=None):\n        pass\n\n    def _cache(self):\n"
+                       "        pass\n\n\ndef read(path, *, strict=False) -> str:\n    return ''\n\n\ndef close():\n"
+                       "    pass\n", "other.py": ""}
+
+    def rewrite(self, text, rel="api.py"):
+        write(self.top, {rel: text})
+        os.utime(self.top / rel, (time.time() + 10, time.time() + 10))
+        self.map.update()
+        return self.map.pop_changes()
+
+    def test_what_is_kept(self):
+        self.assertEqual(self.map.signatures("api.py"), {
+            "Store": "class", "Store.get": "(self, key, default=None)", "Store._cache": "(self)",
+            "read": "(path, *, strict=False) -> str", "close": "()"})
+        self.assertEqual(self.map.pop_changes(), [])  # a first read is no change
+
+    def test_a_parameter_renamed_and_a_function_removed(self):
+        text = (self.top / "api.py").read_text().replace("read(path,", "read(source,").replace("def close():", "def shut():")
+        [(rel, before, after)] = self.rewrite(text)
+        self.assertEqual(crewchat_map.signature_changes(before, after), [
+            "read(path, *, strict=False) -> str is now read(source, *, strict=False) -> str",
+            "close() was renamed shut"])
+
+    def test_a_body_or_a_private_name_is_no_change(self):
+        text = (self.top / "api.py").read_text().replace("return ''", "return 'x'").replace("_cache(self)", "_cache(self, n)")
+        changes = self.rewrite(text)
+        self.assertEqual([crewchat_map.signature_changes(b, a) for _, b, a in changes], [[]])
+
+    def test_a_file_that_does_not_parse_keeps_what_it_had(self):
+        before = self.map.signatures("api.py")
+        self.assertEqual(self.rewrite("def read(:\n"), [])
+        self.assertEqual(self.map.signatures("api.py"), before)
+
+    def test_a_file_deleted_takes_its_names_with_it(self):
+        (self.top / "api.py").unlink()
+        self.map.update()
+        [(rel, before, after)] = self.map.pop_changes()
+        self.assertEqual((rel, after), ("api.py", {}))
+        self.assertIn("class Store was removed", crewchat_map.signature_changes(before, after))
+
+    def test_many_changes_are_cut_short(self):
+        before = {"f%d" % i: "()" for i in range(8)}
+        lines = crewchat_map.signature_changes(before, {})
+        self.assertEqual((len(lines), lines[-1]), (6, "and 3 more"))
+        self.assertEqual(crewchat_map.signature_changes({"Store.__init__": "(self)"}, {"Store.__init__": "(self, x)"}),
+                         ["Store.__init__(self) is now Store.__init__(self, x)"])  # a constructor is public
 
 
 @unittest.skipUnless(HAS_GIT, "needs git")

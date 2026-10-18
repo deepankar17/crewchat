@@ -111,7 +111,7 @@ SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app doe
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -1512,6 +1512,9 @@ class Hub:
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
         self._map_edited = False  # an agent edited a file since the maps were last brought up to date
+        self._editors = {}  # a path in the project -> the agent that edited it last (memory only)
+        self._iface = {}  # (map, path) -> a Python file's interface change not told yet (C3): before, after, when
+        self._iface_told = {}  # (map, path) -> when agents were last told of a change to it
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -2306,13 +2309,77 @@ class Hub:
             self._maps = crewchat_map.Maps(self.roster.root)
         return self._maps
 
+    def _edited(self, name, path):
+        """An agent edited a file of the project (C0): recorded, and the code map reads it again. Caller holds
+        the lock."""
+        self.events.add_edit(name, path, self._usage_task(name))
+        self._editors[path] = name
+        self._map_edited = True
+        MAP_WAKE.set()
+
     def update_map(self):
-        """Bring the maps up to date: the files agents edited, and any folder whose HEAD moved."""
+        """Bring the maps up to date: the files agents edited, and any folder whose HEAD moved. Then tell agents
+        about interfaces that changed (C3)."""
         maps = self.code_maps()
         if maps is None:
             return {}
         edited, self._map_edited = self._map_edited, False
-        return maps.check(self.project_folders(), edited)
+        done = maps.check(self.project_folders(), edited)
+        self.interface_notices(maps)
+        return done
+
+    # Interface-change notices (C3) ------------------------------------------------------------------
+    def interface_notices(self, maps, now=None):
+        """A Python file whose functions or classes changed their parameters, or were renamed or removed: once
+        it has stayed so for NOTICE_SETTLE (an agent mid-edit changes it many times), and at most every
+        NOTICE_GAP, the holders of tasks whose areas import it hear what changed. Returns the messages."""
+        import crewchat_map
+        now = time.time() if now is None else now
+        for cmap in maps.all():
+            for rel, before, after in cmap.pop_changes():
+                key = (str(cmap.path), rel)
+                if key in self._iface:
+                    self._iface[key].update(after=after, at=now)
+                else:
+                    self._iface[key] = {"map": cmap, "before": before, "after": after, "at": now}
+        sent = []
+        for key, change in list(self._iface.items()):
+            if now - change["at"] < NOTICE_SETTLE or now - self._iface_told.get(key, 0) < NOTICE_GAP:
+                continue
+            del self._iface[key]
+            lines = crewchat_map.signature_changes(change["before"], change["after"])
+            if lines:  # back as it was: nothing to tell
+                self._iface_told[key] = now
+                sent += self._tell_interface(maps, change["map"], key[1], lines)
+        return sent
+
+    def _tell_interface(self, maps, cmap, rel, lines):
+        try:
+            users = [f["path"] for f in cmap.importers(rel, certain_only=True)["files"]]
+        except Exception as e:  # a map being built again
+            sys.stderr.write("%s could not look up what imports %s: %s\n" % (now_iso(), rel, e))
+            return []
+        inside = next((i for i in maps.insides(cmap) if rel.startswith(i)), "")
+        path = rel[len(inside):]  # as the project's tasks and edits name it
+        users = [u[len(inside):] for u in users if u.startswith(inside)]
+        out = []
+        with self.lock:
+            editor = self._editors.get(path, "")
+            holders = {}
+            for mid, holder in self.taken.items():
+                row = self.sheet.get(mid)
+                if row is None or holder == editor or self._row_status(mid) not in ("doing", "review"):
+                    continue
+                if row["areas"] and any(area_covered(user, row["areas"]) for user in users):
+                    holders.setdefault(holder, []).append(mid)
+            for holder, mids in sorted(holders.items()):
+                text = "%s changed %s, which your task%s %s use%s: %s. Check the code that calls it." % (
+                    editor or "Someone", path, "s" if len(mids) > 1 else "", ", ".join("#" + m for m in mids),
+                    "" if len(mids) > 1 else "s", "; ".join(lines))
+                out.append(self._append(SERVER_NAME, holder, text[:MAX_NOTICE], "msg", task=mids[0], changed=path))
+            if out:
+                self._changed()
+        return out
 
     # Token usage (X4) ---------------------------------------------------------------------------
     def usage_on(self):
@@ -3470,9 +3537,7 @@ class Hub:
                 tracking = self.edits_on()
                 clean = clean_edit_path(path) if tracking and path else ""
                 if clean:  # a file it edited, inside its project (C0): kept on this machine only
-                    self.events.add_edit(name, clean, self._usage_task(name))
-                    self._map_edited = True  # the code map reads it again (C1)
-                    MAP_WAKE.set()
+                    self._edited(name, clean)
                 return {"edits": tracking}  # the hook sends edited paths only while this is true
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
@@ -8910,6 +8975,9 @@ def flush_all(projects):
 
 
 MAP_EVERY = 30  # seconds between looks at whether a project folder's HEAD moved (C1)
+NOTICE_SETTLE = 60  # seconds a file's interface must stay put before agents hear it changed (C3)
+NOTICE_GAP = 300  # seconds at least between two notices about one file
+MAX_NOTICE = 700  # characters of an interface-change notice (about 150 tokens)
 MAP_SETTLE = 2  # seconds an edit waits before the map reads it, so a burst of edits is read once
 MAP_WAKE = threading.Event()  # set when an agent edits a file
 

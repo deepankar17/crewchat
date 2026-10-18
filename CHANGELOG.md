@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Agents hear when code they depend on changes its interface.** When an agent changes the
+  parameters of a Python function or class method, or renames or removes one, the agents whose tasks'
+  files import it get one short message once the file has stayed put for a minute, delivered like any
+  message at the end of their turn: "Anya changed paylib/parse.py, which your task #12 uses:
+  read(path) is now read(source)". A change to a body alone sends nothing. Python only for now.
 - **crewchat suggests a task's files, and keeps tasks off code that depends on each other.** When an
   agent marks a task ready for review or done, the folders it changed outside the task's areas are
   suggested to the lead (or to you): at most five, grouped by folder. **Accept files** in the task's
