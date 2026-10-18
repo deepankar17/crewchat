@@ -392,6 +392,20 @@ crewchat tasks done A12                                # or todo (back on the sh
 
 A message you post as a task also goes on the sheet.
 
+**A task's files.** `--areas` says which files a task changes, as path prefixes. Two tasks over the
+same files never run at once, and in a project with edit tracking on (`crewchat edits`), neither
+do two tasks where one's code imports the other's: crewchat's code map knows (`crewchat map`). An
+agent often changes more than its task said. When it marks the task ready for review or done,
+crewchat suggests the folders it changed outside the task's areas (at most five, grouped by folder)
+to the lead, or to you. Accept them with **Accept files** in the task's panel, or:
+
+```bash
+crewchat tasks areas A12 accept           # add the suggested files
+crewchat tasks areas A12 app/login/,docs/ # or set them yourself
+```
+
+A lead accepts them with `hub_task` action `areas`.
+
 **When an agent goes silent.** A crashed session would keep its task until someone gave it back,
 so crewchat reclaims it: a task whose holder has shown no sign of life for 60 minutes (no tool
 call, no hook; a hook waiting for messages counts as alive) goes back on the sheet,

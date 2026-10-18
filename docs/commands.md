@@ -118,6 +118,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |
 | `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
 | `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks areas ID accept\|PATHS` | A task's files: accept the folders crewchat suggested from what its holder changed, or set them |
 | `crewchat tasks assign ID AGENT` | Give a task to an agent |
 | `crewchat tasks move ID up\|down\|top` | Reorder |
 | `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **crewchat suggests a task's files, and keeps tasks off code that depends on each other.** When an
+  agent marks a task ready for review or done, the folders it changed outside the task's areas are
+  suggested to the lead (or to you): at most five, grouped by folder. **Accept files** in the task's
+  panel, `crewchat tasks areas ID accept`, or the lead's `hub_task` action `areas` adds them. With the
+  code map, two tasks also wait for each other when one's files import the other's, even with no path
+  in common.
 - **A map of your project's code**, for the coming overlap checks and interface-change notices: which
   file imports which, and the classes and functions in each, for Python, Java, Kotlin, React (JS, JSX, TS,
   TSX) and Angular (selectors in templates, injected services). Built on your machine with the standard

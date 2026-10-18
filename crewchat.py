@@ -111,7 +111,7 @@ SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app doe
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -948,11 +948,52 @@ def split_list(text):
     return [part.strip().lstrip("#") for part in str(text or "").split(",") if part.strip() and part.strip() != "-"]
 
 
-def areas_overlap(a, b):
-    """Do two tasks touch the same files? Areas are path prefixes; one inside another overlaps."""
-    def norm(area):
-        return area.strip().strip("/").lower() + "/"
-    return any(norm(x).startswith(norm(y)) or norm(y).startswith(norm(x)) for x in a for y in b)
+def area_key(area):
+    return area.strip().strip("/").lower() + "/"
+
+
+def areas_overlap(a, b, linked=None):
+    """Do two tasks touch the same files? Areas are path prefixes; one inside another overlaps. With linked (the
+    code map's, C1), so does an area with a file that imports one of the other's, or is imported by it."""
+    if any(area_key(x).startswith(area_key(y)) or area_key(y).startswith(area_key(x)) for x in a for y in b):
+        return True
+    return linked is not None and any(linked(x, y) for x in a for y in b)
+
+
+def area_covered(area, areas):
+    """Is this area inside one of these?"""
+    return any(area_key(area).startswith(area_key(other)) for other in areas)
+
+
+MAX_SUGGESTED = 5  # areas suggested for a task at most (C2)
+
+
+def group_areas(paths, cap=MAX_SUGGESTED):
+    """The areas of the files a task changed: each file's folder (a file at the top stays a file), folders inside
+    another counted with it, and the deepest raised to their parent until at most cap are left; if there are
+    still more, the cap most edited."""
+    def tidy(counts):
+        out = {}
+        for area in sorted(counts, key=len):
+            outer = next((o for o in out if o.endswith("/") and area.startswith(o)), area)
+            out[outer] = out.get(outer, 0) + counts[area]
+        return out
+    counts = {}
+    for path in paths:
+        area = path.rsplit("/", 1)[0] + "/" if "/" in path else path
+        counts[area] = counts.get(area, 0) + 1
+    counts = tidy(counts)
+    while len(counts) > cap:
+        deepest = max(area.count("/") for area in counts)
+        if deepest <= 1:  # only top folders and files left
+            break
+        raised = {}
+        for area, n in counts.items():
+            if area.count("/") == deepest:
+                area = area[:-1].rsplit("/", 1)[0] + "/"
+            raised[area] = raised.get(area, 0) + n
+        counts = tidy(raised)
+    return sorted(sorted(counts, key=lambda area: (-counts[area], area))[:cap])
 
 
 def project_id(name):
@@ -1654,11 +1695,16 @@ class Hub:
             row.pop("check", None)
             row.pop("verdict", None)
             self._save()
+        if row is not None and msg.get("suggested"):  # areas worked out from the files edited (C2), until accepted
+            row["suggested"] = split_list(msg["suggested"])
+            self._save()
         if kind in ("take", "assign"):
             row = self.sheet.get(msg.get("task")) or {}
             if row.get("reclaimed") == (msg["from"] if kind == "take" else msg["to"]):
                 del row["reclaimed"]  # the agent it was reclaimed from has it again
                 self._save()
+        if kind in ("take", "assign") and msg.get("task") in self.sheet:
+            self.sheet[msg["task"]]["held_seq"] = msg["seq"]  # what its holder works on now (edits and tokens)
         if kind == "take" and msg.get("task") and msg["task"] not in self.taken:
             self.taken[msg["task"]] = msg["from"]
             self._save()
@@ -1669,7 +1715,7 @@ class Hub:
             self.taken.setdefault(msg["id"], msg["to"])
             self._save()
         elif kind == "update" and msg.get("task") and msg.get("status") in STATUSES:
-            self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"]}
+            self.progress[msg["task"]] = {"status": msg["status"], "by": msg["from"], "seq": msg["seq"]}
             if msg["status"] == "todo":
                 # Given back: on the sheet for anyone again. Every machine counts the same messages,
                 # so all of them settle the next claim under the same new key. A reclaim (its holder
@@ -1695,6 +1741,9 @@ class Hub:
                 row.pop("reclaim", None)
             elif msg.get("reclaim"):
                 row["reclaim"] = msg["reclaim"]
+            if msg.get("areas"):  # the owner or the lead set them
+                row["areas"] = split_list(msg["areas"])
+                row.pop("suggested", None)
             self._save()
         elif kind == "ask" and msg.get("task") in self.sheet:
             row = self.sheet[msg["task"]]  # the task's newest check before done; an older answer no longer counts
@@ -2296,10 +2345,12 @@ class Hub:
             return {"kept": True, "task": task or ""}
 
     def _usage_task(self, name):
-        """The task an agent's tokens go to: the one it holds and last reported on. Caller holds the lock."""
+        """The task an agent's tokens and edits go to: of those it holds, the one it took or reported on last.
+        Caller holds the lock."""
         held = [mid for mid, holder in self.taken.items() if holder == name and mid in self.sheet
                 and self._row_status(mid) not in ("done", "removed")]
-        return max(held, key=lambda mid: float((self.progress.get(mid) or {}).get("ts") or 0), default="")
+        return max(held, key=lambda mid: max(int((self.progress.get(mid) or {}).get("seq") or 0),
+                                             int(self.sheet[mid].get("held_seq") or 0)), default="")
 
     def usage_report(self, days=7):
         """Tokens and estimated cost per agent (today, the last days, in all), per day, and per task on the sheet."""
@@ -2840,8 +2891,53 @@ class Hub:
             else:
                 to = OWNER
             msg = self._append(agent, to, note, "update", task=mid, status=status)
+            if status in ("review", "done"):
+                self._suggest_areas(mid)
             self._changed()
             return msg, to
+
+    def _suggest_areas(self, mid):
+        """C2: when a task goes to review or done, the folders its holder edited while holding it (C0) that its
+        areas do not cover, grouped, as a suggestion for its areas that the lead or the owner can accept. Works
+        from this machine's edits. Caller holds the lock. Returns the message, or None."""
+        row = self.sheet.get(mid)
+        if row is None or not self.edits_on():
+            return None
+        try:
+            edited = [e["path"] for e in self.events.edits(task=mid)]
+        except Exception as e:  # a locked or broken events.sqlite: no suggestion, the update still goes
+            sys.stderr.write("%s could not read the files task #%s changed: %s\n" % (now_iso(), mid, e))
+            return None
+        new = [area for area in group_areas(edited) if not area_covered(area, row["areas"])]
+        if not new or new == row.get("suggested"):
+            return None
+        lead = self._lead()
+        how = ("Accept them as its areas: hub_task action=areas id=%s accept=true." % mid if lead else
+               "Accept them in the task's panel, or: crewchat tasks areas %s accept." % mid)
+        text = "Task #%s changed files %s: %s. %s So the sheet keeps other tasks off them." % (
+            mid, "outside its areas" if row["areas"] else "but has no areas", ", ".join(new), how)
+        return self._append(SERVER_NAME, lead or OWNER, text, "msg", task=mid, suggested=",".join(new))
+
+    def set_areas(self, by, mid, areas="", accept=False):
+        """The lead or the owner sets a task's areas, or accepts the ones suggested (C2). Returns (id, areas)."""
+        mid = self._id(mid)
+        with self.lock:
+            if by != OWNER and (self.agents.get(by) or {}).get("role") != "lead":
+                raise HubError("only the lead or the owner sets a task's areas")
+            row = self.sheet.get(mid)
+            if row is None or row.get("removed"):
+                raise HubError("#%s is not on the task sheet" % mid)
+            if accept:
+                if not row.get("suggested"):
+                    raise HubError("task #%s has no suggested areas" % mid)
+                areas = row["areas"] + [a for a in row["suggested"] if not area_covered(a, row["areas"])]
+            else:
+                areas = split_list(areas)
+                if not areas:
+                    raise HubError("give the areas (app/login/,docs/), or accept=true for the suggested ones")
+            self._append(by, "all", "", "plan", task=mid, areas=",".join(areas))
+            self._changed()
+            return mid, areas
 
     def _record_take(self, agent, mid, task):
         """Caller holds the lock."""
@@ -3049,11 +3145,16 @@ class Hub:
         waiting = [d for d in row["depends"] if d in self.sheet and self._row_status(d) != "done"]
         if waiting:
             return "it waits for %s" % ", ".join("#" + d for d in waiting)
+        linked = self._maps.linked if self._maps is not None else None  # the code map (C1), once built
         for other, holder in self.taken.items():
             if other == mid or holder == agent or other not in self.sheet:
                 continue
-            if self._row_status(other) in ("doing", "review") and areas_overlap(row["areas"], self.sheet[other]["areas"]):
+            if self._row_status(other) not in ("doing", "review"):
+                continue
+            if areas_overlap(row["areas"], self.sheet[other]["areas"]):
                 return "its files overlap #%s, which %s is working on" % (other, holder)
+            if linked is not None and areas_overlap(row["areas"], self.sheet[other]["areas"], linked):
+                return "its files import, or are imported by, those of #%s, which %s is working on" % (other, holder)
         if not self._row_machine_ok(agent, row):
             return "it needs the machine %s" % row["where"]
         return ""
@@ -3175,6 +3276,8 @@ class Hub:
             to = self.taken.get(mid) or "all"
             self._append(OWNER, to, note or {"todo": "Back on the sheet.", "done": "Done.", "blocked": "Blocked."}[status],
                          "update", task=mid, status=status)
+            if status == "done":
+                self._suggest_areas(mid)
             self._changed()
 
     def _reclaim_after(self, row):
@@ -3838,7 +3941,7 @@ def roster_text(rows, me=None):
 READ = {"readOnlyHint": True, "openWorldHint": False}
 WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
 SETTING = dict(WRITE, idempotentHint=True)
-TASK_ACTIONS = ("view", "add", "take", "assign", "update")
+TASK_ACTIONS = ("view", "add", "take", "assign", "areas", "update")
 OLD_TASK_TOOLS = {"hub_tasks": "view", "hub_task_add": "add", "hub_take": "take", "hub_assign": "assign",
                   "hub_update": "update"}  # merged into hub_task in 0.15; a session started before asks for them
 
@@ -3862,17 +3965,18 @@ TOOLS = [
         "wait_seconds": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT, "default": 0,
                          "description": "Wait this long for a message if none is waiting."},
         "peek": {"type": "boolean", "default": False, "description": "Do not mark them read."}}),
-    _tool("hub_task", "The task sheet: view, add, take (first wins), assign (lead) or update yours.", WRITE, {
+    _tool("hub_task", "The task sheet: view, add, take (first wins), assign/areas (lead), update yours.", WRITE, {
               "action": {"type": "string", "enum": list(TASK_ACTIONS), "description": "What to do."},
               "id": {"type": ["string", "integer"], "description": "A task number: 12 or A12."},
               "show": {"type": "string", "enum": ["next", "mine", "all"], "default": "next", "description": "view."},
               "title": {"type": "string", "maxLength": MAX_TEXT, "description": "The work, and what done looks like."},
               "depends": {"type": "string", "description": "Task numbers it waits for: A12,A14."},
-              "areas": {"type": "string", "description": "Path prefixes it changes: app/login/,docs/."},
-              "where": {"type": "string", "description": "The machine it needs, if any."},
-              "take": {"type": "boolean", "default": False, "description": "add: yours now."},
+              "areas": {"type": "string", "description": "Path prefixes it changes: app/,docs/."},
+              "where": {"type": "string", "description": "The machine it needs."},
+              "take": {"type": "boolean", "description": "add: yours now."},
+              "accept": {"type": "boolean", "description": "areas: the suggested."},
               "to": {"type": "string", "description": "assign: the agent."},
-              "parent": {"type": ["string", "integer"], "description": "assign with title: the task it is part of."},
+              "parent": {"type": ["string", "integer"], "description": "assign title: the task it is part of."},
               "status": {"type": "string", "enum": list(STATUSES), "description": "update."},
               "note": {"type": "string", "maxLength": MAX_TEXT, "description": "update: what happened."}}, ("action",)),
     _tool("hub_agents", "Who is in the chat: names, roles, online, status. Yours says (you).", READ),
@@ -4072,6 +4176,9 @@ def call_tool(hub, sid, name, args, owner=False):
             raise HubError("role must be a string")
         msg = hub.set_role(me, me, role.strip().lower())
         return msg["text"]
+    if name == "task:areas":
+        mid, areas = hub.set_areas(me, args.get("id"), args.get("areas", ""), args.get("accept") is True)
+        return "Task #%s's files: %s." % (mid, ", ".join(areas))
     if name == "task:update":
         note = args.get("note") or ""
         if not isinstance(note, str) or len(note) > MAX_TEXT:
@@ -4099,6 +4206,8 @@ def sheet_line(row):
         extra.append("waits for " + ", ".join("#" + d for d in row["depends"]))
     if row["areas"]:
         extra.append("files " + ", ".join(row["areas"]))
+    if row.get("suggested"):
+        extra.append("suggested files " + ", ".join(row["suggested"]))
     if row["where"]:
         extra.append("on " + row["where"])
     if row["to"] != "all":
@@ -4348,6 +4457,9 @@ COMMANDS = [
         ("usage [show|on|off] [--days N]",
          "The tokens this project's agents used (Claude Code, counted at the end of each turn) per agent, day and "
          "task, and roughly what they would cost at API prices. on or off: keep counting them, or not.", None),
+        ("tasks areas ID accept|PATHS",
+         "A task's files (path prefixes): accept the ones crewchat suggested from what its holder changed, or set "
+         "them. Other tasks over the same files, or over code that imports them, wait for it.", None),
         ("tasks advisor [on|off]",
          "Let a task be marked done only after the advisor (the agent with the advisor role) approves it. Off "
          "unless set; with no value, shows it.", None),
@@ -5132,8 +5244,11 @@ class Handler(BaseHTTPRequestHandler):
             return {"reclaim": self.hub.set_reclaim(data.get("minutes"), task or None)}
         elif op == "advisor":
             return {"advisor": self.hub.set_advisor_check(data.get("value"))}
+        elif op == "areas":
+            mid, areas = self.hub.set_areas(OWNER, task, data.get("areas", ""), data.get("accept") is True)
+            return {"id": mid, "areas": areas}
         else:
-            raise HubError("op is add, assign, move, status, remove, reclaim or advisor")
+            raise HubError("op is add, assign, move, status, remove, reclaim, advisor or areas")
         return {"ok": True}
 
     def _rules(self, data):
@@ -9535,6 +9650,8 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   - `take`: claim an open task by its `id`.
   - `assign` (the lead only): give `to` an agent a task on the sheet (`id`), or new work (`title`,
     with `parent`, the owner's task it is part of). They report back to the lead.
+  - `areas` (the lead only): a task's files, set (`areas`) or, when crewchat suggests the folders
+    its holder changed outside them, accepted (`accept`), so other tasks keep off those files.
   - `update`: report on a task you work on, with a short `note`: first `in_progress` with your
     plan, then `blocked` (you need something), `review` (ready to be tested or reviewed) or
     `done`; `todo` gives it back to the sheet for someone else. It goes to whoever coordinates the
@@ -9832,6 +9949,14 @@ def cmd_tasks(args):
             print("%s follows the project's setting again." % whose)
         else:
             print("%s: a task goes back on the sheet when its holder is silent for %s min." % (whose, out))
+        return
+    if args.action == "areas":
+        if len(args.rest) < 2:
+            die("usage: crewchat tasks areas ID accept, or crewchat tasks areas ID app/login/,docs/")
+        accept = args.rest[1] == "accept"
+        out = owner_call("/api/task", {"op": "areas", "task": args.rest[0], "accept": accept,
+                                       "areas": "" if accept else ",".join(args.rest[1:])})
+        print("Task #%s's files: %s." % (out["id"], ", ".join(out["areas"])))
         return
     if args.action == "advisor":
         out = owner_call("/api/task", {"op": "advisor", "value": (args.rest or [""])[0]})["advisor"]
@@ -11057,7 +11182,7 @@ $("give").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopP
 function renderBoard(shown, all) {
   const board = $("board");
   if (boardDrag || board.hidden) return;
-  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.where]), state.showAllDone,
+  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.suggested, r.where]), state.showAllDone,
                               state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
   if (key === state.boardKey) return;
   state.boardKey = key;
@@ -12002,6 +12127,7 @@ function panelTask(id) {
   }
   if (r.depends.length) what.push(field("Waits for", r.depends.map((d) => "#" + d).join(", ")));
   if (r.areas.length) what.push(field("Files", r.areas.join(", ")));
+  if (r.suggested && r.suggested.length) what.push(field("Suggested files", r.suggested.join(", ")));
   if (r.where) what.push(field("Machine", r.where));
   what.push(field("From", r.from === "Owner" ? "you" : r.from));
   if (r.reclaimed) what.push(field("Reclaimed", "from " + r.reclaimed));
@@ -12012,6 +12138,9 @@ function panelTask(id) {
     return line;
   });
   const acts = el("div", "acts");
+  if (r.suggested && r.suggested.length)  // what its holder changed outside its areas: add them, so overlaps show
+    actButton(acts, "Accept files", "Add the suggested files to task " + r.id + "'s",
+              () => taskOp({ op: "areas", task: r.id, accept: true }));
   taskActions(r, acts);
   const need = state.needs.find((n) => n.task === r.id);
   const needCard = need ? [needsCard(need, r)] : [];
@@ -13102,12 +13231,13 @@ def build_parser():
     p.set_defaults(fn=cmd_rules)
 
     p = sub.add_parser("tasks", help="the project's task sheet: list, add, assign, move, done, todo, blocked, remove, "
-                                     "reclaim, advisor")
+                                     "reclaim, advisor, areas")
     p.add_argument("action", nargs="?", default="list",
                    choices=["list", "add", "assign", "move", "done", "todo", "blocked", "remove", "reclaim",
-                            "advisor"])
+                            "advisor", "areas"])
     p.add_argument("rest", nargs="*", help="add: the work; assign: ID AGENT; move: ID up|down|top; "
-                                           "reclaim: [MINUTES|off|default] [ID]; advisor: [on|off]; others: ID [note]")
+                                           "reclaim: [MINUTES|off|default] [ID]; advisor: [on|off]; "
+                                           "areas: ID accept|PATHS; others: ID [note]")
     p.add_argument("--depends", help="add: task numbers it waits for (A12,A14)")
     p.add_argument("--areas", help="add: path prefixes it changes (app/login/,docs/)")
     p.add_argument("--where", help="add: the machine or place it needs")

@@ -430,6 +430,27 @@ class NewPage(Signed):
         self.assertFalse(c.js("$('log').hidden"))
         self.assertEqual(c.errors, [])
 
+    def test_suggested_files_are_accepted_in_the_task_panel(self):
+        # Roadmap C2: when a task goes to review, the folders its holder changed outside its areas are suggested,
+        # and the owner adds them with one click.
+        c = self.chrome
+        mid = self.m.owner.task("all", "Tidy the search box")
+        self.agent.call("hub_task", action="take", id=mid)
+        status, raw, _ = H.request(self.m.url + "/api/hook", {"key": self.agent.key, "event": "tool", "doing": "Editing",
+                                                              "path": "web/search/box.tsx"},
+                                   {"Authorization": "Bearer " + self.agent.token})
+        self.assertEqual(status, 200, raw)
+        self.agent.call("hub_task", action="update", id=mid, status="review", note="ready")
+        c.js("openPanel('task', %s)" % json.dumps(mid))
+        c.until("$('panel-body').innerText.includes('web/search/')", what="the suggested files")
+        self.assertIn("SUGGESTED FILES", c.js("$('panel-body').innerText").upper())
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Accept files').click()")
+        c.until("!$('panel-body').innerText.toUpperCase().includes('SUGGESTED FILES') && "
+                "$('panel-body').innerText.includes('web/search/')", what="the files accepted")
+        self.assertIn("files web/search/", self.agent.call("hub_task", action="view", show="all"))
+        self.m.owner.post("/api/task", {"op": "status", "task": mid, "status": "done"})  # nothing left that needs you
+        self.assertEqual(c.errors, [])
+
     def test_back_from_the_board_shows_what_came_in_meanwhile(self):
         c = self.chrome
         last_in_view = """(() => { const log = $('log'), r = log.getBoundingClientRect();

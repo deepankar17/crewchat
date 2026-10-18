@@ -293,6 +293,7 @@ class CodeMap:
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.executescript(SCHEMA)
         self.base_url, self.aliases = self._ts_paths()
+        self._linked = {}  # (a, b) -> linked(a, b), until the next update changes something
 
     def close(self):
         with self.lock:
@@ -345,6 +346,7 @@ class CodeMap:
             gone = list(known)
             if changed or gone or not self.meta("built"):
                 self._apply([rel for rel, _ in changed], gone, dict(changed))
+                self._linked = {}
             self._set_meta("commit", commit)
             self._set_meta("repo", self.repo)
             self._set_meta("branch", self.branch)
@@ -570,21 +572,28 @@ class CodeMap:
         with self.lock:
             return self.answer({"path": norm(path), "files": self._links(norm(path), False, certain_only)})
 
-    def linked(self, a, b):
-        """Is there a certain link, either way, between a and b? Each is a file, or a folder (ending in /) that
-        stands for every file under it. For C2's check of whether two tasks' areas overlap."""
-        def where(column, p):
-            p = norm(p)
-            if p.endswith("/") or not p:
-                return "%s LIKE ? ESCAPE '\\'" % column, like_prefix(p)
-            return "%s = ?" % column, p
-        (sa, va), (db, vb) = where("s.path", a), where("d.path", b)
-        (sb, _), (da, _) = where("s.path", b), where("d.path", a)
-        with self.lock:
-            row = self.db.execute(
-                "SELECT 1 FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst WHERE e.certain = 1 "
-                "AND ((%s AND %s) OR (%s AND %s)) LIMIT 1" % (sa, db, sb, da), (va, vb, vb, va)).fetchone()
-        return row is not None
+    def linked(self, a, b, wait=True):
+        """Is there a certain link, either way, between a and b? Each is an area as tasks give them: a path
+        prefix, a file or every file under a folder. For C2's check of whether two tasks' areas overlap.
+        wait=False never waits for an update in progress: it answers from what it knew."""
+        a, b = norm(a).rstrip("/"), norm(b).rstrip("/")
+        if not wait and (a, b) in self._linked:
+            return self._linked[(a, b)]
+        if not self.lock.acquire(blocking=wait):  # being updated: what it said before, else no link
+            return self._linked.get((a, b), False)
+        try:
+            if (a, b) not in self._linked:
+                under = "(%s = ? OR %s LIKE ? ESCAPE '\\')"
+                sa, da, sb, db = under % ("s.path", "s.path"), under % ("d.path", "d.path"), \
+                    under % ("s.path", "s.path"), under % ("d.path", "d.path")
+                va, vb = [a, like_prefix(a)], [b, like_prefix(b)]
+                row = self.db.execute(
+                    "SELECT 1 FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst WHERE e.certain = 1 "
+                    "AND ((%s AND %s) OR (%s AND %s)) LIMIT 1" % (sa, db, sb, da), va + vb + vb + va).fetchone()
+                self._linked[(a, b)] = self._linked[(b, a)] = row is not None
+            return self._linked[(a, b)]
+        finally:
+            self.lock.release()
 
     def definitions(self, path):
         with self.lock:
@@ -613,7 +622,8 @@ class Maps:
     def __init__(self, root):
         self.dir = Path(root) / "maps"
         self.maps = {}  # key -> CodeMap
-        self.seen = {}  # folder -> the (branch, commit) its map was last brought up to date at
+        self.seen = {}  # folder -> the (branch, commit) its map was last brought up to date at, and the map's file
+        self.tops = {}  # folder -> (its map, the folder's path inside the repository: "" or "app/")
         self.lock = threading.Lock()
 
     def for_folder(self, folder):
@@ -642,6 +652,9 @@ class Maps:
                 cmap, commit = self.for_folder(folder)
                 done[folder] = cmap.update(commit)
                 self.seen[folder] = (head, cmap.path)
+                inside = git(folder, "rev-parse", "--show-prefix")  # where the folder is in its repository
+                with self.lock:
+                    self.tops[folder] = (cmap, inside)
             except (OSError, sqlite3.Error) as e:
                 done[folder] = "could not map: %s" % e
         return done
@@ -665,6 +678,19 @@ class Maps:
             except ValueError:
                 continue
         return None, path
+
+    def linked(self, a, b):
+        """Is there a certain link between two areas (paths relative to a project folder) in any folder's map?
+        Only maps already built are asked, and no git is run: cheap enough for every look at the task sheet."""
+        with self.lock:
+            tops = list(self.tops.values())
+        for cmap, inside in tops:
+            try:
+                if cmap.linked(inside + a, inside + b, wait=False):
+                    return True
+            except sqlite3.Error:  # a map being built again (its file was deleted)
+                continue
+        return False
 
     def all(self):
         with self.lock:

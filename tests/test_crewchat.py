@@ -696,7 +696,7 @@ class TrimmedTools(Base):
 
     def test_hub_task_takes_one_action_at_a_time(self):
         session, name = self.agent()
-        self.assertIn("action is view, add, take, assign, update", session.text("hub_task", action="peek"))
+        self.assertIn("action is view, add, take, assign, areas, update", session.text("hub_task", action="peek"))
         self.assertIn("action is", session.text("hub_task"))
         added = session.text("hub_task", action="add", title="Write the release notes", areas="docs/")
         tid = re.search(r"#(\w+)", added).group(1)
@@ -800,6 +800,124 @@ class Tasks(Base):
         self.assertIn("Posted message #", cli("say", "plain note"))
         with self.assertRaises(SystemExit):
             cli("say", "--to", "nobody-here", "hello")
+
+
+class TaskAreas(Base):
+    """Roadmap C2: a task's areas suggested from the files its holder edited (C0), accepted by the owner or the
+    lead, and an overlap check that sees imports (C1)."""
+
+    def setUp(self):
+        self.crew = [self.agent() for _ in range(2)]
+        maps = mock.patch.object(self.hub, "_maps", None)  # the code map: none unless a test makes one
+        maps.start()
+        self.addCleanup(maps.stop)
+
+    def task(self, title, areas=""):
+        return crewchat.post_json(self.base + "/api/task", self.owner, {"op": "add", "title": title, "areas": areas})["id"]
+
+    def sheet(self, mid):
+        return self.hub.sheet[mid]
+
+    def suggestions(self, mid):
+        return [m for m in self.hub.messages if m.get("task") == mid and m.get("suggested")]
+
+    def test_the_folders_it_edited_are_suggested_when_it_goes_to_review(self):
+        (a, a_name), _ = self.crew
+        mid = self.task("Fix the login", "login/")
+        a.call("hub_task", action="take", id=mid)
+        for path in ("login/form.kt", "session/store.kt", "session/keys/token.kt", "docs/login.md", "README.md"):
+            self.hub.events.add_edit(a_name, path, mid)
+        self.hub.events.add_edit(a_name, "unrelated/file.kt", "")  # not while it held the task
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        self.assertEqual(self.sheet(mid)["suggested"], ["README.md", "docs/", "session/"])  # login/ it has already
+        [notice] = self.suggestions(mid)
+        self.assertEqual((notice["from"], notice["to"]), (crewchat.SERVER_NAME, crewchat.OWNER))  # no lead: the owner
+        self.assertIn("outside its areas: README.md, docs/, session/", notice["text"])
+        self.assertIn("crewchat tasks areas %s accept" % mid, notice["text"])
+        self.assertIn("suggested files README.md, docs/, session/", cli("tasks"))
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "done"})
+        self.assertEqual(len(self.suggestions(mid)), 1)  # done, with nothing new since: not suggested again
+        out = crewchat.post_json(self.base + "/api/task", self.owner, {"op": "areas", "task": mid, "accept": True})
+        self.assertEqual(out["areas"], ["login/", "README.md", "docs/", "session/"])
+        self.assertNotIn("suggested", self.sheet(mid))
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/task", self.owner, {"op": "areas", "task": mid, "accept": True})
+
+    def test_the_lead_accepts_them_with_hub_task(self):
+        (a, a_name), (lead, lead_name) = self.crew
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": lead_name, "role": "lead"})
+        self.addCleanup(crewchat.post_json, self.base + "/api/role", self.owner, {"agent": lead_name, "role": "none"})
+        mid = self.task("Add search")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.events.add_edit(a_name, "web/search/box.tsx", mid)
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        inbox = lead.text("hub_inbox")
+        self.assertIn("but has no areas: web/search/", inbox)
+        self.assertIn("hub_task action=areas id=%s accept=true" % mid, inbox)
+        self.assertIn("only the lead or the owner", a.text("hub_task", action="areas", id=mid, accept=True))
+        self.assertIn("Task #%s's files: web/search/." % mid, lead.text("hub_task", action="areas", id=mid, accept=True))
+        self.assertIn("Task #%s's files: web/, api/." % mid, lead.text("hub_task", action="areas", id=mid, areas="web/,api/"))
+        self.assertIn("files web/, api/", lead.text("hub_task", action="view", show="all"))
+        self.assertIn("Task #%s's files: web/." % mid, cli("tasks", "areas", mid, "web/"))
+
+    def test_an_edit_goes_to_the_task_its_holder_works_on_now(self):
+        (a, a_name), _ = self.crew
+        first, second, third = self.task("Holding one"), self.task("Holding two"), self.task("Holding three")
+        for mid in (first, second):
+            a.call("hub_task", action="take", id=mid)
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), second)  # taken last
+        a.text("hub_task", action="update", id=first, status="in_progress", note="on it")
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), first)  # reported on last
+        a.call("hub_task", action="take", id=third)
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), third)
+
+    def test_nothing_is_suggested_without_edit_tracking(self):
+        (a, a_name), _ = self.crew
+        mid = self.task("Quiet one", "quiet/")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.events.add_edit(a_name, "elsewhere/x.py", mid)
+        with mock.patch.object(crewchat.Hub, "edits_on", lambda hub: False):
+            a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        self.assertEqual(self.suggestions(mid), [])
+        a.text("hub_task", action="update", id=mid, status="in_progress", note="again")
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")  # tracking on: suggested now
+        self.assertEqual(self.sheet(mid)["suggested"], ["elsewhere/"])
+
+    def test_suggested_areas_travel_as_a_message_field(self):
+        mid = self.task("From another machine")
+        self.assertTrue(self.hub.ingest({"id": "far-%s" % mid, "ts": time.time(), "from": crewchat.SERVER_NAME,
+                                         "to": crewchat.OWNER, "text": "suggested", "kind": "msg", "task": mid,
+                                         "suggested": "api/,docs/"}))
+        self.assertEqual(self.sheet(mid)["suggested"], ["api/", "docs/"])
+
+    def test_tasks_whose_code_imports_the_others_do_not_run_at_once(self):
+        # Done when: two tasks that share no prefix, one importing the other's code, overlap; without the map
+        # (C0 alone) only prefixes count.
+        code = Path(tempfile.mkdtemp(prefix="areas-", dir=TMP)).resolve()
+        for rel, text in {"shopapp/main.py": "from shoplib.parse import read\n", "shoplib/__init__.py": "",
+                          "shoplib/parse.py": "def read():\n    pass\n", "shoptools/run.py": "import json\n"}.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        (a, a_name), (b, b_name) = self.crew
+        first, second, third = self.task("Change the parser", "shoplib/"), self.task("Change the app", "shopapp/"), \
+            self.task("Change the tools", "shoptools/")
+        a.call("hub_task", action="take", id=first)
+        free = lambda: [r["id"] for r in self.hub.sheet_rows(b_name, "next")]  # noqa: E731
+        self.assertIn(second, free())  # no map: shopapp/ and shoplib/ share no prefix
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="areas-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        self.hub._maps = maps
+        self.assertNotIn(second, free())
+        self.assertIn(third, free())
+        self.assertIn("import, or are imported by, those of #%s, which %s is working on" % (first, a_name),
+                      b.text("hub_task", action="take", id=second))
+        a.text("hub_task", action="update", id=first, status="done", note="done")
+        self.assertIn(second, free())  # the parser is done: the app task may start
 
 
 class Teams(Base):
@@ -5273,11 +5391,26 @@ class Lifecycle(Base):
         fine.hub.reclaim_silent.assert_called_once_with()  # one project's error does not stop the others
         self.assertIn("could not check for silent task holders: bad state", err.getvalue())
 
+    def test_areas_are_grouped_by_folder(self):
+        group = crewchat.group_areas
+        self.assertEqual(group(["app/a.kt", "app/b.kt", "README.md"]), ["README.md", "app/"])
+        self.assertEqual(group(["app/login/a.kt", "app/a.kt"]), ["app/"])  # a folder inside another counts with it
+        many = ["app/f%d/x.kt" % i for i in range(8)] + ["docs/a.md", "docs/b.md"]
+        self.assertEqual(group(many), ["app/", "docs/"])  # too many: raised to their parent
+        tops = ["t%d/x.py" % i for i in range(7)] + ["t3/y.py", "t3/z.py", "t5/y.py"]
+        self.assertEqual(group(tops), ["t0/", "t1/", "t2/", "t3/", "t5/"])  # still too many: the most edited
+        self.assertEqual(group([]), [])
+        self.assertTrue(crewchat.area_covered("app/login/", ["app/"]))
+        self.assertFalse(crewchat.area_covered("app/", ["app/login/"]))
+
     def test_areas_overlap_by_path_prefix(self):
         self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
         self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))
         self.assertFalse(crewchat.areas_overlap(["app/login/"], ["app/logout/"]))
         self.assertFalse(crewchat.areas_overlap([], ["app/"]))
+        imports = lambda a, b: {a, b} == {"web/", "lib/"}  # noqa: E731  (the code map's, C1)
+        self.assertTrue(crewchat.areas_overlap(["web/"], ["lib/"], imports))
+        self.assertFalse(crewchat.areas_overlap(["web/"], ["docs/"], imports))
         self.assertEqual(crewchat.split_list("#A1, A2,-"), ["A1", "A2"])
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):

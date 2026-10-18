@@ -41,7 +41,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
-| [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | To do | C0 |
+| [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | To do | C0, C1 |
 | [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | To do | C1, C2 |
 | [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
@@ -506,7 +506,11 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C2
 
-**Auto-suggest and check task areas** · P1 · effort M · To do
+**Auto-suggest and check task areas** · P1 · effort M · Done
+
+> **Decided:** Suggest when a task goes to review or done: the folders edited while it was held, grouped,
+> at most five. The owner accepts with Accept files in the task panel (or `crewchat tasks areas ID accept`),
+> the lead with a new hub_task action `areas` (owner, 18 Oct).
 
 **Goal.** Fill in a task's areas from what the agent actually edits, and catch overlaps the prefix check misses.
 
