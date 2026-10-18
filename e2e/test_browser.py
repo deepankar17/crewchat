@@ -9,6 +9,7 @@ import os
 import socket
 import subprocess
 import sys
+import threading
 import time
 import unittest
 import urllib.request
@@ -38,6 +39,7 @@ class Chrome:
         self.ws = websocket.create_connection(page["webSocketDebuggerUrl"], suppress_origin=True)
         self.n = 0
         self.errors = []
+        self.events = []  # the other events, newest last (ServiceWorker.* when that domain is on)
         for domain in ("Page", "Runtime", "DOM", "Network"):
             self.call(domain + ".enable")
 
@@ -48,6 +50,8 @@ class Chrome:
             msg = json.loads(self.ws.recv())
             if msg.get("method") == "Runtime.exceptionThrown":
                 self.errors.append(msg["params"]["exceptionDetails"])
+            elif msg.get("method"):
+                self.events = (self.events + [msg])[-200:]
             if msg.get("id") == self.n:
                 if "error" in msg:
                     raise RuntimeError("%s: %s" % (method, msg["error"]))
@@ -84,8 +88,7 @@ class Chrome:
 
 
 class Signed(unittest.TestCase):
-    """A machine with one agent, and Chrome signed in to its chat page at PATH."""
-    PATH = "/"
+    """A machine with one agent, and Chrome signed in to its chat page."""
 
     @classmethod
     def setUpClass(cls):
@@ -102,9 +105,6 @@ class Signed(unittest.TestCase):
         cls.chrome.type_into("input[name=code]", code.lower())  # as typed on a phone
         cls.chrome.js("document.querySelector('form').submit()")
         cls.chrome.until("location.pathname === '/' && !!document.getElementById('log')", what="the chat page")
-        if cls.PATH != "/":
-            cls.chrome.open(cls.m.url + cls.PATH)
-            cls.chrome.until("!!document.getElementById('log')", what="the page at " + cls.PATH)
 
     @classmethod
     def tearDownClass(cls):
@@ -118,309 +118,6 @@ class Signed(unittest.TestCase):
         """Elements marked hidden that the page's styles show anyway."""
         return self.chrome.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
                               ".map(e => e.id || e.className)")
-
-
-@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
-class Page(Signed):
-    """The page before 0.14, at /classic for one release."""
-    PATH = "/classic"
-
-    def test_the_page_shows_the_chat_and_the_agent(self):
-        c = self.chrome
-        self.assertEqual(c.js("document.getElementById('project').textContent"), "Demo")
-        c.until("document.getElementById('agents').innerText.includes(%s)" % json.dumps(self.agent.name))
-        self.assertIn(self.agent.name, c.js("[...document.getElementById('to').options].map(o => o.value).join(' ')"))
-        self.assertEqual(c.errors, [])
-
-    def test_send_a_message_and_a_task_from_the_page(self):
-        c = self.chrome
-        c.until("[...document.getElementById('to').options].some(o => o.value === %s)" % json.dumps(self.agent.name))
-        c.js("document.getElementById('to').value = %s" % json.dumps(self.agent.name))
-        c.type_into("#text", "hello from the page")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        self.assertIn("hello from the page", eventually(self.agent.stop_hook, what="the agent to get it"))
-        c.js("document.getElementById('to').value = 'all'")
-        c.js("document.getElementById('task').checked = true")
-        c.type_into("#text", "a task from the page")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        task = self.m.owner.wait_for("a task from the page")
-        self.assertEqual(task["kind"], "task")
-        c.js("document.getElementById('task').checked = false")
-        self.agent.call("hub_take", id=task["id"])
-        c.until("document.getElementById('log').innerText.includes('took task #%s')" % task["id"])
-
-    def test_agent_messages_are_shown_as_text(self):
-        c = self.chrome
-        self.agent.call("hub_send", to="Owner", text='<img src=x onerror="window.pwned=1"><b>bold?</b>')
-        c.until("document.getElementById('log').innerText.includes('onerror=')", what="the message on the page")
-        time.sleep(0.5)
-        self.assertIsNone(c.js("window.pwned"))
-        self.assertEqual(c.js("document.querySelectorAll('#log img[src=x], #log b.bold').length"), 0)
-        self.assertEqual(c.errors, [])
-
-    def test_set_a_role_from_the_agent_card(self):
-        c = self.chrome
-        sel = "select[aria-label='Role for %s']" % self.agent.name
-        c.until("!!document.querySelector(%s)" % json.dumps(sel))
-        c.js("(() => { const s = document.querySelector(%s); s.value = 'qa'; s.dispatchEvent(new Event('change')); })()"
-             % json.dumps(sel))
-        eventually(lambda: self.m.owner.row(self.agent.name)["role"] == "qa", what="the role to be set")
-        self.assertIn("Your role in this chat is now: QA", self.agent.stop_hook())
-        c.until("document.getElementById('agents').innerText.includes('QA')")
-
-    def test_session_controls_follow_its_state(self):
-        c = self.chrome
-        c.until("state.agents.length > 0", what="the agents")
-        # Rows as the server sends them (the page's own data), drawn by the page's own code.
-        out = c.js("""(() => {
-            const saved = state.agents, savedModels = toolModels;
-            toolModels = {claude: [["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]};
-            const base = state.agents[0];
-            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false}, extra);
-            state.agents = [
-              row("running-one", {session: {app: "terminal", running: true, since: state.now - 60, tool: "claude", reopen: true}}),
-              row("in-the-app", {session: {app: "claude-app", running: true, since: state.now, tool: "claude", reopen: true}}),
-              row("closed-one", {session: {app: "terminal", running: false, since: state.now - 240, tool: "claude", reopen: true}}),
-              row("closed-cursor", {session: {app: "terminal", running: false, since: state.now, tool: "cursor", reopen: false}}),
-              row("far-one", {remote: true, device: "laptop", session: null}),
-              row("never-reported", {session: null})];
-            state.names = "";
-            renderAgents();
-            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
-            const buttons = (n) => [...card(n).querySelectorAll('button')].map(b => b.textContent);
-            const out = {
-              running: buttons("running-one"), app: card("in-the-app").innerText,
-              closed: buttons("closed-one"), closedText: card("closed-one").innerText,
-              far: buttons("far-one"), never: buttons("never-reported"), cursor: buttons("closed-cursor"),
-              models: [...card("running-one").querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
-            };
-            state.agents = saved; toolModels = savedModels; state.names = ""; renderAgents();  // as the server says
-            return out;
-        })()""")
-        self.assertIn("Stop", out["running"])
-        self.assertNotIn("Reopen", out["running"])
-        self.assertIn("Running in the Claude app", out["app"])
-        self.assertIn("Reopen", out["closed"])
-        self.assertNotIn("Stop", out["closed"])
-        self.assertIn("Session closed 4 min ago", out["closedText"])
-        for name in ("far", "never", "cursor"):  # no session it could act on here (Cursor: not yet)
-            self.assertNotIn("Stop", out[name])
-            self.assertNotIn("Reopen", out[name])
-        self.assertIn("Switch running-one's model", out["models"])
-        self.assertEqual(c.errors, [])
-
-    def test_avatars_follow_the_profile(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        c.js("""(() => {
-            window.savedAgents = state.agents;
-            const base = state.agents[0];
-            const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false, session: null}, extra);
-            state.agents = [
-              row("rocket-cursor", {client: "cursor", picture: "preset:rocket", colour: ""}),
-              row("lost-picture", {client: "claude", picture: "file:" + "0".repeat(16), colour: "#000000",
-                                   remote: true, device: "pc", os: "windows"})];
-            state.names = "";
-            renderAgents();
-            buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi", ts: state.now})
-              .setAttribute("id", "avatar-probe");
-        })()""")
-        c.until("""(() => { const a = [...document.querySelectorAll('#agents .agent')]
-                     .find(e => e.innerText.includes('lost-picture')); return a && !a.querySelector('.avatar img'); })()""",
-                what="the missing picture to fall back to initials")
-        c.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-color-scheme", "value": "dark"}])
-        self.addCleanup(c.call, "Emulation.setEmulatedMedia", features=[])
-        self.assertTrue(c.js("matchMedia('(prefers-color-scheme: dark)').matches"))
-        out = c.js("""(() => {
-            const card = (n) => [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes(n));
-            const av = (n) => card(n).querySelector('.avatar');
-            const probe = buildMessage({id: "av-1", seq: 1, kind: "msg", from: "rocket-cursor", to: "all", text: "hi",
-                                        ts: state.now});
-            const out = {
-              rocket: av("rocket-cursor").innerText, rocketColour: av("rocket-cursor").style.getPropertyValue("--av"),
-              mark: av("rocket-cursor").querySelector('.mark').textContent,
-              lost: av("lost-picture").querySelector('.initials').textContent,
-              lostInk: getComputedStyle(av("lost-picture").querySelector('.initials')).color,
-              ring: getComputedStyle(av("lost-picture")).boxShadow,
-              os: !!av("lost-picture").querySelector('.os'), osTitle: av("lost-picture").querySelector('.os').title,
-              inMessage: !!probe.querySelector('.avatar'),
-              pictureAction: [...card("rocket-cursor").querySelectorAll('summary')].map(s => s.textContent),
-              remoteAction: [...card("lost-picture").querySelectorAll('summary')].map(s => s.textContent),
-            };
-            state.agents = window.savedAgents; state.names = ""; renderAgents();  // as the server says
-            return out;
-        })()""")
-        self.assertIn("\U0001F680", out["rocket"])
-        self.assertEqual(out["rocketColour"], "#1a1a1a")  # Cursor's own colour
-        self.assertEqual(out["mark"], "Cu")
-        self.assertEqual(out["lost"], "LP")  # its picture is on another machine: initials, not a broken image
-        self.assertEqual(out["lostInk"], "rgb(255, 255, 255)")  # white on black
-        self.assertNotEqual(out["ring"], "none")
-        self.assertTrue(out["os"])  # two machines: each agent says which OS it runs on
-        self.assertEqual(out["osTitle"], "Windows")
-        self.assertTrue(out["inMessage"])
-        self.assertIn("Picture", out["pictureAction"])
-        self.assertNotIn("Picture", out["remoteAction"])  # change it on its own machine
-        self.assertEqual(c.errors, [])
-
-    def test_message_avatars_survive_roster_changes(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        out = c.js("""(() => {
-            const saved = state.agents;
-            const base = state.agents[0];
-            const node = buildMessage({id: "av-2", seq: 2, kind: "msg", from: base.agent, to: "all", text: "kept", ts: state.now});
-            $("log").append(node);
-            state.agents = saved.concat([Object.assign({}, base, {agent: "newcomer", session: null})]);  // someone joins
-            renderAgents();
-            const kept = node.querySelector('[data-who].avatar, .meta > span:first-child').className;
-            state.agents = saved.concat([Object.assign({}, base, {agent: "odd", client: "constructor", session: null}),
-                                         Object.assign({}, base, {agent: "odder", client: "__proto__", colour: "zz",
-                                                                  session: null})]);
-            let threw = "";
-            try { renderAgents(); } catch (e) { threw = String(e); }
-            const odd = [...document.querySelectorAll('#agents .agent')].find(e => e.innerText.includes("odd"));
-            const oddColour = odd ? odd.querySelector('.avatar').style.getPropertyValue("--av") : "";
-            node.remove(); state.agents = saved; state.names = ""; renderAgents();
-            return {kept, threw, oddColour};
-        })()""")
-        self.assertIn("avatar", out["kept"])  # still drawn as an avatar after the names changed
-        self.assertEqual(out["threw"], "")  # a tool called "constructor" is just an unknown tool
-        self.assertEqual(out["oddColour"], "#6b7280")
-        self.assertEqual(c.errors, [])
-
-    def test_closing_the_picture_menu_shows_what_changed(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        c.js("""(() => { window.savedAgents = state.agents;
-                 state.agents = [Object.assign({}, state.agents[0], {agent: "menu-one", remote: false, session: null})];
-                 renderAgents(); })()""")
-        c.js("document.querySelector('#agents .picmenu').open = true")
-        c.js("""(() => { state.agents = [Object.assign({}, state.agents[0], {status: "changed while open"})];
-                 renderAgents(); })()""")
-        self.assertNotIn("changed while open", c.js("$('agents').innerText"))  # frozen while choosing
-        c.js("document.querySelector('#agents .picmenu').open = false")
-        c.until("$('agents').innerText.includes('changed while open')", what="the cards to catch up")
-        c.js("state.agents = window.savedAgents; renderAgents()")
-
-    def test_one_machine_shows_no_os_badge(self):
-        c = self.chrome
-        c.until("state.agents.length > 0 && state.tools", what="the agents")
-        self.assertGreater(c.js("document.querySelectorAll('#agents .avatar').length"), 0)
-        self.assertEqual(c.js("document.querySelectorAll('#agents .avatar .os').length"), 0)
-
-    def test_attach_a_file(self):
-        c = self.chrome
-        path = H.TMP / "from-the-page.txt"
-        path.write_text("attached from the page\n")
-        node = c.call("DOM.querySelector", nodeId=c.call("DOM.getDocument")["root"]["nodeId"], selector="#files")
-        c.call("DOM.setFileInputFiles", nodeId=node["nodeId"], files=[str(path)])
-        c.until("document.getElementById('pending').innerText.includes('from-the-page.txt')", what="the file to be attached")
-        c.js("document.getElementById('to').value = %s" % json.dumps(self.agent.name))
-        c.type_into("#text", "see the file")
-        c.js("document.getElementById('text').dispatchEvent(new Event('input'))")
-        c.click("#send")
-        got = eventually(self.agent.stop_hook, what="the agent to get the file")
-        fid = got.split("[file ")[1].split(":")[0]
-        self.assertIn("attached from the page", self.agent.call("hub_file", id=fid))
-
-    def test_a_page_that_was_offline_catches_up_on_everything(self):
-        c = self.chrome
-        c.until("document.querySelectorAll('#log .msg').length > 0 || true")
-        before = c.js("document.querySelectorAll('#log .msg').length")
-        c.call("Network.emulateNetworkConditions", offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        time.sleep(1)
-        for i in range(600):
-            self.agent.call("hub_send", to="Owner", text="overnight %d" % i)
-        c.call("Network.emulateNetworkConditions", offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
-        c.js("window.dispatchEvent(new Event('online'))")
-        c.until("document.querySelectorAll('#log .msg').length >= %d" % (before + 600), timeout=60,
-                what="all 600 messages on the page")
-        texts = c.js("[...document.querySelectorAll('#log .msg .body')].map(e => e.innerText)"
-                     ".filter(t => t.startsWith('overnight '))")
-        self.assertEqual(texts, ["overnight %d" % i for i in range(600)])
-
-    def test_the_task_sheet_on_the_page(self):
-        c = self.chrome
-        c.click("#view-tasks")
-        c.type_into("#t-title", "Write the release notes")
-        c.type_into("#t-areas", "docs/")
-        c.js("document.getElementById('task-form').requestSubmit()")
-        c.until("document.getElementById('sheet').innerText.includes('Write the release notes')", what="the new task")
-        self.assertIn("Write the release notes", self.agent.call("hub_tasks"))
-        row = c.js("[...document.querySelectorAll('#sheet tbody tr')].findIndex(r => r.innerText.includes('release notes'))")
-        c.js("document.querySelectorAll('#sheet tbody tr')[%d].querySelector('button[title^=\"Mark\"]').click()" % row)
-        c.until("document.querySelectorAll('#sheet tbody tr')[%d].className === 'done'" % row, what="done")
-        c.click("#view-chat")
-        self.assertEqual(c.errors, [])
-
-    def test_the_commands_tab_and_the_connection_line(self):
-        c = self.chrome
-        c.until("!document.getElementById('link').hidden", what="the connection line")
-        self.assertIn("This machine only", c.js("document.getElementById('link').innerText"))
-        c.click("#view-commands")
-        c.until("document.querySelectorAll('#cmd-list .cmd').length > 40", what="the commands")
-        row = "[...document.querySelectorAll('#cmd-list .cmd')].find(r => r.querySelector('code').innerText === 'crewchat projects')"
-        c.js(row + ".querySelector('button.run').click()")
-        c.until("!%s.querySelector('pre').hidden && %s.querySelector('pre').innerText.length > 0" % (row, row),
-                timeout=60, what="what projects printed")
-        self.assertEqual(c.js(row + ".querySelector('pre').className"), "", c.js(row + ".querySelector('pre').innerText"))
-        # Searching hides rows; clearing the search brings them back with their output still there.
-        shown = "[...document.querySelectorAll('#cmd-list .cmd')].filter(r => !r.hidden).length"
-        everything = c.js(shown)
-        c.type_into("#cmd-filter", "task sheet")
-        c.until("%s < %d" % (shown, everything), what="the search to hide rows")
-        c.js("const f = document.getElementById('cmd-filter'); f.value = ''; f.dispatchEvent(new Event('input'))")
-        self.assertEqual(c.js(shown), everything)
-        self.assertFalse(c.js(row + ".querySelector('pre').hidden"))
-        c.click("#view-chat")
-        self.assertEqual(c.errors, [])
-
-    def test_what_is_hidden_is_not_shown(self):
-        c = self.chrome
-        # What the agent may do without asking depends on the tool: "Also edit files" is Claude Code's only.
-        c.click("#add-agent")
-        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list")
-        c.js("const t = document.getElementById('l-tool'); t.value = [...t.options].find(o => o.value !== 'claude').value;"
-             "t.dispatchEvent(new Event('change'))")
-        self.assertNotIn("edits", c.js("[...document.getElementById('l-perms').options].map(o => o.value)"))
-        self.assertEqual(self.shown_though_hidden(), [])
-        c.click("#l-cancel")
-        # Opened again, the list starts on its first tool: the box shows exactly when that is Claude Code.
-        c.js("document.getElementById('l-tool').replaceChildren()")  # so that the wait below sees the new list
-        c.click("#add-agent")
-        c.until("document.getElementById('l-tool').options.length > 1", what="the tool list again")
-        self.assertEqual("edits" in c.js("[...document.getElementById('l-perms').options].map(o => o.value)"),
-                         c.js("document.getElementById('l-tool').value === 'claude'"))
-        c.click("#l-cancel")
-        self.assertEqual(c.errors, [])
-
-    def test_phone_and_dark_mode(self):
-        c = self.chrome
-        try:
-            c.size(375, 812, mobile=True, dark=True)
-            c.open(self.m.url + self.PATH)
-            c.until("!!document.getElementById('log')")
-            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
-            bg = c.js("getComputedStyle(document.body).backgroundColor")
-            self.assertNotEqual(bg, "rgb(255, 255, 255)")
-            self.assertEqual(c.errors, [])
-        finally:
-            c.size(1280, 900)
-            c.open(self.m.url + self.PATH)
-            c.until("!!document.getElementById('log')")
-
-    def test_add_an_agent_form_opens_and_closes(self):
-        c = self.chrome
-        c.click("#add-agent")
-        c.until("!document.getElementById('launch').hidden || getComputedStyle(document.getElementById('launch')).display !== 'none'",
-                what="the form to open")
-        c.until("document.getElementById('l-folder').options.length > 0", what="the folder list")
-        self.assertIn("notes-app", c.js("document.getElementById('l-folder').innerText"))
-        c.click("#l-cancel")
-        self.assertEqual(c.errors, [])
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
@@ -441,10 +138,50 @@ class NewPage(Signed):
         self.assertIn(["D\nDemo", "page"], tabs)  # (and one for each other project, not current)
         self.assertEqual([t for t in tabs if t[1] == "page"], [["D\nDemo", "page"]])
         self.assertIn("1 agent", c.js("$('space-meta').textContent"))
-        self.assertTrue(c.js("$('classic-link').href").endswith("/classic"))
         self.assertTrue(c.js("$('panel').hidden"))
         self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])
+
+    def test_agent_messages_are_shown_as_text(self):
+        c = self.chrome
+        self.agent.call("hub_send", to="Owner", text='<img src=x onerror="window.pwned=1"><b>bold?</b>')
+        c.until("$('log').innerText.includes('onerror=')", what="the message on the page")
+        time.sleep(0.5)
+        self.assertIsNone(c.js("window.pwned"))
+        self.assertEqual(c.js("document.querySelectorAll('#log img[src=x], #log b').length"), 0)
+        self.assertEqual(c.errors, [])
+
+    def test_attach_a_file(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        path = H.TMP / "from-the-page.txt"
+        path.write_text("attached from the page\n")
+        node = c.call("DOM.querySelector", nodeId=c.call("DOM.getDocument")["root"]["nodeId"], selector="#files")
+        c.call("DOM.setFileInputFiles", nodeId=node["nodeId"], files=[str(path)])
+        c.until("$('pending').innerText.includes('from-the-page.txt')", what="the file to be attached")
+        c.type_into("#text", "@%s see the file" % self.agent.name)
+        c.js("$('text').dispatchEvent(new Event('input'))")
+        c.click("#send")
+        got = eventually(self.agent.stop_hook, what="the agent to get the file")
+        fid = got.split("[file ")[1].split(":")[0]
+        self.assertIn("attached from the page", self.agent.call("hub_file", id=fid))
+        self.assertEqual(c.errors, [])
+
+    def test_a_page_that_was_offline_catches_up_on_everything(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        before = c.js("document.querySelectorAll('#log .msg').length")
+        c.call("Network.emulateNetworkConditions", offline=True, latency=0, downloadThroughput=-1, uploadThroughput=-1)
+        time.sleep(1)
+        for i in range(600):
+            self.agent.call("hub_send", to="Owner", text="overnight %d" % i)
+        c.call("Network.emulateNetworkConditions", offline=False, latency=0, downloadThroughput=-1, uploadThroughput=-1)
+        c.js("window.dispatchEvent(new Event('online'))")
+        c.until("document.querySelectorAll('#log .msg').length >= %d" % (before + 600), timeout=60,
+                what="all 600 messages on the page")
+        texts = c.js("[...document.querySelectorAll('#log .msg .body')].map(e => e.innerText)"
+                     ".filter(t => t.startsWith('overnight '))")
+        self.assertEqual(texts, ["overnight %d" % i for i in range(600)])
 
     def test_mention_writes_to_one_agent_and_post_as_task(self):
         c = self.chrome
@@ -528,6 +265,35 @@ class NewPage(Signed):
         c.click("#view-commands")
         c.until("$('panel').hidden && $('view-commands').getAttribute('aria-pressed') === 'false'", what="Commands to close")
         self.assertEqual(c.errors, [])
+
+    def test_new_agent_browses_makes_and_connects_a_folder(self):
+        c = self.chrome
+        top = H.TMP / "browse-here"
+        (top / "apps" / "web").mkdir(parents=True, exist_ok=True)
+        try:
+            c.js("openLaunch(); showStep(1)")
+            c.js("$('l-path').value = %s" % json.dumps(str(top)))
+            c.click("#l-browse")
+            c.until("[...document.querySelectorAll('#l-browser .dirs button')].some(b => b.textContent.includes('apps'))",
+                    what="the folder list")
+            c.js("[...document.querySelectorAll('#l-browser .dirs button')].find(b => b.textContent.includes('apps')).click()")
+            c.until("$('l-path').value.endsWith('/apps') && $('l-browser').innerText.includes('web')", what="into apps")
+            c.js("document.querySelector('#l-browser .make input').value = 'mobile'")
+            c.js("[...document.querySelectorAll('#l-browser .make button')].find(b => b.textContent === 'New folder').click()")
+            c.until("$('l-path').value.endsWith('/apps/mobile')", what="into the new folder")
+            self.assertTrue((top / "apps" / "mobile").is_dir())
+            c.js("[...document.querySelectorAll('#l-browser .make button')].find(b => b.textContent === 'Connect this folder').click()")
+            c.until("$('l-folder').value.endsWith('/apps/mobile') && $('l-browser').hidden", timeout=60, what="connected")
+            self.assertTrue((top / "apps" / "mobile" / ".mcp.json").is_file())
+            # A path that is not there: Connect offers to make it.
+            c.js("$('l-path').value = %s" % json.dumps(str(top / "apps" / "desktop")))
+            c.click("#l-connect")
+            c.until("$('launch-note').innerText.includes('Create it and connect')", what="the offer to make it")
+            c.js("[...$('launch-note').querySelectorAll('button')].find(b => b.textContent === 'Create it and connect').click()")
+            c.until("$('l-folder').value.endsWith('/apps/desktop')", timeout=60, what="made and connected")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("$('launch').close()")
 
     def test_errors_on_the_task_board_are_shown_there_and_keep_the_task(self):
         c = self.chrome
@@ -753,6 +519,87 @@ class NewPage(Signed):
         c.until("$('log').innerText.includes('Done with the button')", what="the message on the page")
         c.js("$('log').scrollTop = $('log').scrollHeight; markRead()")
         c.until("!state.needs.some(n => n.kind === 'message')", what="read while in front")
+    def test_allow_or_deny_a_permission_prompt(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+
+        def ask(command):  # the agent's tool waits on its prompt; its hook asks the page
+            out = {}
+            t = threading.Thread(target=lambda: out.update(text=self.agent.hook(
+                "permission", extra={"tool_name": "Bash", "tool_input": {"command": command}})))
+            t.start()
+            c.until("$('needs-list').innerText.includes(%s)" % json.dumps(command), what="the prompt in Needs you")
+            return t, out
+
+        t, out = ask("npm publish --tag next")
+        item = "[...document.querySelectorAll('#needs-list .need.ask')].find(e => e.innerText.includes('npm publish'))"
+        self.assertIn("ASKS PERMISSION", c.js(item + ".querySelector('.k').innerText").upper())
+        self.assertIn(self.agent.name, c.js(item + ".textContent"))
+        self.assertEqual(c.js("$('needs-list').firstElementChild.classList.contains('ask')"), True)  # first of all
+        c.js(item + ".querySelector('button:not(.ghost)').click()")
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"]["decision"], {"behavior": "allow"})
+        c.until("!$('needs-list').innerText.includes('npm publish')", what="the prompt to go")
+
+        t, out = ask("<img src=x onerror=window.pwned=1>")
+        c.js("[...document.querySelectorAll('#needs-list .need.ask button')].find(b => b.textContent === 'Deny').click()")
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"]["decision"]["behavior"], "deny")
+        self.assertIsNone(c.js("window.pwned"))
+        self.assertEqual(self.shown_though_hidden(), [])
+        self.assertEqual(c.errors, [])
+
+    def test_notifications_subscribe_to_push_and_a_push_shows_one(self):
+        c = self.chrome
+        self.addCleanup(c.js, "try { localStorage.removeItem(notifyKey()); } catch (e) {} showBell()")
+        # The page subscribes when notifications are turned on (the push service stubbed: no Google here).
+        c.js("""window.pushed = []; window.realPost = postJSON;
+                postJSON = (path, body) => { window.pushed.push([path, body]); return window.realPost(path, body); };
+                Object.defineProperty(navigator.serviceWorker, 'ready', {configurable: true, value: Promise.resolve({pushManager: {
+                  getSubscription: async () => null,
+                  subscribe: async (o) => { window.serverKey = o.applicationServerKey.length;
+                                            return {endpoint: 'https://fcm.googleapis.com/fcm/send/e2e'}; }}})});
+                window.Notification = class { static requestPermission() { return Promise.resolve('granted'); } };
+                Notification.permission = 'granted';""")
+        self.addCleanup(c.js, "postJSON = window.realPost; delete navigator.serviceWorker.ready; delete window.Notification")
+        c.js("document.querySelector('[data-notify=mentions]').click()")
+        c.until("window.pushed.some(p => p[1].op === 'mode')", what="the subscription sent")
+        self.assertEqual(c.js("window.serverKey"), 65)  # this machine's VAPID key, uncompressed P-256
+        self.assertEqual(c.js("window.pushed.find(p => p[1].op === 'mode')[1]"),
+                         {"op": "mode", "endpoint": "https://fcm.googleapis.com/fcm/send/e2e", "mode": "mentions"})
+        # A push reaches the service worker (as from the push service): it shows a notification.
+        c.call("Browser.grantPermissions", permissions=["notifications"], origin=self.m.url)
+        c.call("ServiceWorker.enable")
+        reg = eventually(lambda: c.js("0") or next((r["registrationId"] for e in c.events
+                                                    if e["method"] == "ServiceWorker.workerRegistrationUpdated"
+                                                    for r in e["params"]["registrations"]
+                                                    if r["scopeURL"].startswith(self.m.url)), None), what="the service worker")
+        # Its fetch of what the push is about is signed in, as the page is (its cookie goes with it).
+        worker = next(v["targetId"] for e in c.events if e["method"] == "ServiceWorker.workerVersionUpdated"
+                      for v in e["params"]["versions"] if v["registrationId"] == reg and v.get("targetId"))
+        session = c.call("Target.attachToTarget", targetId=worker, flatten=True)["sessionId"]
+        c.n += 1
+        c.ws.send(json.dumps({"id": c.n, "sessionId": session, "method": "Runtime.evaluate", "params": {
+            "expression": "fetch('/api/push', {method: 'POST', headers: {'Content-Type': 'application/json'},"
+                          " body: JSON.stringify({op: 'notices', endpoint: 'x'})}).then(r => r.status)",
+            "awaitPromise": True, "returnByValue": True}}))
+        while True:
+            msg = json.loads(c.ws.recv())
+            if msg.get("id") == c.n:
+                break
+        self.assertEqual(msg["result"]["result"]["value"], 200)
+        c.call("Target.detachFromTarget", sessionId=session)
+        shown = ("navigator.serviceWorker.getRegistration().then(r => r.getNotifications())"
+                 ".then(n => n.some(x => x.body === 'Something new needs you.'))")
+
+        def pushed():  # a push that reaches a worker still starting is dropped: send it again until one shows
+            c.call("ServiceWorker.deliverPushMessage", origin=self.m.url, registrationId=reg, data="")
+            return any(c.js(shown) or time.sleep(0.2) for _ in range(10))
+        c.js("navigator.serviceWorker.ready.then(() => true)")
+        eventually(pushed, timeout=30, what="the notification")
+        c.call("ServiceWorker.disable")
+        self.assertEqual(c.errors, [])
+
     def test_dragging_a_card_with_the_mouse(self):
         c = self.chrome
         c.click("#view-tasks")
@@ -833,6 +680,37 @@ class NewPage(Signed):
         self.assertNotIn("hello", shown.lower().replace("elephant", ""))
         c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
         self.assertEqual(c.js("[...$('log').children].filter(n => n.hidden).length"), 0)
+
+    def test_what_the_ui_test_found(self):
+        c = self.chrome
+        # A search that matches nothing says so, and the note goes with the search.
+        c.js("$('search').value = 'zzz-nothing'; $('search').dispatchEvent(new Event('input'))")
+        self.assertFalse(c.js("$('search-none').hidden"))
+        self.agent.call("hub_send", to="Owner", text="zzz-nothing after all")  # a match arriving during the search
+        c.until("$('search-none').hidden && $('log').innerText.includes('zzz-nothing after all')", what="the match shown")
+        c.js("$('search').value = ''; $('search').dispatchEvent(new Event('input'))")
+        self.assertTrue(c.js("$('search-none').hidden"))
+        # New agent's templates read as their role's name; no install notes for tools that are not here.
+        c.js("openLaunch()")
+        c.until("$('l-template').options.length > 1", what="the templates")
+        self.assertIn("Lead role", c.js("[...$('l-template').options].map(o => o.text)"))
+        self.assertNotIn("Needs", c.js("$('launch-note').textContent"))  # no install notes for tools not here
+        c.click("#l-cancel")
+        # An agent silent for long is not shown working, whatever its hooks said last.
+        self.assertEqual(c.js("doing({activity: 'working', seen: state.now - 1200})"), "Not heard from lately")
+        self.assertEqual(c.js("doing({activity: 'working', seen: state.now})"), "Working")
+        # A message to you in Needs you: to the message, marked, with a reply to its sender started.
+        c.js("Object.defineProperty(document, 'hidden', {value: true, configurable: true})")  # unread while away
+        self.addCleanup(c.js, "delete document.hidden")
+        self.agent.call("hub_send", to="Owner", text="Can you look at the build?")
+        c.until("$('needs-list').innerText.includes('Can you look at the build?')", what="the message in Needs you")
+        c.js("""delete document.hidden; $('text').value = '';
+                [...document.querySelectorAll('#needs-list .need')].find(b => b.innerText.includes('look at the build')).click()""")
+        self.assertEqual(c.js("$('text').value"), "@%s " % self.agent.name)
+        self.assertTrue(c.js("[...document.querySelectorAll('#log .msg.flash')].some(m => m.innerText.includes('look at the build'))"))
+        self.assertTrue(c.js("$('agent-pane').hidden"))
+        c.js("$('text').value = ''")
+        self.assertEqual(c.errors, [])
 
     def test_a_new_project_from_the_tab_menu(self):
         c = self.chrome

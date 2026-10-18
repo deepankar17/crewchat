@@ -1,5 +1,58 @@
 # Changelog
 
+## Unreleased
+
+- **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
+  with its push service; when something new needs you and no page of the project is open, the
+  server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the
+  page's service worker fetches what is new from the server and shows it. Nothing from the chat goes
+  through the push service. Works on a computer, and on a phone with the app installed, at an
+  `https` address (`tailscale serve`). Standard library only: the signing is plain Python.
+- **Allow or Deny a Claude Code agent's permission prompts from the page.** When an agent wants to do
+  something it has not been allowed, a new `PermissionRequest` hook puts it first in **Needs you**: the
+  agent, the tool, and the command, file or address in full, with **Allow** and **Deny** (and a
+  notification while the page is in the background). With no answer in 10 minutes, or one given in its
+  terminal, the item goes and Claude Code asks there as before. `crewchat setup --permissions terminal`
+  keeps prompts in the terminal; `/api/permission` answers one. The server adds the hook to folders
+  connected before.
+- **The classic page is gone.** The page from before 0.14, kept at `/classic` for one release, is
+  removed with its link in the project menu.
+- **New agent says what a tool still needs.** Picking a tool shows whether it is installed, signed in
+  (Claude Code, Cursor, Codex and OpenCode by their own status commands; Gemini CLI and Qwen Code by
+  their settings), and what it asks once in the chosen folder (trust; Codex's and Gemini CLI's review of
+  crewchat's hooks; OpenCode's first setup of crewchat's plugin), with the command to run and **Check
+  again** (`/api/tool-check`, the owner's only, for the project's own folders).
+- **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
+  chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
+  and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
+  `connect`).
+- **Fixes from a UI test of every page element.** An answered question in Needs you waits on the agent,
+  not you; a message there takes you to it and starts a reply; a search with no match says so; an
+  agent silent for long no longer shows Working; the Roles list says what each role does; New
+  agent's templates are named after their role and it no longer lists install notes for every tool
+  not here; New project points at New agent's Connect; the message box's hint fits a phone.
+- **More agent tools: Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a
+  folder for each one installed (`--client codex|gemini|qwen|opencode` for one), and **New agent**
+  starts them, with what each may do without asking (Codex its workspace sandbox or none; Gemini and
+  Qwen `auto_edit` or `--yolo`). Gemini CLI and Qwen Code get crewchat in the folder's settings, its
+  tools trusted; OpenCode in its `opencode.json` (not a committed one); Codex once in
+  `~/.codex/config.toml`, as `crewchat stdio --local-only` (it serves only folders connected to this
+  machine's chat, never a server a cloned repository's `.mcp.json` names).
+  Uninstall takes crewchat out of all of them.
+- **Codex CLI, Gemini CLI, Qwen Code and OpenCode get their messages at the end of each turn**, as Claude
+  Code and Cursor do: the first prompt asks the agent to link, a message that arrives starts its next
+  turn, and its tool calls show what it is doing. Codex's hooks go in crewchat's block of
+  `~/.codex/config.toml` (Codex asks once to review them, and keeps that through upgrades); Gemini
+  CLI's and Qwen Code's in the folder's `.gemini/` or `.qwen/settings.json`, beside your own (each
+  asks once to trust them); OpenCode runs them from crewchat's plugin, `.opencode/plugins/crewchat.js`.
+- **Reopen for Codex CLI, Gemini CLI, Qwen Code and OpenCode.** Their hooks now report each session,
+  so **Stop** and **Reopen** work for them as for Claude Code: Codex with `codex resume`, Gemini CLI
+  and Qwen Code with `--resume`, OpenCode with `--session` (it does not send a prompt with a session
+  it continues, so crewchat's plugin does, once). OpenCode's session ids (`ses_…`) are now kept.
+- **Codex's "edit and run commands" permission works with current Codex.** It no longer has
+  `--full-auto`, so New agent refused it; crewchat now asks for what that was, `--sandbox
+  workspace-write --ask-for-approval on-request`.
+
 ## 0.14.0
 
 - **Hooks never hold up an agent when crewchat is off.** A hook that cannot reach the server for

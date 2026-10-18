@@ -32,6 +32,7 @@ import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 crewchat.Handler.log_message = lambda *args: None  # keep the request log out of the test output
 crewchat.user_home = lambda: Path(TMP) / "user"  # never the real ~/.claude.json or ~/.cursor
 os.environ.pop("CLAUDE_CONFIG_DIR", None)
+os.environ.pop("CODEX_HOME", None)  # Codex's settings: under user_home too
 
 
 def cli(*argv):
@@ -1027,6 +1028,18 @@ class Activity(Base):
                          "Editing Login.kt")
         self.assertEqual(say("claude", {"tool_name": "Read", "tool_input": {"file_path": ["a", "b"]}}), "Reading")
         self.assertEqual(say("cursor", {"tool_name": "hub_send"}), "")
+        # Gemini CLI's and Codex's own tool names and arguments.
+        self.assertEqual(say("gemini", {"tool_name": "replace", "tool_input": {"file_path": "/x/Login.kt"}}), "Editing Login.kt")
+        self.assertEqual(say("gemini", {"tool_name": "read_file", "tool_input": {"absolute_path": "/x/.env"}}), "Reading .env")
+        self.assertEqual(say("gemini", {"tool_name": "run_shell_command", "tool_input": {"command": "npm test --x=1"}}),
+                         "Running npm test")
+        self.assertEqual(say("qwen", {"tool_name": "edit", "tool_input": {"file_path": "/x/App.kt"}}), "Editing App.kt")
+        self.assertEqual(say("opencode", {"tool_name": "read", "tool_input": {"filePath": "/x/main.py"}}), "Reading main.py")
+        self.assertEqual(say("opencode", {"tool_name": "bash", "tool_input": {"command": "npm test"}}), "Running npm test")
+        self.assertEqual(say("codex", {"tool_name": "shell", "tool_input": {"command": ["bash", "-lc", "pytest -q x"]}}),
+                         "Running pytest")
+        self.assertEqual(say("codex", {"tool_name": "exec_command", "tool_input": {"command": ["git", "status"]}}),
+                         "Running git status")
         self.assertEqual(say("cursor", {"tool_name": "browser_navigate", "command": "npx @playwright/mcp"}), "Using browser_navigate")
         for leaked in ("abc", "xyz", "s3cret", "password", "/x/app", "/secret"):
             for out in (say("claude", {"tool_name": "Bash", "tool_input": {"command": "TOKEN=abc npm test --token=xyz"}}),
@@ -1100,6 +1113,29 @@ class NeedsYou(Base):
         self.assertIn("given_back", left)
         b.text("hub_take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
+
+    def test_an_answered_question_waits_on_the_agent_not_the_owner(self):
+        a, a_name = self.agent()
+        mid = self.add("Pick the icons")
+        a.text("hub_take", id=mid)
+        a.text("hub_update", id=mid, status="blocked", note="Outline or filled?")
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: Outline" % mid)  # as the answer box in Needs you sends it
+        self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])  # the agent's turn now
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s1: about another task" % mid)
+        a.text("hub_update", id=mid, status="blocked", note="Which size?")  # asks again: it needs the owner again
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        b, b_name = self.agent()
+        self.hub.send(crewchat.OWNER, b_name, "Re #%s: Small" % mid)  # to another agent: not an answer to this one
+        self.hub.send(crewchat.OWNER, "all", "Re #%s: Small" % mid)
+        self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
+        review = self.add("Polish the icons")
+        a.text("hub_take", id=review)
+        a.text("hub_update", id=review, status="review", note="Have a look")
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: thanks" % review)
+        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])  # a review waits for Mark done
+        for t in (mid, review):
+            crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": t, "status": "done"})
 
     def test_a_note_is_credited_to_the_agent_that_wrote_it(self):
         a, a_name = self.agent()
@@ -1307,7 +1343,7 @@ class Launching(Base):
     """Add an agent from the chat page: the launcher is replaced, so no window opens."""
 
     def setUp(self):
-        self.launched = []
+        self.launched, self.opened_env = [], []
         self.saved = crewchat.launch_agent, crewchat.find_tool
         self.real_launch_agent = crewchat.launch_agent
         self.models, self.advisors = [], []
@@ -1335,8 +1371,88 @@ class Launching(Base):
         status, body, _ = self.raw("/api/launch", opener=opener)
         options = json.loads(body)
         self.assertIn({"path": str(self.folder), "name": self.folder.name, "place": self.place}, options["folders"])
-        self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor"])
+        self.assertEqual([t["id"] for t in options["tools"]], ["claude", "cursor", "codex", "gemini", "qwen", "opencode"])
         self.assertEqual(self.raw("/api/launch")[0], 401)
+
+    def test_new_agent_says_what_a_tool_still_needs(self):
+        home = Path(tempfile.mkdtemp(prefix="tool-home-", dir=TMP)).resolve()
+        folder = str(self.folder)
+        answers = {}  # what each tool's own status command says: (exit code, output)
+        ready = lambda tool, folder="": [(i["state"], i["text"], i["fix"]) for i in  # noqa: E731
+                                         crewchat.tool_readiness(tool, folder, fresh=True)]
+        with mock.patch.object(crewchat, "user_home", lambda: home), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(home / ".codex")}), \
+                mock.patch.object(crewchat, "status_of", lambda command: answers.get(command[1], (None, ""))):
+            for key in ("GEMINI_API_KEY", "OPENAI_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA",
+                        "CLAUDE_CONFIG_DIR"):
+                os.environ.pop(key, None)
+            # Signed in, or not, as each tool's own status command says.
+            answers["auth"] = (0, '{"loggedIn": false, "authMethod": "none"}')
+            self.assertEqual(ready("claude")[0], ("todo", "Claude Code is not signed in", "claude, then /login"))
+            answers["auth"] = (0, 'warning\n{"loggedIn": true, "authMethod": "claude.ai"}')
+            self.assertEqual(ready("claude")[0][:2], ("ok", "Signed in"))
+            answers["status"] = (0, "Not logged in")
+            self.assertEqual(ready("cursor")[0], ("todo", "Cursor is not signed in", "cursor-agent login"))
+            answers["status"] = (0, "\u2713 Logged in as someone")
+            self.assertEqual(ready("cursor")[0][:2], ("ok", "Signed in"))
+            answers["login"] = (1, "Not logged in")
+            self.assertEqual(ready("codex")[0], ("todo", "Codex CLI is not signed in", "codex login"))
+            (home / ".codex").mkdir()
+            (home / ".codex" / "config.toml").write_text('model_provider = "ollama"\n')
+            self.assertEqual(ready("codex")[0][:2], ("ok", "Uses its own model provider (ollama)"))
+            answers["login"] = (0, "Logged in using an API key - ***")
+            self.assertEqual(ready("codex")[0][:2], ("ok", "Signed in with an API key"))
+            # Gemini CLI and Qwen Code: by their settings and credentials.
+            self.assertEqual(ready("gemini")[0][0], "todo")
+            (home / ".gemini").mkdir()
+            (home / ".gemini" / "settings.json").write_text('{"security": {"auth": {"selectedType": "oauth-personal"}}}')
+            self.assertEqual(ready("gemini")[0][:2], ("todo", "Gemini CLI is set to sign in, but has not yet"))
+            (home / ".gemini" / "oauth_creds.json").write_text("{}")
+            self.assertEqual(ready("gemini")[0][:2], ("ok", "Signed in with Google"))
+            (home / ".qwen").mkdir()
+            (home / ".qwen" / "settings.json").write_text('{"security": {"auth": {"selectedType": "openai"}}}')
+            self.assertEqual(ready("qwen")[0][0], "note")  # a key crewchat cannot see from here
+            with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "x"}):
+                self.assertEqual(ready("qwen")[0][:2], ("ok", "Set up (openai)"))
+            answers["auth"] = (0, "\u2514  0 credentials")
+            self.assertEqual(ready("opencode")[0][0], "note")  # it has free models of its own
+            answers["auth"] = (0, "\u2514  \x1b[90m2\x1b[0m credentials")
+            self.assertEqual(ready("opencode")[0][:2], ("ok", "Signed in to 2 providers"))
+            # In the folder: what each asks once (trust, crewchat's hooks), and whether it already did.
+            answers["auth"] = (0, '{"loggedIn": true}')
+            self.assertEqual(ready("claude", folder)[1][0], "note")
+            (home / ".claude.json").write_text(json.dumps({"projects": {str(self.folder.parent): {"hasTrustDialogAccepted": True}}}))
+            self.assertEqual(ready("claude", folder)[1][:2], ("ok", "Trusts this folder"))  # a folder it is inside
+            crewchat.install_codex()
+            self.assertEqual([i[0] for i in ready("codex", folder)[1:]], ["note", "note"])
+            with open(home / ".codex" / "config.toml", "a") as f:
+                f.write('\n[projects.%s]\ntrust_level = "trusted"\n\n[hooks.state."%s:stop:0:0"]\ntrusted_hash = "h"\n'
+                        % (json.dumps(folder), crewchat.codex_config()))
+            self.assertEqual([i[:2] for i in ready("codex", folder)[1:]],
+                             [("ok", "Trusts this folder"), ("ok", "crewchat's hooks are approved")])
+            self.assertEqual([i[0] for i in ready("gemini", folder)[1:]], ["note", "note"])
+            (home / ".gemini" / "trustedFolders.json").write_text(json.dumps({folder + "/inside": "TRUST_PARENT"}))
+            (home / ".gemini" / "trusted_hooks.json").write_text(json.dumps(
+                {folder: ["crewchat-stop:" + crewchat.hook_command("gemini", "stop")]}))
+            self.assertEqual([i[0] for i in ready("gemini", folder)[1:]], ["ok", "ok"])
+            self.assertEqual(len(ready("qwen", folder)), 1)  # Qwen Code checks trust only when told to
+            self.assertEqual(ready("opencode", folder)[1][0], "note")  # its plugin not set up yet
+            (self.folder / ".opencode" / "node_modules").mkdir()
+            self.assertEqual(ready("opencode", folder)[1][:2], ("ok", "crewchat's plugin is set up"))
+            crewchat.uninstall_codex()
+            # Not installed: how to get it, and nothing else.
+            with mock.patch.object(crewchat, "find_tool", lambda tool, config: None):
+                self.assertEqual(ready("codex", folder), [("todo", "Codex CLI is not installed here", "npm install -g @openai/codex")])
+        # The page asks the server, for this project's folders only, and only as the owner.
+        opener, _ = self.owner_browser()
+        with mock.patch.object(crewchat, "tool_readiness", lambda tool, folder, config, fresh=False: [
+                {"state": "ok", "text": "%s in %s%s" % (tool, folder or "-", " again" if fresh else ""), "fix": ""}]):
+            out = json.loads(self.raw("/api/tool-check?tool=gemini&folder=" + urllib.parse.quote(folder), opener=opener)[1])
+            self.assertEqual(out["items"][0]["text"], "gemini in %s" % folder)
+            out = json.loads(self.raw("/api/tool-check?tool=gemini&fresh=1&folder=/etc", opener=opener)[1])
+            self.assertEqual(out["items"][0]["text"], "gemini in - again")  # not one of its folders: not looked at
+        self.assertEqual(self.raw("/api/tool-check?tool=vim", opener=opener)[0], 400)
+        self.assertEqual(self.raw("/api/tool-check?tool=claude")[0], 401)
 
     def test_a_launched_agent_gets_its_name_role_and_task(self):
         self.assertEqual(self.launch(name="docs-writer", role="docs", task="Write the settings guide"), {"ok": True})
@@ -1511,6 +1627,260 @@ class Launching(Base):
         cli("start", str(elsewhere), "--no-open", "--no-service", "--chat", "connect-other")
         self.assertIn("is in the project \"connect-other\"", connect(str(elsewhere))["error"])  # one project per folder
 
+    def test_browse_and_make_folders_from_the_page(self):
+        def op(**body):
+            try:
+                return crewchat.post_json(self.base + "/api/folders", self.owner, body)
+            except urllib.error.HTTPError as e:
+                return {"status": e.code, "error": json.loads(e.read())["error"]}
+        top = Path(tempfile.mkdtemp(prefix="browse-", dir=TMP)).resolve()
+        for name in ("beta", "Alpha", ".git"):
+            (top / name).mkdir()
+        (top / "notes.txt").write_text("a file, not a folder")
+        out = op(op="list", path=str(top))
+        self.assertEqual(out["path"], str(top))
+        self.assertEqual([f["name"] for f in out["folders"]], ["Alpha", "beta"])  # no hidden ones, no files
+        self.assertEqual(out["folders"][0]["path"], str(top / "Alpha"))
+        self.assertEqual(out["parent"], str(top.parent))
+        self.assertEqual(op(op="list")["path"], str(Path.home().resolve()))  # home to begin with
+        nearest = op(op="list", path=str(top / "nope" / "deeper"))  # not there yet: the nearest folder above it
+        self.assertEqual((nearest["path"], nearest["missing"]), (str(top), str(top / "nope" / "deeper")))
+        self.assertEqual(out["missing"], "")
+        # crewchat's own folder is not offered, nor can a folder be made in it.
+        self.assertNotIn(str(crewchat.home().resolve()), [f["path"] for f in op(op="list", path=str(crewchat.home().parent))["folders"]])
+        self.assertIn("crewchat's own folder", op(op="mkdir", path=str(crewchat.home()), name="x")["error"])
+        made = op(op="mkdir", path=str(top), name="my app")
+        self.assertEqual(made, {"path": str(top / "my app")})
+        self.assertTrue((top / "my app").is_dir())
+        self.assertIn("already", op(op="mkdir", path=str(top), name="my app")["error"])
+        for bad in ("", "..", "a/b", "a\\b", "c:d", ".hidden", "app.", "a*b", 'a"b', "a|b"):
+            self.assertIn("folder's name", op(op="mkdir", path=str(top), name=bad)["error"], bad)
+        self.assertEqual(op(op="rename")["status"], 400)
+        # Connect makes a missing folder when asked to (not its missing parents).
+        self.assertIn("there is no folder", op(op="connect", path=str(top / "new-app"))["error"])
+        self.assertIn("could not make", op(op="connect", path=str(top / "a" / "b"), create=True)["error"])
+        out = op(op="connect", path=str(top / "new-app"), create=True)
+        self.assertEqual(out["path"], str(top / "new-app"))
+        self.assertIn(str(top / "new-app"), [f["path"] for f in out["folders"]])
+        self.assertTrue((top / "new-app" / ".mcp.json").is_file())  # connected: crewchat start ran in it
+        self.assertEqual(self.raw("/api/folders", data=b'{"op": "list"}')[0], 401)  # the owner's only
+
+    def test_more_agent_tools_join_by_their_mcp_settings(self):
+        folder = Path(tempfile.mkdtemp(prefix="more-tools-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=False)
+        (folder / "opencode.json").write_text(json.dumps({"theme": "mine"}))  # the user's own settings stay
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo")  # every tool is "installed" here
+        place, token, clients = crewchat.joined_place(folder)
+        self.assertEqual(clients, ["claude", "cursor", "gemini", "qwen", "opencode"])  # Codex's chat is the .mcp.json
+        gemini = json.loads((folder / ".gemini" / "settings.json").read_text())["mcpServers"]["crewchat"]
+        self.assertEqual(gemini, {"httpUrl": self.base + "/mcp", "headers": {"Authorization": "Bearer " + token}, "trust": True})
+        self.assertEqual(json.loads((folder / ".qwen" / "settings.json").read_text())["mcpServers"]["crewchat"]["trust"], True)
+        opencode = json.loads((folder / "opencode.json").read_text())
+        self.assertEqual(opencode["theme"], "mine")
+        self.assertEqual(opencode["mcp"]["crewchat"], {"url": self.base + "/mcp", "type": "remote", "enabled": True,
+                                                      "headers": {"Authorization": "Bearer " + token}})
+        self.assertEqual(crewchat.client_config(folder, "gemini"), (self.base, token))
+        excluded = (folder / ".git" / "info" / "exclude").read_text()
+        for rel in (".gemini/settings.json", ".qwen/settings.json", "opencode.json"):  # the token stays out of git
+            self.assertIn(rel, excluded)
+        # Codex: once, in its own settings, `crewchat stdio` (which reads this folder's .mcp.json).
+        codex = crewchat.codex_config().read_text()
+        self.assertIn("[mcp_servers.crewchat]", codex)
+        self.assertIn('"stdio", "--local-only"]', codex)
+        self.assertEqual(codex.count("[mcp_servers.crewchat]"), 1)
+        # Run again with a tool asked for (or installed since), a connected folder gets it too.
+        shutil.rmtree(folder / ".qwen")
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "qwen")
+        self.assertEqual(crewchat.connection_entry(folder, "qwen")[1], token)
+        # Taken out again, leaving the user's own.
+        crewchat.disconnect_folder(folder)
+        self.assertFalse((folder / ".gemini" / "settings.json").exists())
+        self.assertEqual(json.loads((folder / "opencode.json").read_text()), {"theme": "mine"})
+
+    def test_a_committed_settings_file_gets_no_token(self):
+        folder = Path(tempfile.mkdtemp(prefix="committed-", dir=TMP)).resolve()
+        git = lambda *a: subprocess.run(["git", "-C", str(folder)] + list(a), capture_output=True, check=True)  # noqa: E731
+        git("init", "-q")
+        (folder / "opencode.json").write_text('{"theme": "team"}')
+        git("add", "opencode.json")
+        git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "team settings")
+        out = cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "opencode")
+        self.assertIn("opencode.json is committed", out)
+        self.assertEqual((folder / "opencode.json").read_text(), '{"theme": "team"}')
+
+    def test_a_tool_connected_later_is_added_at_launch_or_refused(self):
+        tool = lambda t, c: "/bin/" + t  # noqa: E731  (every tool installed)
+        shutil.rmtree(self.folder / ".gemini")  # as if Gemini CLI was installed after the folder joined
+        self.assertNotIn("gemini", crewchat.joined_place(self.folder)[2])
+        with mock.patch.object(crewchat, "find_tool", side_effect=tool), \
+                mock.patch.object(crewchat, "tool_help", return_value=""):
+            crewchat.agent_tool("gemini", str(self.folder), "ask", self.hub.home)
+            self.assertIn("gemini", crewchat.joined_place(self.folder)[2])  # its settings got crewchat
+            with mock.patch.object(crewchat, "install_client", return_value=[]):
+                shutil.rmtree(self.folder / ".qwen", ignore_errors=True)
+                with self.assertRaises(crewchat.HubError) as e:
+                    crewchat.agent_tool("qwen", str(self.folder), "ask", self.hub.home)
+                self.assertIn("could not add itself to Qwen Code's settings", str(e.exception))
+
+    def test_stdio_finds_the_chat_in_any_tools_settings(self):
+        folder = Path(tempfile.mkdtemp(prefix="gemini-only-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "gemini")
+        self.assertFalse((folder / ".mcp.json").exists())
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "codex-mcp-client"}}},
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+        env = dict(os.environ, HOME=str(crewchat.user_home()), USERPROFILE=str(crewchat.user_home()))
+        done = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--local-only", "--project", str(folder)],
+                              input=("\n".join(json.dumps(r) for r in requests) + "\n").encode(), capture_output=True,
+                              env=env, timeout=60)
+        answers = [json.loads(line) for line in done.stdout.decode().splitlines() if line.strip()]
+        tools = next(a for a in answers if a.get("id") == 2)["result"]["tools"]
+        self.assertIn("hub_link", [t["name"] for t in tools], done.stderr)
+
+    def test_codex_settings_get_one_block_of_crewchats_own(self):
+        path = crewchat.codex_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n')
+        self.assertTrue(crewchat.install_codex())
+        self.assertFalse(crewchat.install_codex())  # already there
+        text = path.read_text()
+        self.assertTrue(text.startswith('model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n\n# crewchat: begin'))
+        with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+            self.assertTrue(crewchat.install_codex())  # brought up to this copy's command
+        self.assertIn('command = "/tools/crewchat/bin/crewchat"\nargs = ["stdio", "--local-only"]', path.read_text())
+        self.assertEqual(path.read_text().count("[mcp_servers.crewchat]"), 1)
+        try:
+            import tomllib  # Python 3.11+: Codex must still be able to read its settings
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            with mock.patch.object(crewchat, "run_command", return_value=['C:\\Users\\Ünï "q"\\crewchat.exe']):
+                crewchat.install_codex()
+            parsed = tomllib.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["mcp_servers"]["crewchat"], {"command": 'C:\\Users\\Ünï "q"\\crewchat.exe',
+                                                                 "args": ["stdio", "--local-only"]})
+            self.assertEqual(parsed["mcp_servers"]["other"], {"command": "other"})
+        self.assertTrue(crewchat.uninstall_codex())
+        self.assertEqual(path.read_text(), 'model = "gpt-6"\n\n[mcp_servers.other]\ncommand = "other"\n')
+        self.assertFalse(crewchat.uninstall_codex())
+        for theirs in ('[mcp_servers.crewchat]\ncommand = "uvx"\n', 'mcp_servers = { crewchat = { command = "x" } }\n',
+                       '[mcp_servers."crewchat"]\ncommand = "x"\n', 'mcp_servers.crewchat.command = "x"\n',
+                       '[mcp_servers]\ncrewchat = { command = "x" }\n', '[mcp_servers.crewchat.env]\nA = "b"\n',
+                       'mcp_servers = { other = { command = "x" } }\n'):
+            path.write_text(theirs)
+            self.assertFalse(crewchat.install_codex())  # a server the user set up is theirs
+            self.assertEqual(path.read_text(), theirs)
+        path.unlink()
+
+    def test_codex_runs_crewchats_hooks_and_keeps_its_review_of_them(self):
+        path = crewchat.codex_config()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("")
+        self.assertTrue(crewchat.install_codex())
+        text = path.read_text()
+        for event in ("UserPromptSubmit", "Stop", "PostToolUse"):
+            self.assertEqual(text.count("[[hooks.%s]]" % event), 1, event)
+        try:
+            import tomllib
+        except ImportError:
+            tomllib = None
+        if tomllib:
+            stop = tomllib.loads(text)["hooks"]["Stop"][0]["hooks"][0]
+            self.assertEqual(stop, {"type": "command", "command": crewchat.hook_command("codex", "stop"),
+                                    "timeout": crewchat.MAX_LISTEN + 100})
+        # Codex keeps the owner's review of the hooks in our block; a newer copy keeps it too.
+        state = '[hooks.state."crewchat:stop"]\ntrusted_hash = "abc"\n'
+        path.write_text(text.replace(crewchat.CODEX_END, state + crewchat.CODEX_END))
+        with mock.patch.object(crewchat, "run_command", return_value=["/tools/crewchat/bin/crewchat"]):
+            self.assertTrue(crewchat.install_codex())
+            self.assertFalse(crewchat.install_codex())
+        self.assertEqual(path.read_text().count(state), 1)
+        self.assertEqual(path.read_text().count(crewchat.CODEX_END), 1)
+        if tomllib:
+            self.assertEqual(tomllib.loads(path.read_text())["hooks"]["state"], {"crewchat:stop": {"trusted_hash": "abc"}})
+        self.assertTrue(crewchat.uninstall_codex())
+        self.assertEqual(path.read_text(), state)
+        # The user's own hooks written inline: a table of ours could not join them, so the server only.
+        theirs = '[hooks]\nStop = [{ hooks = [{ type = "command", command = "mine" }] }]\n'
+        path.write_text(theirs)
+        self.assertTrue(crewchat.install_codex())
+        self.assertNotIn("[[hooks.", path.read_text())
+        self.assertIn("[mcp_servers.crewchat]", path.read_text())
+        path.unlink()
+
+    def test_gemini_and_qwen_settings_get_crewchats_hooks_beside_the_users(self):
+        ours = lambda s: {event: [h for g in groups for h in g["hooks"] if crewchat.is_our_hook(h["command"])]  # noqa: E731
+                          for event, groups in s["hooks"].items()}
+        for client, rel, (prompt, stop, tool) in (
+                ("gemini", ".gemini/settings.json", ("BeforeAgent", "AfterAgent", "AfterTool")),
+                ("qwen", ".qwen/settings.json", ("UserPromptSubmit", "Stop", "PostToolUse"))):
+            folder = Path(tempfile.mkdtemp(prefix=client + "-hooks-", dir=TMP)).resolve()
+            mine = {"matcher": "write_file", "hooks": [{"type": "command", "command": "echo mine"}]}
+            (folder / rel).parent.mkdir()
+            (folder / rel).write_text(json.dumps({"hooks": {tool: [mine]}}))
+            cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", client)
+            settings = json.loads((folder / rel).read_text())
+            self.assertEqual({e: [h["name"] for h in hs] for e, hs in ours(settings).items()},
+                             {prompt: ["crewchat-prompt"], stop: ["crewchat-stop"], tool: ["crewchat-tool"]}, client)
+            self.assertIn(" hook %s stop" % client, ours(settings)[stop][0]["command"])
+            # Milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds.
+            self.assertEqual(ours(settings)[stop][0]["timeout"], (crewchat.MAX_LISTEN + 100) * 1000)
+            self.assertGreaterEqual(min(h["timeout"] for hs in ours(settings).values() for h in hs), 1000)
+            self.assertEqual(settings["hooks"][tool][0], mine)
+            crewchat.set_settings_hooks(settings, client)  # again: replaced, not added
+            self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 3)
+            del settings["hooks"][stop]  # a folder connected before crewchat had them: hooks refresh adds them
+            (folder / rel).write_text(json.dumps(settings))
+            self.assertIn(rel, crewchat.update_hooks(folder))
+            self.assertIn(stop, json.loads((folder / rel).read_text())["hooks"])
+            crewchat.disconnect_folder(folder)
+            self.assertEqual(json.loads((folder / rel).read_text()), {"hooks": {tool: [mine]}})
+
+    def test_opencode_gets_crewchats_plugin(self):
+        folder = Path(tempfile.mkdtemp(prefix="opencode-plugin-", dir=TMP)).resolve()
+        subprocess.run(["git", "init", "-q", str(folder)], check=True)
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "opencode")
+        plugin = folder / crewchat.OPENCODE_PLUGIN_FILE
+        text = plugin.read_text()
+        self.assertTrue(text.startswith(crewchat.OPENCODE_PLUGIN_MARK))
+        self.assertIn(json.dumps(crewchat.run_command() + ["hook", "opencode"]), text)
+        self.assertIn("const REOPEN_PROMPT = %s;" % json.dumps(crewchat.REOPEN_PROMPT), text)  # what Reopen asks
+        self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, (folder / ".git" / "info" / "exclude").read_text())  # never committed
+        if shutil.which("node"):  # the plugin is a module OpenCode can load
+            check = subprocess.run(["node", "--check", "--input-type=module"], input=text, capture_output=True, text=True)
+            self.assertEqual(check.returncode, 0, check.stderr)
+        plugin.write_text(text.replace(json.dumps(crewchat.run_command() + ["hook", "opencode"]),
+                                       '["/old/crewchat", "hook", "opencode"]'))
+        self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, crewchat.update_hooks(folder))  # brought up to this copy
+        self.assertEqual(plugin.read_text(), text)
+        self.assertEqual(crewchat.update_hooks(folder), [])
+        crewchat.disconnect_folder(folder)
+        self.assertFalse((folder / ".opencode").exists())  # its folders too, once empty
+        mine = folder / ".opencode" / "plugins" / "crewchat.js"  # a file of the same name the user wrote: theirs
+        mine.parent.mkdir(parents=True)
+        mine.write_text("export const Mine = async () => ({})\n")
+        crewchat.disconnect_folder(folder)
+        self.assertTrue(mine.exists())
+
+    def test_how_the_other_tools_are_started(self):
+        prompt = crewchat.LAUNCH_PROMPT % "start-k"
+        self.assertEqual(crewchat.launch_command("gemini", "gemini", "start-k", "edits"),
+                         ["gemini", "--approval-mode", "auto_edit", "-i", prompt])
+        self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "all"), ["qwen", "--yolo", "-i", prompt])
+        self.assertEqual(crewchat.launch_command("qwen", "qwen", "start-k", "edits")[1:3], ["--approval-mode", "auto-edit"])
+        self.assertEqual(crewchat.launch_command("opencode", "opencode", "start-k"), ["opencode", "--prompt", prompt])
+        # What --full-auto was: Codex no longer has that option, but has its workspace sandbox and approvals.
+        self.assertEqual(crewchat.launch_command("codex", "codex", "start-k", "edits"),
+                         ["codex", "--sandbox", "workspace-write", "--ask-for-approval", "on-request", prompt])
+        # A copy that does not know the option is refused rather than started wrongly.
+        self.assertEqual(crewchat.fit_options("--yolo --approval-mode <default|yolo>", "gemini", "edits")[1], ["auto_edit"])
+        self.assertEqual(crewchat.fit_options("--approval-mode default|auto_edit|yolo", "gemini", "edits")[1], [])
+        self.assertEqual(self.launch(tool="opencode", permissions="all")["status"], 400)  # OpenCode: its own settings
+        with mock.patch.object(crewchat, "find_tool", side_effect=lambda t, c: "/bin/" + t if t in ("claude", "codex") else None):
+            self.assertEqual(crewchat.clients_for("all"), ["claude", "cursor", "codex"])  # the others: when installed
+        self.assertEqual(crewchat.clients_for("qwen"), ["qwen"])
+
     def test_bad_launches_are_refused(self):
         self.assertEqual(self.launch(folder="/etc")["status"], 400)
         self.assertEqual(self.launch(tool="vim")["status"], 400)
@@ -1577,8 +1947,8 @@ class Launching(Base):
 
     def reopened(self, **body):
         opened = []
-        with mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
-                               opened.append((folder, command, key, title))):
+        with mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                               opened.append((folder, command, key, title)) or self.opened_env.append(env)):
             out = crewchat.post_json(self.base + "/api/agent", self.owner, dict({"op": "reopen"}, **body))
         return out, opened
 
@@ -1601,6 +1971,31 @@ class Launching(Base):
         self.hub.links = {k: v for k, v in self.hub.links.items() if v != name}
         _, opened = self.reopened(agent=name)
         self.assertEqual(self.hub.links[opened[0][2]], name)
+
+    def test_the_other_tools_reopen_their_own_conversations(self):
+        for tool, resume in (("codex", ["resume", "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
+                                        "sess-0003-abc", crewchat.REOPEN_PROMPT]),
+                             ("gemini", ["--approval-mode", "auto_edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
+                             ("qwen", ["--approval-mode", "auto-edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
+                             ("opencode", ["--session=sess-0003-abc"])):
+            name = self.closed_session(tool=tool)
+            if tool == "opencode":
+                self.hub.agents[name]["permissions"] = "ask"  # all it has
+            self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["reopen"], tool)
+            out, opened = self.reopened(agent=name)
+            self.assertEqual(out, {"ok": True})
+            self.assertEqual(opened[0][1], ["/usr/local/bin/" + tool] + resume, tool)
+            env = self.opened_env[-1] or {}
+            if tool == "opencode":  # OpenCode does not send a prompt with the session it continues: its plugin does
+                self.assertRegex(env.get("CREWCHAT_REOPEN", ""), r"^sess-0003-abc:[0-9a-f]{16}$")
+            else:
+                self.assertNotIn("CREWCHAT_REOPEN", env)
+        # OpenCode's session ids have an underscore; never an option, nor a line of its own.
+        self.assertTrue(crewchat.SESSION_RE.fullmatch("ses_ebba941c8ffecgoR55RwC2KYIa"))
+        for bad in ("_ses_ebba941c8ffe", "-ses_ebba941c8ffe", "ses ebba941c8ffe", "ses_ebba941c8ffe\n"):
+            self.assertFalse(crewchat.SESSION_RE.fullmatch(bad), bad)
+        script = crewchat.macos_script("/tmp/x", ["/x/opencode"], "link-0123456789", env={"CREWCHAT_REOPEN": "s:n"})
+        self.assertIn("export CREWCHAT_LINK_KEY=link-0123456789\nexport CREWCHAT_REOPEN=s:n", script)
 
     def test_cursor_sessions_can_be_stopped_but_not_reopened_yet(self):
         name = self.closed_session(tool="cursor")
@@ -1635,7 +2030,7 @@ class Launching(Base):
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
                 mock.patch.object(crewchat, "stop_process", stop), \
                 mock.patch.object(crewchat, "tool_models", lambda tool: [["opus", "Opus"], ["sonnet", "Sonnet"]]), \
-                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(steps[0], "stop")
@@ -1662,7 +2057,7 @@ class Launching(Base):
         self.assertEqual(opened[0][1][-4:-2], ["--advisor", "fable"])
         self.hub.agents[name]["session"].pop("reopening", None)
         with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
-                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None:
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
                                   opened.append((folder, command, key, title))):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(opened[-1][1][-6:-2], ["--model", "sonnet", "--advisor", "fable"])
@@ -2025,9 +2420,8 @@ class Profiles(Base):
 
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
-        for path in ("/", "/classic"):
-            status, _, headers = self.raw(path)
-            self.assertEqual((status, headers["Location"]), (303, "/login"))
+        status, _, headers = self.raw("/")
+        self.assertEqual((status, headers["Location"]), (303, "/login"))
         self.assertEqual(self.raw("/api/poll")[0], 401)
         self.assertEqual(self.raw("/api/send", b"{}", {"Content-Type": "application/json"})[0], 401)
         status, body, headers = self.raw("/login")
@@ -2061,10 +2455,7 @@ class ChatPage(Base):
         self.assertIn(b"<title>crewchat</title>", body)
         self.assertIn(b'id="panel"', body)  # the page from 0.14
         self.assertEqual(headers["Cache-Control"], "no-store")
-        status, classic, _ = self.raw("/classic", opener=opener)  # the page before it, for one release
-        self.assertEqual(status, 200)
-        self.assertIn(b'id="views"', classic)
-        self.assertNotIn(b'id="panel"', classic)
+        self.assertEqual(self.raw("/classic", opener=opener)[0], 404)  # the page before 0.14 is gone
         send = lambda obj, extra=None: self.raw(  # noqa: E731
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)
         self.assertEqual(send({"to": "all", "text": "x"}, {"Origin": "https://evil.example"})[0], 403)
@@ -2129,6 +2520,133 @@ class ChatPage(Base):
         self.assertIn("manifest-src 'self'", headers["Content-Security-Policy"])
         opener, _ = self.owner_browser()
         self.assertIn(b"serviceWorker.register('/sw.js')", self.raw("/", opener=opener)[1])
+
+
+class WebPush(Base):
+    ENDPOINT = "https://fcm.googleapis.com/fcm/send/abc123"
+
+    def projects(self):
+        return self.server.RequestHandlerClass.projects
+
+    def store(self):
+        return crewchat.push_store(self.projects().base)
+
+    def tearDown(self):
+        store = self.store()
+        for sub in list(store.subs):
+            store.forget(sub["endpoint"])
+
+    def test_the_key_and_its_signatures(self):
+        d = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721  # RFC 6979, A.2.5
+        self.assertEqual(crewchat.p256_public(d).hex(),
+                         "04" "60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6"
+                         "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299")
+        message = b"a push"
+        sig = crewchat.es256_sign(d, message)
+        r, s_ = int.from_bytes(sig[:32], "big"), int.from_bytes(sig[32:], "big")
+        n, z = crewchat._N, int.from_bytes(crewchat.hashlib.sha256(message).digest(), "big")
+        w = pow(s_, n - 2, n)  # ECDSA verification, by the book
+        point = crewchat._p256_add(crewchat._p256_mul(z * w % n), crewchat._p256_mul(r * w % n, crewchat._p256_mul(d)))
+        self.assertEqual(point[0] % n, r)
+        self.assertNotEqual(crewchat.es256_sign(d, message), sig)  # a fresh nonce each time
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric import ec, utils
+        except ImportError:
+            return
+        key = ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), crewchat.p256_public(d))
+        key.verify(utils.encode_dss_signature(r, s_), message, ec.ECDSA(hashes.SHA256()))
+
+    def test_only_push_services_are_posted_to(self):
+        for ok in (self.ENDPOINT, "https://web.push.apple.com/QGuA", "https://updates.push.services.mozilla.com/wpush/v2/x",
+                   "https://wns2-par02p.notify.windows.com/w/?token=x"):
+            self.assertTrue(crewchat.push_host_ok(ok), ok)
+        for bad in ("http://fcm.googleapis.com/x", "https://evil.example/x", "https://fcm.googleapis.com.evil.example/x",
+                    "https://127.0.0.1/x", "https://user@fcm.googleapis.com/x", "https://fcm.googleapis.com:8443/x",
+                    "https://push.apple.com.evil/x", "https://evilpush.apple.com/x", "https://x/" + "a" * 1000, "", None):
+            self.assertFalse(crewchat.push_host_ok(bad or ""), bad)
+
+    def test_subscriptions_and_the_vapid_headers(self):
+        store = self.store()
+        key = store.public_key()
+        self.assertEqual(len(base64.urlsafe_b64decode(key + "=")), 65)
+        if os.name != "nt":  # Windows has no POSIX mode bits: every file reads back as 0o666
+            self.assertEqual(oct(os.stat(store.path).st_mode & 0o777), "0o600")
+        store.set_mode(self.ENDPOINT, "demo", "all")
+        store.set_mode(self.ENDPOINT, "other", "mentions")
+        self.assertEqual(store.wanted("demo"), [(self.ENDPOINT, "all")])
+        self.assertEqual(crewchat.PushStore(store.path.parent).subs, store.subs)  # kept on disk
+        self.assertEqual(crewchat.PushStore(store.path.parent).public_key(), key)
+        with self.assertRaises(crewchat.HubError):
+            store.set_mode("https://evil.example/x", "demo", "all")
+        with self.assertRaises(crewchat.HubError):
+            store.set_mode(self.ENDPOINT, "demo", "loud")
+        headers = store.headers(self.ENDPOINT)
+        jwt, k = re.match(r"vapid t=([^,]+), k=(.+)$", headers["Authorization"]).groups()
+        self.assertEqual(k, key)
+        head, claims, sig = jwt.split(".")
+        claims = json.loads(base64.urlsafe_b64decode(claims + "=" * (-len(claims) % 4)))
+        self.assertEqual(claims["aud"], "https://fcm.googleapis.com")
+        self.assertGreater(claims["exp"], time.time())
+        self.assertEqual(len(base64.urlsafe_b64decode(sig + "=" * (-len(sig) % 4))), 64)
+        store.set_mode(self.ENDPOINT, "demo", "off")
+        store.set_mode(self.ENDPOINT, "other", "off")
+        self.assertEqual(store.subs, [])  # no project left: the browser is forgotten
+
+    def test_what_is_new_is_pushed_only_while_no_page_is_open(self):
+        store, seen, sent = self.store(), {}, []
+        store.set_mode(self.ENDPOINT, self.projects().primary.id, "all")
+        send = lambda st, endpoint: sent.append(endpoint)  # noqa: E731
+        self.hub.page_seen = 0
+        session, name = self.agent()
+        session.call("hub_send", to="Owner", text="first, before the server looked")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual((sent, store.take(self.ENDPOINT)), ([], []))  # what was there already is not news
+        session.call("hub_send", to="Owner", text="Can I merge?")
+        crewchat.push_round(self.projects(), store, seen, send)
+        time.sleep(0.2)
+        self.assertEqual(sent, [self.ENDPOINT])
+        notes = store.take(self.ENDPOINT)
+        self.assertEqual((notes[0]["title"], notes[0]["body"], notes[0]["url"]), ("Demo: Message · " + name, "Can I merge?", "/"))
+        self.assertEqual(store.take(self.ENDPOINT), [])  # handed over once
+        self.hub.page_seen = time.time()  # a page is open: it notifies by itself
+        session.call("hub_send", to="Owner", text="Merged")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual(sent, [self.ENDPOINT])
+        self.hub.page_seen = 0
+        store.set_mode(self.ENDPOINT, self.projects().primary.id, "mentions")
+        tid = self.say("all", "Ship it", "task")
+        session.call("hub_take", id=tid)
+        session.call("hub_update", id=tid, status="blocked", note="Which branch?")
+        crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual(sent, [self.ENDPOINT])  # messages only: a blocked task is not pushed
+
+    def test_a_subscription_the_service_dropped_is_forgotten(self):
+        store = self.store()
+        store.set_mode(self.ENDPOINT, "demo", "all")
+        gone = urllib.error.HTTPError(self.ENDPOINT, 410, "Gone", {}, io.BytesIO(b""))
+        with mock.patch.object(crewchat.urllib.request, "urlopen", side_effect=gone):
+            self.assertEqual(crewchat.send_push(store, self.ENDPOINT), 410)
+        self.assertEqual(store.subs, [])
+
+    def test_the_page_subscribes_and_its_service_worker_fetches(self):
+        opener, _ = self.owner_browser()
+        post = lambda body, extra=None: self.raw("/api/push", json.dumps(body).encode(), dict(  # noqa: E731
+            {"Content-Type": "application/json", "Origin": self.base}, **(extra or {})), opener)
+        self.assertEqual(self.raw("/api/push", b'{"op":"key"}', {"Content-Type": "application/json"})[0], 401)
+        self.assertEqual(post({"op": "key"}, {"Origin": "https://evil.example"})[0], 403)
+        status, body, _ = post({"op": "key"})
+        self.assertEqual((status, json.loads(body)["key"]), (200, self.store().public_key()))
+        self.assertEqual(post({"op": "mode", "endpoint": "https://evil.example/x", "mode": "all"})[0], 400)
+        self.assertEqual(post({"op": "mode", "endpoint": self.ENDPOINT, "mode": "all"})[0], 200)
+        self.assertEqual(self.store().wanted(self.projects().primary.id), [(self.ENDPOINT, "all")])
+        self.store().queue(self.ENDPOINT, {"title": "t", "body": "b", "tag": "x", "url": "/"})
+        self.assertEqual(json.loads(post({"op": "notices", "endpoint": self.ENDPOINT})[1])["notices"][0]["title"], "t")
+        self.assertEqual(json.loads(post({"op": "notices", "endpoint": self.ENDPOINT})[1])["notices"], [])
+        self.assertEqual(post({"op": "nope"})[0], 400)
+        _, sw, _ = self.raw("/sw.js")
+        self.assertIn(b"addEventListener('push'", sw)
+        self.assertIn(b"addEventListener('notificationclick'", sw)
 
 
 class CommandsTab(Base):
@@ -2490,6 +3008,19 @@ class OtherNames(Base):
         self.assertEqual(answers[4]["error"]["code"], -32700)
         self.assertEqual(len(answers), 5)  # nothing for the notification
 
+    def test_stdio_registered_for_every_folder_follows_only_this_machines_chat(self):
+        repo = Path(tempfile.mkdtemp(prefix="cloned-", dir=TMP)).resolve()  # a repository with its own .mcp.json
+        (repo / ".mcp.json").write_text(json.dumps({"mcpServers": {"crewchat": {
+            "url": "https://chat.example/mcp", "headers": {"Authorization": "Bearer theirs"}}}}))
+        self.assertFalse(crewchat.local_folder(repo))
+        env = dict(os.environ, HOME=str(self.user), USERPROFILE=str(self.user))
+        done = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "stdio", "--local-only", "--project", str(repo)],
+                              input=b"", capture_output=True, env=env, timeout=60)
+        self.assertIn(b"is not connected to a crewchat", done.stderr)  # not relayed to chat.example
+        mine = Path(tempfile.mkdtemp(prefix="mine-", dir=TMP)).resolve()
+        cli("start", str(mine), "--no-open", "--no-service", "--chat", "demo", "--client", "claude")
+        self.assertTrue(crewchat.local_folder(mine))
+
     def test_the_chat_tools_are_not_shown_as_activity_by_any_name(self):
         for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_update)"):
             self.assertEqual(crewchat.tool_summary("claude", {"tool_name": name}), "", name)
@@ -2545,6 +3076,86 @@ class Hooks(Base):
         self.hook("claude", "tool", {"session_id": "busy-turn"})
         self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute: no call to the server
         self.assertEqual(self.hook("claude", "tool", {"session_id": "never-linked"}), "")  # no key yet: quiet
+
+    def test_a_permission_prompt_is_answered_on_the_page(self):
+        session, name = self.linked("asks-first")
+        asked = {"session_id": "asks-first", "tool_name": "Bash",
+                 "tool_input": {"command": "rm -rf build", "description": "Clean the build"}}
+
+        def ask():  # the hook waits for an answer: run it beside the test, and get the item it puts up
+            out = {}
+            t = threading.Thread(target=lambda: out.update(text=self.hook("claude", "permission", asked)))
+            t.start()
+            for _ in range(200):
+                item = next((n for n in self.hub.needs_you() if n["kind"] == "permission"), None)
+                if item:
+                    return t, out, item
+                time.sleep(0.05)
+            self.fail("the prompt never reached Needs you")
+
+        t, out, item = ask()
+        self.assertEqual((item["agent"], item["tool"], item["text"]), (name, "Bash", "rm -rf build\n(Clean the build)"))
+        self.assertEqual(self.hub.needs_you()[0]["kind"], "permission")  # before anything else
+        answer = lambda pid, a: crewchat.post_json(self.base + "/api/permission", self.owner, {"id": pid, "answer": a})  # noqa: E731
+        with self.assertRaises(urllib.error.HTTPError):
+            answer(item["id"], "maybe")
+        self.assertEqual(answer(item["id"], "allow"), {"agent": name, "answer": "allow"})
+        t.join(30)
+        self.assertEqual(json.loads(out["text"])["hookSpecificOutput"],
+                         {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}})
+        self.assertFalse([n for n in self.hub.needs_you() if n["kind"] == "permission"])  # handled: gone
+        with self.assertRaises(urllib.error.HTTPError):
+            answer(item["id"], "deny")  # answered already
+
+        t, out, item = ask()
+        answer(item["id"], "deny")
+        t.join(30)
+        decision = json.loads(out["text"])["hookSpecificOutput"]["decision"]
+        self.assertEqual(decision["behavior"], "deny")
+        self.assertIn("denied", decision["message"])
+
+        # Answered in its terminal instead: its next turn (or the end of this one) takes the item away,
+        # and the hook says nothing.
+        t, out, item = ask()
+        self.hook("claude", "prompt", {"session_id": "asks-first"})
+        t.join(30)
+        self.assertEqual(out["text"], "")
+        self.assertFalse([n for n in self.hub.needs_you() if n["kind"] == "permission"])
+
+        # A session that never checked in, or the owner keeping prompts in the terminal: no wait at all.
+        self.assertEqual(self.hook("claude", "permission", dict(asked, session_id="never-linked")), "")
+        config = crewchat.load_config()
+        config["permissions"] = "terminal"
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            started = time.time()
+            self.assertEqual(self.hook("claude", "permission", asked), "")
+            self.assertLess(time.time() - started, 15)
+        finally:
+            config.pop("permissions")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+    def test_nobody_answers_a_permission_prompt_in_time(self):
+        session, name = self.linked("asks-nobody")
+        place = self.hub.agents[name]["place"]
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        self.assertEqual(self.hub.ask_permission(place, key, "Write", "notes.md", wait=0.3), "")  # its own prompt shows
+        self.assertFalse(self.hub.permissions)
+        self.assertEqual(self.hub.ask_permission(place, "unknownkey123", "Write", "x", wait=5), "")  # not linked
+        with self.assertRaises(crewchat.HubError):
+            self.hub.ask_permission(place, "bad key!", "Write", "x")
+
+    def test_what_a_permission_prompt_shows(self):
+        self.assertEqual(crewchat.permission_text({"tool_name": "Write", "tool_input": {"file_path": "/a/b.py", "content": "x"}}),
+                         ("Write", "/a/b.py"))
+        self.assertEqual(crewchat.permission_text({"tool_name": "WebFetch", "tool_input": {"url": "https://x.dev", "prompt": "p"}}),
+                         ("WebFetch", "https://x.dev"))
+        self.assertEqual(crewchat.permission_text({"tool_name": "mcp__x__y", "tool_input": {"a": 1}}), ("mcp__x__y", '{"a": 1}'))
+        self.assertEqual(len(crewchat.permission_text({"tool_name": "Bash", "tool_input": {"command": "x" * 9000}})[1]),
+                         crewchat.MAX_PERMISSION_TEXT)
+        self.assertEqual(crewchat.permission_text({}), ("", ""))
 
     def test_a_session_is_reported_once(self):
         session, name = self.linked("sess-0001-abc")
@@ -2625,6 +3236,17 @@ class Hooks(Base):
             self.assertFalse(crewchat.SESSION_RE.fullmatch("abcdefgh\n"))
             cursor = {10: (9, "a", "sh -c hook"), 9: (1, "b", "/Users/x/.local/bin/cursor-agent --trust")}
             self.assertEqual(crewchat.agent_process("cursor", cursor), {"pid": 9, "started": "b", "app": "terminal"})
+            for client, command in (("codex", "/usr/local/lib/node_modules/@openai/codex/vendor/x/codex/codex resume"),
+                                    ("codex", "node /usr/local/bin/codex"),
+                                    ("gemini", "node /usr/local/bin/gemini -i hello"),
+                                    ("gemini", "node /opt/homebrew/lib/node_modules/@google/gemini-cli/dist/index.js"),
+                                    ("qwen", "node /usr/local/bin/qwen"),
+                                    ("qwen", "node /usr/lib/node_modules/@qwen-code/qwen-code/cli.js -i hi"),
+                                    ("opencode", "/Users/x/.opencode/bin/opencode --prompt hi")):
+                table = {10: (9, "a", "sh -c hook"), 9: (1, "b", command)}
+                self.assertEqual(crewchat.agent_process(client, table)["pid"], 9, command)
+                self.assertIsNone(crewchat.agent_process("cursor" if client == "codex" else "codex", table))
+            self.assertIsNone(crewchat.agent_process("zed", table))  # a tool it cannot tell: no report
 
     def test_listening_set_on_the_chat_page_wins_over_the_folder(self):
         session, name = self.linked("page-listen")
@@ -2654,6 +3276,30 @@ class Hooks(Base):
         self.hook("cursor", "tool", {"conversation_id": "first-turn"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)  # no stop hook ran yet
 
+    def test_codex_gemini_qwen_and_opencode_get_messages_as_their_hooks_expect(self):
+        folder = Path(tempfile.mkdtemp(prefix="other-hooks-", dir=TMP))
+        crewchat.install_claude(folder, self.base, self.token)  # Codex's chat: the folder's .mcp.json
+        crewchat.install_mcp_settings(folder, self.base, self.token, "gemini")
+        crewchat.install_mcp_settings(folder, self.base, self.token, "qwen")
+        crewchat.install_mcp_settings(folder, self.base, self.token, "opencode")
+        for client, prompt_event in (("codex", "UserPromptSubmit"), ("gemini", "BeforeAgent"), ("qwen", "UserPromptSubmit"),
+                                     ("opencode", None)):
+            conversation = "other-%s-0001" % client
+            asked = self.hook(client, "prompt", {"session_id": conversation}, project=folder)
+            if prompt_event:
+                asked = json.loads(asked)
+                self.assertEqual(asked["hookSpecificOutput"]["hookEventName"], prompt_event)  # strict JSON, or ignored
+                asked = asked["hookSpecificOutput"]["additionalContext"]
+            key = re.search(r'key "([^"]+)"', asked).group(1)  # OpenCode's plugin adds the text to the message
+            session = Session(self.base, self.token, client)
+            session.call("hub_link", key=key)
+            self.say(session.me, "hello %s" % client)
+            told = json.loads(self.hook(client, "stop", {"session_id": conversation}, project=folder))
+            self.assertEqual(told["decision"], "block")  # the reason starts the next turn
+            self.assertIn("hello %s" % client, told["reason"])
+            self.assertEqual(self.hook(client, "stop", {"session_id": conversation}, project=folder), "")  # nothing new
+            self.assertEqual(self.hook(client, "stop", {"session_id": "other-never-linked"}, project=folder), "")
+
     def test_upgrading_adds_new_hooks_and_keeps_the_users_own(self):
         folder = Path(tempfile.mkdtemp(prefix="old-hooks-", dir=TMP))
         mine = {"type": "command", "command": "echo mine"}
@@ -2677,7 +3323,11 @@ class Hooks(Base):
         self.assertEqual(json.loads((folder / ".claude" / "settings.local.json").read_text())["permissions"],
                          {"allow": crewchat.crewchat_rules(crewchat.CLAUDE_ALLOW)})  # after an upgrade too
         claude = json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
-        self.assertEqual(sorted(claude), ["PostToolUse", "Stop", "UserPromptSubmit"])
+        self.assertEqual(sorted(claude), ["PermissionRequest", "PostToolUse", "Stop", "UserPromptSubmit"])
+        asks = [h for g in claude["PermissionRequest"] for h in g["hooks"]]
+        self.assertEqual(len(asks), 1)
+        self.assertTrue(asks[0]["command"].endswith(" hook claude permission"))
+        self.assertGreater(asks[0]["timeout"], crewchat.PERMISSION_WAIT)  # the hook outlives its wait
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
         self.assertEqual((len(tool), tool[0]), (2, "echo mine"))
         self.assertTrue(tool[1].endswith(" hook claude tool"))

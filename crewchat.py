@@ -89,6 +89,8 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an agent (config: max_chain)
 MAX_LISTEN = 55 * 60
+PERMISSION_WAIT = 10 * 60  # how long a permission prompt waits for Allow or Deny on the page (then: the agent's own)
+MAX_PERMISSION_TEXT = 2000  # of what the agent asks to run or change, shown with Allow and Deny
 DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
 LISTEN_GRACE = 15  # a listening hook re-asks within this many seconds; after that it has stopped
 ONLINE_SECS = 900  # an agent heard from this recently counts as online
@@ -276,7 +278,7 @@ or clash before it does."""),
     }),
     "blank": {"label": "Blank", "crew": "general", "roles": {}},
 }
-KNOWN_CLIENTS = ("claude", "cursor", "codex", "windsurf", "copilot", "gemini", "cline", "zed")
+KNOWN_CLIENTS = ("claude", "cursor", "codex", "qwen", "opencode", "windsurf", "copilot", "gemini", "cline", "zed")
 # First names a new agent is given, unless the machine names agents after their tool and folder
 # (config "agent_names": "place"). Short, easy to type after @, and from many places.
 AGENT_NAMES = (
@@ -292,6 +294,7 @@ TOOLS_INFO = {
     for tool, label, colour, mark in (
         ("claude", "Claude Code", "#d97757", "C"), ("cursor", "Cursor", "#1a1a1a", "Cu"),
         ("codex", "Codex", "#000000", "Cx"), ("gemini", "Gemini CLI", "#4285f4", "G"),
+        ("qwen", "Qwen Code", "#615ced", "Q"), ("opencode", "OpenCode", "#211e1e", "Oc"),
         ("antigravity", "Antigravity", "#3186ff", "Ag"), ("grok", "Grok", "#000000", "Gk"),
         ("windsurf", "Windsurf", "#09b6a2", "W"), ("copilot", "Copilot", "#8957e5", "Cp"),
         ("cline", "Cline", "#2b2b2b", "Cn"), ("zed", "Zed", "#084ccf", "Z"), ("agent", "Agent", "#6b7280", "•"),
@@ -1088,6 +1091,8 @@ class Hub:
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
+        self.permissions = {}  # id -> an agent's permission prompt waiting for Allow or Deny (memory only)
+        self.page_seen = 0  # when a chat page of this project last polled (Web Push skips an open page)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
         self.started = time.time()  # nobody can be heard while the server is down (memory only)
@@ -1704,9 +1709,13 @@ class Hub:
 
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
+            answered = {}  # (task, agent) -> the newest answer the owner sent it ("Re #12: ...", as Needs you sends one)
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
                 if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
+                reply = m["from"] == OWNER and m["kind"] == "msg" and re.match(r"Re #([A-Za-z]*\d+): ", m["text"])
+                if reply:
+                    answered.setdefault((reply.group(1), m["to"]), m["seq"])
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
         items = []
@@ -1717,6 +1726,8 @@ class Hub:
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
             if kind in ("blocked", "review") and r.get("note") == OWNER:
                 continue  # the owner set it so: nothing waits on the owner
+            if kind == "blocked" and answered.get((r["id"], said.get("from") or r["holder"]), 0) > said.get("seq", 0):
+                continue  # the agent that asked has its answer since: its turn (a review waits for Mark done)
             if kind:
                 # Named after whoever wrote the note (any agent may update a task), so an answer goes back
                 # to the agent that asked; a reclaimed task, after the agent it was taken from.
@@ -1725,13 +1736,62 @@ class Hub:
                 items.append({"kind": kind, "task": r["id"], "title": r["title"], "agent": agent, "holder": r["holder"],
                               "text": said.get("text", "") if fits else "",
                               "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
+        with self.lock:
+            for ask in self.permissions.values():
+                if not ask["answer"]:
+                    items.append({"kind": "permission", "id": ask["id"], "agent": ask["agent"], "tool": ask["tool"],
+                                  "text": ask["text"], "ts": ask["ts"], "blocking": 0})
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
-        order = {"blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
+        order = {"permission": -1, "blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
         items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
         self._needs = (version, items)
         return items
+
+    # Permission prompts ------------------------------------------------------------------------
+    def ask_permission(self, place, key, tool, text, wait=PERMISSION_WAIT):
+        """An agent's tool waits on a permission prompt (Claude Code's PermissionRequest hook): it waits in
+        Needs you for the owner's Allow or Deny, up to wait seconds. Returns "allow", "deny", or "" when
+        nobody answered here (the agent's own prompt shows then), the agent is not linked, or the owner
+        keeps permission prompts in the agents' terminals."""
+        if not isinstance(key, str) or not KEY_RE.match(key):
+            raise HubError("bad key")
+        with self.lock:
+            name = self.links.get(key)
+            agent = self.agents.get(name) if name else None
+            if agent is None or agent["place"] != place or self.machine_config().get("permissions") == "terminal":
+                return ""
+            ask = {"id": secrets.token_hex(6), "agent": name, "tool": clean_doing(tool)[:60] or "a tool",
+                   "text": str(text or "")[:MAX_PERMISSION_TEXT], "ts": time.time(), "answer": ""}
+            self.permissions[ask["id"]] = ask
+            self.touch(name, active=True)
+            self._changed()
+            try:
+                self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self.permissions, timeout=wait)
+            finally:
+                self.permissions.pop(ask["id"], None)
+                self._changed()
+        return ask["answer"] if ask["answer"] in ("allow", "deny") else ""
+
+    def answer_permission(self, pid, answer):
+        """The owner's Allow or Deny for a permission prompt in Needs you."""
+        if answer not in ("allow", "deny"):
+            raise HubError("answer is allow or deny")
+        with self.lock:
+            ask = self.permissions.get(pid) if isinstance(pid, str) else None
+            if ask is None or ask["answer"]:
+                raise HubError("that permission prompt is not waiting any more")
+            ask["answer"] = answer
+            self._changed()
+        return {"agent": ask["agent"], "answer": answer}
+
+    def _drop_permissions(self, name):
+        """A turn of the agent began or ended: what it asked was answered elsewhere (in its terminal).
+        Caller holds the lock."""
+        for ask in list(self.permissions.values()):
+            if ask["agent"] == name and not ask["answer"]:
+                del self.permissions[ask["id"]]
 
     def owner_read(self, seq):
         """The owner has seen the chat up to seq (the page, while it is in front)."""
@@ -2749,6 +2809,7 @@ class Hub:
                 return {}
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
+            self._drop_permissions(name)
             # A newer session of the same tool in the same place that has not linked yet may be this
             # very agent after a reconnect. Ask once; a hub_link from the right session merges them.
             newest = max((r["created"] for r in self.sessions.values()
@@ -2891,7 +2952,8 @@ class Hub:
             agent = self._local_agent(name, "start")
             state = self._session_state(agent)
             if agent.get("client") not in LAUNCH_TOOLS:
-                raise HubError("only Claude Code and Cursor agents can be started from the page")
+                raise HubError("only %s agents can be started from the page"
+                               % ", ".join(label for label, _ in LAUNCH_TOOLS.values()))
             if state and state["reopen"] and not running:
                 raise HubError("%s has a conversation to reopen: use Reopen" % name)
             if running or not self.startable(name):  # waiting for messages, or started a moment ago
@@ -2935,7 +2997,10 @@ class Hub:
     def _open_again(self, name, model, session, folder, command):
         with self.lock:
             key = self._link_key(name)
-        open_terminal(folder, command, key, title=name, root=self.home)
+        # OpenCode does not send a prompt given with the session it continues: crewchat's plugin does,
+        # once (the nonce), to that session.
+        env = {"CREWCHAT_REOPEN": "%s:%s" % (session["id"], secrets.token_hex(8))} if session.get("tool") == "opencode" else {}
+        open_terminal(folder, command, key, title=name, root=self.home, env=env)
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
                 self.agents[name]["session"]["reopening"] = time.time()  # until its hooks report the new process
@@ -3791,7 +3856,7 @@ PAGE_HEADERS = {
 # uninstall are never run from the page: a stray tap on a phone must not undo a setup.
 COMMANDS = [
     ("Getting going", [
-        ("start [FOLDER] [--place NAME] [--client all|claude|cursor] [--chat PROJECT]",
+        ("start [FOLDER] [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode] [--chat PROJECT]",
          "Host a chat here if there is none yet, start the server, connect the folder and open this page. Safe to "
          "run again. --place labels the folder in agent names; --chat puts it in that project (made if there is none).", None),
         ("start [--project NAME] [--port PORT] [--no-service] [--keep-awake] [--no-open] [--pack ID]",
@@ -3802,11 +3867,11 @@ COMMANDS = [
         ("ui", "Open this page in the browser on this machine.", None),
         ("ui --print", "A sign-in code to type on another device. It works once, for two minutes.", {"argv": ["ui", "--print"]}),
         ("status", "Is the server running, its addresses, connected folders, linked machines, and who is here.", {"argv": ["status"], "chat": True}),
-        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off]",
+        ("setup [--project NAME] [--port PORT] [--url URL] [--max-chain N] [--agent-names people|place] [--activity on|off] [--permissions page|terminal]",
          "Change settings: the chat's name, the local port, the address other machines use, how many turns in "
          "a row an agent may take on other agents' messages before only you can wake it (default 10), and how new "
          "agents are named: a first name (people) or their tool and folder (place), and whether the page shows what agents are "
-         "doing (--activity).", None),
+         "doing (--activity), and whether Claude Code agents ask permission in Needs you first (--permissions).", None),
     ]),
     ("The server", [
         ("serve [--port PORT] [--log FILE]", "Run the server in a terminal.", None),
@@ -3883,9 +3948,9 @@ COMMANDS = [
          {"argv": ["hooks", "refresh"]}),
         ("places", "The connected folders' labels.", {"argv": ["places"], "chat": True}),
         ("place remove NAME", "Shut a folder out: its token stops working at once.", None),
-        ("invite [--local] [--place NAME] [--client all|claude|cursor|generic] [--url URL]",
+        ("invite [--local] [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode|generic] [--url URL]",
          "A join command for another folder, with a single-use code (10 minutes).", {"argv": ["invite"], "chat": True, "ask": True}),
-        ("join --url URL --code CODE [--place NAME] [--client all|claude|cursor|generic] [--project FOLDER]",
+        ("join --url URL --code CODE [--place NAME] [--client all|claude|cursor|codex|gemini|qwen|opencode|generic] [--project FOLDER]",
          "Connect a folder to a chat, with the command from an invite (run it in that folder).", None),
     ]),
     ("Several machines over Tailscale", [
@@ -3911,7 +3976,7 @@ COMMANDS = [
     ]),
     ("One host, and other tools", [
         ("url [ADDRESS]", "Show (or set) the address other machines use to reach this host.", {"argv": ["url"]}),
-        ("stdio [--project FOLDER] [--url URL] [--token TOKEN]",
+        ("stdio [--project FOLDER] [--url URL] [--token TOKEN] [--local-only]",
          "crewchat's tools over standard input and output, for MCP clients that only start local programs.", None),
     ]),
 ]
@@ -3978,21 +4043,84 @@ def run_crewchat(argv, root=None):
     return {"code": done.returncode, "output": ANSI.sub("", text)[:20000] or "(no output)"}
 
 
-def connect_folder(path, chat, root=None):
-    """The owner connects a folder on this machine to a project from the chat page's New agent:
-    `crewchat start` in it, as in a terminal. Returns the folder as the launch options list it."""
+MAX_LISTED_FOLDERS = 500  # Browse on the page lists this many folders of one folder
+
+
+def typed_folder(path):
+    """A folder path the owner typed on the page, made absolute (~ is the home folder)."""
     raw = str(path or "").strip()
     if not raw:
         raise HubError("type the folder's path")
     folder = Path(os.path.expanduser(raw))
     if not folder.is_absolute():
         raise HubError("type the folder's full path, such as ~/code/my-app")
-    folder = folder.resolve()
-    if not folder.is_dir():
-        raise HubError("there is no folder at %s" % folder)
+    return folder.resolve()
+
+
+def list_folders(path, root=None):
+    """The folders in a folder on this machine, for New agent's Browse: hidden ones (.git, .cache)
+    and crewchat's own folder left out. A path that is not there yet lists the nearest folder above
+    it that is (missing: the path asked for)."""
+    asked = folder = typed_folder(path or "~")
+    while not folder.is_dir() and folder.parent != folder:
+        folder = folder.parent
+    own = Path(root or home()).resolve()
+    try:
+        mine = os.stat(str(own))
+    except OSError:
+        mine = None
+
+    def is_own(entry):
+        """crewchat's folder: by its path, or by file identity for another name of it (POSIX only:
+        on Windows, scandir's stat leaves st_ino at 0)."""
+        if os.path.normcase(entry.path) == os.path.normcase(str(own)):
+            return True
+        st = entry.stat()
+        return bool(mine and st.st_ino) and os.path.samestat(st, mine)
+    try:
+        names = sorted((e.name for e in os.scandir(folder) if not e.name.startswith(".") and e.is_dir()
+                        and not is_own(e)), key=str.lower)
+    except OSError as e:  # no permission (on a Mac: Desktop, Documents)
+        raise HubError("cannot open %s (%s)" % (folder, e.strerror or e))
+    return {"path": str(folder), "parent": str(folder.parent) if folder.parent != folder else "",
+            "home": str(Path.home().resolve()), "more": len(names) > MAX_LISTED_FOLDERS,
+            "missing": str(asked) if asked != folder else "",
+            "folders": [{"name": n, "path": str(folder / n)} for n in names[:MAX_LISTED_FOLDERS]]}
+
+
+def make_folder(path, name, root=None):
+    """A new folder called name in a folder on this machine, made from New agent's Browse."""
+    parent = typed_folder(path)
+    name = str(name or "").strip()
+    # Not hidden (Browse would not show it), and nothing Windows refuses or quietly changes.
+    if (not name or name.startswith(".") or name.endswith((".", " ")) or len(name) > 100
+            or re.search(r'[\\/:*?"<>|\x00-\x1f]', name)):
+        raise HubError('a folder\'s name has no / \\ : * ? " < > |, does not start or end with a dot, '
+                       'and is 100 characters at most')
+    folder = parent / name
+    if inside_any(folder, {Path(root or home())}):
+        raise HubError("not in crewchat's own folder")
+    try:
+        folder.mkdir()
+    except FileExistsError:
+        raise HubError("there is already a %s in %s" % (name, parent))
+    except OSError as e:  # no such parent, no permission
+        raise HubError("could not make %s (%s)" % (folder, e.strerror or e))
+    return str(folder)
+
+
+def connect_folder(path, chat, root=None, create=False):
+    """The owner connects a folder on this machine to a project from the chat page's New agent:
+    `crewchat start` in it, as in a terminal (create: make the folder first if it is not there).
+    Returns the folder as the launch options list it."""
+    folder = typed_folder(path)
     # Not the disk, home or above it (a .claude folder there is every session's), nor crewchat's own folder.
     if folder == Path(folder.anchor) or inside_any(Path.home(), {folder}) or inside_any(folder, {Path(root or home())}):
         raise HubError("pick a project's own folder, not %s" % folder)
+    if not folder.is_dir():
+        if not create:
+            raise HubError("there is no folder at %s" % folder)
+        make_folder(folder.parent, folder.name, root)
     done = run_crewchat(["start", str(folder), "--chat", chat, "--no-open"], root)
     if done["code"] != 0:
         lines = [line for line in done["output"].splitlines() if line.strip()]
@@ -4006,7 +4134,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -4039,6 +4167,29 @@ self.addEventListener('fetch', e => {
   if (e.request.mode !== 'navigate' || e.request.method !== 'GET') return;
   e.respondWith(fetch(e.request).catch(() =>
     new Response(OFFLINE, {headers: {'Content-Type': 'text/html; charset=utf-8'}})));
+});
+// Web Push: the push is empty; what it is about comes from the server, signed in as the page is.
+self.addEventListener('push', e => e.waitUntil((async () => {
+  let notes = [];
+  try {
+    const sub = await self.registration.pushManager.getSubscription();
+    const r = await fetch('/api/push', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                        body: JSON.stringify({op: 'notices', endpoint: sub ? sub.endpoint : ''})});
+    if (r.ok) notes = (await r.json()).notices || [];
+  } catch (err) {}
+  if (!notes.length) notes = [{title: 'crewchat', body: 'Something new needs you.', tag: 'crewchat', url: '/'}];
+  for (const n of notes.slice(0, 3))
+    await self.registration.showNotification(n.title, {body: n.body, tag: n.tag, icon: '/icon-192.png', data: {url: n.url}});
+})()));
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  const url = e.notification.data && e.notification.data.url;
+  e.waitUntil(self.clients.matchAll({type: 'window', includeUncontrolled: true}).then(list => {
+    const open = list.find(c => new URL(c.url).origin === self.location.origin);
+    if (open && url) return open.navigate(url).then(c => (c || open).focus());
+    if (open) return open.focus();
+    return self.clients.openWindow(url || '/');
+  }));
 });
 """
 SW_REGISTER = ("<script>if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js')"
@@ -4383,9 +4534,9 @@ class Handler(BaseHTTPRequestHandler):
                         extra={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
         elif url.path == "/mcp":
             self._reply(405, b"", extra={"Allow": "POST, DELETE"})
-        elif url.path in ("/", "/classic"):  # /classic: the page before 0.14, for one release
+        elif url.path == "/":
             if self._owner_session():
-                self._html(200, CHAT_PAGE if url.path == "/" else CLASSIC_PAGE)
+                self._html(200, CHAT_PAGE)
             else:
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/login":
@@ -4410,6 +4561,20 @@ class Handler(BaseHTTPRequestHandler):
             if not self._use_asked():
                 return
             self._json(200, launch_options(self.hub.machine_config(), self.roster.root, self.hub.chat_key))
+        elif url.path == "/api/tool-check":
+            if not self._owner_session():
+                self._json(401, {"error": "sign in"})
+                return
+            query = urllib.parse.parse_qs(url.query)
+            tool, folder = (query.get("tool") or [""])[0], (query.get("folder") or [""])[0]
+            if tool not in LAUNCH_TOOLS:
+                self._json(400, {"error": "no tool called %s" % tool[:40]})
+                return
+            config = self.hub.machine_config()
+            if folder not in [f["path"] for f in launch_folders(config, self.roster.root, self.hub.chat_key)]:
+                folder = ""  # only this project's folders on this machine
+            self._json(200, {"tool": tool, "folder": folder, "items": tool_readiness(
+                tool, folder, config, fresh=(query.get("fresh") or [""])[0] == "1")})
         elif url.path == "/api/commands":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -4428,7 +4593,9 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._json(400, {"error": "bad query"})
                 return
+            self.hub.page_seen = time.time()
             data = self.hub.poll(after, version, wait)
+            self.hub.page_seen = time.time()
             data["chat"] = self.project.id
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
@@ -4557,6 +4724,20 @@ class Handler(BaseHTTPRequestHandler):
     def _role(self, data):
         return {"id": self.hub.set_role(OWNER, data.get("agent"), data.get("role"))["id"]}
 
+    def _push(self, data):
+        """Web Push for the chat page: this machine's key to subscribe with, a browser's notifications for
+        this project (all, mentions or off), and what waits for its service worker."""
+        store, op = push_store(self.projects.base), data.get("op")
+        if op == "key":
+            return {"key": store.public_key()}
+        endpoint = data.get("endpoint")
+        if op == "mode":
+            store.set_mode(endpoint, self.project.id, data.get("mode"))
+            return {}
+        if op == "notices":
+            return {"notices": store.take(endpoint)}
+        raise HubError("op is key, mode or notices")
+
     def _read(self, data):
         try:
             return {"read": self.hub.owner_read(int(data.get("seq")))}
@@ -4594,10 +4775,15 @@ class Handler(BaseHTTPRequestHandler):
         return answer
 
     def _folders(self, data):
-        """The owner connects a folder on this machine to this project, for New agent."""
-        if data.get("op") != "connect":
-            raise HubError("unknown op")
-        path = connect_folder(data.get("path"), self.project.id, self.projects.base)
+        """New agent's folders on this machine: list one (Browse), make one, or connect one to this project."""
+        op, base = data.get("op"), self.projects.base
+        if op == "list":
+            return list_folders(data.get("path"), base)
+        if op == "mkdir":
+            return {"path": make_folder(data.get("path"), data.get("name"), base)}
+        if op != "connect":
+            raise HubError("op is list, mkdir or connect")
+        path = connect_folder(data.get("path"), self.project.id, base, create=data.get("create") is True)
         self.projects.primary.roster.refresh()  # the machine's folders and the folder's token, just written
         return {"path": path, "folders": launch_folders(self.hub.machine_config(), self.roster.root, self.hub.chat_key)}
 
@@ -4801,7 +4987,9 @@ class Handler(BaseHTTPRequestHandler):
         owner_actions = {"/api/send": self._send_as_owner, "/api/role": self._role, "/api/roles": self._roles,
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
                          "/api/read": self._read, "/api/folders": self._folders,
-                         "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op}
+                         "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
+                         "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
+                         "/api/push": self._push}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -4819,6 +5007,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(403, {"error": "hooks use a place token"})
                 return
             data = self._object(raw)
+            if data.get("event") == "permission":
+                try:
+                    self._json(200, {"answer": self.hub.ask_permission(who[1], data.get("key"), str(data.get("tool") or ""),
+                                                                       str(data.get("text") or ""))})
+                except HubError:
+                    self._json(400, {"error": "bad request"})
+                return
             try:
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
@@ -4964,7 +5159,7 @@ def free_port(start):
     return start
 
 
-def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None):
+def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=None, activity=None, permissions=None):
     root = home()
     existing = load_config() if (root / "config.json").exists() else {}
     config = dict(existing)  # keeps settings made elsewhere, such as cloud sync
@@ -4980,6 +5175,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
         config["agent_names"] = agent_names
     if activity:
         config["activity"] = activity
+    if permissions:
+        config["permissions"] = permissions
     (root / "tokens").mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
         os.chmod(root, 0o700)
@@ -4991,7 +5188,8 @@ def setup_host(project=None, port=None, url=None, max_chain=None, agent_names=No
 
 def cmd_setup(args):
     config = setup_host(args.project, args.port, args.url, getattr(args, "max_chain", None),
-                        getattr(args, "agent_names", None), getattr(args, "activity", None))
+                        getattr(args, "agent_names", None), getattr(args, "activity", None),
+                        getattr(args, "permissions", None))
     print("crewchat is set up in %s for %s." % (home(), config["project"]))
     print()
     print("Next:")
@@ -5084,20 +5282,22 @@ def joined_place(project, config=None, root=None):
     want = local_url(config or load_config(root)) + "/mcp"
     tokens = {read_token(p, root): p for p in list_places(root)}
     found, token, clients = None, None, []
-    for client, rel in CLIENT_FILES.items():
-        entry = (read_json(project / rel).get("mcpServers") or {}).get(SERVER_NAME) or {}
-        auth = (entry.get("headers") or {}).get("Authorization", "")
-        if entry.get("url") == want and auth[7:] in tokens:
-            found, token = tokens[auth[7:]], auth[7:]
+    for client in ALL_CLIENTS:
+        entry = connection_entry(project, client)
+        if entry and entry[0] == want and entry[1] in tokens:
+            found, token = tokens[entry[1]], entry[1]
             clients.append(client)
     return found, token, clients
 
 
 # Agents launched from the chat page ---------------------------------------------------------
-LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent")}
+LAUNCH_TOOLS = {"claude": ("Claude Code", "claude"), "cursor": ("Cursor", "cursor-agent"), "codex": ("Codex CLI", "codex"),
+                "gemini": ("Gemini CLI", "gemini"), "qwen": ("Qwen Code", "qwen"), "opencode": ("OpenCode", "opencode")}
+MORE_TOOLS = ("codex", "gemini", "qwen", "opencode")  # joined by their MCP settings (and their hooks)
+PROMPT_OPTION = {"gemini": ["-i"], "qwen": ["-i"], "opencode": ["--prompt"]}  # else the prompt is the last argument
 # Options every agent started from the chat page gets: Cursor's agent is not stopped by the folder's
 # trust prompt (crewchat's MCP server alone is approved before it starts, see launch_agent).
-LAUNCH_BASE = {"claude": [], "cursor": ["--trust"]}
+LAUNCH_BASE = {"claude": [], "cursor": ["--trust"], "codex": [], "gemini": [], "qwen": [], "opencode": []}
 # What it may do without asking, per tool: id -> (what the page says, its command-line options).
 # crewchat's own tools are always allowed, by the folder's settings (CLAUDE_ALLOW, CURSOR_ALLOW).
 LAUNCH_PERMISSIONS = {
@@ -5108,6 +5308,18 @@ LAUNCH_PERMISSIONS = {
     "cursor": {"ask": ("Use crewchat; ask before sending a message or anything else", []),
                "auto": ("Also run what Cursor judges safe (auto-review)", ["--auto-review"]),
                "all": ("Run any command (--force)", ["--force"])},
+    "codex": {"ask": ("As Codex's own settings say", []),
+              # What --full-auto was (Codex no longer has it): its workspace sandbox, asking when it decides to.
+              "edits": ("Edit and run commands in the folder without asking (its workspace sandbox)",
+                        ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]),
+              "all": ("Do anything, outside its sandbox too (no prompts at all)", ["--dangerously-bypass-approvals-and-sandbox"])},
+    "gemini": {"ask": ("Ask before each change (its default)", []),
+               "edits": ("Also edit files without asking", ["--approval-mode", "auto_edit"]),
+               "all": ("Do anything (--yolo: no prompts at all)", ["--yolo"])},
+    "qwen": {"ask": ("Ask before each change (its default)", []),
+             "edits": ("Also edit files without asking", ["--approval-mode", "auto-edit"]),
+             "all": ("Do anything (--yolo: no prompts at all)", ["--yolo"])},
+    "opencode": {"ask": ("As OpenCode's own settings say", [])},
 }
 # Where these tools usually live: the server may run with a short PATH (started at login).
 TOOL_DIRS = ("~/.local/bin", "~/.claude/local", "/opt/homebrew/bin", "/usr/local/bin", "~/.npm-global/bin",
@@ -5175,7 +5387,11 @@ def launch_folders(config, root=None, chat=""):
 
 
 TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
-              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash"}
+              "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash",
+              "codex": "Needs Codex CLI: npm install -g @openai/codex",
+              "gemini": "Needs Gemini CLI: npm install -g @google/gemini-cli",
+              "qwen": "Needs Qwen Code: npm install -g @qwen-code/qwen-code",
+              "opencode": "Needs OpenCode: curl -fsSL https://opencode.ai/install | bash"}
 
 
 def launch_options(config, root=None, chat=""):
@@ -5188,6 +5404,189 @@ def launch_options(config, root=None, chat=""):
                            "models": tool_models(t) if exe else [], "advisors": tool_advisors(t) if exe else []},
                           **({} if exe else {"missing": TOOL_HINTS[t]})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
+
+
+# Is a tool ready for an agent (New agent says what is left to do)? Each check reads what the tool keeps
+# in the user's home, or asks the tool itself (its sign-in status command). Nothing is changed, and
+# nothing secret is read out: only whether it is there. "todo": to do before starting it; "note": what
+# it asks once in its window, or what crewchat cannot see from here; "ok": done.
+READY_EVERY = 60  # seconds a tool's sign-in answer is kept (the commands take a second or two)
+_READY = {}  # tool -> (when, its sign-in item)
+
+
+def json_file(path):
+    """A JSON file as a dict, or {} (missing, unreadable, not an object)."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def ready_item(state, text, fix=""):
+    return {"state": state, "text": text, "fix": fix}
+
+
+def status_of(command):
+    """(exit code, what it printed) of a tool's own status command, or (None, "") if it did not run."""
+    try:
+        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return out.returncode, out.stdout + out.stderr
+
+
+def within(folder, parent):
+    """Is folder parent itself, or inside it?"""
+    try:
+        Path(folder).resolve().relative_to(Path(parent).expanduser().resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def auth_settings(settings):
+    """The auth method Gemini CLI's or Qwen Code's settings choose ('' if none)."""
+    auth = ((settings.get("security") or {}).get("auth") or {}) if isinstance(settings.get("security"), dict) else {}
+    chosen = auth.get("selectedType") if isinstance(auth, dict) else None
+    return str(chosen or settings.get("selectedAuthType") or "")
+
+
+def signed_in(tool, exe, folder=""):
+    """Whether the tool can reach its model: signed in, or set up with a key or a provider."""
+    name = LAUNCH_TOOLS[tool][0]
+    if tool == "claude":
+        code, out = status_of([exe, "auth", "status"])
+        try:
+            status = json.loads(out[out.index("{"):])
+        except ValueError:
+            return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+        if status.get("loggedIn"):
+            return ready_item("ok", "Signed in")
+        return ready_item("todo", "%s is not signed in" % name, "claude, then /login")
+    if tool == "cursor":
+        code, out = status_of([exe, "status"])
+        if "not logged in" in out.lower():
+            command = Path(exe).stem if Path(exe).stem in ("cursor-agent", "agent") else "cursor-agent"
+            return ready_item("todo", "%s is not signed in" % name, "%s login" % command)
+        if "logged in" in out.lower():
+            return ready_item("ok", "Signed in")
+        return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+    if tool == "codex":
+        code, out = status_of([exe, "login", "status"])
+        if code == 0:
+            return ready_item("ok", "Signed in" + (" with an API key" if "api key" in out.lower() else ""))
+        try:
+            settings = codex_config().read_text(encoding="utf-8")
+        except OSError:
+            settings = ""
+        provider = re.search(r'^\s*model_provider\s*=\s*"([^"]+)"', settings.split("\n[", 1)[0], re.M)
+        if provider and provider.group(1) != "openai":
+            return ready_item("ok", "Uses its own model provider (%s)" % provider.group(1)[:40])
+        if code is None:
+            return ready_item("note", "crewchat could not tell whether %s is signed in" % name)
+        return ready_item("todo", "%s is not signed in" % name, "codex login")
+    if tool in ("gemini", "qwen"):
+        own = user_home() / (".gemini" if tool == "gemini" else ".qwen")
+        settings = [json_file(own / "settings.json")] + ([json_file(Path(folder) / MCP_FILES[tool][0])] if folder else [])
+        chosen = next((a for a in map(auth_settings, settings) if a), "")
+        keys = ("GEMINI_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_GCA") if tool == "gemini" else ("OPENAI_API_KEY",)
+        try:
+            env_file = (own / ".env").read_text(encoding="utf-8")
+        except OSError:
+            env_file = ""
+        has_key = any(os.environ.get(k) or re.search(r"^\s*(export\s+)?%s\s*=" % k, env_file, re.M) for k in keys)
+        if chosen in ("oauth-personal", "qwen-oauth"):
+            if (own / "oauth_creds.json").is_file():
+                return ready_item("ok", "Signed in" + (" with Google" if tool == "gemini" else ""))
+            return ready_item("todo", "%s is set to sign in, but has not yet" % name, tool)
+        if chosen or has_key:
+            api_key = chosen in ("gemini-api-key", "openai") or (not chosen and has_key)
+            if api_key and not has_key and not any(isinstance(((s.get("security") or {}).get("auth") or {}).get("apiKey"), str)
+                                                    for s in settings if isinstance(s.get("security"), dict)):
+                return ready_item("note", "Set up to use an API key (%s): crewchat cannot see it from here, so make sure "
+                                          "the terminal it opens in has it" % keys[0])
+            return ready_item("ok", "Set up" + (" (%s)" % chosen if chosen else " with an API key"))
+        return ready_item("todo", "%s is not set up: open it once and choose how it signs in" % name, tool)
+    if tool == "opencode":
+        code, out = status_of([exe, "auth", "list"])
+        found = re.search(r"(\d+)\s+credentials?", re.sub(r"\x1b\[[0-9;]*m", "", out))
+        if found and int(found.group(1)) > 0:
+            return ready_item("ok", "Signed in to %s provider%s" % (found.group(1), "" if found.group(1) == "1" else "s"))
+        return ready_item("note", "No provider signed in: OpenCode can use its own free models, or sign in to one",
+                          "opencode auth login")
+    return ready_item("note", "crewchat cannot check %s" % name)
+
+
+def folder_ready(tool, folder):
+    """What the tool asks once in this folder (trust, crewchat's hooks), and whether it already has."""
+    home_dir, items = user_home(), []
+    if tool == "claude":
+        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        projects = json_file(Path(config_dir) / ".claude.json" if config_dir else home_dir / ".claude.json").get("projects") or {}
+        trusted = isinstance(projects, dict) and any(isinstance(v, dict) and v.get("hasTrustDialogAccepted")
+                                                     and within(folder, k) for k, v in projects.items())
+        items.append(ready_item("ok", "Trusts this folder") if trusted else
+                     ready_item("note", "Asks once whether you trust this folder: answer in its window"))
+    elif tool == "codex":
+        try:
+            settings = codex_config().read_text(encoding="utf-8")
+        except OSError:
+            settings = ""
+        trusted = False
+        for header, body in re.findall(r'^\[projects\.("(?:[^"\\]|\\.)*")\]\s*$(.*?)(?=^\[|\Z)', settings, re.M | re.S):
+            try:
+                path = json.loads(header)
+            except ValueError:
+                continue
+            if within(folder, path) and re.search(r'^\s*trust_level\s*=\s*"trusted"', body, re.M):
+                trusted = True
+        items.append(ready_item("ok", "Trusts this folder") if trusted else
+                     ready_item("note", "Asks once whether you trust this folder: answer in its window"))
+        if CODEX_BEGIN in settings:
+            reviewed = re.search(r'^\[hooks\.state\."[^"]*:stop:\d+:\d+"\]', settings, re.M)
+            items.append(ready_item("ok", "crewchat's hooks are approved") if reviewed else ready_item(
+                "note", "Asks once to review crewchat's hooks: choose Trust all and continue, or messages "
+                        "wait until it checks hub_inbox"))
+    elif tool in ("gemini", "qwen"):
+        own = home_dir / (".gemini" if tool == "gemini" else ".qwen")
+        settings = json_file(own / "settings.json")
+        trust_setting = ((settings.get("security") or {}).get("folderTrust") or {}) if isinstance(settings.get("security"), dict) else {}
+        enabled = trust_setting.get("enabled") if isinstance(trust_setting, dict) else None
+        if enabled is True or (enabled is None and tool == "gemini"):  # Gemini CLI checks by default
+            levels = json_file(own / "trustedFolders.json")
+            trusted = any(within(folder, path if level == "TRUST_FOLDER" else str(Path(path).parent))
+                          for path, level in levels.items() if level in ("TRUST_FOLDER", "TRUST_PARENT"))
+            if levels.get(str(Path(folder))) == "DO_NOT_TRUST":
+                trusted = False
+            items.append(ready_item("ok", "Trusts this folder") if trusted else
+                         ready_item("note", "Asks once whether you trust this folder: answer in its window, or its "
+                                            "hooks and crewchat's settings there are skipped"))
+        if tool == "gemini":
+            approved = json_file(own / "trusted_hooks.json").get(str(Path(folder)))
+            ours = "crewchat-stop:" + hook_command("gemini", "stop")
+            items.append(ready_item("ok", "crewchat's hooks are approved") if isinstance(approved, list) and ours in approved
+                         else ready_item("note", "Asks once to trust crewchat's hooks in this folder: answer in its window"))
+    elif tool == "opencode":
+        if (Path(folder) / OPENCODE_PLUGIN_FILE).is_file():
+            set_up = (Path(folder) / ".opencode" / "node_modules").is_dir()
+            items.append(ready_item("ok", "crewchat's plugin is set up") if set_up else ready_item(
+                "note", "Sets up crewchat's plugin the first time it opens here; if that first session gets no "
+                        "messages, close it and Reopen it"))
+    return items
+
+
+def tool_readiness(tool, folder="", config=None, fresh=False):
+    """What is left before an agent of this tool can work, on this machine and in folder (one of this
+    project's): installed, signed in, and what it asks once in the folder."""
+    exe = find_tool(tool, config or {})
+    if not exe:
+        return [ready_item("todo", "%s is not installed here" % LAUNCH_TOOLS[tool][0], TOOL_HINTS[tool].split(": ", 1)[-1])]
+    kept = _READY.get(tool)
+    if fresh or not kept or time.time() - kept[0] > READY_EVERY or kept[2] != folder:
+        kept = (time.time(), signed_in(tool, exe, folder), folder)
+        _READY[tool] = kept
+    return [kept[1]] + (folder_ready(tool, folder) if folder else [])
 
 
 def tool_options(tool, permissions="ask", base=None, model="", advisor=""):
@@ -5214,10 +5613,10 @@ def launch_command(exe, tool, key, permissions="ask", base=None, model="", advis
     """The agent's command line. Only the fixed prompt, the key, fixed options and a model and an
     advisor from tool_models and tool_advisors reach it: no text typed on the chat page is ever
     passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base, model, advisor) + [LAUNCH_PROMPT % key]
+    return [exe] + tool_options(tool, permissions, base, model, advisor) + PROMPT_OPTION.get(tool, []) + [LAUNCH_PROMPT % key]
 
 
-def macos_script(folder, command, key, title=""):
+def macos_script(folder, command, key, title="", env=None):
     return "\n".join([
         "#!/bin/sh",
         "# Opened by crewchat to start an agent. It deletes itself.",
@@ -5225,7 +5624,8 @@ def macos_script(folder, command, key, title=""):
     ] + (["printf '\\033]0;%%s\\007' %s" % shlex.quote(title)] if title else []) + [  # the window's title
         "cd %s || exit 1" % shlex.quote(str(folder)),
         'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"',
-        "export CREWCHAT_LINK_KEY=%s" % shlex.quote(key),  # its hooks link with the same key
+    ] + ["export %s=%s" % (name, shlex.quote(value))  # its hooks link with the same key
+         for name, value in sorted(dict(env or {}, CREWCHAT_LINK_KEY=key).items())] + [
         "exec " + " ".join(shlex.quote(part) for part in command),
     ]) + "\n"
 
@@ -5248,6 +5648,7 @@ def fit_options(help_text, tool, permissions):
     chosen = LAUNCH_PERMISSIONS[tool][permissions][1]
     missing = [o for o in chosen if o.startswith("--") and o not in help_text]
     missing += [v for o, v in zip(chosen, chosen[1:]) if o == "--permission-mode" and '"%s"' % v not in help_text]
+    missing += [v for o, v in zip(chosen, chosen[1:]) if o == "--approval-mode" and v not in help_text]
     return [o for o in LAUNCH_BASE[tool] if o in help_text], missing
 
 
@@ -5262,6 +5663,17 @@ def agent_tool(tool, folder, permissions, root=None):
     if missing:
         raise HubError("this %s does not know %s yet: update it, or choose another permission" % (
             LAUNCH_TOOLS[tool][0], " ".join(missing)))
+    if tool in MORE_TOOLS and not connection_entry(folder, "claude" if tool == "codex" else tool):
+        # Connected before this tool was installed: its settings get crewchat now.
+        config = load_config(root)
+        _, token, _ = joined_place(Path(folder), config, root)
+        written = install_client(tool, Path(folder), local_url(config), token) if token else []
+        if not written:
+            raise HubError("crewchat could not add itself to %s's settings in this folder (see the server log); "
+                           "run `crewchat start --client %s` there" % (LAUNCH_TOOLS[tool][0], tool))
+        git_exclude(Path(folder), written)
+    elif tool == "codex":
+        install_codex()  # Codex's settings have crewchat (`crewchat stdio` finds this folder's chat)
     if tool == "cursor":
         for name in registered_names(folder, "cursor", root):  # crewchat's MCP server alone (not
             try:  # every server the folder lists, --approve-mcps), under each name it has
@@ -5274,7 +5686,11 @@ def agent_tool(tool, folder, permissions, root=None):
 REOPEN_WAIT = 120  # seconds a reopened session has to report before Reopen may be clicked again
 REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_inbox, then carry on with "
                  "your task.")
-REOPEN_TOOLS = ("claude",)  # Cursor's agent: resuming a chat by id is not checked yet, so Stop only
+# How each tool resumes a conversation by the id its hooks report (checked with each tool: Codex's is
+# a subcommand). Cursor's agent: resuming a chat by id is not checked yet, so Stop only.
+RESUME_ARGS = {"claude": lambda session: ["--resume=" + session], "gemini": lambda session: ["--resume=" + session],
+               "qwen": lambda session: ["--resume=" + session], "opencode": lambda session: ["--session=" + session]}
+REOPEN_TOOLS = ("claude", "codex", "gemini", "qwen", "opencode")
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
 # The models Claude Code's own advisor (--advisor) can be: its aliases that can act as one (Haiku 4.5
@@ -5296,11 +5712,15 @@ def tool_advisors(tool):
 
 def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor=""):
     """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
-    if not SESSION_RE.fullmatch(str(session)):
+    if not SESSION_RE.fullmatch(str(session)) or tool not in REOPEN_TOOLS:
         raise HubError("that session cannot be reopened")
-    # One argument, so an id can never be taken for an option of its own.
-    return ([exe] + tool_options(tool, permissions, base, model or "", advisor or "")
-            + ["--resume=" + session, REOPEN_PROMPT])
+    options = tool_options(tool, permissions, base, model or "", advisor or "")
+    if tool == "codex":  # codex resume [options] <id> <prompt>; an id never starts with "-" (SESSION_RE)
+        return [exe, "resume"] + options + [session, REOPEN_PROMPT]
+    # The id in one argument with its option, so it can never be taken for an option of its own.
+    if tool == "opencode":  # its plugin sends REOPEN_PROMPT (see _open_again)
+        return [exe] + options + RESUME_ARGS[tool](session)
+    return [exe] + options + RESUME_ARGS[tool](session) + PROMPT_OPTION.get(tool, []) + [REOPEN_PROMPT]
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
@@ -5309,24 +5729,25 @@ def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advi
     open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, advisor), key, root=root)
 
 
-def open_terminal(folder, command, key, title="", root=None):
+def open_terminal(folder, command, key, title="", root=None, env=None):
     """Run an agent's command in a new terminal window on this machine, in folder, its hooks given
-    key (CREWCHAT_LINK_KEY); title names the window where the terminal allows."""
+    key (CREWCHAT_LINK_KEY) and env; title names the window where the terminal allows."""
+    env = dict(env or {}, CREWCHAT_LINK_KEY=key)
     if sys.platform == "darwin":
         script = (Path(root) if root else home()) / "launch" / ("agent-%s.command" % key[-8:])
         script.parent.mkdir(parents=True, exist_ok=True)
-        script.write_text(macos_script(folder, command, key, title), encoding="utf-8")
+        script.write_text(macos_script(folder, command, key, title, env), encoding="utf-8")
         os.chmod(script, 0o700)
         out = run(["open", str(script)])
         if out.returncode != 0:
             raise HubError("could not open a Terminal window: %s" % (out.stderr.strip() or out.stdout.strip()))
     elif os.name == "nt":
-        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, CREWCHAT_LINK_KEY=key),
+        subprocess.Popen(command, cwd=str(folder), env=dict(os.environ, **env),
                          creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0x10))
     else:
         # Some terminals start the window from a server process that does not get this one's
         # environment, so the key goes on the command line, through env.
-        command = ["env", "CREWCHAT_LINK_KEY=%s" % key] + command
+        command = ["env"] + ["%s=%s" % item for item in sorted(env.items())] + command
         for term in (["x-terminal-emulator", "-e"], ["gnome-terminal", "--"], ["konsole", "-e"], ["xterm", "-e"]):
             if shutil.which(term[0]):
                 subprocess.Popen(term + command, cwd=str(folder), start_new_session=True)
@@ -5394,9 +5815,13 @@ def cmd_start(args):
 
     place, token, clients, chosen = connected_project(project, config)
     if place and (not args.chat or find_chat(args.chat) == chosen):
-        # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since.
-        for client in clients:
-            {"claude": install_claude, "cursor": install_cursor}[client](project, local_url(config), token)
+        # Rewrite the hooks too, in case crewchat was reinstalled somewhere else since; and add the tool
+        # asked for, or (all) the other tools installed since.
+        asked = [c for c in clients_for(args.client, config) if args.client != "all" or c in MORE_TOOLS]
+        written = []
+        for client in clients + [c for c in asked if c not in clients]:
+            written += install_client(client, project, local_url(config), token)
+        git_exclude(project, written)
         remember(project, place, chat=chosen["chat"])
         print("- %s is connected to the project \"%s\", as \"%s\"." % (project, chosen["name"], place))
         if args.pack:
@@ -5442,8 +5867,8 @@ def cmd_start(args):
                   "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
     except OSError as e:
         print("- Could not write the project's guide for its agents (%s)." % e)
-    for client in ("claude", "cursor") if args.client == "all" else (args.client,):
-        note = client in CLIENT_FILES and duplicate_note(project, client)
+    for client in [c for c in clients_for(args.client, config) if c in CLIENT_FILES]:
+        note = duplicate_note(project, client)
         if note:
             print("- Note: " + note)
 
@@ -5452,12 +5877,13 @@ def cmd_start(args):
     if not args.no_open:
         cmd_ui(argparse.Namespace(print=False))
     print()
-    kinds = {"all": ("claude", "cursor"), "claude": ("claude",), "cursor": ("cursor",)}[args.client]
+    kinds = clients_for(args.client, config)
     where = "this folder" if project == Path.cwd().resolve() else str(project)
     named = ("named %s-%s, %s-%s-2, ..." % (kinds[0], place, kinds[0], place) if config.get("agent_names") == "place"
              else "with a first name of its own (Maya, Teo, ...)")
     print("Now open %s in %s. Each new session joins the chat by itself, %s"
-          % (" or ".join({"claude": "Claude Code", "cursor": "Cursor"}[k] for k in kinds), where, named))
+          % (", ".join(LAUNCH_TOOLS[k][0] for k in kinds[:-1]) + (" or " if len(kinds) > 1 else "")
+             + LAUNCH_TOOLS[kinds[-1]][0], where, named))
     print("Sessions that were already open need a restart. After each turn, a Claude Code agent waits")
     print("up to %d minutes for chat messages; `crewchat listen off` turns that off." % (DEFAULT_LISTEN // 60))
     if not (config.get("peers") or config.get("cloud")):
@@ -5577,6 +6003,7 @@ def cmd_serve(args):
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=push_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -5634,7 +6061,7 @@ def cmd_invite(args):
     print("  crewchat join --url %s --code %s-%s%s" % (
         url, code[:4], code[4:], "" if args.client == "all" else " --client " + args.client))
     print()
-    print("Every Claude Code and Cursor session opened in that folder then joins the chat by itself.")
+    print("Every agent session (Claude Code, Cursor, Codex, Gemini CLI, ...) opened in that folder then joins the chat.")
     if url.startswith("http://127.0.0.1"):
         print("That address only works on this machine. For another machine, set the shared address")
         print("first (`crewchat url`), or pass --url.")
@@ -5926,7 +6353,30 @@ def cmd_status(_args):
 # --------------------------------------------------------------------------------------------
 # Agent-side commands: join a chat, and the hooks that check it
 # --------------------------------------------------------------------------------------------
-CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}
+CLIENT_FILES = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json"}  # the tools crewchat's hooks run in
+# Tools that join by their MCP settings (Gemini CLI's and Qwen Code's hooks are in them too; OpenCode's are
+# a plugin, OPENCODE_PLUGIN): the folder's file and the key of the server's address in it. Codex keeps its servers in the user's own config instead (install_codex), so a
+# Codex folder's chat is its .mcp.json.
+# For each: the file, the key its servers are under, the key of a server's address, and what else
+# crewchat's entry says (Gemini CLI and Qwen Code trust its tools, as Claude Code and Cursor do).
+MCP_FILES = {"gemini": (".gemini/settings.json", "mcpServers", "httpUrl", {"trust": True}),
+             "qwen": (".qwen/settings.json", "mcpServers", "httpUrl", {"trust": True}),
+             "opencode": ("opencode.json", "mcp", "url", {"type": "remote", "enabled": True})}
+ALL_CLIENTS = list(CLIENT_FILES) + list(MCP_FILES)  # every tool whose folder file can hold crewchat's entry
+
+
+def connection_entry(project, client):
+    """(server address, place token) of crewchat's server in a folder's settings for a tool, or None."""
+    rel, servers, key = (CLIENT_FILES[client], "mcpServers", "url") if client in CLIENT_FILES else MCP_FILES[client][:3]
+    try:
+        data = json.loads((Path(project) / rel).read_text(encoding="utf-8"))
+        entry = data[servers][SERVER_NAME]
+        url, auth = entry[key], entry["headers"]["Authorization"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not (isinstance(url, str) and isinstance(auth, str) and auth.startswith("Bearer ")):
+        return None
+    return url, auth[len("Bearer "):]
 HOOK_REASON = (
     "New messages on the crewchat:\n\n%s\n\n"
     "Handle what is for you, as the crewchat rules say: answer anything Owner wrote with hub_send, "
@@ -5997,16 +6447,37 @@ def hook_command(client, event):
     return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
 
 
+HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini", "qwen", "opencode")  # the tools whose hooks hand messages over
+# The file whose presence marks a connected folder, for a tool's hooks (Codex's chat is its .mcp.json).
+HOOK_MARKERS = {"claude": ".mcp.json", "cursor": ".cursor/mcp.json", "codex": ".mcp.json",
+                "gemini": ".gemini/settings.json", "qwen": ".qwen/settings.json", "opencode": "opencode.json"}
+# Tools whose hooks work as Claude Code's: a prompt hook adds context, a stop hook answers
+# {"decision": "block", "reason": ...} to go on with the chat's messages (Cursor: followup_message).
+# OpenCode's are crewchat's plugin (OPENCODE_PLUGIN), which reads them the same way.
+BLOCK_CLIENTS = ("claude", "codex", "gemini", "qwen", "opencode")
+PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent", "qwen": "UserPromptSubmit"}  # answered in JSON
+# The hooks of the tools that keep them beside crewchat's server, in the folder's settings (MCP_FILES):
+# each event, the hook it runs, and its timeout in seconds.
+SETTINGS_HOOKS = {
+    "gemini": (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100), ("AfterTool", "tool", 10)),
+    "qwen": (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100), ("PostToolUse", "tool", 10))}
+
+
 def is_our_hook(command):
-    return " hook claude " in command or " hook cursor " in command
+    return any(" hook %s " % client in command for client in HOOK_CLIENTS)
 
 
-def install_claude(project, url, token):
+def write_mcp_json(project, url, token):
+    """crewchat in the folder's .mcp.json: Claude Code's, and where `crewchat stdio` finds the chat."""
     config = read_json(project / ".mcp.json")
     config.setdefault("mcpServers", {})[SERVER_NAME] = {
         "type": "http", "url": url + "/mcp", "headers": {"Authorization": "Bearer %s" % token},
     }
     write_json(project / ".mcp.json", config, private=True)
+
+
+def install_claude(project, url, token):
+    write_mcp_json(project, url, token)
     settings_path = project / ".claude" / "settings.local.json"
     settings = read_json(settings_path)
     enabled = settings.setdefault("enabledMcpjsonServers", [])
@@ -6174,11 +6645,28 @@ def set_claude_hooks(settings, names=(SERVER_NAME,)):
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
                                                  "statusMessage": "Waiting for crewchat messages"}),
-                               ("PostToolUse", "tool", {"timeout": 10})):  # a sign of life
+                               ("PostToolUse", "tool", {"timeout": 10}),  # a sign of life
+                               ("PermissionRequest", "permission", {"timeout": PERMISSION_WAIT + 30,
+                                                                    "statusMessage": "Asking on the crewchat page"})):
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
         groups.append({"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]})
         hooks[event] = groups
+
+
+def set_settings_hooks(settings, client):
+    """crewchat's hooks in Gemini CLI's or Qwen Code's settings (the folder's .gemini/ or .qwen/settings.json),
+    replacing its own older ones and keeping the user's. Each tool asks once to trust them. Timeouts in
+    milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds."""
+    hooks = settings.setdefault("hooks", {})
+    for event, name, timeout in SETTINGS_HOOKS[client]:
+        groups = [g for g in hooks.get(event, [])
+                  if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
+        group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command(client, name),
+                            "timeout": timeout * 1000}]}
+        if name == "tool":
+            group["matcher"] = ".*"
+        hooks[event] = groups + [group]
 
 
 def install_cursor(project, url, token):
@@ -6193,6 +6681,215 @@ def install_cursor(project, url, token):
     write_json(hooks_path, hooks)
     allow_cursor_tools(project)
     return [".cursor/mcp.json", ".cursor/hooks.json", ".cursor/cli.json"]
+
+
+OPENCODE_PLUGIN_FILE = ".opencode/plugins/crewchat.js"
+OPENCODE_PLUGIN_MARK = "// crewchat's plugin"
+# OpenCode has no hooks of its own to run a command: this plugin runs crewchat's. Its prompt hook's text
+# joins the user's message; at the end of a turn (the session goes idle), the stop hook's messages are
+# sent as the session's next prompt. Never waited for: OpenCode goes on while the hook listens.
+OPENCODE_PLUGIN = OPENCODE_PLUGIN_MARK + r""": hands the chat's messages to OpenCode's agents at the end of each turn.
+// `crewchat uninstall` (or `crewchat hooks refresh`) takes care of this file; edits to it are not kept.
+import {closeSync, mkdirSync, openSync} from "fs";
+import {tmpdir} from "os";
+import {join} from "path";
+
+const HOOK = %(hook)s;
+const REOPEN_PROMPT = %(reopen)s;
+
+async function hook(event, data, directory) {
+  try {
+    const run = Bun.spawn([...HOOK, event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
+                                             env: {...process.env, CREWCHAT_PROJECT: directory}});
+    run.stdin.write(JSON.stringify(data));
+    run.stdin.end();
+    const out = (await new Response(run.stdout).text()).trim();
+    await run.exited;
+    if (!out.startsWith("{")) return out;
+    const said = JSON.parse(out);
+    return said.reason || said.followup_message || "";
+  } catch (e) {
+    return "";
+  }
+}
+
+// Reopened from the chat page (CREWCHAT_REOPEN: the session and a nonce): OpenCode does not send a prompt
+// given with the session it continues, so this does, once. A command the agent runs inherits the
+// variable: the nonce, claimed by making a file of its name, keeps it from sending it again.
+function reopened() {
+  const [session, nonce] = (process.env.CREWCHAT_REOPEN || "").split(":");
+  delete process.env.CREWCHAT_REOPEN;
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(session || "") || !/^[0-9a-f]{16}$/.test(nonce || "")) return "";
+  try {
+    const dir = join(tmpdir(), "crewchat-hooks");
+    mkdirSync(dir, {recursive: true});
+    closeSync(openSync(join(dir, "opencode-reopen-" + nonce), "wx"));
+    return session;
+  } catch (e) {
+    return "";
+  }
+}
+
+export const CrewchatPlugin = async ({client, directory}) => {
+  const session = reopened();
+  if (session) setTimeout(() => client.session.promptAsync(
+    {path: {id: session}, body: {parts: [{type: "text", text: REOPEN_PROMPT}]}}).catch(() => {}), 1000);
+  return {
+  "chat.message": async (input, output) => {
+    const text = await hook("prompt", {session_id: input.sessionID}, directory);
+    const part = text && (output.parts || []).find((p) => p.type === "text" && !p.synthetic);
+    if (part) part.text += "\n\n" + text;
+  },
+  "tool.execute.after": async (input) => {
+    hook("tool", {session_id: input.sessionID, tool_name: input.tool, tool_input: input.args || {}}, directory);
+  },
+  event: async ({event}) => {
+    const sessionID = event.type === "session.idle" && event.properties && event.properties.sessionID;
+    if (!sessionID) return;
+    hook("stop", {session_id: sessionID}, directory).then((text) => text && client.session.promptAsync(
+      {path: {id: sessionID}, body: {parts: [{type: "text", text}]}})).catch(() => {});
+  },
+  };
+};
+"""
+
+
+def write_opencode_plugin(project):
+    """crewchat's plugin in the folder (OPENCODE_PLUGIN), running this copy. Returns whether it changed."""
+    path = Path(project) / OPENCODE_PLUGIN_FILE
+    text = OPENCODE_PLUGIN % {"hook": json.dumps(run_command() + ["hook", "opencode"]), "reopen": json.dumps(REOPEN_PROMPT)}
+    try:
+        if path.read_text(encoding="utf-8") == text:
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return True
+
+
+def install_mcp_settings(project, url, token, client):
+    """crewchat in a folder's settings for a tool that joins by them alone (MCP_FILES): Gemini CLI's and
+    Qwen Code's (its tools trusted, as crewchat's are in Claude Code and Cursor), OpenCode's. Not into
+    a file the folder's repository has: it would carry the token into a commit."""
+    rel, servers, key, extra = MCP_FILES[client]
+    path = Path(project) / rel
+    if tracked_by_git(project, rel):
+        print("- %s is committed in this folder, so crewchat did not add itself there (the token would go "
+              "into a commit). Add an MCP server that runs `crewchat stdio` in %s instead." % (rel, LAUNCH_TOOLS[client][0]))
+        return []
+    try:
+        data = read_json(path)
+    except SystemExit:  # not plain JSON (OpenCode's may have comments): left alone
+        print("- Could not add crewchat to %s: it is not plain JSON." % rel)
+        return []
+    data.setdefault(servers, {})[SERVER_NAME] = dict({key: url + "/mcp", "headers": {"Authorization": "Bearer %s" % token}},
+                                                     **extra)
+    if client in SETTINGS_HOOKS:
+        set_settings_hooks(data, client)  # messages at the end of each turn, as Claude Code gets them
+    write_json(path, data, private=True)
+    if client == "opencode" and not tracked_by_git(project, OPENCODE_PLUGIN_FILE):
+        write_opencode_plugin(project)  # OpenCode's hooks
+        return [rel, OPENCODE_PLUGIN_FILE]
+    return [rel]
+
+
+def codex_config():
+    """Codex's own settings, where it keeps its MCP servers (it has none per folder)."""
+    return Path(os.environ.get("CODEX_HOME") or (user_home() / ".codex")).expanduser() / "config.toml"
+
+
+CODEX_BEGIN, CODEX_END = "# crewchat: begin (`crewchat uninstall` takes this out)", "# crewchat: end"
+CODEX_STATE = re.compile(r"^\[hooks\.state\b.*?(?=^\[|^#|\Z)", re.M | re.S)  # Codex's record of approved hooks
+CODEX_BLOCK = re.compile(r"\n?%s\n.*?%s\n?" % (re.escape(CODEX_BEGIN), re.escape(CODEX_END)), re.S)
+# A crewchat server the user set up themselves, in any of TOML's ways ([mcp_servers.crewchat],
+# [mcp_servers."crewchat"], mcp_servers.crewchat.command = ..., crewchat = {...} under [mcp_servers]),
+# or servers given inline (mcp_servers = {...}), where a table of ours cannot be added.
+CODEX_THEIRS = re.compile(r'mcp_servers[^\n]*\bcrewchat\b|^\s*"?crewchat"?\s*=|^\s*mcp_servers\s*=', re.M)
+
+
+def install_codex():
+    """crewchat in Codex's settings, once for every folder: `crewchat stdio`, which finds the chat of the
+    folder Codex runs in (its .mcp.json). Our own block is brought up to this copy's command; a crewchat
+    server the user set up, or settings written another way, are left alone. Returns whether it changed."""
+    path = codex_config()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    string = lambda v: json.dumps(v, ensure_ascii=False)  # noqa: E731  (a TOML basic string, as JSON writes one)
+    command = run_command()
+    outside = CODEX_BLOCK.sub("\n", text)
+    # Its hooks too (messages at the end of each turn), unless the user's own hooks are written in a
+    # way a table of ours can't join (hooks = {...}, Stop = [...]). Codex asks once to review them.
+    hooks = "" if re.search(r"^\s*hooks\s*=|^\s*(Stop|UserPromptSubmit|PostToolUse)\s*=", outside, re.M) else "".join(
+        "[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\ntimeout = %d\n" % (
+            event, event, string(hook_command("codex", name)), timeout)
+        for event, name, timeout in (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100),
+                                     ("PostToolUse", "tool", 10)))
+    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s%s\n" % (
+        CODEX_BEGIN, SERVER_NAME, string(command[0]),
+        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), hooks, CODEX_END)
+    if CODEX_THEIRS.search(outside):
+        return False  # the user's own crewchat, or servers written inline: not ours to change
+    old = CODEX_BLOCK.search(text)
+    if old and old.group(0).strip("\n") == block.strip("\n"):
+        return False  # as it should be (rewriting it could drop what Codex wrote in it)
+    if old:
+        kept = "".join(m.group(0).rstrip("\n") + "\n" for m in CODEX_STATE.finditer(old.group(0)))
+        new = CODEX_BLOCK.sub(lambda m: ("\n" if m.group(0).startswith("\n") else "") + block + kept, text, count=1)
+    else:
+        new = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
+    if new == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
+    return True
+
+
+def uninstall_codex():
+    """Take crewchat's block out of Codex's settings. Returns whether it was there."""
+    path = codex_config()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    old = CODEX_BLOCK.search(text)
+    kept = "".join(m.group(0).rstrip("\n") + "\n" for m in CODEX_STATE.finditer(old.group(0))) if old else ""
+    new = CODEX_BLOCK.sub(lambda m: "\n" + kept, text, count=1)  # Codex's own records stay its
+    if new == text:
+        return False
+    path.write_text(new.strip("\n") + ("\n" if new.strip() else ""), encoding="utf-8")
+    return True
+
+
+def refresh_codex():
+    """At server start (so after every upgrade): crewchat's block in Codex's settings runs this copy."""
+    try:
+        if CODEX_BEGIN in codex_config().read_text(encoding="utf-8"):
+            install_codex()
+    except OSError:
+        pass
+
+
+def install_client(client, project, url, token):
+    """Connect a folder for one agent tool. Returns the files written in it (to keep out of git)."""
+    if client == "claude":
+        return install_claude(project, url, token)
+    if client == "cursor":
+        return install_cursor(project, url, token)
+    if client == "codex":  # its chat is the folder's .mcp.json, which `crewchat stdio` reads
+        write_mcp_json(project, url, token)
+        install_codex()
+        return [".mcp.json"]
+    return install_mcp_settings(project, url, token, client)
+
+
+def clients_for(choice, config=None):
+    """The tools `--client` asks for: one, or all (Claude Code and Cursor, and the others found here)."""
+    if choice != "all":
+        return [choice]
+    return ["claude", "cursor"] + [t for t in MORE_TOOLS if find_tool(t, config or {})]
 
 
 def allow_cursor_tools(project):
@@ -6241,6 +6938,17 @@ def update_hooks(folder):
     if ".cursor/hooks.json" in ours and not tracked_by_git(folder, ".cursor/cli.json") and allow_cursor_tools(folder):
         git_exclude(folder, [".cursor/cli.json"])  # as when the folder joined
         changed.append(".cursor/cli.json")
+    # Gemini CLI and Qwen Code: their settings hold crewchat's server, so its hooks belong there too (also
+    # for a folder connected before crewchat had them).
+    for client in SETTINGS_HOOKS:
+        rel = MCP_FILES[client][0]
+        if connection_entry(folder, client) and not tracked_by_git(folder, rel) and \
+                edit_json(folder / rel, lambda data, client=client: set_settings_hooks(data, client)):
+            changed.append(rel)
+    if connection_entry(folder, "opencode") and not tracked_by_git(folder, OPENCODE_PLUGIN_FILE) and \
+            write_opencode_plugin(folder):
+        git_exclude(folder, [OPENCODE_PLUGIN_FILE])
+        changed.append(OPENCODE_PLUGIN_FILE)
     return changed
 
 
@@ -6304,10 +7012,8 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
         print("agents in their instructions to check hub_inbox.")
         return place
     written = []
-    if client in ("all", "claude"):
-        written += install_claude(project, url, token)
-    if client in ("all", "cursor"):
-        written += install_cursor(project, url, token)
+    for tool in clients_for(client):
+        written += install_client(tool, project, url, token)
     ignored = git_exclude(project, written + [".crewchat-listen"])
     if (home() / "config.json").exists() and url == local_url():
         remember(project, place, chat=answer.get("chat", ""))
@@ -6319,16 +7025,18 @@ def join_folder(url, code, project, place=None, client="all", quiet=False):
     print("Wrote: %s" % ", ".join(written))
     if not ignored:
         print("These files hold a secret token or machine paths: do not commit them.")
-    print("Every new Claude Code or Cursor session in this folder now joins the chat under its own")
-    print("name (%s-%s, %s-%s-2, ...). Sessions that are already open need a restart." % (
-        "claude" if client != "cursor" else "cursor", place, "claude" if client != "cursor" else "cursor", place))
+    tools = clients_for(client)
+    print("Every new %s session in this folder now joins the chat under a name of its own." % " or ".join(
+        LAUNCH_TOOLS[t][0] for t in tools))
+    print("Sessions that are already open need a restart.")
     return place
 
 
 def find_project(client):
     """The project folder a hook runs for: the one holding this client's connection file."""
-    marker = CLIENT_FILES[client]
-    starts = [os.environ.get("CREWCHAT_PROJECT"), os.environ.get("CLAUDE_PROJECT_DIR"), os.getcwd()]
+    marker = HOOK_MARKERS[client]
+    starts = [os.environ.get("CREWCHAT_PROJECT"), os.environ.get("CLAUDE_PROJECT_DIR"),
+              os.environ.get("GEMINI_PROJECT_DIR"), os.environ.get("QWEN_PROJECT_DIR"), os.getcwd()]
     for start in starts:
         if not start:
             continue
@@ -6341,12 +7049,8 @@ def find_project(client):
 
 def client_config(project, client):
     """(server address, place token) from the project's connection file, or None."""
-    try:
-        entry = json.loads((project / CLIENT_FILES[client]).read_text(encoding="utf-8"))["mcpServers"][SERVER_NAME]
-        url = entry["url"]
-        return (url[:-4] if url.endswith("/mcp") else url), entry["headers"]["Authorization"][len("Bearer "):]
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
+    entry = connection_entry(project, "claude" if client == "codex" else client)  # Codex's chat: the .mcp.json
+    return entry and ((entry[0][:-4] if entry[0].endswith("/mcp") else entry[0]), entry[1])
 
 
 def hooks_off(project):
@@ -6452,10 +7156,14 @@ def claim_launch_key(folder, key, session):
     return True
 
 
-SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
+SESSION_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{7,63}")  # (fullmatch) a session id that reaches a command line: never an option
 AGENT_COMMAND = {  # the agent's own process, by its command line (Windows: a quoted path, or npm's node + cli.js)
     "claude": re.compile(r'(^|[/\\])claude(\.exe)?"?(\s|$)|[/\\]claude-code[/\\]cli\.js'),
-    "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)')}
+    "cursor": re.compile(r'(^|[/\\])(cursor-agent|agent)(\.exe)?"?(\s|$)'),
+    "codex": re.compile(r'(^|[/\\])codex(\.exe|\.js)?"?(\s|$)'),  # its native program, or npm's codex.js
+    "gemini": re.compile(r'(^|[/\\])gemini(\.exe|\.js)?"?(\s|$)|[/\\]gemini-cli[/\\]'),
+    "qwen": re.compile(r'(^|[/\\])qwen(\.exe|\.js)?"?(\s|$)|[/\\]@qwen-code[/\\]'),
+    "opencode": re.compile(r'(^|[/\\])opencode(\.exe)?"?(\s|$)')}
 
 
 def process_table(pids=None):
@@ -6524,13 +7232,16 @@ def agent_process(client, table=None):
     ("claude-app" under the Claude desktop app, else "terminal"), or None."""
     if os.environ.get("CREWCHAT_TEST_PROCESS"):  # tests: hooks run as subprocesses of the test
         return json.loads(os.environ["CREWCHAT_TEST_PROCESS"])
+    command_of_agent = AGENT_COMMAND.get(client)
+    if command_of_agent is None:
+        return None  # a tool crewchat cannot tell by its command line
     table = process_table() if table is None else table
     pid, found, app = os.getppid(), None, "terminal"
     for _ in range(16):
         if pid not in table:
             break
         parent, started, command = table[pid]
-        if found is None and AGENT_COMMAND[client].search(command):
+        if found is None and command_of_agent.search(command):
             found = {"pid": pid, "started": started}
         if "/Claude.app/" in command or "\\AnthropicClaude\\" in command:
             app = "claude-app"
@@ -6593,8 +7304,31 @@ TOOL_WORDS = {"Read": "Reading", "Edit": "Editing", "MultiEdit": "Editing", "Wri
               "TodoWrite": "Planning"}
 
 
+OTHER_TOOL_NAMES = {"read_file": "Read", "read_many_files": "Read", "write_file": "Write", "replace": "Edit",
+                    "run_shell_command": "Bash", "glob": "Glob", "search_file_content": "Grep", "grep": "Grep",
+                    "web_fetch": "WebFetch", "google_web_search": "WebSearch",  # Gemini CLI
+                    "edit": "Edit", "grep_search": "Grep", "web_search": "WebSearch", "todo_write": "TodoWrite",  # Qwen Code
+                    "bash": "Bash", "read": "Read", "write": "Write", "webfetch": "WebFetch", "todowrite": "TodoWrite",
+                    "patch": "Edit",  # OpenCode
+                    "shell": "Bash", "exec_command": "Bash", "local_shell": "Bash", "apply_patch": "Edit"}  # Codex
+
+
 def clean_doing(value):
     return " ".join(str(value or "").split())[:80]
+
+
+def permission_text(data):
+    """What a tool asks permission for, in full for the owner to decide on (the page shows it as text):
+    the tool and its command, file, address or search, or else its input."""
+    name = str(data.get("tool_name") or "")
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    for field in ("command", "file_path", "notebook_path", "url", "pattern", "query", "path"):
+        if isinstance(args.get(field), str) and args[field].strip():
+            text = args[field]
+            if field == "command" and isinstance(args.get("description"), str) and args["description"].strip():
+                text += "\n(" + args["description"].strip() + ")"
+            return name, text[:MAX_PERMISSION_TEXT]
+    return name, (json.dumps(args, ensure_ascii=False) if args else "")[:MAX_PERMISSION_TEXT]
 
 
 def tool_summary(client, data):
@@ -6602,6 +7336,13 @@ def tool_summary(client, data):
     program (and a well-known tool's subcommand), never their arguments or what was read or written."""
     name = str(data.get("tool_name") or "")
     args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    if name in OTHER_TOOL_NAMES:  # Gemini CLI's, Qwen Code's, OpenCode's and Codex's own names for the same tools
+        name = OTHER_TOOL_NAMES[name]
+        command = args.get("command")
+        if isinstance(command, list):  # Codex's ["bash", "-lc", "npm test"]: the script the shell runs
+            command = command[2] if len(command) == 3 and command[1] in ("-c", "-lc") else " ".join(map(str, command))
+        args = dict(args, file_path=args.get("file_path") or args.get("filePath") or args.get("absolute_path") or args.get("path"),
+                    command=command)
     if client == "cursor" and not name:  # afterFileEdit sends a file, afterShellExecution a command
         if data.get("file_path"):
             name, args = "Edit", {"file_path": data["file_path"]}
@@ -6677,6 +7418,21 @@ def run_hook(client, event):
         key = launched
     else:
         key = state.get("key") or secrets.token_urlsafe(12)
+    if event == "permission":
+        # A tool waits on a permission prompt: ask the owner on the chat page first. Allow or Deny there
+        # answers it; with no answer in time (or the owner keeps prompts in the terminal), the agent's own
+        # prompt shows.
+        if client != "claude" or not state.get("key") and key != launched:
+            return  # a session that never checked in is not in the chat
+        tool, text = permission_text(data)
+        out = post_json(base + "/api/hook", token, {"key": key, "event": "permission", "tool": tool, "text": text},
+                        timeout=PERMISSION_WAIT + 20) or {}
+        if out.get("answer") == "allow":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {"behavior": "allow"}}}))
+        elif out.get("answer") == "deny":
+            print(json.dumps({"hookSpecificOutput": {"hookEventName": "PermissionRequest", "decision": {
+                "behavior": "deny", "message": "The owner denied this on the crewchat page."}}}))
+        return
     chain = int(state.get("chain", 0))
     asks = int(state.get("asks", 0))
     # Messages are handed over unread and only confirmed here, on this session's NEXT hook call:
@@ -6718,12 +7474,12 @@ def run_hook(client, event):
                 return
             ignored += 1
             save(0, pending, 1)
-            if client == "claude":
-                print(HOOK_LINK % key)
+            if client in BLOCK_CLIENTS:
+                prompt_context(client, HOOK_LINK % key)
             return
         save(0, last, 0)
-        if text and client == "claude":
-            print("crewchat: new messages arrived since your last turn.\n\n" + text)
+        if text and client in BLOCK_CLIENTS:
+            prompt_context(client, "crewchat: new messages arrived since your last turn.\n\n" + text)
         return
 
     # stop: the agent finished a turn.
@@ -6738,7 +7494,7 @@ def run_hook(client, event):
         # Code is asked at its user's prompt instead; here only a session that was linked and must
         # link again (it may be listening, with no prompt to come), and Cursor, which has no
         # prompt hook.
-        if capped or asks >= MAX_LINK_ASKS or (client == "claude" and kind == "link"):
+        if capped or asks >= MAX_LINK_ASKS or (client in BLOCK_CLIENTS and kind == "link"):
             return
         save(chain + 1, pending, asks + 1)
         text = HOOK_LINK % key
@@ -6753,10 +7509,19 @@ def run_hook(client, event):
     else:
         save(1 if from_owner else chain + 1, last, 0)
         text = HOOK_REASON % text
-    if client == "claude":
+    if client in BLOCK_CLIENTS:
         print(json.dumps({"decision": "block", "reason": text}))
     else:
         print(json.dumps({"followup_message": text}))
+
+
+def prompt_context(client, text):
+    """Text a prompt hook adds to the user's prompt: Claude Code takes it as printed, Codex and Gemini
+    CLI as JSON (Codex refuses any other output)."""
+    if client in PROMPT_EVENT:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": PROMPT_EVENT[client], "additionalContext": text}}))
+    else:
+        print(text)
 
 
 def cmd_hook(args):
@@ -6864,17 +7629,29 @@ def cmd_stdio(args):
     else:
         start = Path(args.project or ".").resolve()
         found = next(((folder, client_config(folder, client)) for folder in [start] + list(start.parents)
-                      for client in CLIENT_FILES if client_config(folder, client)), None)
+                      for client in ALL_CLIENTS if client_config(folder, client)), None)
         if found is None:
             # Registered for every folder (user scope, as directories publish it), it starts in folders
             # that never joined a chat too: there it is a server with no tools, not a failed one.
             return serve_unconnected(start)
         folder, (base, token) = found
+        if getattr(args, "local_only", False) and not local_folder(folder):
+            # Registered for every folder (Codex's settings): a .mcp.json naming a crewchat elsewhere, as
+            # a repository could commit, is not followed; only this machine's chat is.
+            return serve_unconnected(start)
         try:  # the name this server was registered under is allowed too, as crewchat is
             allow_registered(folder)
         except OSError:
             pass
     StdioRelay((base if base.endswith("/mcp") else base + "/mcp"), token).run()
+
+
+def local_folder(folder):
+    """Is this folder connected to this machine's own chat (its address, a place token it gave)?"""
+    try:
+        return any(joined_place(Path(folder), load_config(), entry["root"])[0] for entry in list_projects())
+    except SystemExit:  # no chat set up on this machine
+        return False
 
 
 def serve_unconnected(start, stdin=None, stdout=None):
@@ -7265,7 +8042,8 @@ def update_checks(projects):
 
 def upgrade_folders(projects):
     """At server start (so after every upgrade): each connected folder gets this version's guide and
-    crewchat hooks. Only what changed is written."""
+    crewchat hooks, and Codex's settings this copy's command. Only what changed is written."""
+    refresh_codex()
     for project in projects.all():
         for folder in project.hub.project_folders():
             try:
@@ -7284,6 +8062,247 @@ def reclaim_checks(projects):
                 project.hub.reclaim_silent()
             except Exception as e:  # one bad check must not stop the next
                 sys.stderr.write("%s could not check for silent task holders: %s\n" % (now_iso(), e))
+
+
+# --------------------------------------------------------------------------------------------
+# Web Push: notifications while no chat page is open
+# --------------------------------------------------------------------------------------------
+# A browser that turned notifications on subscribes with its push service (Google's, Apple's,
+# Mozilla's, Microsoft's). When something new needs the owner and no page of that project has polled
+# for a while, the server sends that service an empty push, signed with this machine's VAPID key
+# (ES256). The page's service worker wakes, fetches what is new from the server (signed in, as the
+# page is) and shows it. Nothing about the chat goes through the push service.
+PUSH_FILE = "push.json"  # in the crewchat home: the VAPID key and the browsers subscribed (private)
+PUSH_HOSTS = ("fcm.googleapis.com", "android.googleapis.com", ".push.apple.com", ".push.services.mozilla.com",
+              ".notify.windows.com")
+PUSH_PAGE_GONE = 45  # seconds since a page last polled a project: none of its pages is open
+PUSH_EVERY = 3  # how often the server looks for something new to push (seconds)
+MAX_PUSH_SUBS = 20
+MAX_PUSH_NOTICES = 10  # kept per browser until its service worker fetches them
+NEED_LABELS = {"permission": "Asks permission", "blocked": "Needs you", "review": "Ready for review", "message": "Message",
+               "given_back": "Given back", "reclaimed": "Reclaimed"}  # as the page says them (NEED_LOOK)
+
+# P-256 (NIST, FIPS 186-4): enough of it to make a key and sign, in plain Python. Only this machine's own
+# key is used, on what it sends; nothing received is ever verified with it.
+_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+_A = _P - 3
+_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+      0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def _p256_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % _P == 0:
+        return None
+    if a == b:
+        slope = (3 * a[0] * a[0] + _A) * pow(2 * a[1], _P - 2, _P) % _P
+    else:
+        slope = (b[1] - a[1]) * pow(b[0] - a[0], _P - 2, _P) % _P
+    x = (slope * slope - a[0] - b[0]) % _P
+    return x, (slope * (a[0] - x) - a[1]) % _P
+
+
+def _p256_mul(k, point=_G):
+    out = None
+    for bit in bin(k)[2:]:
+        out = _p256_add(out, out)
+        if bit == "1":
+            out = _p256_add(out, point)
+    return out
+
+
+def b64url(raw):
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+
+def p256_public(d):
+    """The public key of private key d, uncompressed (65 bytes), as browsers take a VAPID key."""
+    x, y = _p256_mul(d)
+    return b"\x04" + x.to_bytes(32, "big") + y.to_bytes(32, "big")
+
+
+def es256_sign(d, message):
+    """An ES256 signature (r and s, 32 bytes each, as JWTs carry them) of message by private key d."""
+    z = int.from_bytes(hashlib.sha256(message).digest(), "big")
+    while True:
+        k = secrets.randbelow(_N - 1) + 1
+        r = _p256_mul(k)[0] % _N
+        s = pow(k, _N - 2, _N) * (z + r * d) % _N
+        if r and s:
+            return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+
+def push_host_ok(endpoint):
+    """Is this a push service's address (https, a known service)? Only those are ever posted to."""
+    try:
+        url = urllib.parse.urlsplit(endpoint)
+    except ValueError:
+        return False
+    host = (url.hostname or "").lower()
+    return url.scheme == "https" and len(endpoint) <= 1000 and not url.username and url.port in (None, 443) and \
+        any(host == h or (h.startswith(".") and host.endswith(h)) for h in PUSH_HOSTS)
+
+
+class PushStore:
+    """This machine's VAPID key, the browsers subscribed to push and, for each, the projects it wants
+    notified (all that needs the owner, or messages only) and what is waiting for its service worker."""
+
+    def __init__(self, base):
+        self.path = Path(base) / PUSH_FILE
+        self.lock = threading.Lock()
+        self.notices = {}  # endpoint -> [notice] (memory only)
+        data = read_json(self.path) if self.path.exists() else {}
+        try:
+            self.key = int(data.get("vapid") or "0", 16)
+        except (TypeError, ValueError):
+            self.key = 0
+        subs = data.get("subscriptions")
+        self.subs = [x for x in subs if isinstance(x, dict) and push_host_ok(x.get("endpoint", ""))] \
+            if isinstance(subs, list) else []
+
+    def _save(self):
+        write_json(self.path, {"vapid": "%064x" % self.key, "subscriptions": self.subs}, private=True)
+
+    def public_key(self):
+        with self.lock:
+            if not 0 < self.key < _N:
+                self.key = secrets.randbelow(_N - 1) + 1
+                self._save()
+            return b64url(p256_public(self.key))
+
+    def set_mode(self, endpoint, chat, mode):
+        """A browser's notifications for one project: all, mentions (messages to the owner) or off."""
+        if not isinstance(endpoint, str) or not push_host_ok(endpoint):
+            raise HubError("not a push service's address")
+        if mode not in ("all", "mentions", "off"):
+            raise HubError("mode is all, mentions or off")
+        with self.lock:
+            sub = next((x for x in self.subs if x["endpoint"] == endpoint), None)
+            if sub is None:
+                if mode == "off":
+                    return
+                sub = {"endpoint": endpoint, "modes": {}}
+                self.subs = (self.subs + [sub])[-MAX_PUSH_SUBS:]
+            if mode == "off":
+                sub["modes"].pop(chat, None)
+            else:
+                sub["modes"][chat] = mode
+            if not sub["modes"]:
+                self.subs.remove(sub)
+                self.notices.pop(endpoint, None)
+            self._save()
+
+    def wanted(self, chat):
+        """(endpoint, mode) of every browser that wants this project's notifications."""
+        with self.lock:
+            return [(x["endpoint"], x["modes"][chat]) for x in self.subs if x["modes"].get(chat) in ("all", "mentions")]
+
+    def queue(self, endpoint, notice):
+        with self.lock:
+            self.notices[endpoint] = (self.notices.get(endpoint, []) + [notice])[-MAX_PUSH_NOTICES:]
+
+    def take(self, endpoint):
+        """What waits for this browser's service worker, once."""
+        with self.lock:
+            return self.notices.pop(endpoint, []) if isinstance(endpoint, str) else []
+
+    def forget(self, endpoint):
+        """The push service says this subscription is gone (the browser unsubscribed, or cleared the site)."""
+        with self.lock:
+            before = len(self.subs)
+            self.subs = [x for x in self.subs if x["endpoint"] != endpoint]
+            self.notices.pop(endpoint, None)
+            if len(self.subs) != before:
+                self._save()
+
+    def headers(self, endpoint):
+        """The VAPID headers for one push: a JWT for the push service's origin, signed with this machine's key."""
+        url = urllib.parse.urlsplit(endpoint)
+        claims = {"aud": "%s://%s" % (url.scheme, url.netloc), "exp": int(time.time()) + 12 * 3600,
+                  "sub": "https://crewchat.dev"}
+        public = self.public_key()
+        signed = b64url(b'{"typ":"JWT","alg":"ES256"}') + "." + b64url(json.dumps(claims, separators=(",", ":")).encode())
+        jwt = signed + "." + b64url(es256_sign(self.key, signed.encode("ascii")))
+        return {"Authorization": "vapid t=%s, k=%s" % (jwt, public), "TTL": "86400", "Urgency": "high",
+                "Content-Length": "0"}
+
+
+_push_stores = {}
+_push_stores_lock = threading.Lock()
+
+
+def push_store(base):
+    with _push_stores_lock:
+        key = str(Path(base))
+        if key not in _push_stores:
+            _push_stores[key] = PushStore(base)
+        return _push_stores[key]
+
+
+def send_push(store, endpoint):
+    """One empty push to a browser, through its push service. A subscription the service says is gone
+    is forgotten."""
+    req = urllib.request.Request(endpoint, data=b"", headers=store.headers(endpoint), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 410):
+            store.forget(endpoint)
+        return e.code
+    except (OSError, ValueError):
+        return 0
+
+
+def push_notice(project, item):
+    """A Needs you item as a notification, worded as the page words its own."""
+    label = NEED_LABELS.get(item["kind"], "Needs you")
+    if item.get("task"):
+        body = "#%s %s" % (item["task"], item.get("title") or "") + ("\n" + item["text"] if item.get("text") else "")
+    elif item["kind"] == "permission":
+        body = item.get("tool", "") + (": " + item["text"][:200] if item.get("text") else "")
+    else:
+        body = item.get("text", "")
+    return {"title": "%s: %s" % (project.name, label) + (" · " + item["agent"] if item.get("agent") else ""),
+            "body": body[:400], "tag": "%s:%s:%s" % (project.id, item["kind"], item.get("task") or item.get("id") or ""),
+            "url": "/" if project.primary else "/?chat=" + urllib.parse.quote(project.id)}
+
+
+def push_round(projects, store, seen, send=send_push):
+    """One look at every project: what is new in Needs you since the last look is pushed to the browsers
+    that want it, unless one of the project's pages is open (it notifies by itself). seen holds what each
+    project's Needs you had; a project seen for the first time pushes nothing (a restart is not news)."""
+    for project in projects.all():
+        items = project.hub.needs_you()
+        keys = {"%s:%s" % (i["kind"], i.get("task") or i.get("id")): i for i in items}
+        before, seen[project.id] = seen.get(project.id), set(keys)
+        if before is None or time.time() - project.hub.page_seen < PUSH_PAGE_GONE:
+            continue
+        fresh = [i for k, i in keys.items() if k not in before]
+        if not fresh:
+            continue
+        for endpoint, mode in store.wanted(project.id):
+            wanted = [i for i in fresh if mode == "all" or i["kind"] == "message"]
+            for item in wanted[:3]:
+                store.queue(endpoint, push_notice(project, item))
+            if wanted:
+                threading.Thread(target=send, args=(store, endpoint), daemon=True).start()
+
+
+def push_checks(projects):
+    """Every PUSH_EVERY seconds, push what is new to browsers with no chat page open."""
+    store, seen = push_store(projects.base), {}
+    while True:
+        try:
+            if store.subs or seen:
+                push_round(projects, store, seen)
+        except Exception as e:  # one bad look must not stop the next
+            sys.stderr.write("%s could not check what to push: %s\n" % (now_iso(), e))
+        time.sleep(PUSH_EVERY)
 
 
 INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
@@ -7584,7 +8603,10 @@ def disconnect_folder(project):
             data["enabledMcpjsonServers"] = enabled
         else:
             data.pop("enabledMcpjsonServers", None)
-        hooks = data.get("hooks") or {}
+        grouped_hooks(data)
+
+    def grouped_hooks(data):  # Claude Code's and Gemini CLI's: {event: [{"hooks": [...]}]}
+        hooks = data.get("hooks") if isinstance(data.get("hooks"), dict) else {}
         for event in list(hooks):
             groups = []
             for group in hooks[event]:
@@ -7615,6 +8637,26 @@ def disconnect_folder(project):
     edit(".cursor/mcp.json", servers)
     edit(".cursor/hooks.json", cursor_hooks)
     edit(".cursor/cli.json", lambda data: disallow_rule(data, CURSOR_ALLOW, names["cursor"]))
+    for rel, key, _, _ in MCP_FILES.values():
+        def drop(data, key=key):
+            (data.get(key) or {}).pop(SERVER_NAME, None)
+            if data.get(key) == {}:
+                del data[key]
+            if "hooks" in data:  # Gemini CLI's
+                grouped_hooks(data)
+        try:
+            edit(rel, drop)
+        except SystemExit:  # not plain JSON: left as it is
+            pass
+    plugin = project / OPENCODE_PLUGIN_FILE
+    try:
+        if plugin.read_text(encoding="utf-8").startswith(OPENCODE_PLUGIN_MARK):
+            plugin.unlink()
+            changed.append(OPENCODE_PLUGIN_FILE)
+            for folder in (plugin.parent, plugin.parent.parent):  # .opencode/plugins and .opencode, if now empty
+                folder.rmdir()
+    except OSError:
+        pass
     for name in (".crewchat-listen", ".crewchat-hooks"):
         try:
             (project / name).unlink()
@@ -7661,6 +8703,8 @@ def cmd_uninstall(args):
             changed = disconnect_folder(Path(folder))
             if changed:
                 print("- Took crewchat out of %s (%s)." % (folder, ", ".join(changed)))
+    if uninstall_codex():
+        print("- Took crewchat out of Codex's settings (%s)." % codex_config())
     data = home()
     if data.exists():
         if args.purge or (not args.yes and ask("Also delete your chats, files and settings in %s?" % data)):
@@ -8005,1253 +9049,7 @@ autofocus required maxlength="12"><button>Sign in</button></form>
 <p class="tip">On a phone, sign in, then use <b>Add to Home Screen</b> to keep the chat as an app.
 An iPhone app keeps its own sign-in, so you sign in once more inside it.</p></main></html>"""
 
-CLASSIC_PAGE = r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>crewchat</title>
-<style>
-:root {
-  color-scheme: light dark;
-  --bg: #f4f2ed; --panel: #ffffff; --ink: #1d1b18; --muted: #6a665e; --line: #e2ded5;
-  --accent: #2b57c4; --on-accent: #ffffff; --task: #fff6dd; --task-line: #e2c36b; --task-ink: #6b4e00;
-  --ok: #1f7a45; --warn: #a56a00; --off: #9a968d; --err: #b3261e;
-  --a0: #b0501a; --a1: #1f6f4c; --a2: #7440a8; --a3: #176a86;
-  --a4: #a3345f; --a5: #5d6b12; --a6: #3a50b8; --a7: #8a5a14;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #131210; --panel: #1c1b18; --ink: #edeae4; --muted: #a09b91; --line: #2f2d28;
-    --accent: #8fb0ff; --on-accent: #0d1a3a; --task: #2a2412; --task-line: #6f5a1c; --task-ink: #f0d88a;
-    --ok: #63c58c; --warn: #e0b055; --off: #6f6b63; --err: #f2b8b5;
-    --a0: #f0a070; --a1: #7fd0a6; --a2: #c9a2f0; --a3: #7cc8e2;
-    --a4: #f29bbb; --a5: #c3d36a; --a6: #a3b4ff; --a7: #e6bd72;
-  }
-}
-* { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  margin: 0; background: var(--bg); color: var(--ink);
-  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  display: grid; grid-template-columns: 280px minmax(0, 1fr); grid-template-rows: 100dvh;
-}
-aside { border-right: 1px solid var(--line); padding: 20px 16px; overflow-y: auto; }
-h1 { font-size: 17px; margin: 0; letter-spacing: -0.01em; overflow-wrap: anywhere; display: flex; align-items: center; gap: 9px; }
-.logo { width: 30px; height: 30px; flex: none; }
-#projects { font: inherit; font-weight: 700; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
-  border-radius: 8px; padding: 3px 6px; max-width: 100%; min-width: 0; cursor: pointer; }
-.sub { color: var(--muted); font-size: 13px; margin: 2px 0 18px; }
-.agent { padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); margin-bottom: 8px; }
-.agent .top { display: flex; align-items: center; gap: 8px; }
-.agent .name { font-weight: 600; overflow-wrap: anywhere; }
-.avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
-  width: 28px; height: 28px; border-radius: 50%; background: var(--av); box-shadow: 0 0 0 1px var(--off); }
-.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
-.avatar .initials { color: var(--av-ink); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
-.avatar .emoji { font-size: 16px; line-height: 1; }
-.avatar .mark, .avatar .os { position: absolute; bottom: -4px; height: 13px; min-width: 13px; padding: 0 2px;
-  border-radius: 7px; font-size: 7.5px; line-height: 13px; text-align: center;
-  box-shadow: 0 0 0 1.5px var(--panel), 0 0 0 2.5px var(--off); }
-.avatar .mark { right: -5px; background: var(--mk); color: #fff; font-weight: 700; }
-.avatar .os { left: -5px; background: var(--panel); }
-.msg .meta .avatar { width: 20px; height: 20px; align-self: center; }
-.msg .meta .avatar .initials { font-size: 8.5px; } .msg .meta .avatar .emoji { font-size: 12px; }
-.msg .meta .avatar .mark, .msg .meta .avatar .os { display: none; }
-.picmenu > summary { cursor: pointer; font-size: 12px; color: var(--accent); list-style: none; display: inline; }
-.picmenu[open] .picks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
-.picmenu .picks button { min-width: 30px; }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; }
-.dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
-.agent .seen { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
-.agent .where { font-size: 12px; color: var(--muted); margin-top: 2px; }
-.agent .status { font-size: 13px; color: var(--ink); margin-top: 4px; overflow-wrap: anywhere; }
-.agent .unread { font-size: 12px; margin-top: 4px; color: var(--warn); }
-.agent .activity { font-size: 12px; margin-top: 4px; color: var(--muted); }
-.agent .activity.listening { color: var(--ok); }
-.none { font-size: 13px; color: var(--muted); }
-.hint { font-size: 12.5px; color: var(--muted); margin-top: 16px; }
-.hint b { color: var(--ink); font-weight: 600; }
-
-main { display: flex; flex-direction: column; min-width: 0; min-height: 0; overflow: hidden; }
-#log { flex: 1; min-height: 0; overflow-y: auto; padding: 20px max(16px, calc((100% - 820px) / 2)); }
-form, #banner { flex: none; }
-#banner { display: none; background: var(--err); color: var(--panel); font-size: 13px; padding: 6px 16px; text-align: center; }
-#banner.show { display: block; }
-#update { display: none; flex: none; align-items: center; gap: 10px; justify-content: center; flex-wrap: wrap;
-  background: var(--task); color: var(--task-ink); border-bottom: 1px solid var(--task-line); font-size: 13px; padding: 6px 16px; }
-#update.show { display: flex; }
-#update code { font-size: 12px; }
-#update a { color: inherit; }
-#update button { border: 0; background: none; color: inherit; font-size: 16px; line-height: 1; cursor: pointer; padding: 0 4px; }
-.empty { color: var(--muted); text-align: center; margin-top: 18vh; }
-.spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent);
-  border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 7px; }
-@keyframes spin { to { transform: rotate(360deg); } }
-@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
-#switching { font-size: 13px; color: var(--ink); margin: 0 0 14px; }
-body.switching main { opacity: 0.45; pointer-events: none; transition: opacity 0.15s; }
-.day { text-align: center; color: var(--muted); font-size: 12px; margin: 18px 0 10px; }
-.msg { margin: 0 0 12px; max-width: 86%; }
-.msg .meta { font-size: 12.5px; color: var(--muted); margin-bottom: 3px; display: flex; gap: 6px; flex-wrap: wrap; align-items: baseline; }
-.msg .who { font-weight: 650; }
-.msg .to { border: 1px solid var(--line); border-radius: 99px; padding: 0 7px; font-size: 11.5px; }
-.msg .body { background: var(--panel); border: 1px solid var(--line); border-radius: 4px 14px 14px 14px; padding: 9px 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
-.msg.own { margin-left: auto; }
-.msg.own .meta { justify-content: flex-end; }
-.msg.own .body { background: var(--accent); color: var(--on-accent); border-color: transparent; border-radius: 14px 4px 14px 14px; }
-.msg.task .body { background: var(--task); color: var(--ink); border: 1px solid var(--task-line); border-radius: 12px; }
-.msg.task .label { display: flex; gap: 8px; align-items: center; font-size: 12px; font-weight: 650; color: var(--task-ink); margin-bottom: 4px; letter-spacing: 0.03em; }
-.msg.task .state { margin-left: auto; font-weight: 600; letter-spacing: 0; }
-.msg .receipt { font-size: 11.5px; color: var(--muted); margin-top: 3px; text-align: right; }
-.sys { text-align: center; font-size: 12.5px; color: var(--muted); margin: 4px 0 12px; }
-.sys details { display: inline; } .sys summary { display: inline; cursor: pointer; text-decoration: underline dotted; }
-.sys .prompt { display: block; text-align: left; white-space: pre-wrap; margin: 6px auto 0; max-width: 640px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--ink); }
-.msg.update .body { border-style: dashed; }
-.msg .pill { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 0 8px; background: var(--line); color: var(--ink); }
-.pill.done { background: var(--ok); color: var(--panel); } .pill.blocked { background: var(--err); color: var(--panel); }
-.agent .badge { font-size: 11px; font-weight: 650; border: 1px solid currentColor; border-radius: 99px; padding: 0 6px; color: var(--muted); white-space: nowrap; }
-.agent .badge.lead { color: var(--accent); }
-.agent .rolepick { margin-top: 6px; font-size: 12px; padding: 2px 6px; max-width: 100%; }
-#l-perms-note { margin: 4px 0 0; font-size: 12px; } #l-perms-note.warn { color: var(--err); }
-.agent .session { font-size: 12px; color: var(--muted); margin-top: 2px; } .agent .session.off { color: var(--warn); }
-.agent .acts { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; align-items: center; }
-.agent .acts button, .agent .acts select { font-size: 12px; padding: 2px 6px; }
-.sys b { font-weight: 650; }
-.c0 { color: var(--a0); } .c1 { color: var(--a1); } .c2 { color: var(--a2); } .c3 { color: var(--a3); }
-.c4 { color: var(--a4); } .c5 { color: var(--a5); } .c6 { color: var(--a6); } .c7 { color: var(--a7); }
-
-#form { border-top: 1px solid var(--line); background: var(--panel); padding: 12px max(16px, calc((100% - 820px) / 2)) max(12px, env(safe-area-inset-bottom)); }
-.row { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; font-size: 13px; color: var(--muted); }
-select, textarea, button { font: inherit; color: inherit; }
-select { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 5px 8px; max-width: 60vw; }
-label.check { display: flex; gap: 6px; align-items: center; cursor: pointer; }
-.compose { display: flex; gap: 8px; align-items: flex-end; }
-.attach { background: transparent; color: var(--muted); border: 1px solid var(--line); padding: 9px 11px; font-size: 16px; line-height: 1; }
-#pending { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
-#pending:empty { display: none; }
-.chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 8px; padding: 3px 4px 3px 6px; font-size: 12.5px; background: var(--bg); max-width: 100%; }
-.chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; }
-.chip .s { color: var(--muted); }
-.chip .n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 180px; }
-.chip button { background: transparent; color: var(--muted); padding: 0 6px; font-size: 15px; }
-#form.dragging { outline: 2px dashed var(--accent); outline-offset: -6px; }
-#views { display: flex; gap: 4px; padding: 10px max(16px, calc((100% - 820px) / 2)) 0; border-bottom: 1px solid var(--line); }
-#views button { background: none; color: var(--muted); border: 0; border-bottom: 2px solid transparent; border-radius: 0;
-  padding: 6px 10px; font-weight: 600; }
-#views button.on { color: var(--ink); border-bottom-color: var(--accent); }
-#tasks { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-[hidden] { display: none !important; }  /* also where a rule gives the element its own display (.linkline, label.check) */
-#commands { flex: 1; min-height: 0; overflow-y: auto; padding: 16px max(16px, calc((100% - 980px) / 2)); }
-#cmd-filter { width: 100%; box-sizing: border-box; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-  padding: 8px 10px; color: var(--ink); font: inherit; font-size: 14px; margin-bottom: 12px; }
-.cmd-group h3 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; font-weight: 650; }
-.cmd { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 9px 11px; margin-bottom: 6px; }
-.cmd .top { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-.cmd code.u { font-size: 13.5px; font-weight: 600; flex: 1 1 200px; min-width: 0; overflow-wrap: anywhere; }
-.cmd p { margin: 4px 0 0; font-size: 13px; color: var(--muted); }
-.cmd button { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
-.cmd button.run { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
-.cmd input { font: inherit; font-size: 13px; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 3px 7px; width: 9em; }
-.cmd pre { margin: 8px 0 0; padding: 8px 10px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
-  font-size: 12.5px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 320px; overflow-y: auto; }
-.cmd pre.bad { border-color: var(--err); }
-.linkline { font-size: 12.5px; color: var(--muted); margin: -10px 0 14px; display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
-.linkline b { color: var(--ink); font-weight: 650; }
-.linkline .m { white-space: nowrap; }
-.linkline .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--line); margin-right: 4px; vertical-align: 1px; }
-.linkline .dot.on { background: var(--ok); }
-.tasks-help { font-size: 13px; color: var(--muted); margin: 0 0 12px; }
-.task-form { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 14px; }
-.task-form input { flex: 1 1 120px; min-width: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-  padding: 7px 9px; color: var(--ink); font: inherit; font-size: 13.5px; }
-.task-form #t-title { flex: 3 1 260px; }
-#sheet { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-#sheet th { text-align: left; font-size: 12px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
-#sheet td { padding: 7px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-#sheet td.meta { font-size: 12px; color: var(--muted); }
-#sheet tr.done td { opacity: .55; }
-#sheet .st { font-size: 11.5px; font-weight: 650; border-radius: 99px; padding: 1px 8px; background: var(--line); white-space: nowrap; }
-#sheet .st.doing, #sheet .st.review { background: var(--accent); color: var(--on-accent); }
-#sheet .st.done { background: var(--ok); color: var(--panel); } #sheet .st.blocked { background: var(--err); color: var(--panel); }
-#sheet .acts { white-space: nowrap; text-align: right; }
-#sheet .acts button, #sheet .acts select { font-size: 12px; padding: 2px 6px; margin-left: 3px; background: transparent;
-  color: var(--ink); border: 1px solid var(--line); border-radius: 6px; }
-.msg .files { display: flex; flex-wrap: wrap; align-items: flex-start; gap: 6px; margin-top: 6px; white-space: normal; }
-.msg .body > .files:first-child { margin-top: 0; }
-.msg .file { display: inline-flex; gap: 6px; align-items: baseline; color: inherit; border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; font-size: 13px; text-decoration: none; background: var(--bg); color: var(--ink); }
-.msg .file .s { color: var(--muted); font-size: 12px; }
-.msg .file.image { padding: 0; border: 0; background: none; }
-.msg .file.image img { display: block; max-width: min(320px, 100%); max-height: 240px; border-radius: 8px; border: 1px solid var(--line); }
-textarea { flex: 1; min-width: 0; resize: none; max-height: 40dvh; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 9px 12px; }
-button { background: var(--accent); color: var(--on-accent); border: 0; border-radius: 10px; padding: 9px 18px; font-weight: 600; cursor: pointer; }
-button:disabled { opacity: 0.5; cursor: default; }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-#error { color: var(--err); font-size: 13px; margin-top: 6px; min-height: 0; }
-.add-agent { width: 100%; margin: 0 0 10px; background: transparent; color: var(--accent); border: 1px dashed var(--line); }
-dialog#launch, dialog#rules-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--ink); width: min(92vw, 460px); padding: 18px 20px; }
-dialog#launch::backdrop, dialog#rules-dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
-#launch h2, #rules-dialog h2 { font-size: 17px; margin: 0 0 4px; }
-#launch p, #rules-dialog p { margin: 0 0 12px; font-size: 13px; color: var(--muted); }
-#rules-input { width: 100%; box-sizing: border-box; min-height: 160px; resize: vertical; background: var(--bg);
-  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; color: var(--ink); font: inherit; }
-#rules-dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
-#rules-dialog .buttons .secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-#rules-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
-#setup { margin-top: 14px; }
-#setup h3 { font-size: 13px; margin: 12px 0 4px; display: flex; justify-content: space-between; align-items: center; }
-#setup .rules { font-size: 12.5px; white-space: pre-wrap; margin: 0; color: var(--muted); max-height: 7.5em; overflow: hidden; }
-#setup ul { list-style: none; margin: 0; padding: 0; font-size: 12.5px; }
-#setup li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
-button.link { background: none; border: 0; padding: 0; color: var(--accent); font: inherit; font-size: 12.5px; cursor: pointer; }
-#launch label { display: block; font-size: 13px; font-weight: 600; margin: 10px 0 4px; }
-#launch label.check { font-weight: 400; display: flex; gap: 8px; align-items: center; }
-#launch select, #launch input[type=text], #launch textarea { width: 100%; box-sizing: border-box; max-width: none; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; }
-#launch textarea { min-height: 70px; resize: vertical; }
-#launch .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
-#launch .buttons .secondary { background: transparent; color: var(--ink); border: 1px solid var(--line); }
-#launch-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
-
-@media (max-width: 760px) {
-  body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); height: 100dvh; }
-  aside { border-right: 0; border-bottom: 1px solid var(--line); padding: 12px 16px 10px; overflow: visible; }
-  .sub, .hint { display: none; }
-  h1 { margin-bottom: 8px; }
-  #agents { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 2px; }
-  .agent { flex: none; width: 240px; margin: 0; }
-  .agent .name { min-width: 0; }
-  .agent .name, .agent .where, .agent .status, .agent .activity { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .msg { max-width: 94%; }
-}
-</style>
-</head>
-<body>
-<aside>
-  <h1>__LOGO__<span id="project">crewchat</span><select id="projects" aria-label="Project" hidden></select></h1>
-  <p class="sub">Everything your agents say to each other, live.</p>
-  <p id="link" class="linkline" hidden></p>
-  <p id="switching" role="status" hidden></p>
-  <button type="button" id="add-agent" class="add-agent">+ Add an agent</button>
-  <div id="agents"></div>
-  <section id="setup" aria-label="What this project's agents learn">
-    <h3>Project rules <button type="button" class="link" id="rules-edit">Edit</button></h3>
-    <p id="rules-text" class="rules"></p>
-    <h3>Shared skills <button type="button" class="link" id="skill-add">Add</button></h3>
-    <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
-    <ul id="skills-list"></ul>
-  </section>
-  <p class="hint"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent has the <b>Lead</b> role, it takes your tasks and hands out the work instead. Give agents roles with the menu on their cards.</p>
-  <p class="hint">Agents appear here by themselves when a session starts in a joined folder, and drop off after a day of silence. An agent <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types (<code>crewchat listen</code> changes how long agents wait). Grey means it has not been heard from lately.</p>
-</aside>
-<dialog id="launch" aria-labelledby="launch-title">
-  <form id="launch-form" method="dialog">
-    <h2 id="launch-title">Add an agent</h2>
-    <p>Opens a new agent session in a terminal window on the machine that hosts this page. It joins the chat with the name, role and first task you give it.</p>
-    <div id="launch-fields">
-      <label for="l-tool">Agent</label><select id="l-tool"></select>
-      <label for="l-folder">Project folder</label><select id="l-folder"></select>
-      <label for="l-name">Name (optional)</label><input type="text" id="l-name" maxlength="32" placeholder="for example docs-writer" autocomplete="off">
-      <label for="l-role">Role</label><select id="l-role"></select>
-      <label for="l-task">First task (optional)</label><textarea id="l-task" maxlength="4000" placeholder="for example: Write a user guide for the settings screen"></textarea>
-      <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
-      <p class="meta" id="l-perms-note"></p>
-    </div>
-    <div id="launch-note" role="status"></div>
-    <div class="buttons"><button type="button" class="secondary" id="l-cancel">Cancel</button><button type="submit" id="l-start">Start</button></div>
-  </form>
-</dialog>
-<dialog id="rules-dialog" aria-labelledby="rules-title">
-  <form id="rules-form" method="dialog">
-    <h2 id="rules-title">Project rules</h2>
-    <p>What every agent in this project should follow: who does what, how to test, what never to do. They get them as a message now, and new sessions read them from the project's guide.</p>
-    <textarea id="rules-input" maxlength="16000" placeholder="For example: The Mac agent does Apple work, the laptop agent Windows. Run the tests before reporting done. Never push to main."></textarea>
-    <div id="rules-note" role="status"></div>
-    <div class="buttons"><button type="button" class="secondary" id="rules-cancel">Cancel</button><button type="submit" id="rules-save">Save</button></div>
-  </form>
-</dialog>
-<main>
-  <div id="update" role="status"><span>A newer crewchat, <b id="update-version"></b>, is available. Run
-    <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
-    <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
-  <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
-  <nav id="views" aria-label="View">
-    <button type="button" id="view-chat" class="on" aria-pressed="true">Chat</button>
-    <button type="button" id="view-tasks" aria-pressed="false">Task sheet <span id="tasks-count"></span></button>
-    <button type="button" id="view-commands" aria-pressed="false">Commands</button>
-  </nav>
-  <div id="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
-  <section id="tasks" hidden aria-label="Task sheet">
-    <p class="tasks-help">Every task in this project, in order. An agent with nothing to do takes the top one it may:
-      what it waits for is done, nobody else is in its files, and it suits its machine. Agents add the work they find;
-      the lead hands tasks out.</p>
-    <form id="task-form" class="task-form">
-      <input id="t-title" maxlength="4000" placeholder="A new task: the work, and what done looks like" aria-label="Task">
-      <input id="t-depends" placeholder="waits for (#12)" aria-label="Waits for">
-      <input id="t-areas" placeholder="files (app/login/)" aria-label="Files">
-      <input id="t-where" placeholder="machine" aria-label="Machine">
-      <button id="t-add">Add</button>
-    </form>
-    <table id="sheet"><thead><tr><th>#</th><th>Task</th><th>Status</th><th>Who</th><th></th></tr></thead><tbody></tbody></table>
-  </section>
-  <section id="commands" hidden aria-label="Commands">
-    <p class="tasks-help">Every <code>crewchat</code> command. <b>Copy</b> one to run it in a terminal on the
-      host; <b>Run</b> runs it here and shows what it prints. Commands that remove, unlink, stop or uninstall
-      are only for the terminal. Most commands also take <code>--chat PROJECT</code>, to act on another project
-      than the one of the folder you are in.</p>
-    <input id="cmd-filter" type="search" placeholder="Find a command" aria-label="Find a command" autocomplete="off">
-    <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
-  </section>
-  <form id="form">
-    <div class="row">
-      <label for="to">To</label>
-      <select id="to"><option value="all">Everyone</option></select>
-      <label class="check"><input type="checkbox" id="task"> Post as task</label>
-    </div>
-    <div id="pending" aria-label="Files to send"></div>
-    <div class="compose">
-      <button type="button" class="attach" id="attach" title="Attach files (or paste a screenshot)" aria-label="Attach files">📎</button>
-      <input type="file" id="files" multiple hidden>
-      <textarea id="text" rows="1" maxlength="4000" placeholder="Message the agents…" aria-label="Message"></textarea>
-      <button id="send" disabled>Send</button>
-    </div>
-    <div id="error" role="alert"></div>
-  </form>
-</main>
-<script>
-"use strict";
-const $ = (id) => document.getElementById(id);
-const el = (tag, cls, text) => {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  if (text !== undefined) n.textContent = text;
-  return n;
-};
-const state = { after: -1, version: -1, messages: [], nodes: new Map(), taken: {}, progress: {}, roles: [], statuses: {},
-                images: [], maxUpload: 20 * 1024 * 1024, pending: [],
-                agents: [], names: "", title: "crewchat",
-                now: Date.now() / 1000, lastDay: "" };
-
-// Colour by position in the roster; agents that have left the chat stay neutral.
-function colour(name) {
-  const i = state.agents.findIndex((a) => a.agent === name);
-  return i < 0 ? "" : "c" + (i % 8);
-}
-
-function ago(seen, now) {
-  if (!seen) return "never";
-  const s = Math.max(0, now - seen);
-  if (s < 90) return "now";
-  if (s < 3600) return Math.round(s / 60) + " min ago";
-  if (s < 86400) return Math.round(s / 3600) + " h ago";
-  return Math.round(s / 86400) + " d ago";
-}
-
-// POST to the chat server. Sends the page to sign-in on 401; throws the server's error otherwise.
-// The project this page shows (?chat=, or the first one): every request names it.
-const CHAT = new URLSearchParams(location.search).get("chat") || "";
-function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "chat=" + encodeURIComponent(CHAT) : path; }
-
-// Several projects: a menu to switch, marking the ones with messages since you last looked there.
-document.addEventListener("change", (e) => {
-  if (!e.target || e.target.id !== "projects") return;
-  // The page reloads for the other project: say so at once, so the old chat is not taken for the new one.
-  const name = e.target.selectedOptions[0] ? e.target.selectedOptions[0].text.replace(/\s*\(shared\).*$/, "") : "";
-  const note = $("switching");
-  note.replaceChildren(el("span", "spinner"), "Opening " + name + "…");
-  note.hidden = false;
-  e.target.disabled = true;
-  document.body.classList.add("switching");
-  location.href = "/?chat=" + encodeURIComponent(e.target.value);
-});
-// Back to this page from the browser's history: it comes back as it was left, mid-switch.
-window.addEventListener("pageshow", (e) => {
-  if (!e.persisted) return;
-  document.body.classList.remove("switching");
-  $("switching").hidden = true;
-  $("projects").disabled = false;
-});
-function seen(id, last) {
-  try {
-    if (last === undefined) return Number(localStorage.getItem("crewchat-seen-" + id) || 0);
-    localStorage.setItem("crewchat-seen-" + id, String(last));
-  } catch (e) {}
-  return 0;
-}
-function renderProjects(list, current) {
-  const menu = $("projects");
-  if (!list || list.length < 2) { menu.hidden = true; $("project").hidden = false; return; }
-  const mine = list.find((p) => p.id === current);
-  if (mine) seen(mine.id, mine.last);
-  if (menu === document.activeElement) return;  // open: do not rebuild it under the pointer
-  menu.replaceChildren(...list.map((p) => {
-    const fresh = p.id !== current && p.last > seen(p.id);
-    // Shared with your linked machines (for now the first project only), said in words.
-    const option = new Option(p.name + (p.linked ? " (shared)" : "") + (fresh ? "  \u2022 new" : ""), p.id);
-    if (p.linked) option.title = "Shared with your linked machines: their agents and messages are here too";
-    option.selected = p.id === current;
-    return option;
-  }));
-  menu.hidden = false;
-  $("project").hidden = true;
-}
-
-async function postJSON(path, body) {
-  const res = await fetch(api(path), { method: "POST", headers: { "Content-Type": "application/json" },
-                                  body: JSON.stringify(body) });
-  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
-  return res.json();
-}
-
-// The task sheet: every task of the project, in order, with who holds it.
-// Chat, Task sheet or Commands.
-function showView(view) {
-  $("log").hidden = view !== "chat"; $("form").hidden = view !== "chat";
-  $("tasks").hidden = view !== "tasks"; $("commands").hidden = view !== "commands";
-  for (const name of ["chat", "tasks", "commands"]) {
-    $("view-" + name).classList.toggle("on", view === name);
-    $("view-" + name).setAttribute("aria-pressed", String(view === name));
-  }
-  if (view === "commands") loadCommands();
-  try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
-}
-$("view-chat").addEventListener("click", () => showView("chat"));
-$("view-tasks").addEventListener("click", () => showView("tasks"));
-$("view-commands").addEventListener("click", () => showView("commands"));
-
-// How this machine reaches your others: over Tailscale, with cloud sync (Firestore), or not at all.
-function renderLink(link) {
-  const line = $("link");
-  if (!link) { line.hidden = true; return; }
-  const parts = [];
-  const dot = (on, label, title) => {
-    const m = el("span", "m");
-    if (title) m.title = title;
-    m.append(el("span", "dot" + (on ? " on" : "")), label);
-    return m;
-  };
-  if (link.via === "tailscale") {
-    parts.push(el("b", "", "Linked over Tailscale"));
-    for (const m of link.machines || [])
-      parts.push(dot(m.online, m.name, m.online ? "Reachable now" : "Not reachable just now"));
-    if (!(link.machines || []).length) parts.push("no other machines yet");
-  } else if (link.via === "cloud") {
-    parts.push(el("b", "", "Linked with cloud sync (Firestore)"));
-    parts.push(dot(link.online, link.online ? "online" : "offline"));
-    if (!link.approved) parts.push("waiting for approval on another machine");
-  } else if (link.via === "linked") {
-    parts.push(el("b", "", "Linked with your other machines"));
-  } else {
-    parts.push("This machine only");
-  }
-  if (link.via !== "none" && link.shared === false) parts.push("(this project stays on this machine)");
-  line.replaceChildren();
-  parts.forEach((part, i) => { if (i) line.append(" "); line.append(part); });
-  line.title = link.via === "tailscale" ? "Each machine is reached directly through your private Tailscale network"
-    : link.via === "cloud" ? "Messages travel encrypted through your own Firebase project (Firestore)"
-    : link.via === "none" ? "crewchat connect links another machine, over Tailscale or with cloud sync" : "";
-  line.hidden = false;
-}
-
-// The Commands tab: every command for help; the safe ones run here (POST /api/run).
-let commandsLoad = null;  // the one request for the list; null again after a failure, to retry
-function loadCommands() {
-  if (!commandsLoad) commandsLoad = (async () => {
-    try {
-      const res = await fetch(api("/api/commands"), { cache: "no-store" });
-      if (res.status === 401) { location.href = "/login"; return; }
-      if (!res.ok) throw new Error("the host answered " + res.status);
-      renderCommands((await res.json()).groups || []);
-    } catch (e) {
-      commandsLoad = null;
-      $("cmd-list").replaceChildren(el("p", "tasks-help", "Could not load the commands: " + e.message));
-    }
-  })();
-  return commandsLoad;
-}
-const noCommand = el("p", "tasks-help", "No command matches.");
-function renderCommands(groups) {
-  const list = $("cmd-list");
-  list.replaceChildren();
-  for (const group of groups) {
-    const box = el("div", "cmd-group");
-    box.append(el("h3", "", group.group), ...group.commands.map(commandRow));
-    list.append(box);
-  }
-  list.append(noCommand);
-  filterCommands();
-}
-// The search box hides what does not match; rows keep what was typed in them and any output.
-function filterCommands() {
-  const want = $("cmd-filter").value.trim().toLowerCase(), list = $("cmd-list");
-  for (const row of list.querySelectorAll(".cmd")) row.hidden = !!want && !row.dataset.find.includes(want);
-  for (const box of list.querySelectorAll(".cmd-group")) box.hidden = !box.querySelector(".cmd:not([hidden])");
-  noCommand.hidden = !!list.querySelector(".cmd:not([hidden])");
-}
-function commandRow(c) {
-  const row = el("div", "cmd"), top = el("div", "top"), out = el("pre");
-  row.dataset.find = (c.usage + " " + c.text).toLowerCase();
-  out.hidden = true;
-  top.append(el("code", "u", "crewchat " + c.usage));
-  const inputs = {};
-  for (const name of c.needs || []) {
-    const input = el("input");
-    input.placeholder = name.toLowerCase();
-    input.setAttribute("aria-label", name.toLowerCase() + " for crewchat " + c.usage);
-    inputs[name] = input;
-    top.append(input);
-  }
-  const values = () => Object.fromEntries(Object.entries(inputs).map(([name, input]) => [name, input.value.trim()]));
-  // The command as typed in a terminal, with the values filled in where they were given.
-  const filled = () => { const v = values(); return "crewchat " + c.usage.replace(/\b[A-Z]+\b/g, (n) => v[n] || n); };
-  const copy = el("button", "", "Copy");
-  copy.type = "button";
-  copy.addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText(filled()); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
-    setTimeout(() => { copy.textContent = "Copy"; }, 1500);
-  });
-  top.append(copy);
-  if (c.run) {
-    const run = el("button", "run", "Run");
-    run.type = "button";
-    run.addEventListener("click", async () => {
-      if (c.ask && !confirm("Run " + filled() + " on the host?")) return;
-      run.disabled = true; run.textContent = "Running…";
-      out.hidden = false; out.className = ""; out.textContent = "";
-      try {
-        const res = await postJSON("/api/run", { usage: c.usage, values: values() });
-        out.textContent = res.output;
-        if (res.code !== 0) out.className = "bad";
-      } catch (e) {
-        out.textContent = e.message; out.className = "bad";
-      } finally {
-        run.disabled = false; run.textContent = "Run";
-      }
-    });
-    top.append(run);
-  }
-  row.append(top, el("p", "", c.text), out);
-  return row;
-}
-$("cmd-filter").addEventListener("input", filterCommands);
-async function taskOp(body) {
-  try { await postJSON("/api/task", body); } catch (e) { alert(e.message); }
-}
-function renderSheet(rows) {
-  const open = rows.filter((r) => r.status !== "done").length;
-  $("tasks-count").textContent = open ? "(" + open + ")" : "";
-  const body = $("sheet").tBodies[0];
-  if (body.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;
-  if (!rows.length) {
-    const row = body.insertRow(); body.replaceChildren(row);
-    const cell = row.insertCell(); cell.colSpan = 5; cell.className = "meta";
-    cell.textContent = "No tasks yet. Add one above, or post a message as a task.";
-    return;
-  }
-  body.replaceChildren(...rows.map((r) => {
-    const tr = el("tr", r.status);
-    tr.append(el("td", "meta", "#" + r.id));
-    const what = el("td");
-    what.append(el("div", "", r.title));
-    const meta = [];
-    if (r.depends.length) meta.push("waits for " + r.depends.map((d) => "#" + d).join(", "));
-    if (r.areas.length) meta.push("files " + r.areas.join(", "));
-    if (r.where) meta.push("on " + r.where);
-    if (r.to !== "all") meta.push("for " + r.to);
-    if (r.reclaimed) meta.push("reclaimed from " + r.reclaimed);
-    meta.push("from " + (r.from === "Owner" ? "you" : r.from));
-    what.append(el("div", "meta", meta.join(" · ")));
-    tr.append(what);
-    const st = el("td"); st.append(el("span", "st " + r.status, r.status)); tr.append(st);
-    tr.append(el("td", "meta", r.holder || ""));
-    const acts = el("td", "acts");
-    if (r.status === "todo" || r.status === "waiting") {
-      const pick = el("select");
-      pick.setAttribute("aria-label", "Give task " + r.id + " to");
-      pick.append(new Option("Give to…", ""), ...state.agents.map((a) => new Option(a.agent, a.agent)));
-      pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
-      acts.append(pick);
-    }
-    const button = (label, title, body) => actButton(acts, label, title, () => taskOp(body));
-    button("\u2191", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
-    button("\u2193", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
-    if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
-    if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
-      button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
-    button("\u00d7", "Take task " + r.id + " off the sheet", { op: "remove", task: r.id });
-    tr.append(acts);
-    return tr;
-  }));
-}
-$("task-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const title = $("t-title").value.trim();
-  if (!title) return;
-  await taskOp({ op: "add", title, depends: $("t-depends").value, areas: $("t-areas").value, where: $("t-where").value });
-  for (const id of ["t-title", "t-depends", "t-areas", "t-where"]) $(id).value = "";
-});
-try { const v = sessionStorage.getItem("crewchat-view"); if (v === "tasks" || v === "commands") showView(v); } catch (e) {}
-
-// The project's rules and shared skills: what its agents learn by themselves.
-function renderSetup(rules, skills) {
-  const text = $("rules-text");
-  text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
-  state.rules = rules || "";
-  const list = $("skills-list");
-  list.replaceChildren(...(skills || []).map((name) => {
-    const item = el("li");
-    const remove = el("button", "link", "Remove");
-    remove.type = "button";
-    remove.setAttribute("aria-label", "Remove the skill " + name);
-    remove.addEventListener("click", async () => {
-      if (!confirm("Remove the skill " + name + " from every folder of this project?")) return;
-      try { await postJSON("/api/skills", { op: "remove", name }); } catch (e) { alert(e.message); }
-    });
-    item.append(el("span", "", name), remove);
-    return item;
-  }));
-  if (!(skills || []).length) list.append(el("li", "", "None yet: Add shares a SKILL.md with every agent."));
-}
-$("rules-edit").addEventListener("click", () => {
-  $("rules-input").value = state.rules || "";
-  $("rules-note").textContent = "";
-  $("rules-dialog").showModal();
-});
-$("rules-cancel").addEventListener("click", () => $("rules-dialog").close());
-$("rules-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  $("rules-note").textContent = "Saving…";
-  try {
-    await postJSON("/api/rules", { rules: $("rules-input").value });
-    $("rules-dialog").close();
-  } catch (e) {
-    $("rules-note").textContent = e.message;
-  }
-});
-$("skill-add").addEventListener("click", () => $("skill-file").click());
-$("skill-file").addEventListener("change", async () => {
-  const file = $("skill-file").files[0];
-  $("skill-file").value = "";
-  if (!file) return;
-  const suggested = file.name.toLowerCase().replace(/\.md$/, "").replace(/^skill$/, "").replace(/[^a-z0-9-]+/g, "-");
-  const name = prompt("A name for the skill (lowercase letters, digits and -):", suggested);
-  if (!name) return;
-  try {
-    await postJSON("/api/skills", { op: "add", name, files: { "SKILL.md": await file.text() } });
-  } catch (e) { alert(e.message); }
-});
-
-// What Add an agent offers on this machine (tools, folders, permissions, models): the dialog and the
-// cards' Switch model read it.
-async function launchOptions() {
-  const res = await fetch(api("/api/launch"), { cache: "no-store" });
-  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
-  const opts = await res.json();
-  toolModels = {};
-  for (const t of opts.tools || []) toolModels[t.id] = t.models || [];
-  return opts;
-}
-
-async function openLaunch() {
-  const dialog = $("launch"), note = $("launch-note");
-  note.textContent = ""; $("l-start").disabled = false;
-  dialog.showModal();
-  try {
-    const opts = await launchOptions();
-    $("l-tool").replaceChildren(...opts.tools.map((t) => {
-      const option = new Option(t.missing ? t.label + " (not installed)" : t.label, t.id);
-      option.disabled = !!t.missing;
-      option.title = t.missing || "";
-      return option;
-    }));
-    launchTools = opts.tools;
-    showPermissions();  // the rebuilt list may pick another tool
-    const missing = opts.tools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
-    opts.tools = opts.tools.filter((t) => !t.missing);
-    $("l-folder").replaceChildren(...opts.folders.map((f) => new Option(f.name + " (" + f.path + ")", f.path)));
-    $("l-role").replaceChildren(new Option("No role", ""), ...state.roles.map((r) => new Option(r.title, r.name)));
-    if (!opts.tools.length || !opts.folders.length) {
-      note.textContent = !opts.tools.length
-        ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then run `crewchat start` in a project folder."
-        : "No project folder on this machine is connected yet. Run `crewchat start` in one first.";
-      $("l-start").disabled = true;
-    } else if (missing) {
-      note.textContent = missing;
-    }
-  } catch (err) {
-    note.textContent = "Could not load the options: " + err.message;
-  }
-}
-
-// What a new agent may do without asking, as the server offers it for the chosen tool (crewchat's own
-// tools are always allowed).
-let launchTools = [];
-function showPermissions(event) {
-  const pick = $("l-perms"), keep = pick.value;
-  if (!event || event.target !== pick) {  // a tool was picked: its own choices
-    const tool = launchTools.find((t) => t.id === $("l-tool").value);
-    const options = (tool && tool.permissions) || [];
-    pick.replaceChildren(...options.map(([value, label]) => new Option(label, value)));
-    pick.value = options.some(([value]) => value === keep) ? keep : "ask";
-  }
-  $("l-perms-note").textContent = pick.value === "all"
-    ? "Careful: it will run commands and change files with nobody watching. Use it in a folder you can restore (git), on a machine without secrets it could leak."
-    : "When it needs something else, it asks in its terminal window.";
-  $("l-perms-note").className = pick.value === "all" ? "meta warn" : "meta";
-}
-
-async function startAgent(event) {
-  event.preventDefault();
-  const note = $("launch-note");
-  $("l-start").disabled = true;
-  note.textContent = "Starting…";
-  try {
-    await postJSON("/api/launch", { tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(),
-                                    role: $("l-role").value, task: $("l-task").value.trim(), permissions: $("l-perms").value });
-    note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
-    $("l-name").value = ""; $("l-task").value = "";
-    setTimeout(() => $("launch").close(), 4000);
-  } catch (err) {
-    note.textContent = "Not started: " + err.message;
-    $("l-start").disabled = false;
-  }
-}
-
-function roleTitle(name) {
-  const r = state.roles.find((x) => x.name === name);
-  return r ? r.title : name;
-}
-
-// An owner action from a control: the control waits while it runs; a failure is shown.
-async function postAction(path, body, what, control) {
-  if (control) control.disabled = true;
-  try {
-    await postJSON(path, body);
-    $("error").textContent = "";
-  } catch (err) {
-    $("error").textContent = what + ": " + err.message;
-  }
-  if (control) control.disabled = false;
-}
-
-function actButton(parent, label, title, onClick) {
-  const b = el("button", "", label); b.type = "button"; b.title = title; b.setAttribute("aria-label", title);
-  b.addEventListener("click", () => onClick(b)); parent.append(b);
-  return b;
-}
-
-// The owner on an agent's card: rename, remove, listening (on, off, or its folder's default).
-function agentActions(a) {
-  const acts = el("div", "acts");
-  const remote = a.remote ? "Runs on " + a.device + ": change it there" : "";
-  const agentOp = (body, what, control) => postAction("/api/agent", body, what, control);
-  const button = (label, title, run) => {
-    const b = actButton(acts, label, title, run);
-    if (remote) { b.title = remote; b.disabled = true; }
-  };
-  button("Rename", "Rename " + a.agent, (b) => {
-    const name = prompt("New name for " + a.agent + " (letters, digits, - _ .):", a.agent);
-    if (name && name.trim() && name.trim() !== a.agent)
-      agentOp({ op: "rename", agent: a.agent, new: name.trim() }, "Not renamed", b);
-  });
-  button("Remove", "Remove " + a.agent + " from the chat", (b) => {
-    if (confirm("Remove " + a.agent + " from the chat? Its tasks go back on the sheet. If its session is " +
-                "still open, it joins again the next time it uses crewchat."))
-      agentOp({ op: "remove", agent: a.agent }, "Not removed", b);
-  });
-  sessionControls(a, acts, agentOp);
-  if (!remote) acts.append(pictureMenu(a, agentOp));
-  const listen = el("select");
-  listen.setAttribute("aria-label", "Listening for " + a.agent);
-  listen.title = remote || "Wait for messages after each turn (On), check once (Off), or as its folder says";
-  listen.append(new Option("Listening: folder's", "default"), new Option("Listening: on", "on"),
-                new Option("Listening: off", "off"));
-  listen.value = a.listen || "default";
-  listen.disabled = !!remote;
-  listen.addEventListener("change", () => agentOp({ op: "listen", agent: a.agent, mode: listen.value },
-                                                   "Listening not changed", listen));
-  acts.append(listen);
-  return acts;
-}
-
-// Its session: Stop while it runs, Reopen (the same conversation) when it does not, Switch model.
-let toolModels = null;  // tool -> [[id, label], ...], from /api/launch, fetched once
-let modelsAsked = false;
-async function loadModels() {
-  if (modelsAsked) return;  // once per page, whatever the answer
-  modelsAsked = true;
-  try {
-    await launchOptions();
-    renderAgents();
-  } catch (err) {}
-}
-
-function sessionLine(a) {
-  const s = a.session;
-  if (!s) return "";
-  if (s.running) return s.app === "claude-app" ? "Running in the Claude app" : "Running in Terminal";
-  return "Session closed " + ago(s.since, state.now);
-}
-
-function sessionControls(a, acts, agentOp) {
-  const s = a.session;
-  if (!s || a.remote) return;
-  if (s.running) {
-    actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {
-      if (confirm("Stop " + a.agent + "? Its session ends and its tasks go back on the sheet. Reopen brings it back."))
-        agentOp({ op: "stop", agent: a.agent }, "Not stopped", b);
-    });
-  } else if (s.reopen) {
-    actButton(acts, "Reopen", "Reopen " + a.agent + "'s conversation", (b) => {
-      const where = s.app === "claude-app"
-        ? "It reopens in a Terminal window. If it is still open in the Claude app, close it there first."
-        : "It reopens in a Terminal window on this machine, with its memory and name.";
-      if (confirm("Reopen " + a.agent + "? " + where)) agentOp({ op: "reopen", agent: a.agent }, "Not reopened", b);
-    });
-  }
-  if (!s.reopen) return;  // switching a model reopens the session
-  loadModels();
-  const models = (toolModels || {})[s.tool] || [];
-  if (!models.length) return;
-  const pick = el("select");
-  pick.setAttribute("aria-label", "Switch " + a.agent + "'s model");
-  pick.append(new Option("Switch model…", ""), ...models.map(([id, label]) => new Option(label, id)));
-  pick.addEventListener("change", () => {
-    const model = pick.value;
-    pick.value = "";
-    if (model && confirm("Switch " + a.agent + " to " + model + "? Its session restarts on that model, same conversation."))
-      agentOp({ op: "model", agent: a.agent, model }, "Model not switched", pick);
-  });
-  acts.append(pick);
-}
-
-function setRole(agent, role, pick) {
-  return postAction("/api/role", { agent, role }, "Role not changed", pick);
-}
-
-function renderAgents() {
-  const box = $("agents");
-  if (box.contains(document.activeElement) && document.activeElement.tagName === "SELECT") return;  // menu open
-  if (box.querySelector(".picmenu[open]")) return;  // choosing a picture
-  box.replaceChildren();
-  if (!state.agents.length) box.append(el("p", "none", "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use Add an agent above."));
-  for (const a of state.agents) {
-    const age = a.seen ? state.now - a.seen : Infinity;
-    const card = el("div", "agent");
-    const top = el("div", "top");
-    const dot = el("span", "dot" + (age < 90 ? " on" : age < 900 ? " recent" : ""));
-    dot.setAttribute("aria-hidden", "true");
-    top.append(avatar(a), dot, el("span", "name " + colour(a.agent), a.agent), el("span", "seen", ago(a.seen, state.now)));
-    // The role goes under the name: names are long and the card is narrow.
-    const where = el("div", "where");
-    if (a.role) where.append(el("span", "badge " + a.role, roleTitle(a.role)), document.createTextNode(" "));
-    where.append(document.createTextNode(a.client + " on " + a.place + (a.remote ? " · machine " + a.device : "")));
-    card.append(top, where, el("div", "status", a.status || "No status set"));
-    const doing = {working: "Working", listening: "Waiting for messages: answers right away",
-                   idle: "Idle: sees messages when its user next types"}[a.activity];
-    const closed = a.session && !a.session.running;  // what its hooks last said no longer holds
-    if (doing && age < 900 && !closed) card.append(el("div", "activity " + a.activity, doing));
-    if (a.session) card.append(el("div", "session " + (a.session.running ? "on" : "off"), sessionLine(a)));
-    const pick = el("select", "rolepick");
-    pick.setAttribute("aria-label", "Role for " + a.agent);
-    pick.append(new Option("No role", "none"), ...state.roles.map((r) => new Option("Role: " + r.title, r.name)));
-    pick.value = a.role || "none";
-    pick.addEventListener("change", () => setRole(a.agent, pick.value, pick));
-    card.append(pick, agentActions(a));
-    if (a.unread) card.append(el("div", "unread", a.unread + " unread"));
-    box.append(card);
-  }
-  const names = state.agents.map((a) => a.agent).join("\n");
-  if (names !== state.names) {
-    state.names = names;
-    const select = $("to"), keep = select.value;
-    select.replaceChildren(new Option("Everyone", "all"), ...state.agents.map((a) => new Option(a.agent, a.agent)));
-    select.value = [...select.options].some((o) => o.value === keep) ? keep : "all";
-    // Names colour by roster position, so repaint what is already on screen.
-    for (const n of $("log").querySelectorAll("[data-cls]")) n.className = n.dataset.cls + " " + colour(n.dataset.who);
-  }
-  const looks = state.agents.map((a) => [a.agent, a.client, a.picture, a.colour, a.os, a.device].join(" ")).join("\n");
-  if (looks !== state.looks) {  // a new picture or colour: repaint the ones on messages too
-    state.looks = looks;
-    for (const n of $("log").querySelectorAll(".avatar[data-who]")) n.replaceWith(avatar(agentRow(n.dataset.who)));
-  }
-}
-
-// An agent's picture: its uploaded image, a preset, or its initials, on its colour (the tool's own by
-// default), with its tool's lettermark, and its machine's OS when the chat spans several machines.
-const OS_BADGES = { mac: ["\u{1F34E}", "macOS"], windows: ["\u{1FA9F}", "Windows"], linux: ["\u{1F427}", "Linux"] };
-
-function agentRow(name) {
-  return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
-}
-
-function own(table, key) {
-  return table && Object.hasOwn(table, key) ? table[key] : undefined;
-}
-
-function inkOn(hex) {
-  if (!/^#[0-9a-f]{6}$/i.test(hex)) return "#fff";
-  const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255)
-    .map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
-  return 0.2126 * r + 0.7152 * g + 0.0722 * b > 0.5 ? "#111" : "#fff";
-}
-
-function initials(name) {
-  const parts = name.split(/[-_.]+/).filter(Boolean);
-  return parts.slice(0, 2).map((p) => p[0]).join("").toUpperCase() || "?";
-}
-
-function avatar(a) {
-  const tool = own(state.tools, a.client) || own(state.tools, "agent") || { colour: "#6b7280", mark: "", label: "" };
-  const fill = a.colour || tool.colour;
-  const box = el("span", "avatar");
-  box.dataset.who = a.agent;
-  box.style.setProperty("--av", fill);
-  box.style.setProperty("--av-ink", inkOn(fill));
-  const letters = () => el("span", "initials", initials(a.agent));
-  const [kind, id] = (a.picture || "").split(":");
-  if (kind === "file") {
-    const img = el("img");
-    img.alt = ""; img.src = "/files/" + id;
-    img.addEventListener("error", () => img.replaceWith(letters()));
-    box.append(img);
-  } else if (kind === "preset" && own(state.presets, id)) {
-    box.append(el("span", "emoji", state.presets[id]));
-  } else {
-    box.append(letters());
-  }
-  if (tool.mark) {
-    const mark = el("span", "mark", tool.mark);
-    mark.style.setProperty("--mk", tool.colour); mark.title = tool.label;
-    box.append(mark);
-  }
-  const os = OS_BADGES[a.os];
-  if (os && new Set(state.agents.map((r) => r.device)).size > 1) {
-    const badge = el("span", "os", os[0]); badge.title = os[1];
-    box.append(badge);
-  }
-  box.title = a.agent + (tool.label ? " · " + tool.label : "");
-  return box;
-}
-
-// The card's Picture menu: a preset, initials, an image of your own, and a colour.
-function pictureMenu(a, agentOp) {
-  const menu = el("details", "picmenu");
-  menu.append(el("summary", "", "Picture"));
-  menu.addEventListener("toggle", () => { if (!menu.open) renderAgents(); });  // cards wait while it is open
-  const picks = el("div", "picks");
-  const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
-    .then(() => { menu.open = false; });
-  for (const [id, emoji] of Object.entries(state.presets || {}))
-    actButton(picks, emoji, "Picture: " + id, (b) => set({ picture: "preset:" + id }, b));
-  actButton(picks, "Initials", "Picture: initials", (b) => set({ picture: "" }, b));
-  const file = el("input");
-  file.type = "file"; file.accept = "image/png,image/jpeg,image/webp"; file.hidden = true;
-  file.addEventListener("change", async () => {
-    const f = file.files[0]; file.value = "";
-    if (!f) return;
-    try { await set({ picture: "file:" + await uploadFile(f) }); }
-    catch (err) { $("error").textContent = "Picture not changed: " + err.message; }
-  });
-  actButton(picks, "Upload\u2026", "Upload a picture (PNG, JPEG or WebP, 512 KB at most)", () => file.click());
-  const tint = el("input");
-  tint.type = "color"; tint.value = a.colour || (own(state.tools, a.client) || {}).colour || "#6b7280";
-  tint.setAttribute("aria-label", "Colour for " + a.agent);
-  tint.addEventListener("change", () => set({ colour: tint.value }, tint));
-  actButton(picks, "Tool colour", "Back to the tool's own colour", (b) => set({ colour: "" }, b));
-  picks.append(file, tint);
-  menu.append(picks);
-  return menu;
-}
-
-function named(tag, cls, name) {
-  const n = el(tag, cls + " " + colour(name), name);
-  n.dataset.who = name; n.dataset.cls = cls;
-  return n;
-}
-
-function receipt(m) {
-  const targets = m.to === "all" ? state.agents.map((a) => a.agent) : [m.to];
-  const read = state.agents.filter((a) => targets.includes(a.agent) && a.cursor >= m.seq).map((a) => a.agent);
-  if (!read.length) return "Not read yet";
-  if (read.length === targets.length) return targets.length > 1 ? "Read by everyone" : "Read";
-  return "Read by " + read.join(", ");
-}
-
-function sizeText(n) {
-  return n < 1024 ? n + " bytes" : n < 1048576 ? (n / 1024).toFixed(1) + " KB" : (n / 1048576).toFixed(1) + " MB";
-}
-
-function fileLinks(files) {
-  const list = el("div", "files");
-  for (const f of files) {
-    const a = el("a", "file");
-    a.href = "/files/" + f.id + "/" + encodeURIComponent(f.name);
-    a.target = "_blank"; a.rel = "noopener";
-    a.title = f.name + " (" + sizeText(f.size) + ")";
-    if (state.images.includes(f.type)) {
-      const img = el("img"); img.src = a.href; img.alt = f.name; img.loading = "lazy";
-      a.classList.add("image"); a.append(img);
-    } else {
-      a.append(el("span", "", "📄 " + f.name), el("span", "s", sizeText(f.size)));
-    }
-    list.append(a);
-  }
-  return list;
-}
-
-function buildMessage(m) {
-  if (m.kind === "event") return el("p", "sys", m.text);
-  if (m.kind === "role") {
-    const line = el("p", "sys");
-    const by = m.from === "Owner" ? el("b", "", "You") : named("b", "", m.from);
-    const what = m.role ? (m.from === m.to ? " took the role " : " made ") : " removed the role of ";
-    line.append(by, document.createTextNode(what));
-    if (m.from !== m.to || !m.role) line.append(named("b", "", m.to));
-    if (m.role) {
-      if (m.from !== m.to) line.append(document.createTextNode(" the "));
-      const more = el("details");
-      more.append(el("summary", "", roleTitle(m.role)), el("span", "prompt", m.text));
-      line.append(more);
-    }
-    return line;
-  }
-  if (m.kind === "take") {
-    const line = el("p", "sys");
-    line.append(named("b", "", m.from), document.createTextNode(" " + m.text.replace(/^I am taking/, "took")));
-    return line;
-  }
-  const own = m.from === "Owner";
-  const box = el("div", "msg" + (own ? " own" : "") + (m.kind === "task" ? " task" : "") + (m.kind === "update" ? " update" : ""));
-  box.dataset.id = m.id;
-  const meta = el("div", "meta");
-  if (!own) meta.append(avatar(agentRow(m.from)));
-  meta.append(own ? el("span", "who", "You") : named("span", "who", m.from));
-  if (m.to !== "all") meta.append(el("span", "to", "to " + (m.to === "Owner" ? "you" : m.to)));
-  meta.append(el("span", "", new Date(m.ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })));
-  const body = el("div", "body");
-  if (m.kind === "task") {
-    const label = el("div", "label");
-    label.append(el("span", "", "TASK #" + m.id + (m.task ? " · part of #" + m.task : "")), el("span", "state"));
-    body.append(label);
-  }
-  if (m.kind === "update") {
-    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (state.statuses[m.status] || m.status)));
-  }
-  if (m.kind === "ask") meta.append(el("span", "pill", "question" + (m.task ? " · done check #" + m.task : "")));
-  if (m.kind === "answer") {
-    const verdict = { approve: " · approved", changes: " · changes needed" }[m.verdict] || "";
-    meta.append(el("span", "pill" + (m.verdict === "approve" ? " done" : m.verdict === "changes" ? " blocked" : ""),
-                   "answer to #" + m.answers + verdict));
-  }
-  if (m.text) body.append(document.createTextNode(m.text));
-  if (m.files && m.files.length) body.append(fileLinks(m.files));
-  box.append(meta, body);
-  if (own) box.append(el("div", "receipt"));
-  return box;
-}
-
-function refreshDynamic() {
-  // Only your messages (read receipts) and tasks (who has them, progress) change after they are shown.
-  for (const [m, node] of state.nodes.values()) {
-    if (m.from === "Owner") node.querySelector(".receipt").textContent = receipt(m);
-    if (m.kind === "task") {
-      const who = state.taken[m.id];
-      const p = state.progress[m.id];
-      const st = node.querySelector(".state");
-      st.textContent = (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
-        + (p ? " · " + (state.statuses[p.status] || p.status) : "");
-      st.className = "state" + (who ? " " + colour(who) : "");
-    }
-  }
-}
-
-function addMessages(list, first) {
-  if (!list.length) return;
-  const log = $("log");
-  $("empty")?.remove();
-  for (const m of list) {
-    if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
-    const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
-    if (day !== state.lastDay) { log.append(el("p", "day", day)); state.lastDay = day; }
-    const node = buildMessage(m);
-    log.append(node);
-    if (node.classList.contains("msg") && (m.from === "Owner" || m.kind === "task")) state.nodes.set(m.id, [m, node]);
-    state.messages.push(m);
-    state.after = m.seq;
-  }
-  if (document.hidden && !first) {
-    state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
-    if (state.missed) document.title = "(" + state.missed + ") " + state.title;
-  }
-}
-
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) { state.missed = 0; document.title = state.title; if (state.wake) state.wake(); }
-});
-window.addEventListener("online", () => { if (state.wake) state.wake(); });
-
-// A newer crewchat: say so until the owner dismisses it, then not again for that version.
-function showUpdate(version, releases) {
-  let dismissed = "";
-  try { dismissed = localStorage.getItem("crewchat-update-dismissed") || ""; } catch (e) {}
-  $("update-version").textContent = version;
-  $("update-notes").href = releases + "/tag/v" + version;
-  $("update").classList.toggle("show", !!version && version !== dismissed);
-}
-$("update-close").addEventListener("click", () => {
-  try { localStorage.setItem("crewchat-update-dismissed", $("update-version").textContent); } catch (e) {}
-  $("update").classList.remove("show");
-});
-
-async function loop() {
-  for (;;) {
-    try {
-      const wait = state.version < 0 ? 0 : 25;
-      // With more messages to catch up on, ask again at once (a version that never matches).
-      const res = await fetch(api("/api/poll?after=" + state.after + "&v=" + (state.more ? -2 : state.version) + "&wait=" + wait),
-                              { cache: "no-store" });
-      if (res.status === 401) { location.href = "/login"; return; }
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const data = await res.json();
-      state.failures = 0;
-      $("banner").classList.remove("show");
-      const first = state.version < 0;
-      state.version = data.version; state.taken = data.taken; state.agents = data.agents; state.now = data.now;
-      state.more = !!data.more;
-      state.progress = data.progress || {}; state.roles = data.roles || []; state.statuses = data.statuses || {};
-      state.tools = data.tools || {}; state.presets = data.presets || {};
-      state.images = data.images || []; state.maxUpload = data.max_upload || state.maxUpload;
-      showUpdate(data.update || "", data.releases || "");
-      if (data.project && data.project + " · crewchat" !== state.title) {
-        state.title = data.project + " · crewchat";
-        $("project").textContent = data.project;
-        if (!state.missed) document.title = state.title;
-      }
-      renderProjects(data.projects, data.chat);
-      renderLink(data.link);
-      renderSetup(data.rules, data.skills);
-      renderSheet(data.sheet || []);
-      const log = $("log");
-      const pinned = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
-      const mine = data.messages.some((m) => m.from === "Owner");
-      renderAgents();
-      addMessages(data.messages, first);
-      if (first && $("empty")) $("empty").textContent = "No messages yet. Say something to the agents below.";
-      refreshDynamic();
-      // Scroll last: the agent cards and read receipts above change the list's height.
-      if (first || mine || (pinned && data.messages.length)) log.scrollTop = log.scrollHeight;
-    } catch (e) {
-      // One failed request is normal (phone locked, tab in the background, network switch): retry
-      // at once. Only say the server is unreachable when it keeps failing.
-      state.failures = (state.failures || 0) + 1;
-      if (state.failures >= 3) $("banner").classList.add("show");
-      await new Promise((r) => { state.wake = r; setTimeout(r, state.failures < 3 ? 800 : 3000); });
-    }
-  }
-}
-
-const text = $("text");
-function fit() {
-  text.style.height = "auto";
-  text.style.height = text.scrollHeight + 2 + "px";
-  $("send").disabled = !text.value.trim() && !state.pending.length;
-}
-text.addEventListener("input", fit);
-// Files waiting to be sent: chosen with the paperclip, pasted (a screenshot) or dropped.
-function addFiles(list) {
-  for (let file of list) {
-    if (file.size > state.maxUpload) { $("error").textContent = file.name + " is too big: " + sizeText(state.maxUpload) + " at most."; continue; }
-    if (/^image\.(png|jpe?g|gif|webp)$/i.test(file.name)) {  // a pasted screenshot: give it a useful name
-      const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, "-");
-      file = new File([file], "screenshot-" + stamp + "." + file.name.split(".").pop(), { type: file.type });
-    }
-    state.pending.push(file);
-  }
-  renderPending();
-}
-
-function renderPending() {
-  const box = $("pending");
-  box.replaceChildren(...state.pending.map((file, i) => {
-    const chip = el("span", "chip");
-    if (file.type.startsWith("image/")) { const img = el("img"); img.src = URL.createObjectURL(file); img.alt = ""; chip.append(img); }
-    chip.append(el("span", "n", file.name), el("span", "s", sizeText(file.size)));
-    const drop = el("button", "", "×");
-    drop.type = "button"; drop.setAttribute("aria-label", "Remove " + file.name);
-    drop.addEventListener("click", () => { state.pending.splice(i, 1); renderPending(); });
-    chip.append(drop);
-    return chip;
-  }));
-  fit();
-}
-
-async function uploadFile(file) {
-  const res = await fetch(api("/api/upload"), { method: "POST", body: file,
-    headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } });
-  if (res.status === 401) { location.href = "/login"; throw new Error("signed out"); }
-  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || "HTTP " + res.status);
-  return (await res.json()).id;
-}
-
-$("attach").addEventListener("click", () => $("files").click());
-$("files").addEventListener("change", () => { addFiles($("files").files); $("files").value = ""; });
-text.addEventListener("paste", (e) => {
-  const files = [...(e.clipboardData?.files || [])];
-  if (files.length) { e.preventDefault(); addFiles(files); }
-});
-$("form").addEventListener("dragover", (e) => { e.preventDefault(); $("form").classList.add("dragging"); });
-$("form").addEventListener("dragleave", () => $("form").classList.remove("dragging"));
-$("form").addEventListener("drop", (e) => {
-  e.preventDefault(); $("form").classList.remove("dragging");
-  addFiles(e.dataTransfer.files);
-});
-
-text.addEventListener("keydown", (e) => {
-  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); $("form").requestSubmit(); }
-});
-$("task").addEventListener("change", () => {
-  text.placeholder = $("task").checked ? "Describe the task. The agents will settle who takes it…" : "Message the agents…";
-});
-$("form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const value = text.value.trim();
-  if (!value && !state.pending.length) return;
-  $("send").disabled = true;
-  $("error").textContent = "";
-  try {
-    const files = [];
-    for (const [i, file] of state.pending.entries()) {
-      $("send").textContent = state.pending.length > 1 ? "Sending " + (i + 1) + "/" + state.pending.length + "…" : "Sending…";
-      files.push(await uploadFile(file));
-    }
-    await postJSON("/api/send", { to: $("to").value, text: value, kind: $("task").checked ? "task" : "msg", files });
-    state.pending = []; renderPending();
-    text.value = "";
-    $("task").checked = false;
-    $("task").dispatchEvent(new Event("change"));
-  } catch (err) {
-    $("error").textContent = "Not sent: " + err.message + ". Your text and files are still here; try again.";
-  }
-  $("send").textContent = "Send";
-  fit();
-  text.focus();
-});
-
-$("add-agent").addEventListener("click", openLaunch);
-$("launch-form").addEventListener("submit", startAgent);
-$("l-cancel").addEventListener("click", () => $("launch").close());
-$("l-tool").addEventListener("change", showPermissions);
-$("l-perms").addEventListener("change", showPermissions);
-
-setInterval(() => { state.now += 30; renderAgents(); }, 30000);
-loop();
-</script>
-</body>
-</html>
-"""
-# The chat page (0.14): project tabs, the crew on the left, the space, a side panel. CLASSIC_PAGE is
-# the page before it, at /classic for one release.
+# The chat page (0.14): project tabs, the crew on the left, the space, a side panel.
 CHAT_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -9381,6 +9179,10 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .need .t { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .need .q { font-size: 12.5px; color: var(--muted); display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
 .need .blk { font-size: 11px; font-weight: 650; color: var(--ink); }
+.need.ask:hover { background: var(--soft); }
+.need .cmd { margin: 4px 0 6px; font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 9em; overflow-y: auto;
+  background: var(--panel); border-radius: 8px; padding: 6px 8px; color: var(--text); }
+.need .acts { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 #needs-list { max-height: 45vh; overflow-y: auto; }
 #needs-count { background: var(--err); color: var(--err-ink); border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
 #needs-count:empty { display: none; }
@@ -9466,6 +9268,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .msg { position: relative; }
 .msg.cont { margin-top: -10px; }
 #log.searching .msg.cont { margin-top: 0; }
+.msg.flash .body { animation: flash 1.6s ease-out; }
+@keyframes flash { 0%, 30% { box-shadow: 0 0 0 3px var(--accent); } 100% { box-shadow: 0 0 0 3px transparent; } }
+@media (prefers-reduced-motion: reduce) { .msg.flash .body { animation: none; outline: 2px solid var(--accent); } }
 #log.searching .msg.cont > .meta { position: static; width: auto; height: auto; clip-path: none; }
 #log.searching .msg.cont > .avatar { visibility: visible; height: auto; }
 .msg.cont > .avatar { visibility: hidden; height: 0; }
@@ -9644,6 +9449,17 @@ dialog select, dialog input[type=text], dialog textarea { width: 100%; }
 dialog textarea { min-height: 80px; resize: vertical; }
 dialog .buttons { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; flex-wrap: wrap; }
 dialog fieldset { border: 0; padding: 0; margin: 0; }
+.browser { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 8px;
+  display: flex; flex-direction: column; gap: 6px; }
+.browser .crumbs { display: flex; gap: 6px; align-items: center; font-size: 13px; }
+.browser .crumbs code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.browser .crumbs button, .browser .make button { padding: 3px 10px; font-size: 12.5px; }
+.browser .dirs { display: flex; flex-direction: column; max-height: 200px; overflow-y: auto; }
+.browser .dirs button { background: none; color: var(--text); text-align: left; border-radius: 10px; padding: 5px 10px;
+  font-weight: 500; font-size: 14px; }
+.browser .dirs button:hover, .browser .dirs button:focus-visible { background: var(--tint); }
+.browser .make { display: flex; gap: 6px; }
+.browser .make input { flex: 1; min-width: 0; }
 .steps { display: flex; gap: 4px; list-style: none; padding: 0; margin: 10px 0 4px; counter-reset: step; }
 .steps li { flex: 1; font-size: 12px; color: var(--muted); text-align: center; padding: 6px 0; border-radius: 99px; background: var(--soft); counter-increment: step; }
 .steps li::before { content: counter(step) ". "; }
@@ -9652,6 +9468,16 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 .inline { display: flex; gap: 10px; align-items: center; }
 .swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; background: var(--sw, var(--off)); }
 #l-perms-note.warn { color: var(--err); }
+.ready { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 8px 12px;
+  font-size: 13px; display: flex; flex-direction: column; gap: 6px; }
+.ready .head { font-weight: 650; }
+.ready .item { display: flex; gap: 8px; align-items: baseline; }
+.ready .mark { flex: none; width: 1.1em; text-align: center; font-weight: 700; }
+.ready .ok .mark { color: var(--ok); } .ready .todo .mark { color: var(--err); } .ready .note .mark { color: var(--warn); }
+.ready .fix { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin-top: 3px; }
+.ready .fix code { overflow-wrap: anywhere; }
+.ready button { padding: 3px 10px; font-size: 12.5px; }
+.ready .again { align-self: flex-start; }
 #l-dice { padding: 6px 12px; font-size: 16px; flex: none; }
 #launch-note, #rules-note, #project-note { font-size: 13px; margin-top: 8px; min-height: 1em; }
 #rules-input { min-height: 180px; }
@@ -9741,8 +9567,6 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
       <div class="menu-list">
         <button type="button" data-panel="project">Rules, skills and machines</button>
         <button type="button" data-panel="roles">Roles</button>
-        <hr>
-        <a id="classic-link" href="/classic">The classic page</a>
       </div>
     </details>
   </header>
@@ -9750,6 +9574,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
+  <p id="search-none" class="none" role="status" hidden>No message here matches the search.</p>
   <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
   <section id="tasks" hidden aria-label="Tasks">
     <div class="view-head"><button type="button" class="icon back" aria-label="Back to the chat">←</button><h2>Tasks</h2>
@@ -9849,11 +9674,14 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
         <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
         <label for="l-path">Or connect one</label>
         <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
+          <button type="button" class="secondary" id="l-browse" aria-expanded="false" aria-controls="l-browser">Browse…</button>
           <button type="button" class="secondary" id="l-connect">Connect</button></div>
+        <div id="l-browser" class="browser" role="group" hidden aria-label="Folders on this machine"></div>
         <label>Machine</label><p id="l-machine"></p>
       </fieldset>
       <fieldset class="step" hidden>
         <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
+        <div id="l-ready" class="ready" role="status" aria-live="polite" hidden></div>
         <label for="l-model">Model</label><select id="l-model"></select>
         <label for="l-advisor">Advisor</label><select id="l-advisor"></select>
         <p class="meta" id="l-advisor-note" hidden>A stronger model it consults on its own at decision points; it reads the whole conversation and uses more tokens. For a chat-wide advisor everyone sees, give an agent the advisor role.</p>
@@ -9877,7 +9705,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 <dialog id="project-dialog" aria-labelledby="project-title">
   <form id="project-form" method="dialog">
     <h2 id="project-title">New project</h2>
-    <p>Its own chat, roles and task board. Connect a folder to it later with <code>crewchat start --chat NAME</code> in that folder.</p>
+    <p>Its own chat, roles and task board. Then <b>New agent</b> connects a folder to it, or makes one.</p>
     <label for="p-name">Name</label><input type="text" id="p-name" maxlength="60" autocomplete="off" required>
     <label for="p-pack">Its crew</label><select id="p-pack"></select>
     <div id="project-note" role="status"></div>
@@ -9909,7 +9737,7 @@ const state = { needs: [], notified: new Set(), after: -1, version: -1, lastSaid
 
 // The words the page uses: a software crew works in folders and commits, any other crew in plain words.
 const WORDS = {
-  software: { folder: "Project folder", none: "No agents yet. Run crewchat start in your project folder, then open Claude Code or Cursor there. Or use New agent below." },
+  software: { folder: "Project folder", none: "No agents yet. Use New agent below, or run crewchat start in your project folder and open Claude Code, Cursor, Codex or another agent tool there." },
   general: { folder: "Folder", none: "No agents yet. Use New agent below, or run crewchat start in a folder and open an agent there." },
 };
 const word = (key) => (WORDS[state.crew] || WORDS.software)[key];
@@ -9932,7 +9760,6 @@ function ago(seen, now) {
 // The project this page shows (?chat=, or the first one): every request names it.
 const CHAT = new URLSearchParams(location.search).get("chat") || "";
 function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "chat=" + encodeURIComponent(CHAT) : path; }
-$("classic-link").href = chatUrl("/classic", CHAT);
 
 // Projects: a tab each (a picker on a phone). Switching loads the page for the other project: say so at
 // once, so the old chat is not taken for the new one.
@@ -10503,6 +10330,7 @@ function showStep(n) {
   $("l-back").hidden = n === 0;
   $("l-next").hidden = n === 3;
   $("l-start").hidden = n !== 3;
+  if (n === 2) checkTool();  // the tool, for the folder just chosen
   const first = document.querySelectorAll("#launch .step")[n].querySelector("select, input, textarea");
   if (first && $("launch").open) first.focus();
 }
@@ -10523,12 +10351,13 @@ async function openLaunch(role) {
   $("plus").open = false;
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
-  for (const id of ["l-name", "l-task", "l-instructions"]) $(id).value = "";
+  for (const id of ["l-name", "l-task", "l-instructions", "l-path"]) $(id).value = "";
+  showBrowser(false);
   $("l-folder-label").textContent = word("folder");
   $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
   const roles = state.roles.map((r) => new Option(r.title, r.name));
   $("l-role").replaceChildren(new Option("No role", ""), ...roles.map((o) => new Option(o.text, o.value)));
-  $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option("A " + o.text.toLowerCase() + " (" + o.text + " role)", o.value)));
+  $("l-template").replaceChildren(new Option("Start from scratch", ""), ...roles.map((o) => new Option(o.text + " role", o.value)));
   $("l-picture").replaceChildren(...pictureOptions(), new Option("Initials", "initials"));
   $("l-colour-tool").checked = true;
   showStep(0);
@@ -10561,29 +10390,132 @@ function showFolders(folders, pick) {
 // What stops a start (no tool, no folder), or the tools that are missing.
 function launchNote(folders) {
   const ready = launchTools.filter((t) => !t.missing);
-  const missing = launchTools.filter((t) => t.missing).map((t) => t.missing).join(" · ");
   $("launch-note").textContent = !ready.length
     ? "Neither Claude Code nor Cursor's agent was found on this machine. Install one, then come back."
-    : !folders.length ? "No folder on this machine is in this project yet: type one's path under Or connect one." : missing;
+    : !folders.length ? "No folder on this machine is in this project yet: Browse to one (or make one), or type its path." : "";
   $("l-start").disabled = !ready.length || !folders.length;
 }
-// The owner connects a folder to this project (`crewchat start` in it, on this machine).
-async function connectFolder() {
-  const path = $("l-path").value.trim(), button = $("l-connect");
+// The owner connects a folder to this project (`crewchat start` in it, on this machine). One that
+// is not there yet can be made: create, for the path that was refused.
+async function connectFolder(create, typed) {
+  const path = typed || $("l-path").value.trim(), button = $("l-connect"), note = $("launch-note");
   if (!path || button.disabled) return;
   button.disabled = true;
-  $("launch-note").textContent = "Connecting " + path + "…";
+  note.textContent = (create ? "Making and connecting " : "Connecting ") + path + "…";
   try {
-    const out = await postJSON("/api/folders", { op: "connect", path });
+    const out = await postJSON("/api/folders", { op: "connect", path, create: create === true });
     showFolders(out.folders, out.path);
     launchNote(out.folders);
     $("l-path").value = "";
-    $("launch-note").textContent = ["Connected " + out.path + ".", $("launch-note").textContent].join(" ").trim();
+    showBrowser(false);
+    note.textContent = ["Connected " + out.path + ".", note.textContent].join(" ").trim();
   } catch (err) {
-    $("launch-note").textContent = "Not connected: " + err.message;
+    note.replaceChildren("Not connected: " + err.message);
+    if (/^there is no folder at /.test(err.message)) {
+      const make = el("button", "link", "Create it and connect");
+      make.type = "button";
+      make.addEventListener("click", () => connectFolder(true, path));
+      note.append(" ", make);
+    }
   } finally {
     button.disabled = false;
   }
+}
+// Browse: the folders on the machine that hosts the page, to pick one or make one (a browser's own
+// file picker cannot say where a folder is).
+function showBrowser(open) {
+  $("l-browser").hidden = !open;
+  $("l-browse").setAttribute("aria-expanded", String(open));
+  if (!open) state.browsing = (state.browsing || 0) + 1;  // a listing still on its way is not shown
+}
+function tilde(path, home) {
+  return home && (path === home || path.startsWith(home + "/") || path.startsWith(home + "\\")) ? "~" + path.slice(home.length) : path;
+}
+async function browse(path) {
+  const box = $("l-browser"), ticket = state.browsing = (state.browsing || 0) + 1;  // only the newest is shown
+  showBrowser(true);
+  let out, failed = "";
+  try { out = await postJSON("/api/folders", { op: "list", path: path || "~" }); }
+  catch (err) { failed = err.message; }
+  if (ticket !== state.browsing) return;  // another folder was opened since, or the browser closed
+  const crumbs = el("div", "crumbs");
+  if (out && out.parent) actButton(crumbs, "↑", "Up to " + tilde(out.parent, out.home), () => browse(out.parent));
+  actButton(crumbs, "~", "The home folder", () => browse("~"));
+  const dirs = el("div", "dirs");
+  dirs.setAttribute("role", "list");
+  if (failed) {
+    crumbs.append(el("code", "", path));
+    dirs.append(el("p", "meta", "Cannot open it: " + failed));
+    box.replaceChildren(crumbs, dirs);
+    return;
+  }
+  $("l-path").value = tilde(out.missing || out.path, out.home);
+  crumbs.append(el("code", "", tilde(out.path, out.home)));
+  for (const f of out.folders) {
+    const b = actButton(dirs, "", "Open " + f.name, () => browse(f.path));
+    b.append(el("span", "", "📁 "), f.name);
+    b.firstChild.setAttribute("aria-hidden", "true");
+    b.setAttribute("role", "listitem");
+  }
+  if (out.missing) dirs.prepend(el("p", "meta", tilde(out.missing, out.home) + " is not there yet: Connect offers to make it."));
+  if (!out.folders.length) dirs.append(el("p", "meta", "No folders in here."));
+  if (out.more) dirs.append(el("p", "meta", "More folders than shown: type the path instead."));
+  const make = el("div", "make");
+  const name = el("input");
+  name.type = "text"; name.placeholder = "New folder in here"; name.maxLength = 100; name.setAttribute("aria-label", "New folder name");
+  make.append(name);
+  const add = actButton(make, "New folder", "Make a folder in " + tilde(out.path, out.home), async () => {
+    if (!name.value.trim() || add.disabled) return;
+    add.disabled = true;
+    try { await browse((await postJSON("/api/folders", { op: "mkdir", path: out.path, name: name.value.trim() })).path); }
+    catch (err) { $("launch-note").textContent = "Not made: " + err.message; add.disabled = false; }
+  });
+  add.className = "secondary";
+  name.addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); add.click(); } });
+  actButton(make, "Connect this folder", "Connect " + tilde(out.path, out.home) + " to this project", () => connectFolder(false, out.path));
+  const keep = box.contains(document.activeElement);
+  box.replaceChildren(crumbs, dirs, make);
+  if (keep) (dirs.querySelector("button") || crumbs.querySelector("button")).focus();  // focus stays in the list
+}
+// What the chosen tool still needs, on this machine and in the chosen folder: installed, signed in, and
+// what it asks once there (trust, crewchat's hooks). Checked when the Tool step shows or the tool changes.
+let readySeq = 0;
+async function checkTool(fresh) {
+  const box = $("l-ready"), tool = launchTools.find((t) => t.id === $("l-tool").value), seq = ++readySeq;
+  if (!tool || tool.missing) { box.hidden = true; return; }
+  box.hidden = false;
+  box.replaceChildren(el("div", "meta", "Checking " + tool.label + "…"));
+  let out;
+  try {
+    out = await request("/api/tool-check?tool=" + encodeURIComponent(tool.id) + "&folder=" +
+                        encodeURIComponent($("l-folder").value) + (fresh ? "&fresh=1" : ""));
+  } catch (err) {
+    if (seq === readySeq) box.replaceChildren(el("div", "meta", "Could not check " + tool.label + ": " + err.message));
+    return;
+  }
+  if (seq !== readySeq) return;  // another tool was picked meanwhile
+  const rows = out.items.map((item) => {
+    const row = el("div", "item " + item.state), body = el("div");
+    const mark = el("span", "mark", item.state === "ok" ? "✓" : item.state === "todo" ? "!" : "i");
+    mark.setAttribute("aria-hidden", "true");
+    body.append(el("span", "", item.text));
+    if (item.fix) {
+      const fix = el("div", "fix"), copy = el("button", "secondary", "Copy");
+      copy.type = "button";
+      copy.addEventListener("click", async () => {
+        try { await navigator.clipboard.writeText(item.fix); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Select it"; }
+      });
+      fix.append(el("span", "meta", "In a terminal:"), el("code", "", item.fix), copy);
+      body.append(fix);
+    }
+    row.append(mark, body);
+    return row;
+  });
+  const todo = out.items.some((i) => i.state === "todo"), notes = out.items.some((i) => i.state === "note");
+  const again = el("button", "secondary again", "Check again");
+  again.type = "button";
+  again.addEventListener("click", () => checkTool(true));
+  box.replaceChildren(el("div", "head", todo ? "Before it can work" : notes ? "Ready, with a note" : "Ready"), ...rows, again);
 }
 // The chosen tool: its colour, its models, and what it may do without asking.
 function showTool() {
@@ -10597,6 +10529,7 @@ function showTool() {
   $("l-advisor").replaceChildren(new Option("None", ""), ...advisors.map(([id, label]) => new Option(label, id)));
   $("l-advisor").disabled = !advisors.length;
   $("l-advisor-note").hidden = true;
+  if (launchStep === 2) checkTool();
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
   showPermissions();
@@ -10611,7 +10544,9 @@ function showPermissions(event) {
   }
   $("l-perms-note").textContent = pick.value === "all"
     ? "Careful: it will run commands and change files with nobody watching. Use it in a folder you can restore (git), on a machine without secrets it could leak."
-    : "When it needs something else, it asks in its terminal window.";
+    : $("l-tool").value === "claude"
+      ? "When it needs something else, it asks here, in Needs you, with Allow and Deny (and in its terminal window if nobody answers)."
+      : "When it needs something else, it asks in its terminal window.";
   $("l-perms-note").className = pick.value === "all" ? "meta warn" : "meta";
 }
 async function startAgent(event) {
@@ -10653,8 +10588,9 @@ $("l-dice").addEventListener("click", () => {
   if (free.length) $("l-name").value = free[Math.floor(Math.random() * free.length)];
   else $("l-dice").disabled = true;  // every first name is in use
 });
-$("l-connect").addEventListener("click", connectFolder);
-$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); connectFolder(); } });
+$("l-connect").addEventListener("click", () => connectFolder());
+$("l-browse").addEventListener("click", () => ($("l-browser").hidden ? browse($("l-path").value.trim() || "~") : showBrowser(false)));
+$("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isComposing) { e.preventDefault(); connectFolder(); } });
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
@@ -10762,7 +10698,9 @@ function isWorking(a) {
   return a.activity === "working" && state.now - a.seen < 300 && !(a.session && !a.session.running);
 }
 function doing(a) {
-  return a.session && !a.session.running ? "Its session is closed" : DOING[a.activity] || "Not heard from lately";
+  if (a.session && !a.session.running) return "Its session is closed";
+  if (a.activity === "working" && !isWorking(a)) return "Not heard from lately";  // its hooks said so, long ago
+  return DOING[a.activity] || "Not heard from lately";
 }
 
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
@@ -11247,7 +11185,9 @@ function panelRoles() {
     b.type = "button";
     const n = state.agents.filter((a) => a.role === r.name).length;
     const words = el("span");
-    words.append(el("div", "", r.label), el("div", "meta", r.name + (n ? " · " + n + " agent" + (n > 1 ? "s" : "") : "") + (r.source === "yours" ? " · yours" : "")));
+    const gist = String(r.description || "").split("\n")[0].trim();
+    words.append(el("div", "", r.label), el("div", "meta", [gist.length > 70 ? gist.slice(0, 69) + "…" : gist || r.name,
+      n ? n + " agent" + (n > 1 ? "s" : "") : "", r.source === "yours" ? "yours" : ""].filter(Boolean).join(" · ")));
     b.append(roleAvatar(r), words);
     b.addEventListener("click", () => openPanel("role", r.name));
     item.append(b); list.append(item);
@@ -11353,7 +11293,7 @@ function roleForm(r) {
     return n;
   };
   const name = r ? null : input("input", "Name", "", { type: "text", maxLength: 32, placeholder: "for example designer" });
-  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat" });
+  const label = input("input", "Label", r ? r.label : "", { type: "text", maxLength: 40, placeholder: "the name in the chat (empty: from its name)" });
   const picture = el("select");
   picture.setAttribute("aria-label", "Picture");
   picture.append(...pictureOptions());
@@ -11556,6 +11496,11 @@ function applySearch() {
   const want = searchWant();
   $("log").classList.toggle("searching", !!want);
   for (const node of $("log").children) if (node.id !== "empty") node.hidden = !matches(node, want);
+  searchNote();
+}
+// Searching, with nothing shown: say so (again as messages arrive).
+function searchNote() {
+  $("search-none").hidden = !searchWant() || [...$("log").children].some((n) => !n.hidden && n.id !== "empty");
 }
 $("search").addEventListener("input", applySearch);
 
@@ -11570,7 +11515,7 @@ function welcome() {
   actButton(acts, "Roles", "See the project's roles", () => openPanel("roles"));
   box.append(img, el("h2", "", "Your crew's chat starts here"),
              el("p", "", state.agents.length ? "Say hello, or post a task: the crew settles who takes it."
-                                            : "Add an agent, or open Claude Code or Cursor in a connected folder: it joins by itself."), acts);
+                                            : "Add an agent, or open an agent tool (Claude Code, Cursor, Codex…) in a connected folder: it joins by itself."), acts);
   return box;
 }
 
@@ -11599,6 +11544,7 @@ function addMessages(list, first) {
     remember(m);
     state.after = m.seq;
   }
+  if (searchWant()) searchNote();
   if (document.hidden && !first) {
     state.missed = (state.missed || 0) + list.filter((m) => m.from !== "Owner" && m.kind !== "event").length;
     if (state.missed) document.title = "(" + state.missed + ") " + state.title;
@@ -11624,7 +11570,7 @@ $("update-close").addEventListener("click", () => {
 });
 
 // Needs you: blocked tasks (with the agent's question), reviews, unread messages to you, tasks given back.
-const NEED_LOOK = { blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
+const NEED_LOOK = { permission: ["Asks permission", "var(--err)"], blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
                     message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"] };
 const needKey = (n) => n.kind + ":" + (n.task || n.id);
 function renderNeeds(needs) {
@@ -11638,6 +11584,7 @@ function renderNeeds(needs) {
     $("needs-said").textContent = added.length + " new: " + added.map((n) => (NEED_LOOK[n.kind] || [""])[0] + (n.task ? " #" + n.task : "") + (n.agent ? " from " + n.agent : "")).join("; ");
   state.needsShown = new Set(needs.map(needKey));
   box.replaceChildren(...needs.map((n) => {
+    if (n.kind === "permission") return permissionItem(n);
     const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
     const b = el("button", "need");
     b.setAttribute("role", "listitem");
@@ -11649,14 +11596,53 @@ function renderNeeds(needs) {
     if (n.blocking) b.append(el("span", "blk", "holds up " + n.blocking + " task" + (n.blocking > 1 ? "s" : "")));
     b.addEventListener("click", () => {
       if (n.kind === "message") {
-        if (n.agent) openPanel("agent", n.agent);
+        // To the message itself, marked for a moment, with a reply to its sender started.
+        showView("chat");
         const node = [...$("log").querySelectorAll(".msg")].find((x) => x.dataset.id === n.id);
-        if (node) { showView("chat"); node.scrollIntoView({ block: "center" }); }
+        if (node) {
+          node.scrollIntoView({ block: "center" });
+          node.classList.remove("flash"); void node.offsetWidth; node.classList.add("flash");
+          setTimeout(() => node.classList.remove("flash"), 1700);
+        }
+        if (state.agents.some((a) => a.agent === n.agent) && !leadingMention(text.value)) {
+          text.value = "@" + n.agent + " " + text.value; fit();
+        }
+        text.focus({ preventScroll: true });
         markRead(n.seq);
       } else openPanel("task", n.task);
     });
     return b;
   }));
+}
+// A permission prompt of an agent's tool: what it asks to run or change, and Allow or Deny. With no answer
+// here in time, the agent asks in its terminal instead.
+function permissionItem(n) {
+  const box = el("div", "need ask");
+  box.setAttribute("role", "listitem");
+  box.style.setProperty("--need", NEED_LOOK.permission[1]);
+  box.append(el("span", "k", NEED_LOOK.permission[0] + " · " + n.agent), el("span", "t", n.tool));
+  if (n.text) box.append(el("pre", "cmd", n.text));
+  const acts = el("div", "acts"), said = el("span", "meta");
+  said.setAttribute("role", "status");
+  for (const [answer, label] of [["allow", "Allow"], ["deny", "Deny"]]) {
+    const b = el("button", answer === "allow" ? "" : "ghost", label);
+    b.type = "button";
+    b.setAttribute("aria-label", label + " " + n.agent + ": " + n.tool);
+    b.addEventListener("click", async () => {
+      for (const x of acts.querySelectorAll("button")) x.disabled = true;
+      try {
+        await postJSON("/api/permission", { id: n.id, answer });
+        said.textContent = answer === "allow" ? "Allowed" : "Denied";
+      } catch (e) {
+        said.textContent = e.message || "Not sent";
+        for (const x of acts.querySelectorAll("button")) x.disabled = false;
+      }
+    });
+    acts.append(b);
+  }
+  acts.append(said);
+  box.append(acts);
+  return box;
 }
 // What you have seen of the chat: messages to you count as read while the page is in front.
 // (in front: the window has focus and the chat is showing), or up to the one clicked in Needs you.
@@ -11696,8 +11682,27 @@ for (const b of document.querySelectorAll("[data-notify]")) b.addEventListener("
     try { localStorage.setItem(notifyKey(), "off"); } catch (e) {}  // nothing could be shown: say so, and stay off
   showBell();
   if (typeof Notification !== "undefined" && Notification.permission === "denied") $("bell-note").textContent = "The browser blocks notifications for this page: allow them in its site settings, then turn them on here.";
+  syncPush();
 });
 showBell();
+// Web Push: with notifications on, this browser subscribes, so they come even while no page of the chat is
+// open (the server pushes only then). Needs a secure page (localhost, or https) and a browser with push.
+async function syncPush() {
+  const mode = notifyMode();
+  if (!("serviceWorker" in navigator) || typeof PushManager === "undefined") return;
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub && (mode === "off" || typeof Notification === "undefined" || Notification.permission !== "granted")) return;
+    if (!sub) {
+      const { key } = await postJSON("/api/push", { op: "key" });
+      const raw = atob(key.replace(/-/g, "+").replace(/_/g, "/"));
+      sub = await reg.pushManager.subscribe({ userVisibleOnly: true,
+                                               applicationServerKey: Uint8Array.from(raw, (c) => c.charCodeAt(0)) });
+    }
+    await postJSON("/api/push", { op: "mode", endpoint: sub.endpoint, mode });
+  } catch (e) {}  // no push here: notifications still come while the page is open
+}
 function Notice(title, options) {
   try { return new Notification(title, options); }
   catch (e) {  // Android Chrome: only a service worker may show one
@@ -11715,9 +11720,16 @@ function notify(needs) {
   for (const n of wanted.slice(0, 3)) {
     const [label] = NEED_LOOK[n.kind] || [""];
     const note = Notice((state.project || "crewchat") + ": " + label + (n.agent ? " · " + n.agent : ""),
-                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "") : n.text,
+                                  { body: n.task ? "#" + n.task + " " + (n.title || "") + (n.text ? "\n" + n.text : "")
+                                          : n.kind === "permission" ? n.tool + (n.text ? ": " + n.text.slice(0, 200) : "") : n.text,
                                     tag: (state.chat || CHAT) + ":" + needKey(n) });
-    note.onclick = () => { window.focus(); n.kind === "message" ? openPanel("agent", n.agent) : openPanel("task", n.task); note.close?.(); };
+    note.onclick = () => {
+      window.focus();
+      if (n.kind === "message") openPanel("agent", n.agent);
+      else if (n.kind === "permission") $("needs-you").scrollIntoView({ block: "nearest" });
+      else openPanel("task", n.task);
+      note.close?.();
+    };
   }
   if (wanted.length > 3) {
     const more = Notice((state.project || "crewchat") + ": " + (wanted.length - 3) + " more need you", { tag: (state.chat || CHAT) + ":more" });
@@ -11789,7 +11801,7 @@ async function loop() {
       renderSetup(data.rules, data.skills);
       renderSheet(state.sheet);
       state.needs = data.needs || [];
-      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); }
+      if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); syncPush(); }
       renderNeeds(state.needs);
       try { notify(state.needs); } catch (e) {}  // a browser that refuses one (Android Chrome) must not stop the chat
       renderHeader();
@@ -11869,11 +11881,19 @@ async function uploadFile(file) {
     headers: { "Content-Type": file.type || "application/octet-stream", "X-File-Name": encodeURIComponent(file.name) } })).id;
 }
 
+// The message box's hint, shorter on a phone (it must fit on one line).
+const narrow = matchMedia("(max-width: 760px)");
+function composerHint(asTask) {
+  return asTask ? (narrow.matches ? "Describe the task…" : "Describe the task. The crew settles who takes it…")
+    : narrow.matches ? "Message the crew" : "Message the crew (@name writes to one)";
+}
+narrow.addEventListener("change", () => { text.placeholder = composerHint(state.asTask); });
+text.placeholder = composerHint(false);
 function setTask(on) {
   state.asTask = on;
   $("as-task").setAttribute("aria-pressed", String(on));
   $("task-chip").hidden = !on;
-  text.placeholder = on ? "Describe the task. The crew settles who takes it…" : "Message the crew (@name writes to one)";
+  text.placeholder = composerHint(on);
 }
 $("as-task").addEventListener("click", () => { setTask(!state.asTask); $("plus").open = false; text.focus(); });
 $("task-off").addEventListener("click", () => setTask(false));
@@ -11998,7 +12018,6 @@ loop();
 """
 LOGIN_PAGE = LOGIN_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 CHAT_PAGE = CHAT_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
-CLASSIC_PAGE = CLASSIC_PAGE.replace("</title>", "</title>" + APP_HEAD + SW_REGISTER, 1).replace("__LOGO__", LOGO_INLINE)
 
 
 # --------------------------------------------------------------------------------------------
@@ -12019,7 +12038,7 @@ def build_parser():
                        "run again.")
     p.add_argument("folder", nargs="?", help="project folder (default: the current folder)")
     p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
-    p.add_argument("--client", choices=["all", "claude", "cursor"], default="all")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS), default="all")
     p.add_argument("--project", help="chat name on first setup (default: the folder's name)")
     p.add_argument("--port", type=int, help="local port on first setup (default: %d or the next free one)"
                    % DEFAULT_PORT)
@@ -12038,6 +12057,10 @@ def build_parser():
                    "before only you can wake it (default %d, at most %d)" % (MAX_CHAIN, MAX_CHAIN_LIMIT))
     p.add_argument("--activity", choices=["on", "off"], help="show on the chat page what each agent is doing, from its "
                    "tool calls (a file's name, a command's program; on by default)")
+    p.add_argument("--permissions", choices=["page", "terminal"], help="where a Claude Code agent's permission "
+                   "prompts are answered: in Needs you on the chat page first, with Allow and Deny, then in its "
+                   "terminal if nobody answers in %d minutes (page, the default), or only in its terminal"
+                   % (PERMISSION_WAIT // 60))
     p.add_argument("--agent-names", choices=["people", "place"], help="how new agents are named: a first "
                    "name such as Maya (people, the default), or after their tool and folder, such as claude-macbook (place)")
     p.set_defaults(fn=cmd_setup)
@@ -12058,8 +12081,9 @@ def build_parser():
 
     p = sub.add_parser("invite", help="print the command that connects a project folder")
     p.add_argument("--place", help="label for that folder, used in agent names (default: its machine's name)")
-    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all",
-                   help="all = Claude Code and Cursor (default), generic = print the MCP settings")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS) + ["generic"], default="all",
+                   help="all = Claude Code, Cursor and the other tools installed here (default), "
+                        "generic = print the MCP settings")
     p.add_argument("--url", help="address that machine should use")
     p.add_argument("--local", action="store_true", help="the folder is on this machine")
     p.set_defaults(fn=cmd_invite)
@@ -12149,7 +12173,7 @@ def build_parser():
     p = sub.add_parser("join", help="connect this project folder to a chat")
     p.add_argument("--url", required=True)
     p.add_argument("--code", required=True, help="single-use code from `crewchat invite`")
-    p.add_argument("--client", choices=["all", "claude", "cursor", "generic"], default="all")
+    p.add_argument("--client", choices=["all"] + list(LAUNCH_TOOLS) + ["generic"], default="all")
     p.add_argument("--place", help="label for this folder in agent names (default: this machine's name)")
     p.add_argument("--project", help="project folder (default: the current folder)")
     p.set_defaults(fn=cmd_join)
@@ -12217,6 +12241,8 @@ def build_parser():
     p.add_argument("--project", help="a folder connected with `crewchat start` (default: this folder)")
     p.add_argument("--url", help="the chat's address instead, with --token")
     p.add_argument("--token", help="with --url: the folder's token (or set CREWCHAT_TOKEN)")
+    p.add_argument("--local-only", action="store_true",
+                   help="only a folder connected to this machine's own chat (registered for every folder)")
     p.set_defaults(fn=cmd_stdio)
 
     p = sub.add_parser("projects", help="list this machine's projects (each its own chat) and their folders")
@@ -12230,8 +12256,8 @@ def build_parser():
                                        "none is called that); default: a project named after the folder")
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
-    p.add_argument("client", choices=["claude", "cursor"])
-    p.add_argument("event", choices=["prompt", "stop", "tool"])
+    p.add_argument("client", choices=list(HOOK_CLIENTS))
+    p.add_argument("event", choices=["prompt", "stop", "tool", "permission"])
     p.set_defaults(fn=cmd_hook)
     return parser
 

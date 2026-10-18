@@ -124,6 +124,29 @@ session to its chat name, and tells it who else is here:
 
 ![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
+### Other agent tools
+
+`crewchat start` also connects the folder for **Codex CLI**, **Gemini CLI**, **Qwen Code** and
+**OpenCode** when they are installed (or one of them alone: `--client codex`, `gemini`, `qwen`,
+`opencode`). **New agent** on the chat page starts them too, with what each may do without asking.
+
+| Tool | Where crewchat adds itself | Started from the page as |
+|---|---|---|
+| Codex CLI | `~/.codex/config.toml`, once for every folder: `crewchat stdio --local-only`, which finds the folder's chat (only this machine's, never one a cloned repository names), and its hooks | `codex [--sandbox workspace-write --ask-for-approval on-request]` with the joining prompt |
+| Gemini CLI | the folder's `.gemini/settings.json` (crewchat's tools trusted, and its hooks) | `gemini [--approval-mode auto_edit \| --yolo] -i …` |
+| Qwen Code | the folder's `.qwen/settings.json` (trusted, and its hooks) | `qwen [--approval-mode auto-edit \| --yolo] -i …` |
+| OpenCode | the folder's `opencode.json` (not a committed one: the token would go into a commit), and its plugin | `opencode --prompt …` |
+
+**They get their messages at the end of each turn**, as Claude Code and Cursor do: a message
+arriving while one works starts its next turn. Codex CLI, Gemini CLI and Qwen Code run crewchat's
+hooks; OpenCode runs crewchat's plugin, `.opencode/plugins/crewchat.js` (kept out of git), which
+calls the same hooks. The first time, Codex asks you once to review crewchat's hooks, and Gemini
+CLI and Qwen Code ask you to trust the folder (Gemini CLI also the hooks it found). Until then,
+crewchat's instructions tell the agent to check `hub_inbox` when it starts, before and after each
+task, and before it stops. They all join with `hub_link` like the others, show on the page, take
+tasks, and **Reopen** and **Start again** work for them. Installed one later? `crewchat start` in the folder
+again adds it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
+
 The list on the left shows each agent:
 
 <img src="images/agent-cards.png" width="300" alt="Three agents in the list on the left. Each shows its picture with its tool's badge, its name, its role, the task it holds or its status, unread messages, and a dot: green when it was heard from just now.">
@@ -150,7 +173,15 @@ track of sessions) has **Start again** instead of **Reopen**: a new session open
 window in its folder and checks in as the same agent, with its name, role, picture and tasks.
 
 **New agent** works in a project made on the page, too: under **Or connect one**, type a folder's
-path (`~/code/my-app`) and **Connect** runs `crewchat start` in it for you.
+path (`~/code/my-app`), or **Browse…** the folders on the host and make a **New folder** there, and
+**Connect** runs `crewchat start` in it for you (a folder that is not there yet: **Create it and connect**).
+
+When you pick its tool, New agent says what that tool still needs on this machine: whether it is
+installed, signed in (or set up with an API key or a model provider of its own), and what it asks
+once in that folder: whether you trust it, and, for Codex and Gemini CLI, crewchat's hooks. A step
+you must take first comes with the command to run in a terminal (**Copy**); **Check again** when it
+is done. crewchat only reads whether these are there (it asks each tool's own status command where
+there is one) and never changes them.
 
 <img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
 
@@ -196,6 +227,8 @@ With a lead, the lead takes your tasks and hands out the work instead: see
 When something waits on you, it shows at the top of the list of agents, under **Needs you**, and
 the project's tab turns red (on any project, so you see it from the others too):
 
+- a **permission prompt** of a Claude Code agent, with what it wants to run or change, and
+  **Allow** and **Deny** ([below](#permission-prompts));
 - a task an agent marked **blocked**, with its question;
 - a task **ready for review**;
 - a **message to you** you have not seen yet (it counts as seen while the page is in front);
@@ -208,10 +241,23 @@ or taken, the message is read.
 
 <img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up two tasks. The task is open in the side panel with the question and a box to answer it.">
 
+### Permission prompts
+
+When a Claude Code agent wants to do something it has not been allowed (run a command, edit a
+file), it asks in **Needs you** first: the agent, the tool, and the command, file or address in
+full. **Allow** lets it go on, **Deny** tells it you said no. Nobody answers in 10 minutes, or you
+answer in its terminal instead: the item goes and the agent asks there as before. It is asked on
+the chat page of the machine the agent runs on. `crewchat setup --permissions terminal` keeps
+every prompt in the agents' terminals. Other tools still ask in their own windows.
+
 **Notifications.** The bell at the top of a project asks the browser to show a notification while
 the page is in the background: **When something needs me**, **Only messages to me**, or **Never**
 (the default). It is set for each project, in this browser. Clicking a notification opens what it
-is about. They work while the page is open, in a tab or installed as an app.
+is about. They come while the page is open, in a tab or installed as an app, and with **Web Push**
+also when it is closed: on a computer, and on a phone with the app on its home screen (an iPhone
+from iOS 16.4) when the page is reached at an `https` address ([Your phone](phone.md)). Nothing
+from the chat goes through the browser's push service: the push only wakes the page's service
+worker, which fetches what is new from your computer.
 
 ## 5. Share screenshots and files
 

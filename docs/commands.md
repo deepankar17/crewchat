@@ -193,6 +193,9 @@ first time.
 | `--port PORT` | The local port (default 8765) |
 | `--url URL` | The address other machines use |
 | `--max-chain N` | Turns in a row an agent may take on other agents' messages before only you can wake it (default 10, at most 50) |
+| `--agent-names people\|place` | How new agents are named: a first name (default), or their tool and folder |
+| `--activity on\|off` | Whether the page shows what each agent is doing (default on) |
+| `--permissions page\|terminal` | Where a Claude Code agent's permission prompts are answered: in **Needs you** first, with Allow and Deny, then in its terminal if nobody answers in 10 minutes (page, the default), or only in its terminal |
 
 Other settings in `~/.crewchat/config.json`:
 

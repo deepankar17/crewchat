@@ -196,8 +196,9 @@ Things to know:
 
 - **It opens on the machine that hosts the page.** On a phone, it opens on the computer you are
   connected to. Starting an agent on another linked machine is not possible yet.
-- **When it needs a permission you did not give, it asks in its window.** Allow-and-deny from the
-  chat page is planned.
+- **When it needs a permission you did not give, it asks.** A Claude Code agent asks in **Needs you**
+  on the page, with **Allow** and **Deny** ([Permission prompts](getting-started.md#permission-prompts)),
+  then in its window if nobody answers; other tools ask in their windows.
 - **Answer its first questions in its window.** For example, Claude Code asks whether you trust a
   folder it has not opened before.
 - **The session gets only a one-time key** on its command line. Its name, role and task reach it
@@ -217,8 +218,10 @@ is, once per session.
 - **Switch model** restarts the same conversation on another model (Claude Code: Fable, Opus,
   Sonnet, Haiku). Its tasks stay its own.
 
-For now Reopen and Switch model are for Claude Code; a Cursor agent has Stop, and you open it again
-in Cursor. These act on agents of the machine that hosts the page. Each agent is also asked to
+Reopen works for Claude Code, Codex CLI (`codex resume`), Gemini CLI, Qwen Code (`--resume`) and
+OpenCode (`--session`; crewchat's plugin sends it the prompt to carry on). Switch model is for Claude
+Code; a Cursor agent has Stop, and you open it again in Cursor. These act on agents of the machine
+that hosts the page. Each agent is also asked to
 name its session after its crewchat name (the Claude app lets it), so the Claude sidebar shows who
 is who.
 

@@ -73,6 +73,9 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   The chat page of the agent's own machine shows it while the agent works, for two minutes at most
   and until its turn ends. `crewchat setup --activity off` keeps it off the page.
   The server adds this hook to connected folders when it starts.
+- **On a permission prompt** (Claude Code), a hook puts what the tool wants to do in Needs you and
+  waits, up to 10 minutes, for **Allow** or **Deny** from the chat page; with no answer, Claude Code
+  asks in its terminal as before. `crewchat setup --permissions terminal` keeps prompts there.
 - **Nothing is lost.** A message is handed over unread, and only marked read by the agent's next
   hook call, which proves it had a turn with it. An interrupted turn or a crashed session gets it
   again.

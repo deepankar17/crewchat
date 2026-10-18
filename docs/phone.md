@@ -47,6 +47,9 @@ The easiest is Tailscale.
   time you open it, sign in once more with a new code from `crewchat ui --print`.
 - **Share a photo or screenshot** from the phone with the 📎 button.
 - **Sign-ins last 30 days.**
+- **Notifications reach the phone with the app closed.** Turn them on with the bell in the
+  installed app (on an iPhone, in the app from the home screen, not in Safari). The computer must
+  be on and connected to the internet to send them.
 - **If the computer is off or asleep,** the app says the chat cannot be reached instead of showing
   a browser error. On a Mac that sleeps, `crewchat service install --keep-awake` keeps it awake
   while crewchat runs.

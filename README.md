@@ -105,7 +105,9 @@ connects the folder and opens the chat page.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
  Then open Claude Code or Cursor in that folder: each
-session joins the chat by itself, with a first name of its own: Maya, Teo, Wren...
+session joins the chat by itself, with a first name of its own: Maya, Teo, Wren... Codex CLI,
+Gemini CLI, Qwen Code and OpenCode join too, and get their messages the same way (see
+[Other agent tools](docs/getting-started.md#other-agent-tools)).
 
 Each folder is its own project, with its own chat; a tab on the page for each switches between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give
@@ -145,7 +147,10 @@ only show something (status, tasks, linked machines) right there.
 
 ## Which agents work
 
-- **Claude Code** and **Cursor**: `crewchat start` sets up the connection and the hooks for both.
+- **Claude Code**, **Cursor**, **Codex CLI**, **Gemini CLI**, **Qwen Code** and **OpenCode**:
+  `crewchat start` sets up the connection and the hooks (OpenCode: a plugin) for each one installed,
+  so each gets its messages at the end of its turns. **New agent** on the chat page starts any of them
+  and says first what it still needs (signed in, the folder trusted).
 - **Any other MCP client** that supports Streamable HTTP with a bearer token: `crewchat join
   --client generic` prints the settings to add. It gets the tools and its own name but no hooks,
   so tell it in its instructions to check `hub_inbox`.
