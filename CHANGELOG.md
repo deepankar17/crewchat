@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Liquid Glass.** The chat page takes the look of macOS 26 and iOS 26: the tabs, the list of agents, the
+  project's header, the message box, the side panel, menus and dialogs are glass, see-through and softly
+  blurred over a colourful backdrop, with rounder, capsule-shaped controls. The chat, the board and the
+  analytics scroll on under the header. What you read (messages, task cards) stays solid. With "Reduce
+  transparency" or "Increase contrast" on in your system settings, or in a browser that cannot blur, it is
+  solid as before. The sign-in page matches, and now fits a phone's width.
 - **The chat page, tried end to end, and what it turned up fixed.**
   - A task you take off the sheet now asks first, as removing an agent or a role does, and its card in the chat
     says "Off the sheet" instead of "Open".

@@ -10620,17 +10620,34 @@ def cmd_skills(args):
 # --------------------------------------------------------------------------------------------
 LOGIN_PAGE = """<!doctype html><html lang="en"><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>crewchat sign-in</title>
-<style>:root{color-scheme:light dark}body{margin:0;min-height:100vh;display:grid;place-items:center;
-font:16px/1.5 system-ui,sans-serif;background:#f4f2ed;color:#1d1b18}main{width:min(92vw,360px)}
+<style>:root{color-scheme:light dark;--ink:#0b1f55;--muted:#5d6a8f;--accent:#2f5fd6;--glass:rgba(255,255,255,.62);
+--rim:inset 0 1px 0 rgba(255,255,255,.85),inset 0 0 0 1px rgba(255,255,255,.45);--line:rgba(11,31,85,.12);
+--bg:radial-gradient(60% 55% at 0% 0%,#c7d7ff 0%,transparent 62%),radial-gradient(55% 50% at 100% 0%,#e7d6ff 0%,transparent 60%),
+radial-gradient(60% 55% at 85% 100%,#ffe1cc 0%,transparent 62%),#eef3ff}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);background-attachment:fixed;color:var(--ink);
+font:16px/1.5 ui-rounded,"SF Pro Rounded",system-ui,-apple-system,"Segoe UI",sans-serif}
+main{box-sizing:border-box;width:min(92vw,380px);padding:28px 26px;border-radius:28px;background:var(--glass);
+-webkit-backdrop-filter:blur(22px) saturate(180%);backdrop-filter:blur(22px) saturate(180%);
+box-shadow:var(--rim),0 12px 40px rgba(11,31,85,.14)}
 h1{font-size:24px;margin:0 0 10px;display:flex;align-items:center;gap:10px;letter-spacing:-.02em}
-h1 b{color:#2b57c4}.logo{width:40px;height:40px}
-p{margin:0 0 16px;color:#6a665e}code{font-family:ui-monospace,monospace}
-input,button{font:inherit;width:100%;box-sizing:border-box;padding:10px 12px;border-radius:8px}
-input{border:1px solid #c9c5bc;background:#fff;color:inherit;letter-spacing:.12em;text-transform:uppercase}
-button{margin-top:10px;border:0;background:#2b57c4;color:#fff;font-weight:600;cursor:pointer}
-.err{color:#b3261e}.tip{margin-top:20px;font-size:14px}@media(prefers-color-scheme:dark){body{background:#131210;color:#edeae4}
-p{color:#a09b91}input{background:#1c1b18;border-color:#3a3833}.err{color:#f2b8b5}
-h1 b{color:#8fb0ff}}</style>
+h1 b{color:var(--accent)}.logo{width:40px;height:40px}
+p{margin:0 0 16px;color:var(--muted)}code{font-family:ui-monospace,monospace}
+input,button{font:inherit;width:100%;box-sizing:border-box;padding:11px 16px;border-radius:999px}
+input{border:1px solid var(--line);background:rgba(255,255,255,.7);color:inherit;letter-spacing:.12em;text-transform:uppercase}
+button{margin-top:10px;border:0;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;
+background-image:linear-gradient(180deg,rgba(255,255,255,.22),rgba(255,255,255,0) 55%);
+box-shadow:inset 0 1px 0 rgba(255,255,255,.35),0 2px 8px rgba(47,95,214,.22)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.err{color:#b3261e}.tip{margin:20px 0 0;font-size:14px}
+@media(prefers-color-scheme:dark){:root{--ink:#e8eeff;--muted:#9daad3;--accent:#5b8cff;--glass:rgba(22,33,72,.6);
+--rim:inset 0 1px 0 rgba(255,255,255,.16),inset 0 0 0 1px rgba(255,255,255,.07);--line:rgba(255,255,255,.12);
+--bg:radial-gradient(60% 55% at 0% 0%,rgba(70,105,230,.35) 0%,transparent 62%),radial-gradient(55% 50% at 100% 0%,rgba(140,80,220,.28) 0%,transparent 60%),
+radial-gradient(60% 55% at 85% 100%,rgba(230,120,70,.18) 0%,transparent 62%),#0a1330}
+input{background:rgba(10,19,48,.6)}button{color:#0b1f55}.err{color:#f2b8b5}}
+@media(prefers-reduced-transparency:reduce),(prefers-contrast:more){:root{--glass:#fff;--bg:#eef3ff}
+main{-webkit-backdrop-filter:none;backdrop-filter:none}}
+@media(prefers-color-scheme:dark) and ((prefers-reduced-transparency:reduce) or (prefers-contrast:more)){:root{--glass:#111c40;--bg:#0a1330}}
+</style>
 <main><h1>__LOGO__<span>crew<b>chat</b></span></h1><p>On the machine that hosts the chat, run <code>crewchat ui --print</code>
 and type the code it shows. A code works once, for two minutes.</p>__ERROR__
 <form method="post" action="/login"><input name="code" aria-label="Sign-in code" placeholder="ABCD-EFGH" autocomplete="off"
@@ -11075,6 +11092,88 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 
 /* A phone: the rail becomes a drawer, the panel a full-screen sheet, the tabs a project picker. */
 #scrim { display: none; }
+/* Liquid Glass: the controls float above the content as glass (Apple's macOS 26 / iOS 26 material), the content stays
+   solid. The tabs, the rail, the header, the message box, the side panel, menus and dialogs are glass: see-through,
+   blurred and brightened, with a light rim on top. Messages, task cards and the board's cards stay solid, to read.
+   A colourful backdrop gives the glass something to show. Less transparency or more contrast asked for (the
+   system's setting), or no backdrop-filter: solid surfaces, as before. */
+:root {
+  --glass: rgba(255, 255, 255, 0.56); --glass-strong: rgba(255, 255, 255, 0.8); --plate: rgba(255, 255, 255, 0.74);
+  --glass-hover: rgba(255, 255, 255, 0.7); --glass-filter: blur(22px) saturate(180%);
+  --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.85), inset 0 0 0 1px rgba(255, 255, 255, 0.45);
+  --glass-shadow: 0 1px 1px rgba(11, 31, 85, 0.05), 0 10px 30px rgba(11, 31, 85, 0.12);
+  --glass-line: rgba(11, 31, 85, 0.09);
+  --backdrop: radial-gradient(60% 55% at 0% 0%, #c7d7ff 0%, transparent 62%),
+    radial-gradient(55% 50% at 100% 0%, #e7d6ff 0%, transparent 60%),
+    radial-gradient(60% 55% at 85% 100%, #ffe1cc 0%, transparent 62%),
+    radial-gradient(50% 45% at 10% 100%, #d4f1ea 0%, transparent 60%);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --glass: rgba(22, 33, 72, 0.52); --glass-strong: rgba(20, 30, 66, 0.82); --plate: rgba(15, 25, 58, 0.74);
+    --glass-hover: rgba(40, 56, 110, 0.6);
+    --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
+    --glass-shadow: 0 1px 1px rgba(0, 0, 0, 0.25), 0 12px 32px rgba(0, 0, 0, 0.35);
+    --glass-line: rgba(255, 255, 255, 0.08);
+    --backdrop: radial-gradient(60% 55% at 0% 0%, rgba(70, 105, 230, 0.35) 0%, transparent 62%),
+      radial-gradient(55% 50% at 100% 0%, rgba(140, 80, 220, 0.28) 0%, transparent 60%),
+      radial-gradient(60% 55% at 85% 100%, rgba(230, 120, 70, 0.18) 0%, transparent 62%),
+      radial-gradient(50% 45% at 10% 100%, rgba(40, 170, 150, 0.16) 0%, transparent 60%);
+  }
+}
+body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
+.glassy, .tab[aria-current="page"], #needs-you, .agent.on, .rail-tools, #space-head, .pillbox, .menu-list, .mentions,
+#panel .card, dialog, .col, #give {
+  background: var(--glass); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
+  box-shadow: var(--glass-rim), var(--glass-shadow);
+}
+/* What holds text to read gets the denser glass. */
+#needs-you, .menu-list, .mentions, #panel .card, dialog { background: var(--glass-strong); }
+.menu-list, .mentions, dialog, #panel .card { border-color: var(--glass-line); }
+/* The project's space: a plate the thread sits on, the header and the message box floating on it. */
+#space { background: var(--plate); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
+  box-shadow: var(--glass-rim), var(--glass-shadow); border-radius: 26px 26px 0 0; }
+#space-head { margin: 10px 10px 0; border: 0; border-radius: 20px; padding: 10px 14px; }
+/* The thread, the board and the analytics scroll on under the header, seen through its glass. --over: how far the
+   header reaches down (its margin and height); what scrolls starts below it, and a message jumped to stops there. */
+#space { --over: 74px; }
+#space-head { position: relative; z-index: 3; margin-bottom: calc(-1 * var(--over)); }
+#update, #banner { order: -1; }  /* a notice stays above the header, not under it */
+#log { padding-top: calc(18px + var(--over)); scroll-padding-top: calc(12px + var(--over)); }
+#space > #tasks { padding-top: calc(16px + var(--over)); }  /* the list and the board (#tasks.board-on) */
+#space > #analytics { padding-top: calc(16px + var(--over)); }  /* (its own styles come later) */
+#search-none { margin-top: var(--over); }
+.pillbox { border-color: var(--glass-line); border-radius: 999px; }
+.pillbox:focus-within { border-color: var(--accent-2); box-shadow: var(--glass-rim), var(--glass-shadow), 0 0 0 3px rgba(91, 140, 255, 0.22); }
+#search { border-radius: 999px; background: var(--glass-hover); border-color: var(--glass-line); }
+/* The rail: its tools a segmented capsule; the agent open, a glass card. */
+.rail-tools { padding: 3px; border-radius: 999px; }
+.rail-tools button { border-radius: 999px; }
+.tab[aria-current="page"] { box-shadow: var(--glass-rim); }
+.tab:hover, button.icon:hover, button.icon.on, .agent:hover, .menu-list button:hover, .menu-list a:hover,
+#space-menu > summary:hover, #bell > summary:hover, #tab-add > summary:hover, #plus > summary:hover { background: var(--glass-hover); }
+.agent.on { border-radius: 18px; }
+/* The accent buttons (send, add, a dialog's main one): liquid, a light top edge over the accent. */
+#send, #t-add, #give-ok, #rules-save, dialog .buttons button:not(.secondary):not(.ghost) {
+  background-image: linear-gradient(180deg, rgba(255, 255, 255, 0.22), rgba(255, 255, 255, 0) 55%);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35), 0 2px 8px rgba(47, 95, 214, 0.22);
+}
+.acts button, .acts select, .msg .reply { border-color: var(--glass-line); }
+.acts button:hover, .msg .reply:hover { background-color: var(--glass-hover); }
+/* Concentric corners: a card inside a panel, a little rounder than what it holds. */
+#panel .card { border-radius: 22px; }
+.col { border-radius: 22px; }
+.tcard { border-radius: 14px; }
+dialog { border-radius: 28px; border: 1px solid var(--glass-line); }
+dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+/* Solid again: the system asks for less transparency or more contrast, or the browser cannot blur. */
+@media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
+  :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint);
+    --glass-filter: none; --backdrop: none; --glass-line: var(--line); }
+}
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint); --backdrop: none; }
+}
 @media (max-width: 760px) {
   body, body.panel-open { grid-template-areas: "top" "space"; grid-template-columns: minmax(0, 1fr); }
   .phone-only { display: inline-flex !important; }
@@ -11103,6 +11202,14 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   #sheet td:nth-child(2) { flex: 1 1 calc(100% - 48px); min-width: 0; overflow-wrap: anywhere; }
   #sheet td:last-child { flex-basis: 100%; }
   #sheet td:last-child .acts { justify-content: flex-start; }
+}
+/* Glass on a phone: a lighter blur (it costs the most there), the plate and drawer denser. */
+@media (max-width: 760px) {
+  :root { --glass-filter: blur(14px) saturate(160%); }
+  #space { border-radius: 0; background: var(--panel); -webkit-backdrop-filter: none; backdrop-filter: none; }
+  #space-head { margin: 6px 6px 0; }
+  #space { --over: 62px; }
+  #rail { background: var(--glass-strong); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter); }
 }
 @media (prefers-reduced-motion: reduce) { #rail { transition: none; } }
 </style>

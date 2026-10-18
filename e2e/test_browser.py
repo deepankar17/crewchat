@@ -964,6 +964,47 @@ class NewPage(Signed):
             c.open(self.m.url + "/")
             c.until("!!document.getElementById('log')")
 
+    def test_liquid_glass_and_solid_when_asked(self):
+        # The controls are glass (see-through and blurred) over solid content; the system's "reduce transparency"
+        # or "increase contrast" makes them solid again. Nothing starts hidden under the floating header.
+        c = self.chrome
+        glass = ["#space-head", "#form .pillbox"]
+        look = """(sel) => { const s = getComputedStyle(document.querySelector(sel));
+            const a = s.backgroundColor.match(/rgba\\([^)]*,\\s*([\\d.]+)\\)/);
+            return [a ? parseFloat(a[1]) : 1, (s.backdropFilter || s.webkitBackdropFilter || 'none')]; }"""
+        try:
+            for sel in glass:
+                alpha, blur = c.js("(%s)(%s)" % (look, json.dumps(sel)))
+                self.assertLess(alpha, 0.95, sel)
+                self.assertIn("blur", blur, sel)
+            self.agent.call("hub_send", to="all", text="A message to read, on solid ground")
+            c.until("!!document.querySelector('#log .msg:not(.own) .body')", what="a message")
+            alpha, blur = c.js("(%s)('#log .msg:not(.own) .body')" % look)
+            self.assertEqual((alpha, blur), (1, "none"))  # what is read stays solid
+            # Nothing under the header: the thread at its top, the list, the board, the analytics.
+            head = "$('space-head').getBoundingClientRect().bottom"
+            c.js("$('log').scrollTop = 0")
+            self.assertGreaterEqual(c.js("$('log').firstElementChild.getBoundingClientRect().top"), c.js(head) - 1)
+            for view, first in (("tasks", "$('tasks').firstElementChild"), ("analytics", "$('analytics').firstElementChild")):
+                c.js("showView(%s)" % json.dumps(view))
+                for mode in (("as-list", "as-board") if view == "tasks" else ("",)):
+                    if mode:
+                        c.click("#" + mode)
+                    c.until("!!%s && %s.getBoundingClientRect().height > 0" % (first, first), what=view)
+                    self.assertGreaterEqual(c.js("%s.getBoundingClientRect().top" % first), c.js(head) - 1, (view, mode))
+            c.js("showView('chat')")
+            # Asked for less transparency, or more contrast: solid.
+            for feature, value in (("prefers-reduced-transparency", "reduce"), ("prefers-contrast", "more")):
+                c.call("Emulation.setEmulatedMedia", features=[{"name": feature, "value": value}])
+                if not c.js("matchMedia('(%s: %s)').matches" % (feature, value)):
+                    continue  # this Chrome cannot pretend so
+                for sel in glass:
+                    self.assertEqual(c.js("(%s)(%s)" % (look, json.dumps(sel))), [1, "none"], (feature, sel))
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("showView('chat')")
+            c.size(1280, 900)
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:
@@ -974,6 +1015,17 @@ class NewPage(Signed):
             self.assertNotEqual(c.js("getComputedStyle(document.body).backgroundColor"), "rgb(255, 255, 255)")
             self.assertEqual(c.js("getComputedStyle($('tabs')).display"), "none")  # a picker instead
             self.assertNotEqual(c.js("getComputedStyle($('projects')).display"), "none")
+            # The sign-in page fits a phone too (its card once ran off the right edge).
+            c.call("Network.clearBrowserCookies")
+            try:
+                c.open(self.m.url + "/login")
+                c.until("!!document.querySelector('main')", what="the sign-in page")
+                self.assertLessEqual(c.js("document.querySelector('main').getBoundingClientRect().right"), 375)
+                self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
+            finally:
+                code = self.m.cli("ui", "--print").split(": ")[1].split()[0]
+                c.open(self.m.url + "/login?code=" + code.replace("-", ""))
+                c.until("location.pathname === '/' && !!%s" % self.card(), what="signed in again")
             c.click("#rail-open")
             c.until("$('rail').getBoundingClientRect().left >= 0", what="the drawer to open")
             c.js(self.card() + ".click()")
