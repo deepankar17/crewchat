@@ -6492,8 +6492,16 @@ def git_exclude(project, paths):
 def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
     # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
-    # installed crewchat runs by its own launcher.
-    return "%s hook %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in run_command()), client, event)
+    # installed crewchat runs by its own launcher. After each tool call: Python runs the light hook
+    # script instead, which loads in a fraction of the time.
+    return "%s %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in hook_program(event)), client, event)
+
+
+def hook_program(event):
+    """What a hook runs, before its tool's name and the event: the light hook script for the tool event (if
+    it can be written), else crewchat's `hook` command."""
+    script = write_hook_script() if event == "tool" else None
+    return [Path(sys.executable).as_posix(), script.as_posix()] if script else run_command() + ["hook"]
 
 
 HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini", "qwen", "opencode")  # the tools whose hooks hand messages over
@@ -6513,7 +6521,8 @@ SETTINGS_HOOKS = {
 
 
 def is_our_hook(command):
-    return any(" hook %s " % client in command for client in HOOK_CLIENTS)
+    return any(" hook %s " % client in command or "%s %s " % (HOOK_SCRIPT_FILE, client) in command
+               for client in HOOK_CLIENTS)
 
 
 def write_mcp_json(project, url, token):
@@ -6744,11 +6753,12 @@ import {tmpdir} from "os";
 import {join} from "path";
 
 const HOOK = %(hook)s;
+const TOOL_HOOK = %(tool_hook)s;
 const REOPEN_PROMPT = %(reopen)s;
 
 async function hook(event, data, directory) {
   try {
-    const run = Bun.spawn([...HOOK, event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
+    const run = Bun.spawn([...(event === "tool" ? TOOL_HOOK : HOOK), event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
                                              env: {...process.env, CREWCHAT_PROJECT: directory}});
     run.stdin.write(JSON.stringify(data));
     run.stdin.end();
@@ -6806,7 +6816,8 @@ export const CrewchatPlugin = async ({client, directory}) => {
 def write_opencode_plugin(project):
     """crewchat's plugin in the folder (OPENCODE_PLUGIN), running this copy. Returns whether it changed."""
     path = Path(project) / OPENCODE_PLUGIN_FILE
-    text = OPENCODE_PLUGIN % {"hook": json.dumps(run_command() + ["hook", "opencode"]), "reopen": json.dumps(REOPEN_PROMPT)}
+    text = OPENCODE_PLUGIN % {"hook": json.dumps(run_command() + ["hook", "opencode"]),
+                              "tool_hook": json.dumps(hook_program("tool") + ["opencode"]), "reopen": json.dumps(REOPEN_PROMPT)}
     try:
         if path.read_text(encoding="utf-8") == text:
             return False
@@ -7435,6 +7446,109 @@ def tool_summary(client, data):
     return "Using " + name if re.fullmatch(r"[\w.-]{1,40}", name) else ""
 
 
+def tool_hook(client, data):
+    """The hook after each tool call: a sign of life for the server (at most every ALIVE_EVERY seconds, so a
+    long turn without a crewchat tool does not look silent), with what the call was when that changed (at
+    most every DOING_EVERY). Never waits or delivers. It runs in the light hook script (hook_script), with
+    only the standard library and what hook_script copies there: keep it to those."""
+    session = str(data.get("session_id") or data.get("conversation_id") or "default")
+    state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        state = {}
+    if not isinstance(state, dict):
+        state = {}
+    if not state.get("key"):
+        # A session started from the chat page links with its start key, maybe at its first tool call
+        # (Cursor has no prompt hook). Any other session has not been asked to link yet: nothing to say.
+        launched = os.environ.get("CREWCHAT_LINK_KEY", "")
+        if not (KEY_RE.match(launched) and claim_launch_key(state_file.parent, launched, session)):
+            return
+        state["key"] = launched
+    doing = tool_summary(client, data)
+    now = time.time()
+    if now - float(state.get("alive") or 0) < ALIVE_EVERY and (
+            not doing or doing == state.get("doing") or now - float(state.get("doing_at") or 0) < DOING_EVERY):
+        return  # told the server under a minute ago, and nothing new to say
+    project = find_project(client)
+    config = client_config(project, client) if project else None
+    if config is None or hooks_off(project):
+        return  # this project is not connected to a crewchat, or its hooks are switched off
+    state["alive"] = now
+    if doing:
+        state["doing"], state["doing_at"] = doing, now
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps(state))
+    hook_post(config[0] + "/api/hook", config[1], {"key": state["key"], "event": "tool", "doing": doing})
+
+
+def hook_post(url, token, body, timeout=5):
+    """POST body as JSON to a chat server, from a hook. This machine's server over a plain socket: importing
+    urllib alone takes longer than the rest of the light hook. Another machine's (perhaps https) through
+    urllib."""
+    local = re.match(r"^http://(127\.0\.0\.1|localhost):(\d+)(/.*)$", url)
+    data = json.dumps(body).encode("utf-8")
+    if not local:
+        import urllib.request
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json",
+                                                              "Authorization": "Bearer %s" % token})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+        return
+    with socket.create_connection(("127.0.0.1", int(local.group(2))), timeout=timeout) as conn:
+        conn.sendall(("POST %s HTTP/1.1\r\nHost: 127.0.0.1:%s\r\nAuthorization: Bearer %s\r\n"
+                      "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n"
+                      % (local.group(3), local.group(2), token, len(data))).encode("ascii") + data)
+        while conn.recv(4096):  # the whole answer, so the server is done with it
+            pass
+
+
+HOOK_SCRIPT_FILE = "crewchat-hook.py"  # in the crewchat home: the light hook script (hook_script)
+
+
+def hook_script():
+    """The light hook script: crewchat's tool-call hook (tool_hook) and what it needs, copied out of this
+    file, so a hook after every tool call loads a few hundred lines of Python instead of all of crewchat."""
+    import inspect
+
+    def value(v):  # sets in a fixed order, so the same crewchat writes the same file
+        return "frozenset(%r)" % sorted(v) if isinstance(v, (set, frozenset)) else repr(v)
+    names = ("SERVER_NAME", "KEY_RE", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
+             "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS")
+    functions = (sha, find_project, connection_entry, client_config, hooks_off, claim_launch_key, tool_summary,
+                 hook_post, tool_hook)
+    return ('"""crewchat %s\'s hook after each tool call, written by crewchat from its own code (`crewchat hooks\n'
+            'refresh` writes it again). Edits are not kept."""\n'
+            "import hashlib\nimport json\nimport os\nimport re\nimport shlex\nimport socket\nimport sys\n"
+            "import tempfile\nimport time\nfrom pathlib import Path\n\n"
+            % __version__ + "".join("%s = %s\n" % (n, value(globals()[n])) for n in names) + "\n\n"
+            + "\n\n".join(inspect.getsource(f) for f in functions)
+            + '\n\nif __name__ == "__main__":\n'
+              "    try:  # a hook must never break the agent's turn\n"
+              '        data = json.loads(sys.stdin.read() or "{}")\n'
+              "        if isinstance(data, dict) and len(sys.argv) > 1 and sys.argv[1] in HOOK_MARKERS:\n"
+              "            tool_hook(sys.argv[1], data)\n"
+              "    except Exception:\n"
+              "        pass\n")
+
+
+def write_hook_script():
+    """The light hook script in the crewchat home, as this copy of crewchat writes it. Returns its path, or
+    None when it cannot be written (the tool-call hooks then run crewchat itself, as before)."""
+    path = home() / HOOK_SCRIPT_FILE
+    try:
+        text = hook_script()
+        if not path.is_file() or path.read_text(encoding="utf-8") != text:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, path)
+    except (OSError, TypeError):  # TypeError: no source to copy (crewchat run from compiled code only)
+        return None
+    return path
+
+
 def run_hook(client, event):
     try:
         data = json.loads(sys.stdin.read() or "{}")
@@ -7442,16 +7556,15 @@ def run_hook(client, event):
         data = {}
     if not isinstance(data, dict):
         data = {}
+    if event == "tool":
+        tool_hook(client, data)  # the same as the light hook script runs (HOOK_SCRIPT_FILE)
+        return
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
         state = {}
-    doing = tool_summary(client, data) if event == "tool" else ""
-    if event == "tool" and time.time() - float(state.get("alive") or 0) < ALIVE_EVERY and (
-            not doing or doing == state.get("doing") or time.time() - float(state.get("doing_at") or 0) < DOING_EVERY):
-        return  # after every tool call: return at once unless a minute passed, or it does something new
     project = find_project(client)
     config = client_config(project, client) if project else None
     if config is None or hooks_off(project):
@@ -7498,16 +7611,6 @@ def run_hook(client, event):
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
-
-    if event == "tool":
-        # The agent used a tool: tell the server it is alive (at most every ALIVE_EVERY seconds, see
-        # above), so a long turn without a crewchat tool does not look silent. Never waits or delivers.
-        state["alive"] = time.time()
-        if doing:
-            state["doing"], state["doing_at"] = doing, time.time()
-        save(chain, pending, asks)
-        post_json(base + "/api/hook", token, {"key": key, "event": "tool", "doing": doing}, timeout=5)
-        return
 
     state["doing"] = ""  # a turn begins or ends: the next tool call is news again, as the server forgot it too
     if event == "prompt":
@@ -8754,6 +8857,10 @@ def cmd_uninstall(args):
                 print("- Took crewchat out of %s (%s)." % (folder, ", ".join(changed)))
     if uninstall_codex():
         print("- Took crewchat out of Codex's settings (%s)." % codex_config())
+    try:
+        (home() / HOOK_SCRIPT_FILE).unlink()  # the light hook script: no folder runs it now
+    except OSError:
+        pass
     data = home()
     if data.exists():
         if args.purge or (not args.yes and ask("Also delete your chats, files and settings in %s?" % data)):
