@@ -42,6 +42,7 @@ REKEY_GRACE = 600  # the old key still works this long after a change, while mem
 OFFLINE_AFTER = 2  # failed pulls in a row before a member shows as offline
 BACKOFF = (1, 2, 5, 10, 20, 30)
 MAX_BATCH = 500
+RELAY_EVERY = 300  # seconds between asking others for an unreachable member's messages (Y3)
 TAGS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TAGS += [a + b for a in TAGS for b in TAGS]
 
@@ -230,6 +231,9 @@ class PeerSync(crewchat.ProjectLink):
         self.invites = {}  # single-use join code -> expiry (memory only)
         self.threads = {}  # member id -> its puller thread
         self.failures = {}  # member id -> failed pulls in a row
+        self.relayed = {}  # member id -> when its messages were last asked of the others (Y3)
+        self.relaying = set()  # members whose messages are being fetched from the others now
+        self.log_clear = float("inf")  # pulls from at least this point need not read the log: nothing of ours there
         self.agents = {}  # member id -> its last roster
         self.stopped = threading.Event()
         self.removed_me = False
@@ -252,7 +256,8 @@ class PeerSync(crewchat.ProjectLink):
                 self._coordinator, self._term = pick, self._term + 1
             term = self._term
         named = dict(members, **{me["id"]: me}).get(preferred) or {}
-        return {"name": here[pick]["name"], "me": pick == me["id"], "term": term, "preferred": named.get("name", "")}
+        return {"name": here[pick]["name"], "me": pick == me["id"], "term": term, "preferred": named.get("name", ""),
+                "id": pick}
 
     def set_preferred(self, name):
         """The owner's preferred coordinator (a machine's name), or none. It travels to the others with the next
@@ -352,6 +357,7 @@ class PeerSync(crewchat.ProjectLink):
 
     # The hub's side --------------------------------------------------------------------------
     def publish(self, msg):
+        self.log_clear = float("inf")  # a message of its own: once out of memory, it is in the log only
         pass  # members pull; the hub's change notification wakes their waiting pulls
 
     def state_changed(self):
@@ -445,6 +451,9 @@ class PeerSync(crewchat.ProjectLink):
                 if self.failures[mid] == OFFLINE_AFTER:
                     self.log("%s is not reachable (%s)" % (member["name"], e))
                     self.hub.set_remote(mid, member["name"], self.agents.get(mid, []), 0)
+                if self.failures[mid] >= OFFLINE_AFTER and time.time() - self.relayed.get(mid, 0) >= RELAY_EVERY:
+                    self.relayed[mid] = time.time()
+                    threading.Thread(target=self.catch_up, args=(mid,), daemon=True).start()
                 self.stopped.wait(BACKOFF[min(attempt, len(BACKOFF)) - 1])
                 version = ""
                 continue
@@ -461,6 +470,53 @@ class PeerSync(crewchat.ProjectLink):
                 version = ""
                 continue
             version = str(out.get("v", ""))
+
+    def catch_up(self, mid):
+        """A member this machine cannot reach (roadmap Y3): what it wrote that this machine has not seen, from the
+        coordinator first, else from any member that can be reached, which pulled it while it was on. Paged. The
+        messages keep that member's own numbers, so pulling from it again once it is back starts after them.
+        Returns how many messages arrived."""
+        if mid in self.relaying:
+            return 0
+        self.relaying.add(mid)
+        got = 0
+        try:
+            members, coordinator = self.mesh.members(), self.coordinator()["id"]
+            sources = sorted((m for m in members if m != mid and self.reachable(m)), key=lambda m: m != coordinator)
+            if not sources:  # nobody else can be reached yet either: try again at the next failed pull
+                self.relayed.pop(mid, None)
+            for source in sources:
+                while not self.stopped.is_set():
+                    cursor = self._key(mid)
+                    since = self.mesh.cursor(cursor)
+                    try:
+                        out = self._call(members[source], "/peer/relay", {"origin": mid, "since": since}, timeout=60)
+                    except PeerError as e:
+                        self.log("could not catch up on %s's messages through %s (%s)" % (
+                            members.get(mid, {}).get("name", mid), members[source]["name"], e))
+                        break
+                    last = since
+                    for msg in out.get("messages") or []:
+                        if not isinstance(msg, dict) or msg.get("origin") != mid:
+                            continue
+                        number = crewchat.origin_number(msg.get("id"))
+                        if number <= since:
+                            continue
+                        try:
+                            if self.hub.ingest(msg):
+                                got += 1
+                        except Exception as e:  # skip it, as a pull does
+                            self.log("skipped message #%s (%s: %s)" % (msg.get("id"), type(e).__name__, e))
+                        last = max(last, number)
+                    if last > since:
+                        self.mesh.set_cursor(cursor, last)
+                    if not out.get("more") or last == since:
+                        break
+            if got:
+                self.log("caught up on %d of %s's messages through the others" % (got, members.get(mid, {}).get("name", mid)))
+        finally:
+            self.relaying.discard(mid)
+        return got
 
     def _removed(self):
         """Another member removed this machine: stop syncing; its own chat carries on."""
@@ -524,7 +580,7 @@ class PeerSync(crewchat.ProjectLink):
                                   "key changed; join again with a new code"}
         if device in self.mesh.data.get("removed", {}):
             return 403, {"error": "this machine was removed from the chat"}
-        if self.chat is not None and path not in ("/peer/pull", "/peer/file", "/peer/claim"):
+        if self.chat is not None and path not in ("/peer/pull", "/peer/file", "/peer/claim", "/peer/relay"):
             return 404, {"error": "unknown request"}
         sender = body.get("sender") if isinstance(body.get("sender"), dict) else {}
         if self.chat is None and device and sender.get("id") == device:
@@ -535,6 +591,16 @@ class PeerSync(crewchat.ProjectLink):
                 self.shared_with.add(device)  # it asks for this project, so it has it too
                 self._wake(device).set()
             return 200, self._pull(body)
+        if path == "/peer/relay":  # another member's messages, for one that cannot reach it now (Y3)
+            try:
+                since = int(body.get("since") or 0)
+            except (TypeError, ValueError):
+                return 400, {"error": "since is a number"}
+            origin = str(body.get("origin") or "")
+            if not origin or origin == device:
+                return 400, {"error": "relay is for another member's messages"}
+            messages, more = self.hub.messages_after(origin, since, MAX_BATCH, by_id=True)
+            return 200, {"messages": messages, "more": more}
         if path == "/peer/file":
             meta, local = self.hub.file(str(body.get("id") or ""))
             with self.hub.lock:  # only files shared here: a member never relays another's
@@ -618,15 +684,21 @@ class PeerSync(crewchat.ProjectLink):
         known = str(body.get("v", ""))
         deadline = time.time() + wait
         hub = self.hub
-        with hub.lock:
-            while True:
-                own = [m for m in hub.messages if m["seq"] > since and m.get("origin") == self.device_id]
-                agents = hub.local_state()
-                key = self._state_key(agents, self.mesh.data.get("preferred"))
-                if own or key != known or time.time() >= deadline or self.stopped.is_set():
-                    break
-                hub.lock.wait(timeout=max(0.0, deadline - time.time()))
-            own = [dict(m) for m in own[:MAX_BATCH]]
+        older = self._older(since)  # the asker was away for longer than memory holds (Y3): at once, from the log
+        if not older:
+            with hub.lock:
+                while True:
+                    own = [m for m in hub.messages if m["seq"] > since and m.get("origin") == self.device_id]
+                    agents = hub.local_state()
+                    key = self._state_key(agents, self.mesh.data.get("preferred"))
+                    if own or key != known or time.time() >= deadline or self.stopped.is_set():
+                        break
+                    hub.lock.wait(timeout=max(0.0, deadline - time.time()))
+                own = [dict(m) for m in own[:MAX_BATCH]]
+            # More than memory holds was written while this pull waited: its first ones are in the log only.
+            older = self._older(since) if own else []
+        if older:
+            own, agents, key = older, hub.local_state(), ""  # "" : the roster comes again with the next pull
         out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
                "preferred": self.mesh.data.get("preferred")}
         if self.chat is None:
@@ -634,6 +706,18 @@ class PeerSync(crewchat.ProjectLink):
         else:
             out["chat"] = self.chat  # so the asker knows this is the project it asked for (it ignores members)
         return out
+
+    def _older(self, since):
+        """This machine's messages after `since` when memory no longer reaches back that far (roadmap Y3): a page
+        of them from the log, oldest first, or [] when memory has them all (or there are none)."""
+        hub = self.hub
+        with hub.lock:
+            if not hub.messages or hub.messages[0]["seq"] <= since + 1 or since >= self.log_clear:
+                return []
+        older, _ = hub.messages_after(self.device_id, since, MAX_BATCH)
+        if not older:  # nothing of this machine's after that point: no need to look again until it writes
+            self.log_clear = min(self.log_clear, since)
+        return older
 
     # Membership changes ----------------------------------------------------------------------
     def new_invite(self):

@@ -207,7 +207,7 @@ Other settings in `~/.crewchat/config.json`:
 | Key | |
 |---|---|
 | `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
-| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24) |
+| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24). A machine off for longer catches up from the coordinator; only when every machine was off for longer are messages lost |
 | `roles` | The project's own roles (`crewchat roles add` writes them) |
 | `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
 | `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |

@@ -76,8 +76,10 @@ crewchat peers leave             # unlink this machine
 
 How it works: each server asks every other one for news, with long-polls that wait until there is
 something new, so messages arrive within a moment. A machine that was off catches up on what it
-missed when it is back. Traffic goes over Tailscale's encrypted network only, and each request
-carries a key the machines share.
+missed when it is back, however long it was away: each machine keeps every message in its own log,
+and the messages of a machine that is off by then come from the coordinator (`crewchat
+coordinator`), which has them. Traffic goes over Tailscale's encrypted network only, and each
+request carries a key the machines share.
 
 ## With cloud sync
 
@@ -119,7 +121,10 @@ Firestore, and the next machine to log in founds the account again.
 
 Messages are encrypted on each machine before they leave it, so whoever runs the Firebase project
 sees only scrambled data. They are deleted from Firestore once every machine has them, and after
-24 hours at the latest, so a machine that is off for longer misses them. The design, and why:
+24 hours at the latest. A machine that was off for longer asks the coordinator when it is back, and
+gets every message it missed from that machine's own log, encrypted, through Firestore. If every
+machine was off for longer than that, those messages are gone: keep them longer with
+`cloud_ttl_hours` in config.json (for example `72`). The design, and why:
 [cloud-sync-design.md](cloud-sync-design.md).
 
 ## Or: one host for every machine

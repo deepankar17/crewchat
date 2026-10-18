@@ -1446,6 +1446,46 @@ def read_back(path, block=1 << 16):
         yield rest
 
 
+def origin_number(mid):
+    """The number in a message's id (B57 -> 57): its running number on the machine that wrote it."""
+    found = re.search(r"(\d+)$", str(mid or ""))
+    return int(found.group(1)) if found else 0
+
+
+CATCHUP_SLACK = 200  # a catch-up reads the log back this many messages past the point it starts from (Y3)
+CATCHUP_MARGIN = 600  # seconds before the point a cloud catch-up starts from, for machines' clocks that differ
+
+
+def log_from(path, seq):
+    """messages.jsonl's messages after a running number, oldest first. Its lines are in the order of their numbers,
+    so the place is found by halving the file, and only what follows is read: a page of a catch-up costs about
+    the page, however long the log (Y3)."""
+    try:
+        f = open(path, "rb")
+    except OSError:
+        return
+    with f:
+        lo, hi = 0, f.seek(0, os.SEEK_END)
+        while hi - lo > 1 << 14:
+            mid = (lo + hi) // 2
+            f.seek(mid)
+            f.readline()  # on to the start of the next line
+            msg = None
+            while msg is None and f.tell() < hi:  # past a damaged or half-written line
+                msg = log_message(f.readline().rstrip(b"\n"))
+            if msg is None or msg["seq"] > seq:
+                hi = mid
+            else:
+                lo = mid
+        f.seek(lo)
+        if lo:
+            f.readline()
+        for line in f:
+            msg = log_message(line.rstrip(b"\n"))
+            if msg is not None and msg["seq"] > seq:
+                yield msg
+
+
 def log_message(line):
     """One line of messages.jsonl as a message, or None for a line that is not one (half written,
     damaged). Lines end at newlines only: a message's text may hold other line separators."""
@@ -3112,6 +3152,59 @@ class Hub:
                      m.get("task", ""), m.get("status", "")] for m in self.messages
                     if m["ts"] >= since and m["kind"] not in ("event", "plan")][-MAX_STREAM:]
 
+    # Catching up (roadmap Y3) --------------------------------------------------------------------
+    def messages_after(self, origin, after, limit, by_id=False):
+        """One machine's messages after a point, oldest first: at most limit, and whether more follow. `after` is
+        this machine's running number (seq) for its own messages; with by_id, the writer's own number (the one in
+        the id) for messages that came from another machine. From memory when it holds them all, else read back
+        from messages.jsonl: a machine that was away for longer than memory holds still gets every one."""
+        number = (lambda m: origin_number(m["id"])) if by_id else (lambda m: m["seq"])
+        with self.lock:
+            covered = not self.messages or self.messages[0]["seq"] <= 1 or (
+                not by_id and self.messages[0]["seq"] <= after + 1)
+            if covered:
+                found = [dict(m) for m in self.messages if m.get("origin") == origin and number(m) > after]
+        if not covered and not by_id:  # its own, in the order of its numbers: from that place in the log on
+            found = []
+            for msg in log_from(self.home / "messages.jsonl", after):
+                if msg.get("origin") == origin:
+                    found.append(msg)
+                    if len(found) > limit:
+                        break
+        elif not covered:  # another machine's, in the order they arrived: read back to that point
+            found = list(self._read_back(lambda m: m.get("origin") == origin, lambda m: number(m) <= after).values())
+        found.sort(key=number)
+        return found[:limit], len(found) > limit
+
+    def messages_since(self, since, skip=""):
+        """Every message written after a time, by any linked machine but `skip`, oldest first: what a machine that
+        was off for longer than cloud sync keeps them gets from the coordinator (Y3). Read from messages.jsonl,
+        which holds them all."""
+        since -= CATCHUP_MARGIN  # a few the asker has already are dropped by their ids
+        found = self._read_back(lambda m: m.get("origin") and m.get("origin") != skip,
+                                lambda m: float(m.get("ts") or 0) <= since)
+        return sorted(found.values(), key=lambda m: (float(m.get("ts") or 0), m["id"]))
+
+    def _read_back(self, wanted, before):
+        """The log's messages, newest first, until CATCHUP_SLACK in a row are before the point (messages from
+        another machine can arrive out of their order): {id: message} of those wanted and not before it."""
+        found, past = {}, 0
+        try:
+            for line in read_back(self.home / "messages.jsonl"):
+                msg = log_message(line)
+                if msg is None or not wanted(msg):
+                    continue
+                if before(msg):
+                    past += 1
+                    if past >= CATCHUP_SLACK:
+                        break
+                    continue
+                past = 0
+                found.setdefault(msg["id"], msg)
+        except OSError:  # no log yet
+            pass
+        return found
+
     def history(self, limit):
         with self.lock:
             return [dict(m, taken=self.taken.get(m["id"]), progress=self.progress.get(m["id"]))
@@ -4762,7 +4855,7 @@ def link_info(hub, shared=True):
 
 
 POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map", "/api/coordinator")
-PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
+PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file", "/peer/relay")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
 # names no project: like the icons, it is served without signing in.

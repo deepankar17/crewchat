@@ -50,7 +50,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | To do | C1, X1 |
 | [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | In progress | none |
 | [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
-| [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | To do | Y1 |
+| [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | Done | Y1 |
 | [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
 | [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
@@ -787,7 +787,10 @@ where the coordinator settles them.
 
 ### Y3
 
-**Catch-up beyond 24 hours** · P2 · effort M · To do
+**Catch-up beyond 24 hours** · P2 · effort M · Done
+
+> **Decided:** Over Tailscale, the messages of a machine that is off by then come through the coordinator
+> (owner, 18 Oct).
 
 **Goal.** A machine that was off for days catches up on every message, from whichever machine is online.
 

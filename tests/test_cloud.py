@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -318,6 +319,38 @@ class Sync(unittest.TestCase):
             self.a.hub.take(agent, task["id"])
         self.a.link.online = True
         wait_until(lambda: self.b.has("written offline"), timeout=20, message="the offline message")
+
+    def test_a_machine_off_for_three_days_gets_every_message_through_the_coordinator(self):
+        # Roadmap Y3, done when: a machine off for three days, longer than the cloud keeps messages, gets every
+        # message once it is back, in order, as long as some machine was on meanwhile.
+        self.b.stop()  # windows is off
+        texts = ["while windows was off %d: %s" % (i, "x" * 3000) for i in range(30)]  # a few parts' worth
+        for text in texts:
+            self.a.say("all", text)
+        wait_until(lambda: len(self.store.list("messages")) >= 30, message="the messages to be in the cloud")
+        for doc_id, _ in self.store.list("messages"):  # three days on: the cloud has dropped them
+            self.store.delete("messages/" + doc_id)
+        self.a.sync.renew_lease()
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.b.sync.marks["synced_to"] = time.time() - 3 * 86400  # windows last heard from the cloud then
+        self.b.sync._save_marks()
+        with mock.patch.object(cloud, "CATCHUP_PARTS", 1):  # paged: one part at a time, the next once it is read
+            self.b.sync = cloud.CloudSync(self.b.hub, self.b.link, self.b.device, log=lambda text: None).start()
+            wait_until(lambda: all(self.b.has(t) for t in texts), timeout=30, message="windows to catch up")
+        with self.b.hub.lock:
+            got = [m["text"] for m in self.b.hub.messages if m["text"].startswith("while windows was off")]
+        self.assertEqual(got, texts)  # every one, once, in order
+        self.assertEqual({m["origin"] for m in self.b.hub.messages if m["text"] in texts}, {self.a.device.id})
+        wait_until(lambda: not self.store.list("catchup_parts") and not self.store.list("catchups"),
+                   message="the parts to be deleted once read")
+        self.assertGreater(float(self.b.sync.marks["synced_to"]), time.time() - 3600)  # it will not ask again
+
+    def test_a_machine_away_for_less_than_the_ttl_does_not_ask(self):
+        self.b.stop()
+        self.b.sync.marks["synced_to"] = time.time() - 3600
+        self.b.sync = cloud.CloudSync(self.b.hub, self.b.link, self.b.device, log=lambda text: None).start()
+        self.assertEqual(self.store.list("catchups"), [])
+        self.assertEqual(self.a.sync.serve_catch_ups(), 0)
 
     def test_tampered_messages_are_dropped(self):
         original = self.store.set

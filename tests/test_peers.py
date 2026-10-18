@@ -9,6 +9,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -539,6 +540,82 @@ class OfflineAndRemoval(unittest.TestCase):
         finally:
             a.stop()
             b.stop()
+
+    def test_a_machine_off_for_days_gets_every_message_from_whoever_is_on(self):
+        # Roadmap Y3, done when: a machine that was off gets every message once it is back, in order, from the
+        # machines that were on: more than they hold in memory, and those of a machine that is off by then too.
+        def logged(m):
+            return [json.loads(line)["text"] for line in (m.hub.home / "messages.jsonl").read_text().splitlines()]
+        with mock.patch.object(crewchat, "KEEP_MESSAGES", 20):
+            a = Machine("first").found()
+            b = Machine("second").join(a)
+            c = Machine("third").join(b)
+            machines = [a, b, c]
+            try:
+                for m in machines:
+                    eventually(lambda: len(peers.Mesh(m.root).members()) == 2, what="%s to know both others" % m.name)
+                a.say("all", "first: hello")
+                c.say("all", "third: hello")
+                eventually(lambda: b.has("first: hello") and b.has("third: hello"), what="second to be in step")
+                port, root = b.port, b.root
+                b.stop()  # second is off for days
+                firsts = ["first %d" % i for i in range(45)]  # more than first keeps in memory
+                thirds = ["third %d" % i for i in range(30)]
+                for text in firsts:
+                    a.say("all", text)
+                for text in thirds:
+                    c.say("all", text)
+                eventually(lambda: "third 29" in logged(a), what="first to have third's messages")
+                c.stop()  # and third is off by the time second is back: first has its messages
+                b = machines[1] = Machine("second", port=port, root=root)
+                b.sync = peers.start(b.hub, b.root)
+                eventually(lambda: set(firsts + thirds) <= set(logged(b)), timeout=60, what="second to catch up")
+                got = logged(b)
+                self.assertEqual([t for t in got if t.startswith("first ")], firsts)  # all, in order
+                self.assertEqual([t for t in got if t.startswith("third ")], thirds)
+                self.assertEqual(len(got), len(set(got)))  # each once
+            finally:
+                for m in machines:
+                    m.stop()
+
+    def test_a_burst_bigger_than_memory_reaches_the_others_whole(self):
+        # More messages than memory holds, written while another machine's pull waits: the first of them are in
+        # the log only by the time the pull answers. They used to be skipped; they come from the log now (Y3).
+        def logged(m):
+            return [json.loads(line)["text"] for line in (m.hub.home / "messages.jsonl").read_text().splitlines()]
+        with mock.patch.object(crewchat, "KEEP_MESSAGES", 20):
+            a = Machine("quiet").found()
+            b = Machine("busy").join(a)
+            try:
+                b.say("all", "busy: hello")
+                eventually(lambda: a.has("busy: hello"), what="quiet to be in step")
+                burst = ["burst %d" % i for i in range(60)]
+                for text in burst:
+                    b.say("all", text)
+                eventually(lambda: "burst 59" in logged(a), what="the burst to arrive")
+                self.assertEqual([t for t in logged(a) if t.startswith("burst ")], burst)
+            finally:
+                a.stop()
+                b.stop()
+
+    def test_the_log_is_read_from_the_point_asked(self):
+        # Y3: a catch-up's page is found by halving messages.jsonl, past damaged lines, however long the log.
+        m = Machine("logger")
+        try:
+            with mock.patch.object(crewchat, "KEEP_MESSAGES", 5):
+                sent = [m.say("all", "line %d %s" % (i, "x" * 200)) for i in range(400)]
+            log = m.hub.home / "messages.jsonl"
+            with open(log, "ab") as f:
+                f.write(b'{"half written')  # a crash mid-line, at the end
+            seqs = [msg["seq"] for msg in sent]
+            for after in (0, seqs[0], seqs[137], seqs[-2], seqs[-1]):
+                self.assertEqual([x["seq"] for x in crewchat.log_from(log, after)], [s for s in seqs if s > after], after)
+            self.assertEqual(list(crewchat.log_from(m.root / "no-such-log", 0)), [])
+            m.hub.messages[:] = m.hub.messages[-5:]  # memory holds the last five: the rest comes from the log
+            page, more = m.hub.messages_after(m.hub.messages[0].get("origin"), seqs[100], 50)
+            self.assertEqual(([x["seq"] for x in page], more), (seqs[101:151], True))
+        finally:
+            m.stop()
 
     def test_one_bad_message_does_not_stop_the_link(self):
         a = Machine("sender").found()

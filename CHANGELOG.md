@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A machine that was off for days gets every message when it is back.** Over Tailscale, a linked
+  machine now serves what was missed from its log, not only the newest 2,000 in memory, and the
+  messages of a machine that is off by then come from the coordinator. With cloud sync, a machine
+  away for longer than the cloud keeps messages (24 hours, `cloud_ttl_hours`) asks the coordinator,
+  which sends them from its log, encrypted, a page at a time.
+- **Fixed: a burst of messages bigger than memory (2,000) lost its first ones** on the way to a linked
+  machine whose pull was waiting meanwhile. They now come from the log.
 - **A live demo of the analytics view** at [crewchat.dev/demo](https://crewchat.dev/demo/): a made-up crew
   and a day of its work, played in your browser with no server and no sign-in. The same sample is behind
   **Sample data** in the view, to see what it does before your crew has a history; it never mixes with

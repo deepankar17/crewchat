@@ -23,8 +23,11 @@ Firestore layout, all under users/{uid}/ (the security rules confine an account 
   messages/{msgid}  {dev, key_id, nonce, ct, created}  one chat message, encrypted
   state/{id}        {dev, key_id, nonce, ct, updated}  one machine's agents, encrypted
   tasks/{msgid}     {dev, key_id, nonce, ct, created}  who took a task: the first create wins
+  catchups/{id}     {since, after, state, parts, more, by}  a machine back after more than the TTL asks (Y3)
+  catchup_parts/{id}-{n}  {for, dev, key_id, nonce, ct, created}  the messages it missed, sealed by the
+                                                     coordinator, deleted once it has read them
   spaces/{space}    {created}                          a project besides the first, shared by name:
-    messages/, state/, tasks/  as above, for that project only
+    messages/, state/, tasks/, catchups/, catchup_parts/  as above, for that project only
     marks/{id}        {seen, synced_to}                how far each machine has read it
 The first projects of all machines use the top-level collections, whatever their names. Another
 project's space is a hash of its name (space_id), so the name itself never reaches the cloud.
@@ -60,14 +63,16 @@ HOUSEKEEPING = 10 * 60  # delete delivered messages this often
 CLAIM_TIMEOUT = 20
 LEASE_SECS = 90  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
 LEASE_RENEW = 30  # and any approved machine online takes it once it has run out
+CATCHUP_PART_BYTES = 40000  # messages per catch-up part, as JSON: sealed, it stays under the rules' 60,000 characters
+CATCHUP_PARTS = 25  # parts the coordinator writes for a machine at a time: more once it has read those
 
 
 class CloudError(Exception):
     pass
 
 
-COLLECTIONS = ("messages", "tasks", "state", "devices")  # the layout above, besides meta and spaces
-SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks")  # in each spaces/{space}
+COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts")  # the layout above, but meta, spaces
+SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts")  # in each spaces/{space}
 NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
                  "or: pip install \"crewchat[cloud]\"")
 
@@ -797,6 +802,8 @@ class CloudSync(crewchat.ProjectLink):
         self.marks = read_json(self.marks_file, {"published": 0, "synced_to": 0})
         self.clock = time.time  # the lease's clock (the tests move it)
         self.lease = {}  # meta/coordinator as last read
+        self.machine = self  # the machine's link, whose lease says who coordinates (a project's link: set by it)
+        self.catching_up = threading.Lock()  # one catch-up at a time, served or read
 
     # The coordinator (roadmap Y1) --------------------------------------------------------------
     def coordinator(self):
@@ -883,6 +890,10 @@ class CloudSync(crewchat.ProjectLink):
         if self.chat is None:
             self.unsubscribe += [self.store.listen("devices", self._on_devices),
                                  self.store.listen("meta", self._on_meta)]
+        self.unsubscribe.append(self.store.listen(self.base + "catchups", self._on_catchups))
+        synced_to = float(self.marks.get("synced_to", 0))
+        if synced_to and time.time() - synced_to > self.ttl:  # away for longer than the cloud keeps messages
+            self.ask_catch_up(synced_to)
         self._republish()
         for target in (self._worker, self._ticker) + ((self._leaser,) if self.chat is None else ()):
             threading.Thread(target=target, daemon=True).start()
@@ -912,7 +923,9 @@ class CloudSync(crewchat.ProjectLink):
         return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
 
     def _project_link(self, hub, name):
-        return CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
+        link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name)
+        link.machine = self
+        return link
 
     def _drop(self, device_id):
         """Another machine is gone from this project (left it, removed, or no longer trusted)."""
@@ -1054,6 +1067,126 @@ class CloudSync(crewchat.ProjectLink):
         for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
             if now - float(doc.get("created") or now) > self.ttl:
                 self.store.delete(self.base + "tasks/" + doc_id)
+        # Catch-ups: answer any waiting (the coordinator may have changed), read this machine's own, and drop
+        # parts nobody read within the TTL.
+        self.serve_catch_ups()
+        self.read_catch_up()
+        for doc_id, doc in self.store.list(self.base + "catchup_parts", where=("dev", self.device_id)):
+            if now - float(doc.get("created") or now) > self.ttl:
+                self.store.delete(self.base + "catchup_parts/" + doc_id)
+
+    # Catching up after more than the TTL (roadmap Y3) ------------------------------------------------
+    # The cloud keeps a message until every machine has it, but not longer than the TTL: a machine off for longer
+    # asks (catchups/{id}), and the coordinator, which has every message in its own log, answers with the ones
+    # written since, sealed, in parts that the machine reads and deletes. If every machine was off for longer
+    # than the TTL, those messages are gone: cloud_ttl_hours keeps them longer.
+    def ask_catch_up(self, since):
+        try:
+            start = since - crewchat.CATCHUP_MARGIN  # machines' clocks differ; what it has already is dropped by id
+            self.store.set(self.base + "catchups/" + self.device_id, {"since": since, "after": [start, ""], "state": "asked",
+                                                                       "parts": 0, "asked": SERVER_TIME})
+            self.log("away for longer than the cloud keeps messages: asking the coordinator for the ones missed")
+        except Exception as e:  # offline: the next start asks again
+            self.log("could not ask for the messages missed (%s)" % e)
+
+    def _part_aad(self, device_id, n, by):
+        return "crewchat|%s|catchup|%s|%d|%%s|%s" % (self._scope(), device_id, n, by)
+
+    def serve_catch_ups(self):
+        """The coordinator answers the machines that asked: the messages after the point each has read to (by any
+        machine but itself), from this machine's log, oldest first, in sealed parts. Returns how many it sent."""
+        if not (self.device.ready and self.machine.coordinator()["me"]) or not self.catching_up.acquire(blocking=False):
+            return 0
+        sent = 0
+        try:
+            for device_id, doc in self.store.list(self.base + "catchups"):
+                if device_id == self.device_id or doc.get("state") not in ("asked", "read") or \
+                        not self.device.trusted(device_id):
+                    continue
+                after = doc.get("after") or [float(doc.get("since") or 0) - crewchat.CATCHUP_MARGIN, ""]
+                point = (float(after[0] or 0), str(after[1] or ""))
+                missed = [m for m in self.hub.messages_since(float(doc.get("since") or 0), skip=device_id)
+                          if (float(m.get("ts") or 0), m["id"]) > point]
+                parts, part, size = [], [], 0
+                for msg in missed:
+                    payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind", "origin") if k in msg}
+                    payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
+                    n = len(json.dumps(payload))
+                    if part and size + n > CATCHUP_PART_BYTES:
+                        parts.append(part)
+                        part, size = [], 0
+                        if len(parts) == CATCHUP_PARTS:
+                            break
+                    part.append(payload)
+                    size += n
+                if part and len(parts) < CATCHUP_PARTS:
+                    parts.append(part)
+                for n, messages in enumerate(parts):
+                    sealed = self._seal(self._part_aad(device_id, n, self.device_id), {"messages": messages})
+                    sealed.update({"for": device_id, "created": SERVER_TIME})
+                    self.store.set(self.base + "catchup_parts/%s-%d" % (device_id, n), sealed)
+                served = sum(len(p) for p in parts)
+                last = parts[-1][-1] if parts else None
+                self.store.set(self.base + "catchups/" + device_id, {
+                    "state": "ready", "parts": len(parts), "more": served < len(missed), "by": self.device_id,
+                    "after": [last["ts"], last["id"]] if last else after}, merge=True)
+                sent += served
+        except Exception as e:  # offline, or a part refused: the machine asks on, and this tries again
+            self.log("could not send the messages missed (%s)" % e)
+        finally:
+            self.catching_up.release()
+        return sent
+
+    def read_catch_up(self, doc=None):
+        """This machine's answer, once the coordinator has written it: read every part, oldest first, and delete
+        it; ask for more while there are more. Returns how many messages arrived."""
+        doc = doc if doc is not None else self.store.get(self.base + "catchups/" + self.device_id)
+        if not doc or doc.get("state") != "ready" or not self.catching_up.acquire(blocking=False):
+            return 0
+        got = 0
+        try:
+            for n in range(int(doc.get("parts") or 0)):
+                path = self.base + "catchup_parts/%s-%d" % (self.device_id, n)
+                part = self.store.get(path)
+                if part is None:
+                    continue
+                try:
+                    payload = self._open(self._part_aad(self.device_id, n, doc.get("by", "")), part)
+                except Exception:
+                    self.log("dropped part %d of the messages missed: it does not decrypt" % n)
+                    payload = {}
+                for msg in payload.get("messages") or []:
+                    if isinstance(msg, dict) and msg.get("id"):
+                        try:
+                            got += bool(self.hub.ingest(msg))
+                        except Exception as e:  # skip it, as a live message would be
+                            self.log("skipped message %s (%s: %s)" % (msg.get("id"), type(e).__name__, e))
+                self.store.delete(path)
+            if doc.get("more"):
+                self.store.set(self.base + "catchups/" + self.device_id, {"state": "read"}, merge=True)
+            else:
+                self.store.delete(self.base + "catchups/" + self.device_id)
+                self.marks["synced_to"] = max(float(self.marks.get("synced_to", 0)), float(doc.get("asked") or 0))
+                self._save_marks()
+            if got:
+                self.log("caught up on %d messages missed while away" % got)
+        except Exception as e:  # offline: the next look reads on
+            self.log("could not read the messages missed (%s)" % e)
+        finally:
+            self.catching_up.release()
+        return got
+
+    def _on_catchups(self, changes):
+        for kind, device_id, doc in changes:
+            if kind == "removed":
+                continue
+            if device_id == self.device_id:
+                work = lambda d=doc: self.read_catch_up(d)  # noqa: E731
+            elif doc.get("state") in ("asked", "read"):
+                work = self.serve_catch_ups
+            else:
+                continue
+            threading.Thread(target=work, daemon=True).start()  # never in the listener's own thread
 
     # Tasks -------------------------------------------------------------------------------------
     def claim_task(self, task_id, agent, key=None):

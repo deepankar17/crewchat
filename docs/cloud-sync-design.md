@@ -84,8 +84,13 @@ messages they exchange.
 
 **Firestore is a transit queue, not an archive.** History stays in each machine's local store.
 A message is deleted from Firestore once every trusted device has received it, and in any case
-after 24 hours (`cloud_ttl_hours`). A machine that was off for longer than that misses those
-messages.
+after 24 hours (`cloud_ttl_hours`). A machine that was off for longer than that asks for a
+**catch-up** when it is back (roadmap Y3): it writes `catchups/{its id}` with the point it had
+read to, and the coordinator (Y1) answers from its own log with the messages written since, by
+every machine but the asker, sealed with the account key like any message, in parts of about
+40 KB under `catchup_parts/`: 25 parts at a time, the next ones once the asker has read and
+deleted those. Only when every machine was off for longer than `cloud_ttl_hours` are messages
+lost; raise it to keep them longer.
 
 ## 6. Encryption
 
