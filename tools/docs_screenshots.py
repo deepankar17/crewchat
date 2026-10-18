@@ -60,12 +60,15 @@ class Chat:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def agent(self, place="macbook", client="claude", status="", activity="working", name=None):
-        """A new agent; name gives it that first name instead of one the hub picks at random (by a
-        rename, whose line in the chat quiet() drops with the join lines)."""
-        auto = self.hub.agent_for(self.hub.open_session(place, client))
-        if name and name != auto:
-            self.hub.rename(auto, name)
-        name = name or auto
+        """A new agent; name gives it that first name instead of one the hub picks at random (it joins
+        with it, so the chat says so and no rename takes a message number)."""
+        pick = self.hub._agent_name
+        if name:
+            self.hub._agent_name = lambda *where: name
+        try:
+            name = self.hub.agent_for(self.hub.open_session(place, client))
+        finally:
+            self.hub._agent_name = pick
         if status:
             self.hub.set_status(name, status)
         self.doing(name, activity)
@@ -95,7 +98,7 @@ class Chat:
         """Drop the join and role lines, and mark everything read, for a tidy picture."""
         with self.hub.lock:
             self.hub.messages[:] = [m for m in self.hub.messages if m["kind"] not in ("event", "role")]
-            self.hub.ids = {m["id"]: m["seq"] for m in self.hub.messages}
+            self.hub._index()  # ids and by_id, for the messages left
             self.read_all()
 
     def read_all(self):
@@ -243,10 +246,10 @@ def scene_empty_chat(b):
 
 def team_chat():
     chat = Chat()
-    lead = chat.agent(status="Coordinating the dark theme", activity="listening")
-    dev = chat.agent(status="Persisting the theme choice", activity="listening")
-    cur = chat.agent("laptop", "cursor", status="Dark colour scheme")
-    qa = chat.agent(status="Testing the colours")
+    lead = chat.agent(status="Coordinating the dark theme", activity="listening", name="Maya")
+    dev = chat.agent(status="Persisting the theme choice", activity="listening", name="Teo")
+    cur = chat.agent("laptop", "cursor", status="Dark colour scheme", name="Noor")
+    qa = chat.agent(status="Testing the colours", name="Kira")
     for name, role in ((lead, "lead"), (dev, "developer"), (cur, "developer"), (qa, "qa")):
         chat.hub.set_role(O, name, role)
     chat.quiet()
@@ -305,9 +308,9 @@ def scene_team(b):
 
 def scene_agents_joined(b):
     chat = Chat()
-    a = chat.agent(status="Fixing the login test")
-    c = chat.agent("macbook", "cursor", status="Reviewing the settings screen", activity="listening")
-    w = chat.agent("windows", "claude", status="", activity="idle")
+    a = chat.agent(status="Fixing the login test", name="Kai")
+    c = chat.agent("macbook", "cursor", status="Reviewing the settings screen", activity="listening", name="Ines")
+    w = chat.agent("windows", "claude", status="", activity="idle", name="Wren")
     chat.say(a, "all", "Heads up: I'm about to change LoginViewModel.kt and its test.")
     chat.say(c, a, "Fine by me. I'm only in SettingsScreen.kt.")
     chat.say(w, "all", "I'm on the Windows laptop if anything needs checking there.")
@@ -321,14 +324,14 @@ def scene_agents_joined(b):
 
 def scene_task(b):
     chat = Chat()
-    a = chat.agent(status="Free")
-    c = chat.agent("macbook", "cursor", status="Dark theme")
-    w = chat.agent("windows", "claude", status="Free")
+    a = chat.agent(status="Free", name="Luca")
+    c = chat.agent("macbook", "cursor", status="Dark theme", name="Selin")
+    w = chat.agent("windows", "claude", status="Free", name="Odin")
     chat.quiet()
     task = chat.say(O, "all", "Find out why the login test is flaky.", "task")
     chat.say(a, "all", "BID #%s: yes. I wrote that test and I'm free." % task["id"])
     chat.say(c, "all", "BID #%s: no. I'm in the middle of the dark theme." % task["id"])
-    chat.say(w, "all", "BID #%s: yes, but claude-macbook knows that code better." % task["id"])
+    chat.say(w, "all", "BID #%s: yes, but %s knows that code better." % (task["id"], a))
     chat.hub.take(a, task["id"])
     chat.hub.set_status(a, "Flaky login test")
     chat.say(a, O, "Found it: the test waited 100 ms for the token refresh, which takes up to 300 ms on CI. "
@@ -342,7 +345,7 @@ def scene_task(b):
 
 def scene_add_agent(b):
     chat = Chat()
-    chat.agent(status="Coordinating the dark theme", activity="listening")
+    chat.agent(status="Coordinating the dark theme", activity="listening", name="Maya")
     chat.hub.set_role(O, list(chat.hub.agents)[0], "lead")
     chat.quiet()
     old = crewchat.launch_options
@@ -382,8 +385,8 @@ justify-content:space-between;padding:16px 18px;border-top:1px solid #333} .on{c
 def scene_files(b):
     shot = app_screenshot(b)
     chat = Chat()
-    qa = chat.agent(status="Testing the theme switch")
-    dev = chat.agent(status="Persisting the theme choice")
+    qa = chat.agent(status="Testing the theme switch", name="Gia")
+    dev = chat.agent(status="Persisting the theme choice", name="Hana")
     chat.hub.set_role(O, qa, "qa")
     chat.hub.set_role(O, dev, "developer")
     chat.quiet()

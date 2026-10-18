@@ -109,7 +109,7 @@ machine on an older version shares only its first project.
 
 **An agent does not answer messages from the chat.**
 
-![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer?. 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
+![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer? 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
 
 - Click it in the list: its panel says what it is doing. **Idle** means it has stopped waiting: it sees new messages the next time its
   user types. `crewchat listen on` makes agents in that folder wait longer.
@@ -195,7 +195,8 @@ removed and the shared key changed. Run `crewchat peers leave` on it, then
 `crewchat peers invite` on a linked machine and join again.
 
 **Taking a task fails with "cannot reach …".** Over Tailscale, the machine a task was posted on
-settles it, so it must be on. Try again when it is back.
+settles it, or the coordinator while that machine is off: this means neither could be reached. Try
+again when one is back.
 
 ## Cloud sync
 
@@ -214,8 +215,10 @@ behind by an older version is cleared by the next login on 0.11.1 or later.
 **A machine that was removed cannot join again.** Run `crewchat cloud logout` on it, then
 `crewchat cloud login`, and approve it again.
 
-**A shared file does not open on the other machine.** With cloud sync a file opens only on the
-machine it was shared on, for now; over Tailscale the other machine fetches it.
+**A shared file does not open on the other machine.** With cloud sync, files up to 5 MB
+(`cloud_file_mb`) open on every machine while the cloud keeps the message (24 hours,
+`cloud_ttl_hours`); a bigger or older one opens only on the machine it was shared on. Over Tailscale
+the other machine fetches it.
 
 **The machine cannot reach Firestore.** The local chat keeps working; messages wait and go out
 when the connection is back. The log says `cannot send, will retry`.

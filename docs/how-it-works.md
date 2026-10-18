@@ -14,7 +14,7 @@ named, how machines stay in step, and where everything is kept.
 
 ## The pieces
 
-![The pieces. 1: Agents use crewchat's tools over MCP, with the folder's own token. 2: Their hooks ask /api/hook for new messages. 3: You read and write on the chat page, once signed in. 4: Everything is kept in plain files, on this machine. 5: Optionally, it syncs with crewchat on your other machines.](images/diagram-pieces.gif)
+![The pieces. 1: Agents use crewchat's tools over MCP, with the folder's own token. 2: Their hooks ask /api/hook for new messages. 3: You read and write on the chat page, once signed in. 4: Everything stays on this machine: the chat in messages.jsonl, edits and the code map in SQLite. 5: Optionally, it syncs with crewchat on your other machines.](images/diagram-pieces.gif)
 
 - **The server** (`crewchat serve`, usually started at login) runs on each machine with agents. It
   listens on `127.0.0.1` only, and serves two things: an MCP endpoint at `/mcp` for agents, and the
@@ -72,6 +72,8 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   during a long turn. It also says, in a few words, what the call was ("Editing Login.kt",
   "Running npm test"): only a file's name and a command's program (with the subcommand of a
   well-known tool), never arguments or contents, at most every few seconds and only when it changed.
+  With edit tracking on (`crewchat edits`), it also sends the path of a file the agent edits inside
+  the project, kept on this machine ([privacy](privacy.md)).
   The chat page of the agent's own machine shows it while the agent works, for two minutes at most
   and until its turn ends. `crewchat setup --activity off` keeps it off the page.
   This hook runs after every tool call, so it is kept small: a script crewchat writes from its own
@@ -127,15 +129,16 @@ key; that key carries the name, role and first task you chose.
 - **Tasks.** `hub_task` take gives a task to the first caller. A task addressed to one agent, or
   assigned by the lead, is that agent's at once.
 
-![Two agents, one task. 1: Both agents bid yes on task 9. 2: claude-macbook calls hub_task take. 3: A moment later, so does cursor-laptop. 4: The first call wins, and everyone is told. 5: The second gets a clear no, and moves on.](images/diagram-take.gif)
+![Two agents, one task. 1: Both agents bid yes on task 9. 2: Maya calls hub_task take. 3: A moment later, so does Teo. 4: The first call wins, and everyone is told. 5: The second gets a clear no, and moves on. 6: A task from a linked machine that is off: the coordinator settles it instead.](images/diagram-take.gif)
 - **History.** The last 2000 messages are kept in memory; everything is appended to
   `messages.jsonl`.
 - **Files.** A shared file is kept on the machine it was shared on, in `files/<id>/`. A message
   carries only its id, name, size and type. Agents see it as `[file <id>: name, type, size]` and
   open it with `hub_file`. Over Tailscale, another machine fetches the file from the one it was
-  shared on the first time someone opens it. Cloud sync does not carry files yet.
+  shared on the first time someone opens it. With cloud sync, a file up to 5 MB (`cloud_file_mb`)
+  travels with its message, encrypted, and is deleted with it; a bigger one stays on its machine.
 
-![Sharing a screenshot. 1: You paste a screenshot and send it. 2: Only the message and the file's id sync to the laptop. 3: The agent asks for the file. 4: The laptop fetches it from the macbook, once. 5: The file comes over. 6: The agent sees the image itself.](images/diagram-files.gif)
+![Sharing a screenshot. 1: You paste a screenshot and send it. 2: Over Tailscale, only the message and the file's id sync to the laptop. 3: The agent asks for the file. 4: The laptop fetches it from the macbook, once. 5: The file comes over. 6: The agent sees the image itself. 7: With cloud sync, a file up to 5 MB travels with its message, encrypted.](images/diagram-files.gif)
 
 ## Linked machines
 
@@ -150,13 +153,14 @@ Both ways of linking follow the same rules:
 **Over Tailscale** (`crewchat_peers.py`, standard library only): each server long-polls every
 other one at `POST /peer/pull` for the messages it wrote and its roster. A pull only wakes for the
 answering machine's own changes, so news never echoes around. A task is settled by the machine it
-was posted on. Requests carry a key all members share; members tell each other about new members;
+was posted on, or by the coordinator while that machine is off. Requests carry a key all members share; members tell each other about new members;
 removing a member changes the key.
 
 **Cloud sync** (`crewchat_cloud.py`): each server writes its messages, encrypted, to Firestore and
 listens for the others' in real time. Every machine has its own RSA key; one AES-256 account key,
 wrapped for each approved machine, seals every message, roster and task claim. Messages are
-deleted once every machine has them, and after 24 hours at the latest. The full design is in
+deleted once every machine has them, and after 24 hours at the latest; a machine away for longer
+gets what it missed from the coordinator. The full design is in
 [cloud-sync-design.md](cloud-sync-design.md).
 
 ## Where things live

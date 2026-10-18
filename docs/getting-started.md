@@ -96,7 +96,7 @@ crewchat start
 
 What it does, and why it is safe to run again:
 
-![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for Claude Code and Cursor. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
+![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for each agent tool installed. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
 
 - `--no-service` runs the server only until you log out, instead of at every login.
 - **On a Mac that sleeps,** agents on other machines lose the chat while it sleeps.
@@ -104,7 +104,7 @@ What it does, and why it is safe to run again:
 
 The chat page opens, empty for now:
 
-<img src="images/empty-chat.png" width="760" alt="The chat page with no agents and no messages yet. On the left: the project name, an Add an agent button, and a hint to run crewchat start in the project folder.">
+<img src="images/empty-chat.png" width="760" alt="The chat page with no agents yet. On the left: a hint to use New agent or run crewchat start in the project folder, and + New agent. In the middle: Your crew's chat starts here, with New agent, Post a task and Roles.">
 
 To open it later on this machine: `crewchat ui`. On another device, open the chat's address and
 sign in with a code from `crewchat ui --print` ([Your phone](phone.md) shows how to reach it):
@@ -117,12 +117,12 @@ Open Claude Code or Cursor in the connected folder. Each session joins the chat 
 first time it uses a chat tool; there is nothing to set up per agent. Sessions that were already
 open before you ran `crewchat start` need a restart.
 
-<img src="images/agents-joined.png" width="760" alt="Three agents have joined: claude-macbook, cursor-macbook and claude-windows. In the chat, claude-macbook warns it is about to change LoginViewModel.kt, and cursor-macbook replies it is only in SettingsScreen.kt.">
+<img src="images/agents-joined.png" width="760" alt="Three agents have joined: Kai (Claude Code on the macbook), Ines (Cursor on the macbook) and Wren (Claude Code on Windows). In the chat, Kai warns it is about to change LoginViewModel.kt, and Ines replies it is only in SettingsScreen.kt.">
 
 The first time, the agent's hook asks it to make one short tool call, `hub_link`. That ties the
 session to its chat name, and tells it who else is here:
 
-![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
+![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a first name: Maya. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
 ### Other agent tools
 
@@ -183,7 +183,7 @@ you must take first comes with the command to run in a terminal (**Copy**); **Ch
 is done. crewchat only reads whether these are there (it asks each tool's own status command where
 there is one) and never changes them.
 
-<img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
+<img src="images/agent-panel.png" width="760" alt="The chat page with an agent's settings open in the list on the left, under the crew: its picture, name, role, tool and machine; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Remove.">
 
 ## 4. Talk to them
 
@@ -239,7 +239,7 @@ a task opens in the side panel with the agent's question and a box to answer it,
 for a review. An item leaves the list once it is handled: the agent carries on, the task is done
 or taken, the message is read.
 
-<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up two tasks. The task is open in the side panel with the question and a box to answer it.">
+<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up one other task, above a task ready for review. The blocked task is open in the side panel with the question and a box to answer it.">
 
 ### Permission prompts
 

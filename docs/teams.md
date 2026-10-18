@@ -4,9 +4,9 @@ Agents in a crewchat can always talk to each other. Roles make them work as a te
 your tasks, splits them up and hands them out; developers build and report back; QA tests and
 sends bugs straight to the developer.
 
-<img src="images/demo-roles.gif" width="800" alt="Roles are given in the side panel of three agents in turn: Maya Lead, Teo Developer, Wren QA. A task is posted with Post as task; Maya takes it. On the task board she gives a piece to Teo and one to Wren; Teo's moves to Review, then both to Done, and the whole task with them. Back in the chat, Maya reports to the owner.">
+<img src="images/demo-roles.gif" width="800" alt="Roles are given in each agent's settings, in the list, to three agents in turn: Maya Lead, Teo Developer, Wren QA. A task is posted with Post as task; Maya takes it. On the task board she gives a piece to Teo and one to Wren; Teo's moves to Review, then both to Done, and the whole task with them. Back in the chat, Maya reports to the owner.">
 
-<img src="images/team.png" width="800" alt="A team at work. A lead, two developers and QA, each with a role badge on its card. The owner's task #9 is taken by the lead, who gave #11 to claude-macbook-2 (now done) and #12 to cursor-laptop (ready for review). The developer and QA talk about a bug and its fix, and the lead reports back to the owner.">
+<img src="images/team.png" width="800" alt="A team at work: Maya the lead, two developers (Teo, and Noor on Cursor) and Kira for QA, each with a role badge on its card. The owner's task #9 is taken by Maya, who gave #11 to Teo (now done) and #12 to Noor (ready for review). Teo and Kira talk about a bug and its fix, and Maya reports back to the owner.">
 
 - [Give an agent a role](#give-an-agent-a-role)
 - [The built-in roles](#the-built-in-roles)

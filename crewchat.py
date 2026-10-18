@@ -10732,7 +10732,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 /* The rail: Needs you, the crew, New agent. */
 #rail { grid-area: rail; overflow-y: auto; padding: 12px 10px 16px 12px; display: flex; flex-direction: column; gap: 6px; }
 .rail-tools { display: flex; gap: 4px; }
-.rail-tools button { flex: 1; font-size: 13px; font-weight: 600; }
+.rail-tools button { flex: 1 1 auto; font-size: 13px; font-weight: 600; white-space: nowrap; padding-inline: 6px; }
 .rail-head { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 10px 8px 2px; }
 #needs-you { background: var(--panel); border-radius: var(--radius); padding: 8px; box-shadow: var(--shadow); }
 #needs-you .rail-head { margin-top: 2px; color: var(--err); }

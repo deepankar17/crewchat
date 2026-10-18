@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Fixed: the Tasks button beside Commands and Analytics wrapped onto two lines** once the board had
+  open tasks. The three stay on one line.
+- **The docs' pictures show crewchat as it is now:** every screenshot, demo and diagram made again, with
+  `hub_task`, first names, the Analytics view, files over cloud sync, catch-up and the coordinator; and
+  each diagram's description matches what it plays.
 - **Shared files open on your other machines with cloud sync too**, up to 5 MB: a screenshot or a log
   travels with its message, encrypted on your machine, and is deleted from the cloud with the message.
   A bigger file says which machine has it, and why: the free Firebase plan's quota. On a paid (Blaze)

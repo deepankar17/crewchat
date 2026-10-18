@@ -149,6 +149,19 @@ class NewPage(Signed):
         self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])
 
+    def test_the_rail_buttons_stay_on_one_line(self):
+        c = self.chrome
+        was = c.js("$('tasks-count').textContent")
+        c.js("$('tasks-count').textContent = '(12)'")  # a busy board's count
+        try:
+            # Each button's text, the lines it takes (the tops of its text's boxes), and whether it is cut off.
+            shown = c.js("[...document.querySelectorAll('.rail-tools button')].map(b => { const r = document.createRange(); "
+                         "r.selectNodeContents(b); return [b.innerText, new Set([...r.getClientRects()].filter(x => x.width)"
+                         ".map(x => Math.round(x.top))).size, b.scrollWidth > b.clientWidth]; })")
+        finally:
+            c.js("$('tasks-count').textContent = %s" % json.dumps(was))
+        self.assertEqual([t for t, lines, over in shown if lines != 1 or over], [], shown)
+
     def test_agent_messages_are_shown_as_text(self):
         c = self.chrome
         self.agent.call("hub_send", to="Owner", text='<img src=x onerror="window.pwned=1"><b>bold?</b>')
