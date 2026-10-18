@@ -64,7 +64,14 @@ class Chrome:
         return out.get("result", {}).get("value")
 
     def until(self, expression, timeout=15, what=None):
-        return eventually(lambda: self.js(expression), timeout, what or expression)
+        def check():
+            try:
+                return self.js(expression)
+            except RuntimeError as e:  # a page still loading after a click navigated: its script is not in yet
+                if "is not defined" in str(e):
+                    return None
+                raise
+        return eventually(check, timeout, what or expression)
 
     def open(self, url):
         self.call("Page.navigate", url=url)
@@ -370,6 +377,18 @@ class NewPage(Signed):
         self.assertIn("Runs on laptop", out["far"]["text"])
         self.assertEqual(c.errors, [])
 
+    def test_edit_tracking_in_the_project_panel(self):
+        c = self.chrome
+        c.js("openPanel('project')")
+        c.until("$('edits-note').textContent.startsWith('Kept')", what="edit tracking on (a software team)")
+        self.assertEqual(c.js("$('edits-mode').value"), "auto")
+        c.js("$('edits-mode').value = 'off'; $('edits-mode').dispatchEvent(new Event('change'))")
+        c.until("$('edits-note').textContent === 'Not kept.'", what="edit tracking off")
+        self.assertIn("Edit tracking: off", self.m.cli("edits"))
+        c.js("$('edits-mode').value = 'auto'; $('edits-mode').dispatchEvent(new Event('change'))")
+        c.until("$('edits-note').textContent.startsWith('Kept')", what="back to auto")
+        self.assertEqual(c.errors, [])
+
     def test_roles_in_the_panel(self):
         c = self.chrome
         c.js("openPanel('roles')")
@@ -390,6 +409,7 @@ class NewPage(Signed):
         c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
         c.until("$('panel-title').textContent === 'Roles' && !$('panel-body').innerText.includes('Designer')",
                 what="the role gone")
+        c.until("!state.roles.some(r => r.name === 'designer')", what="the page's list to follow (the poll's boot tag)")
         self.assertEqual(c.errors, [])
 
     def test_the_task_board_and_a_task_in_the_panel(self):
@@ -408,6 +428,27 @@ class NewPage(Signed):
         self.assertIn("HISTORY", c.js("$('panel-body').innerText").upper())
         c.click("#tasks .back")
         self.assertFalse(c.js("$('log').hidden"))
+        self.assertEqual(c.errors, [])
+
+    def test_suggested_files_are_accepted_in_the_task_panel(self):
+        # Roadmap C2: when a task goes to review, the folders its holder changed outside its areas are suggested,
+        # and the owner adds them with one click.
+        c = self.chrome
+        mid = self.m.owner.task("all", "Tidy the search box")
+        self.agent.call("hub_task", action="take", id=mid)
+        status, raw, _ = H.request(self.m.url + "/api/hook", {"key": self.agent.key, "event": "tool", "doing": "Editing",
+                                                              "path": "web/search/box.tsx"},
+                                   {"Authorization": "Bearer " + self.agent.token})
+        self.assertEqual(status, 200, raw)
+        self.agent.call("hub_task", action="update", id=mid, status="review", note="ready")
+        c.js("openPanel('task', %s)" % json.dumps(mid))
+        c.until("$('panel-body').innerText.includes('web/search/')", what="the suggested files")
+        self.assertIn("SUGGESTED FILES", c.js("$('panel-body').innerText").upper())
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Accept files').click()")
+        c.until("!$('panel-body').innerText.toUpperCase().includes('SUGGESTED FILES') && "
+                "$('panel-body').innerText.includes('web/search/')", what="the files accepted")
+        self.assertIn("files web/search/", self.agent.call("hub_task", action="view", show="all"))
+        self.m.owner.post("/api/task", {"op": "status", "task": mid, "status": "done"})  # nothing left that needs you
         self.assertEqual(c.errors, [])
 
     def test_back_from_the_board_shows_what_came_in_meanwhile(self):
@@ -728,6 +769,114 @@ class NewPage(Signed):
         c.until("$('project').textContent === 'Demo' && state.agents.length > 0", what="back to Demo")
         self.assertEqual(c.errors, [])
 
+    def test_the_analytics_view(self):
+        # Roadmap X2: the crew at a glance, live through the chat's own poll; light and dark, desktop and phone.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view and its numbers")
+            self.assertTrue(c.js("$('log').hidden && !$('analytics').hidden"))
+            self.assertGreaterEqual(c.js("$('ax-numbers').children.length"), 5)
+            for panel in ("ax-river", "ax-machines", "ax-lanes", "ax-tokens", "ax-heat"):
+                self.assertTrue(c.js("$('%s').children.length > 0" % panel), panel)
+            self.assertEqual(c.js("crewAnalytics.stats().nodes"), c.js("state.agents.length") + 1)  # and you
+            self.assertIn(self.agent.whoami(), c.js("$('ax-canvas').getAttribute('aria-label')"))
+            # Live: a message flies along its path, from the poll the page makes anyway.
+            sent = c.js("crewAnalytics.stats().sent")
+            self.agent.call("hub_send", to="all", text="For the analytics view")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the message to fly")
+            self.assertTrue(c.js("crewAnalytics.stats().animating"))
+            # 60 frames a second with 20 agents and messages in flight: a frame draws in well under 16 ms.
+            self.assertLess(c.js("crewAnalytics.bench(120, 20)"), 16)
+            # Replay: back to the start of the day, then live again.
+            c.js("crewAnalytics.replay(Number($('ax-scrub').min))")
+            self.assertTrue(c.js("$('ax-when').textContent.startsWith('Replay') && !$('ax-live').hidden"))
+            c.click("#ax-live")
+            self.assertEqual(c.js("[$('ax-when').textContent, crewAnalytics.stats().replay]"), ["Live", None])
+            # Presenting: one panel at a time, under the numbers; Esc ends it.
+            c.click("#ax-present")
+            self.assertEqual(c.js("document.querySelectorAll('#analytics .ax-current').length"), 1)
+            c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
+            c.until("!document.body.classList.contains('ax-present')", what="the end of presenting")
+            # Reduced motion: a message lights its path for a moment; nothing flies.
+            c.call("Emulation.setEmulatedMedia", features=[{"name": "prefers-reduced-motion", "value": "reduce"}])
+            c.until("crewAnalytics.stats().reduced", what="reduced motion")
+            sent = c.js("crewAnalytics.stats().sent")
+            self.agent.call("hub_send", to="all", text="Quietly, please")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the quiet message")
+            self.assertEqual(c.js("[crewAnalytics.stats().particles, crewAnalytics.stats().flashes > 0]"), [0, True])
+            # Dark, on a phone: the page's own colours, and nothing wider than the screen.
+            c.size(375, 812, mobile=True, dark=True)
+            c.until("innerWidth === 375 && crewAnalytics.stats().shown", what="a phone")
+            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 375)
+            self.assertLessEqual(c.js("$('analytics').scrollWidth"), 375)
+            self.assertNotEqual(c.js("getComputedStyle(document.querySelector('.ax-card')).backgroundColor"),
+                                "rgb(255, 255, 255)")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.size(1280, 900)
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
+    def test_the_code_by_who_holds_it(self):
+        # Roadmap C8: up to 500 files, each shows; beyond that, folders, opened with a click.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view")
+            graph = lambda n: json.dumps({"on": True, "commit": "abc", "more": 0, "links": [[0, 1, 1], [1, n - 1, 2]],  # noqa: E731
+                                          "files": ["mod%d/sub/f%d.py" % (i % 9, i) for i in range(n)]})
+            self.assertEqual(c.js("crewAnalytics.code(%s)" % graph(480))["files"], 480)
+            shown = c.js("crewAnalytics.code(%s)" % graph(1500))
+            self.assertEqual((shown["files"], shown["folders"]), (0, 9))
+            x, y = shown["first"]
+            c.js("(() => { const cv = $('ax-code').querySelector('canvas'), b = cv.getBoundingClientRect();"
+                 " cv.dispatchEvent(new MouseEvent('click', {clientX: b.left + %f, clientY: b.top + %f})); })()" % (x, y))
+            opened = c.js("crewAnalytics.code()")
+            self.assertEqual((opened["folders"], opened["files"] > 100), (8, True))  # that folder's files show
+            self.assertIn("1500 files", c.js("$('ax-code').innerText"))
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
+    def test_the_analytics_sample_data(self):
+        # Roadmap X3: the sample the public demo shows, in the app too; it never mixes with the chat.
+        c = self.chrome
+        try:
+            c.click("#view-analytics")
+            c.until("window.crewAnalytics && crewAnalytics.stats().report", what="the analytics view")
+            crew = c.js("crewAnalytics.stats().nodes")
+            name = self.agent.whoami()
+            c.click("#ax-sample")
+            self.assertEqual(c.js("[crewAnalytics.stats().demo, crewAnalytics.stats().nodes, $('ax-sample').ariaPressed]"),
+                             [True, 9, "true"])  # its crew of eight, and you
+            self.assertIn("Sample data: a made-up crew", c.js("$('ax-demo-note').textContent"))
+            self.assertFalse(c.js("$('ax-demo-note').hidden"))
+            sent = c.js("crewAnalytics.stats().sent")
+            c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
+            sample = c.js("$('ax-canvas').getAttribute('aria-label')")
+            self.agent.call("hub_send", to="all", text="Not one for the sample")
+            c.until("$('log').textContent.includes('Not one for the sample')", what="the message in the chat")
+            # The chat stays out of it (its agent may share a name with one of the sample's: the crew is the same).
+            self.assertEqual((c.js("$('ax-canvas').getAttribute('aria-label')"), c.js("crewAnalytics.stats().nodes")), (sample, 9))
+            c.click("#ax-sample")
+            c.until("!crewAnalytics.stats().demo && crewAnalytics.stats().nodes === %d" % crew, what="the chat's own crew")
+            self.assertIn(name, c.js("$('ax-canvas').getAttribute('aria-label')"))
+            self.assertNotEqual(c.js("$('ax-canvas').getAttribute('aria-label')"), sample)
+            self.assertTrue(c.js("$('ax-demo-note').hidden"))
+            c.click("#ax-sample")  # left on, then the view closed: off again when it reopens
+            c.click("#view-analytics")
+            c.click("#view-analytics")
+            c.until("crewAnalytics.stats().shown && !crewAnalytics.stats().demo", what="the view without the sample")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("sessionStorage.removeItem('crewchat-view')")
+            c.open(self.m.url + "/")
+            c.until("!!document.getElementById('log')")
+
     def test_phone_and_dark_mode(self):
         c = self.chrome
         try:
@@ -753,6 +902,53 @@ class NewPage(Signed):
             c.size(1280, 900)
             c.open(self.m.url + "/")
             c.until("!!document.getElementById('log')")
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class PublicDemo(unittest.TestCase):
+    """Roadmap X3: crewchat.dev/demo, the analytics view on its sample data with no crewchat server, served with the
+    headers firebase.json gives the site (a policy that allows no inline script or style)."""
+
+    def test_the_demo_runs_in_the_browser_under_the_sites_policy(self):
+        import functools
+        import http.server
+        sys.path.insert(0, str(H.ROOT / "site"))
+        import build
+        site = build.build(H.TMP / "site")
+        policy = json.loads((H.ROOT / "firebase.json").read_text())["hosting"]["headers"][0]["headers"]
+
+        class Site(http.server.SimpleHTTPRequestHandler):
+            def end_headers(self):
+                for header in policy:
+                    self.send_header(header["key"], header["value"])
+                super().end_headers()
+
+            def log_message(self, *args):
+                pass
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(Site, directory=str(site)))
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        c = Chrome()
+        self.addCleanup(c.close)
+        c.size(1280, 900)
+        # Anything the policy refuses is noted before the page's own scripts run.
+        c.call("Page.addScriptToEvaluateOnNewDocument", source="window.refused = []; document.addEventListener("
+               "'securitypolicyviolation', (e) => window.refused.push(e.violatedDirective + ' ' + e.blockedURI));")
+        c.open("http://127.0.0.1:%d/demo/" % server.server_address[1])
+        c.until("window.crewAnalytics && crewAnalytics.stats().demo && crewAnalytics.stats().report", what="the demo")
+        self.assertEqual(c.js("crewAnalytics.stats().nodes"), 9)
+        self.assertIn("A demo: a made-up crew", c.js("$('ax-demo-note').textContent"))  # it says what it is
+        self.assertTrue(c.js("$('ax-sample').hidden"))  # nothing to switch to
+        self.assertGreater(c.js("$('ax-numbers').children.length"), 4)
+        self.assertGreater(c.js("document.querySelectorAll('#ax-heat .ax-tile').length"), 5)
+        code = c.js("crewAnalytics.code()")
+        self.assertEqual((code["files"], code["folders"], code["held"] > 0), (28, 0, True))  # coloured by holder
+        self.assertTrue(c.js("[...document.querySelectorAll('#analytics .avatar img')].every((i) => i.complete && i.naturalWidth)"))
+        sent = c.js("crewAnalytics.stats().sent")
+        c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
+        self.assertEqual(c.js("getComputedStyle(document.querySelector('.ax-card')).borderRadius"), "18px")  # styled
+        self.assertEqual(c.js("window.refused"), [])
+        self.assertEqual(c.errors, [])
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")

@@ -5,7 +5,7 @@ its core.
 
 ## Ground rules
 
-- **No dependencies in the core.** `crewchat.py` and `crewchat_peers.py` use the standard library
+- **No dependencies in the core.** `crewchat.py`, `crewchat_peers.py` and `crewchat_map.py` use the standard library
   only, and `crewchat.py` must keep working when copied on its own to another machine. Cloud sync
   (`crewchat_cloud.py`) is the one optional part with libraries.
 - **The server binds to 127.0.0.1.** Changes that make it listen elsewhere will not be merged;
@@ -22,8 +22,9 @@ its core.
 | `crewchat.py` | The server, the MCP tools, the chat page, hooks, and every command |
 | `crewchat_peers.py` | Linking machines over Tailscale |
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
+| `crewchat_map.py` | The code map: files, definitions and imports of the project's code (standard library) |
 | `install.sh`, `install.ps1` | The installers: macOS and Linux's one line; on Windows the README uses uv and PyPI, and `install.ps1` serves older notes |
-| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines) |
+| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines), `test_map.py` (the code map) |
 | `e2e/` | End-to-end tests: real servers, agents' hooks, the chat page, linked machines, the installer |
 | `tools/docs_screenshots.py` | Makes the pictures in `docs/images` |
 
@@ -33,7 +34,9 @@ its core.
 python3 -m unittest discover -s tests -v
 ```
 
-The cloud-sync tests need `pip install cryptography`; they are skipped without it.
+The cloud-sync tests need `pip install cryptography`; they are skipped without it. The code map's
+accurate readers (C9) are tested with `pip install tree-sitter tree-sitter-java tree-sitter-kotlin
+tree-sitter-javascript tree-sitter-typescript`, and the regular-expression readers without them.
 
 Before a release, run the end-to-end tests too. They start real servers in a throwaway folder
 with the `crewchat` command, and drive them as agents and the owner would:

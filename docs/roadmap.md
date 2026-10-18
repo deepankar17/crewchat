@@ -33,29 +33,29 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P1](#p1) | Lightweight hook script | Speed and efficiency | P1 | M | Done | P0 |
 | [P2](#p2) | Trim agent tool schemas and outputs | Speed and efficiency | P1 | M | Done | P0 |
 | [P3](#p3) | Fast startup from the message log | Speed and efficiency | P2 | S | Done | P0 |
-| [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | To do | P0 |
-| [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | To do | P0 |
-| [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | To do | none |
-| [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | To do | none |
+| [P4](#p4) | Split fixed data out of /api/poll | Speed and efficiency | P2 | S | Done | P0 |
+| [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | Done | P0 |
+| [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | Done | none |
+| [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | Done | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
-| [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | To do | P1 |
-| [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | To do | S1 |
-| [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
-| [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | To do | C0 |
-| [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | To do | C0, C1 |
-| [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | To do | C1, C2 |
-| [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | To do | C0, S1 |
-| [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | To do | C1 |
-| [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | To do | C1 |
-| [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | To do | C1, X1 |
-| [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | To do | none |
-| [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | To do | Y1 |
-| [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | To do | Y1 |
-| [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | To do | Y1 |
-| [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | To do | P4, X4 |
-| [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | To do | P1 |
-| [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | To do | X1 |
-| [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | To do | X2 |
+| [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
+| [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
+| [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | Done | C1 |
+| [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | Done | C0 |
+| [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | Done | C0, C1 |
+| [C4](#c4) | Blast-radius warnings | Code-aware coordination | P2 | S | Done | C1, C2 |
+| [C5](#c5) | Collaboration history links | Code-aware coordination | P2 | M | Done | C0, S1 |
+| [C6](#c6) | Project brief for joining agents | Code-aware coordination | P2 | S | Done | C1 |
+| [C7](#c7) | Lead split suggestions | Code-aware coordination | P3 | M | Done | C1 |
+| [C8](#c8) | Code map view on the chat page | Code-aware coordination | P3 | M | Done | C1, X1 |
+| [Y1](#y1) | Automatic coordinator (no fixed machine) | Multi-machine sync gaps | P2 | S | Done | none |
+| [Y2](#y2) | Claims when the posting machine is off | Multi-machine sync gaps | P2 | M | Done | Y1 |
+| [Y3](#y3) | Catch-up beyond 24 hours | Multi-machine sync gaps | P2 | M | Done | Y1 |
+| [Y4](#y4) | Shared files over cloud sync | Multi-machine sync gaps | P2 | M | Done | Y1 |
+| [X1](#x1) | Analytics data endpoint | Analytics page | P1 | M | Done | P4, X4 |
+| [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
+| [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | Done | X1 |
+| [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | Done | X2 |
 
 ## Speed and efficiency
 
@@ -217,7 +217,7 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 
 ### P4
 
-**Split fixed data out of /api/poll** · P2 · effort S · To do
+**Split fixed data out of /api/poll** · P2 · effort S · Done
 
 **Goal.** The chat page's long-poll carries only what changed, not every constant on every change.
 
@@ -244,9 +244,14 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 
 **Depends on:** [P0](#p0)
 
+**Status.** Done. The classic page was gone already. Owner's choices (17 Oct): roles move to /api/boot as
+well, and every poll carries `boot`, a tag of what /api/boot returns, which changes with the server version
+or the roles, so the page fetches it again then; `statuses` moved too. The poll finds new messages by
+halving (no `bisect` key on Python 3.9). The answer for one new message went from 5,659 to 2,333 bytes.
+
 ### P5
 
-**Coalesce state.json writes** · P3 · effort S · To do
+**Coalesce state.json writes** · P3 · effort S · Done
 
 **Goal.** Fewer full rewrites of state.json as the task sheet grows.
 
@@ -272,9 +277,15 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 
 **Depends on:** [P0](#p0)
 
+**Status.** Done. A one-shot timer (`_save_soon`, `SAVE_DELAY` 1 s) rather than a thread of its own. Owner's
+choices (17 Oct): read positions, status lines, sessions and presence wait; claims, links, the sheet and
+progress, renames, removals and owner settings are written at once (an immediate write takes what waits
+with it). SIGTERM and `crewchat stop` flush first. The benchmark counts state.json writes for a fixed busy
+load in its own process: 179 before, 60 after.
+
 ### P6
 
-**Index messages by id** · P3 · effort S · To do
+**Index messages by id** · P3 · effort S · Done
 
 **Goal.** Remove linear scans when looking up a message by id.
 
@@ -299,9 +310,14 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 
 **Depends on:** nothing
 
+**Status.** Done: `Hub.by_id`, kept by `_store` (and its trimming) and rebuilt with `ids` by `_index` after a
+load, `_apply_renames` and `adopt_open_tasks`; used by `_task`, the advisor's answers, `adopt_open_tasks` and
+crewchat_peers' `claim_task`. `_apply_renames` stays a scan (it also follows `task` references) and runs only
+at load when there are renames.
+
 ### P7
 
-**Compress and cache the chat page** · P3 · effort S · To do
+**Compress and cache the chat page** · P3 · effort S · Done
 
 **Goal.** Fast reloads of the 156 KB page, especially on phones.
 
@@ -325,6 +341,11 @@ whose text held one. `bench.py --log-mb 500` times startup with a grown log; num
 - None significant.
 
 **Depends on:** nothing
+
+**Status.** Done. The page was 170 KB and sent with `Cache-Control: no-store`, so the browser kept nothing and
+never asked again with an ETag. Owner's choice (18 Oct): the page's HTML (the same for everyone, no chat data)
+is `private, no-cache` with an ETag, so a reload is a 304 of 491 bytes; the first load is gzipped (47 KB). The
+API stays `no-store`, the sign-in check comes before any 304, and the CSP is unchanged.
 
 ## Storage rules
 
@@ -364,7 +385,7 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C0
 
-**Opt-in full-path edit events** · P1 · effort S · To do
+**Opt-in full-path edit events** · P1 · effort S · Done
 
 > **Decided:** On by default for the Software team pack, off for every other pack (owner, 17 Oct).
 
@@ -403,11 +424,22 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 **Owner's note:** we can on it of coding projects and keep it off for other project types
 
+**Status.** Done. Owner's choice (18 Oct): the events go in a local SQLite file, `events.sqlite` per project,
+written by the server only and never synced (docs/storage.md now says so). The light tool-call hook works out
+the edited file's path relative to the project (`edited_path`: Claude Code's Edit, MultiEdit, Write and
+NotebookEdit, Cursor's afterFileEdit, the other tools' own names; nothing outside the folder) and sends it only
+while the server's last answer said edits are kept; the server checks it again (`clean_edit_path`) and keeps
+it with the agent and the task it works on. `edit_tracking` per project: auto (on for the software pack),
+on, off; always off with activity off. Shown and set in the project panel ("Files agents edit"), by
+`crewchat edits` and `/api/edits`. Codex's apply_patch names no single file, so its edits are not seen yet.
+
 ### C1
 
-**Built-in code map (stdlib)** · P2 · effort L · To do
+**Built-in code map (stdlib)** · P2 · effort L · Done
 
-> **Decided:** After Python: Java, React, Angular and Kotlin (owner, 17 Oct).
+> **Decided:** After Python: Java, React, Angular and Kotlin (owner, 17 Oct). One map per repository and
+> branch name, not per project (owner, 18 Oct): `projects/<id>/maps/<key>.sqlite`, the key a hash of the
+> repository (its origin remote, else its top folder) and the branch, so checkouts of one branch share a map.
 
 **Goal.** A local map of files, definitions and imports that CrewChat can query, with no dependencies.
 
@@ -446,7 +478,7 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C9
 
-**Accurate parsers as an optional extra** · P3 · effort M · To do
+**Accurate parsers as an optional extra** · P3 · effort M · Done
 
 **Goal.** Exact parsing for Java, Kotlin, TS/JS and Angular for users who opt in, without adding dependencies to the core.
 
@@ -474,7 +506,11 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C2
 
-**Auto-suggest and check task areas** · P1 · effort M · To do
+**Auto-suggest and check task areas** · P1 · effort M · Done
+
+> **Decided:** Suggest when a task goes to review or done: the folders edited while it was held, grouped,
+> at most five. The owner accepts with Accept files in the task panel (or `crewchat tasks areas ID accept`),
+> the lead with a new hub_task action `areas` (owner, 18 Oct).
 
 **Goal.** Fill in a task's areas from what the agent actually edits, and catch overlaps the prefix check misses.
 
@@ -505,7 +541,7 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C3
 
-**Interface-change notices** · P1 · effort M · To do
+**Interface-change notices** · P1 · effort M · Done
 
 **Goal.** When an agent changes a function or class signature, agents whose tasks depend on it hear about it at once.
 
@@ -536,7 +572,11 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C4
 
-**Blast-radius warnings** · P2 · effort S · To do
+**Blast-radius warnings** · P2 · effort S · Done
+
+> Built after C2, which already keeps two tasks over certainly linked code from running at once: so a firm
+> note mostly comes with a task given by the lead or the owner (which C2 does not stop), and taking one
+> brings the hints on guessed links.
 
 **Goal.** Warn, not block, when a task is taken that touches code another agent's task depends on.
 
@@ -563,7 +603,10 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C5
 
-**Collaboration history links** · P2 · effort M · To do
+**Collaboration history links** · P2 · effort M · Done
+
+> **Decided:** A tool only the lead and the advisor get (`hub_code`); every other agent's tool list stays as it
+> was (owner, 18 Oct).
 
 **Goal.** Answer 'who changed this file, for which task, and what was said about it'.
 
@@ -591,7 +634,9 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C6
 
-**Project brief for joining agents** · P2 · effort S · To do
+**Project brief for joining agents** · P2 · effort S · Done
+
+> **Decided:** A generated skill (and a Cursor rule read on demand), not a block in AGENTS.md (owner, 18 Oct).
 
 **Goal.** A new agent starts with a short map of the project instead of exploring from scratch.
 
@@ -617,7 +662,10 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C7
 
-**Lead split suggestions** · P3 · effort M · To do
+**Lead split suggestions** · P3 · effort M · Done
+
+> **Decided:** A tool only the lead and the advisor get (`hub_code`); every other agent's tool list stays as it
+> was (owner, 18 Oct).
 
 **Goal.** Help the lead hand each agent a module that hangs together.
 
@@ -643,7 +691,7 @@ Ideas borrowed from Graphify, built stdlib-only inside crewchat. Software projec
 
 ### C8
 
-**Code map view on the chat page** · P3 · effort M · To do
+**Code map view on the chat page** · P3 · effort M · Done
 
 **Goal.** See files and modules coloured by which agent holds them.
 
@@ -673,7 +721,7 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 ### Y1
 
-**Automatic coordinator (no fixed machine)** · P2 · effort S · To do
+**Automatic coordinator (no fixed machine)** · P2 · effort S · Done
 
 > **Decided:** No always-on machine assumed. Whichever machine is online takes over as coordinator for the session (owner, 17 Oct).
 
@@ -709,11 +757,21 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 **Depends on:** nothing
 
+**Status.** In progress: the coordinator itself is done (docs/cloud-sync-design.md section 8a). Cloud sync:
+the lease `meta/coordinator`, renewed every 30 s for 90 s, taken with the conditional write `transact` (a
+client transaction needs permissions a signed-in user lacks), handed on at a clean stop, cleared with the
+account. Tailscale: the preferred machine if reachable, else the lowest reachable tag; the preference
+travels in pull answers (newest wins). `crewchat coordinator [NAME|none]`, `/api/coordinator`, and the
+page's connection line. Tested: takeover when the coordinator goes off (Tailscale within a minute in the
+test; cloud at the next renewal after the lease runs out, so under 2 minutes), the preferred machine taking
+the role back. The two "Done when" checks about claims (none stuck; one holder after a split) came with
+Y2, which marked Y1 Done.
+
 **Owner's note:** no, users may not have an always on machine. it is possible that they will try to keep a machine always on, but it is possible that his one of the devices will be off due to some personal reasons. in that case whichever device is on, we need to make that as primary device for that session
 
 ### Y2
 
-**Claims when the posting machine is off** · P2 · effort M · To do
+**Claims when the posting machine is off** · P2 · effort M · Done
 
 **Goal.** Over Tailscale, tasks posted on a machine that is off can still be taken.
 
@@ -739,9 +797,19 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 **Depends on:** [Y1](#y1)
 
+**Status.** Done. `claim_task` asks the posting machine; if it cannot be reached, the coordinator (Y1, chosen
+without that machine) settles it under its term, in `Mesh.claim` with the origin recorded. Every decision
+carries a Lamport clock and the deciding machine's tag; pull answers carry the decisions (the newest 500), a
+claim decided only elsewhere is adopted (the posting machine, back, takes over the coordinator's), and two
+decisions for two agents keep the earlier one: the machine whose holder changes posts a take with
+`settled` (a new EXTRA_FIELDS entry, so every machine fixes its holder) and tells the other agent to stop.
+
 ### Y3
 
-**Catch-up beyond 24 hours** · P2 · effort M · To do
+**Catch-up beyond 24 hours** · P2 · effort M · Done
+
+> **Decided:** Over Tailscale, the messages of a machine that is off by then come through the coordinator
+> (owner, 18 Oct).
 
 **Goal.** A machine that was off for days catches up on every message, from whichever machine is online.
 
@@ -768,7 +836,7 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 ### Y4
 
-**Shared files over cloud sync** · P2 · effort M · To do
+**Shared files over cloud sync** · P2 · effort M · Done
 
 **Goal.** Files shared on one machine open on another when using cloud sync.
 
@@ -795,13 +863,20 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 **Depends on:** [Y1](#y1)
 
+**Status.** Done for files up to 5 MB (`CLOUD_FILE_MAX`): the machine that writes the message seals the file in
+512 KB parts (`files/{fid}-{n}`, bound to the account, project, file, part and device), deleted with its message;
+another machine's `fetch_file` reads and checks them. A bigger file, or one gone from the cloud, says which machine
+has it. Larger files: cloud mode has no route between machines except Firestore, so (owner, 18 Oct) they stay on
+their machine and the message says why (the free Firebase plan's quota) and how to change it: on a paid plan,
+`cloud_file_mb` in config.json raises the cap, up to crewchat's 20 MB for a shared file.
+
 ## Analytics page
 
 A live view of the crew at work, computed on the owner's machine, plus a public demo.
 
 ### X1
 
-**Analytics data endpoint** · P1 · effort M · To do
+**Analytics data endpoint** · P1 · effort M · Done
 
 > **Decided:** Yes, show token and cost numbers per agent (owner, 17 Oct). Collection is specced in X4.
 
@@ -835,11 +910,23 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 
 **Depends on:** [P4](#p4), [X4](#x4)
 
+**Status.** Done. Owner-only `POST /api/analytics {days}`: `Analytics` keeps running totals built once
+from the whole messages.jsonl in a background thread at start (counting the log up to the number it held then;
+newer messages come through `_store`, so nothing counts twice and no id set is kept), then fed every new
+message. Messages per hour and per day (by agent and machine), by kind, who-to-whom pairs, the task funnel
+(posted, taken, done, in review, blocked now; median time to take, cycle time, time blocked; review pass rate;
+done today), advisor verdicts, reclaims, files shared, each agent's message counts and first and last message
+with its activity and online state now, and X4's tokens and estimated cost. 50,000 messages: built in about
+140 ms, answered in under 1 ms. Agent timelines (owner, 18 Oct: kept in the local events.sqlite, with C0's
+edits): each change of an agent's state (working, listening, idle) is recorded as it happens, an idle one when
+a listening hook does not ask again within its grace, and `timelines` gives [start, end, state] pieces per agent
+for the days asked; nothing is recorded while activity is off.
+
 **Owner's note:** yes i want
 
 ### X4
 
-**Token and cost tracking** · P1 · effort M · To do
+**Token and cost tracking** · P1 · effort M · Done
 
 **Goal.** Know how many tokens each agent, task and model uses, and roughly what that costs, without reading any conversation content.
 
@@ -872,9 +959,18 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 
 **Depends on:** [P1](#p1)
 
+**Status.** Done. The stop hook (full crewchat, not the light script: only the tool-call hook moved in P1)
+reads the transcript from its last offset and sends `{model: [input, output, cache read, cache write, cache
+write 1h]}` as its own `/api/hook` call (`event: usage`), counting each assistant message once (its lines
+repeat the usage). Kept in state.json (`usage`: day, agent, model; and on the sheet row of the task the agent
+last reported on). Cursor: its hooks give a transcript path but no token counts, and its transcript holds
+none, so it shows "not available". Prices from Anthropic's list of 2026-10-06 (`PRICES`, `PRICES_DATE`).
+Shown by `crewchat usage`, `/api/usage` and a line in the agent panel. Not done yet: carrying the totals to
+other machines (the spec's "can"), left for X1.
+
 ### X2
 
-**Analytics show-off page** · P1 · effort L · To do
+**Analytics show-off page** · P1 · effort L · Done
 
 **Goal.** A page that makes people say 'this is awesome': the crew working, live, at a glance.
 
@@ -909,7 +1005,7 @@ A live view of the crew at work, computed on the owner's machine, plus a public 
 
 ### X3
 
-**Demo mode with sample data** · P2 · effort S · To do
+**Demo mode with sample data** · P2 · effort S · Done
 
 > **Decided:** Public demo on the website, linked from GitHub (owner, 17 Oct).
 

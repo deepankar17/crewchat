@@ -2,7 +2,9 @@
 
 Needs the `cryptography` library; skipped without it. Google's Firestore library is not needed.
 """
+import base64
 import contextlib
+import json
 import os
 import shutil
 import sys
@@ -10,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -191,6 +194,95 @@ class Sync(unittest.TestCase):
         for m in (self.a, self.b):
             m.stop()
 
+    def test_shared_files_open_on_the_other_machine(self):
+        # Roadmap Y4: a file up to 5 MB travels with its message, encrypted, in pieces under Firestore's limit.
+        data = os.urandom(cloud.CLOUD_FILE_MAX)  # a 5 MB screenshot: ten pieces
+        meta = self.a.hub.add_file("screenshot.png", data, "image/png")
+        msg = self.a.hub.send(crewchat.OWNER, "all", "see the screenshot", files=[meta])
+        wait_until(lambda: self.b.has("see the screenshot"), message="the message")
+        wait_until(lambda: self.store.get("files/%s-9" % meta["id"]), message="the file's last piece")
+        got, path = self.b.hub.open_file(meta["id"])
+        self.assertEqual((got["name"], path.read_bytes()), ("screenshot.png", data))
+        # Firestore holds ciphertext only: neither the bytes, nor the name, nor the message.
+        stored = json.dumps(self.store.docs, default=str)
+        self.assertNotIn("screenshot", stored)
+        self.assertNotIn(base64.b64encode(data[:300]).decode()[:200], stored)
+        self.assertEqual(self.store.get("files/%s-0" % meta["id"])["parts"], 10)
+        self.assertTrue(all(len(json.dumps(d)) < 1024 * 1024 for k, d in self.store.docs.items() if k.startswith("files/")))
+        # A file too big to travel stays on its machine, and says so.
+        big = self.a.hub.add_file("video.mov", os.urandom(cloud.CLOUD_FILE_MAX + 1), "video/quicktime")
+        self.a.hub.send(crewchat.OWNER, "all", "the video", files=[big])
+        wait_until(lambda: self.b.has("the video"), message="the second message")
+        with self.assertRaises(crewchat.HubError) as e:
+            self.b.hub.open_file(big["id"])
+        self.assertIn("on mac only", str(e.exception))
+        self.assertIn("paid (Blaze) plan, raise cloud_file_mb", str(e.exception))  # why, and what the owner can do
+        self.assertIsNone(self.store.get("files/%s-0" % big["id"]))
+        # A piece changed in the cloud does not open.
+        small = self.a.hub.add_file("notes.txt", b"tamper with me", "text/plain")
+        self.a.hub.send(crewchat.OWNER, "all", "the notes", files=[small])
+        wait_until(lambda: self.store.get("files/%s-0" % small["id"]), message="the notes in the cloud")
+        doc = dict(self.store.get("files/%s-0" % small["id"]))
+        doc["ct"] = doc["ct"][:-4] + ("AAAA" if not doc["ct"].endswith("AAAA") else "BBBB")
+        self.store.set("files/%s-0" % small["id"], doc)
+        with self.assertRaises(crewchat.HubError) as e:
+            self.b.hub.open_file(small["id"])
+        self.assertIn("cannot fetch that file from the cloud", str(e.exception))
+        # Delivered everywhere: the pieces go with the messages.
+        for m in (self.a, self.b):
+            m.sync.marks["synced_to"] = time.time() + 60
+            m.sync.housekeeping()
+        self.a.sync.housekeeping()
+        self.assertFalse([k for k in self.store.docs if k.startswith("files/")])
+        self.assertTrue(msg)
+
+    def test_on_a_paid_plan_the_owner_can_let_bigger_files_travel(self):
+        for m in (self.a, self.b):
+            m.sync.file_max = 7 * 1024 * 1024  # cloud_file_mb = 7
+        data = os.urandom(6 * 1024 * 1024)
+        meta = self.a.hub.add_file("recording.mov", data, "video/quicktime")
+        self.a.hub.send(crewchat.OWNER, "all", "the recording", files=[meta])
+        wait_until(lambda: self.b.has("the recording"), message="the message")
+        wait_until(lambda: self.store.get("files/%s-11" % meta["id"]), message="the last piece")
+        self.assertEqual(self.b.hub.open_file(meta["id"])[1].read_bytes(), data)
+        self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
+                         crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file
+
+    def test_whichever_machine_is_on_holds_the_coordinators_lease(self):
+        # Roadmap Y1: a lease in meta/coordinator, renewed by its holder, taken over once it runs out.
+        now = [time.time()]
+        for m in (self.a, self.b):
+            m.sync.clock = lambda: now[0]
+        self.a.sync.renew_lease()
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        term = self.a.sync.coordinator()["term"]
+        self.b.sync.renew_lease()  # a live lease is left alone
+        self.assertEqual((self.b.sync.coordinator()["name"], self.b.sync.coordinator()["me"]), ("mac", False))
+        # The mac goes offline: its lease runs out, and the other machine takes it at its next renewal.
+        self.a.link.online = False
+        self.a.sync.renew_lease()  # cannot reach the cloud: nothing changes there
+        now[0] += cloud.LEASE_SECS + 1
+        self.b.sync.renew_lease()
+        self.assertEqual(self.b.sync.coordinator(), {"name": "windows", "me": True, "term": term + 1, "preferred": ""})
+        self.a.link.online = True
+        self.a.sync.renew_lease()
+        self.assertFalse(self.a.sync.coordinator()["me"])  # back, but the lease is someone else's now
+        # The owner prefers the mac: it takes the role back at its next renewal, and the other lets go.
+        self.assertEqual(self.b.sync.set_preferred("mac")["preferred"], "mac")
+        self.a.sync.renew_lease()
+        self.assertEqual(self.a.sync.coordinator()["term"], term + 2)
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.b.sync.renew_lease()
+        self.assertFalse(self.b.sync.coordinator()["me"])
+        # Stopping hands it on at once rather than after LEASE_SECS.
+        self.a.sync.release_lease()
+        self.b.sync.renew_lease()
+        self.assertTrue(self.b.sync.coordinator()["me"])
+        self.b.sync.set_preferred("none")
+        self.assertEqual(self.b.sync.coordinator()["preferred"], "")
+        with self.assertRaises(cloud.CloudError):
+            self.b.sync.set_preferred("nowhere")
+
     def test_messages_reach_the_other_machine_with_global_ids(self):
         msg = self.a.say("all", "hello from the mac")
         self.assertEqual(msg["id"], "A%d" % msg["seq"])
@@ -283,6 +375,45 @@ class Sync(unittest.TestCase):
             self.a.hub.take(agent, task["id"])
         self.a.link.online = True
         wait_until(lambda: self.b.has("written offline"), timeout=20, message="the offline message")
+
+    def test_a_machine_off_for_three_days_gets_every_message_through_the_coordinator(self):
+        # Roadmap Y3, done when: a machine off for three days, longer than the cloud keeps messages, gets every
+        # message once it is back, in order, as long as some machine was on meanwhile.
+        self.b.stop()  # windows is off
+        texts = ["while windows was off %d: %s" % (i, "x" * 3000) for i in range(30)]  # a few parts' worth
+        for text in texts:
+            self.a.say("all", text)
+        wait_until(lambda: len(self.store.list("messages")) >= 30, message="the messages to be in the cloud")
+        for doc_id, _ in self.store.list("messages"):  # three days on: the cloud has dropped them
+            self.store.delete("messages/" + doc_id)
+        self.a.sync.renew_lease()
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.b.sync.marks["synced_to"] = time.time() - 3 * 86400  # windows last heard from the cloud then
+        self.b.sync._save_marks()
+        with mock.patch.object(cloud, "CATCHUP_PARTS", 1):  # paged: one part at a time, the next once it is read
+            self.b.sync = cloud.CloudSync(self.b.hub, self.b.link, self.b.device, log=lambda text: None).start()
+            wait_until(lambda: all(self.b.has(t) for t in texts), timeout=30, message="windows to catch up")
+        with self.b.hub.lock:
+            got = [m["text"] for m in self.b.hub.messages if m["text"].startswith("while windows was off")]
+        self.assertEqual(got, texts)  # every one, once, in order
+        self.assertEqual({m["origin"] for m in self.b.hub.messages if m["text"] in texts}, {self.a.device.id})
+        wait_until(lambda: not self.store.list("catchup_parts") and not self.store.list("catchups"),
+                   message="the parts to be deleted once read")
+        self.assertGreater(float(self.b.sync.marks["synced_to"]), time.time() - 3600)  # it will not ask again
+
+    def test_a_catch_up_keeps_the_order_when_times_are_equal(self):
+        # A coarse clock (Windows) gives many messages one time: they come in their writer's order, A9 before A10.
+        with mock.patch("time.time", return_value=1792000000.0):
+            sent = [self.a.say("all", "same instant %d" % i) for i in range(12)]
+        got = [m["id"] for m in self.a.hub.messages_since(1792000000.0 - 1) if m["text"].startswith("same instant")]
+        self.assertEqual(got, [m["id"] for m in sent])
+
+    def test_a_machine_away_for_less_than_the_ttl_does_not_ask(self):
+        self.b.stop()
+        self.b.sync.marks["synced_to"] = time.time() - 3600
+        self.b.sync = cloud.CloudSync(self.b.hub, self.b.link, self.b.device, log=lambda text: None).start()
+        self.assertEqual(self.store.list("catchups"), [])
+        self.assertEqual(self.a.sync.serve_catch_ups(), 0)
 
     def test_tampered_messages_are_dropped(self):
         original = self.store.set

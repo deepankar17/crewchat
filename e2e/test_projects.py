@@ -20,6 +20,10 @@ class Projects(unittest.TestCase):
         cls.a.link()
         cls.b = cls.m.agent(folder=cls.test2)
         cls.b.link()
+        # Names are drawn per project, so two projects' first agents may get the same one: name them apart.
+        for x, name in ((cls.a, "Alder"), (cls.b, "Birch")):
+            x.call("hub_rename", name=name)
+            x.whoami()
         for x in (cls.a, cls.b):
             x.stop_hook()
 

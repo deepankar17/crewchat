@@ -114,7 +114,11 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
 | `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
 | `crewchat tasks` | The task sheet |
+| `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
+| `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |
+| `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
 | `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks areas ID accept\|PATHS` | A task's files: accept the folders crewchat suggested from what its holder changed, or set them |
 | `crewchat tasks assign ID AGENT` | Give a task to an agent |
 | `crewchat tasks move ID up\|down\|top` | Reorder |
 | `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |
@@ -156,6 +160,7 @@ Registered under another name than `crewchat`, its tools are allowed without ask
 | `crewchat peers invite` | Print a join command for another machine (sets up this machine's tailnet address the first time) |
 | `crewchat peers join URL CODE` | Link this machine, with the command from an invite |
 | `crewchat peers status` | Linked machines, and which are reachable |
+| `crewchat coordinator [NAME\|none]` | Which linked machine coordinates now (settles claims for a machine that is off, serves catch-up and files); with a name, the one that should whenever it is on |
 | `crewchat peers remove NAME` | Drop a machine and change the shared key (asks first; `--yes` does not) |
 | `crewchat peers leave` | Unlink this machine (asks first, naming it; `--yes` does not) |
 
@@ -202,7 +207,8 @@ Other settings in `~/.crewchat/config.json`:
 | Key | |
 |---|---|
 | `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
-| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24) |
+| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24). A machine off for longer catches up from the coordinator; only when every machine was off for longer are messages lost |
+| `cloud_file_mb` | Cloud sync: the largest shared file that travels to your other machines, in MB (default 5, at most 20). The default keeps within the free Firebase plan's quota (1 GiB stored, 20,000 writes and 50,000 reads a day); raise it on a paid (Blaze) plan |
 | `roles` | The project's own roles (`crewchat roles add` writes them) |
 | `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
 | `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |

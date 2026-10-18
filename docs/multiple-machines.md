@@ -76,8 +76,10 @@ crewchat peers leave             # unlink this machine
 
 How it works: each server asks every other one for news, with long-polls that wait until there is
 something new, so messages arrive within a moment. A machine that was off catches up on what it
-missed when it is back. Traffic goes over Tailscale's encrypted network only, and each request
-carries a key the machines share.
+missed when it is back, however long it was away: each machine keeps every message in its own log,
+and the messages of a machine that is off by then come from the coordinator (`crewchat
+coordinator`), which has them. Traffic goes over Tailscale's encrypted network only, and each
+request carries a key the machines share.
 
 ## With cloud sync
 
@@ -119,7 +121,10 @@ Firestore, and the next machine to log in founds the account again.
 
 Messages are encrypted on each machine before they leave it, so whoever runs the Firebase project
 sees only scrambled data. They are deleted from Firestore once every machine has them, and after
-24 hours at the latest, so a machine that is off for longer misses them. The design, and why:
+24 hours at the latest. A machine that was off for longer asks the coordinator when it is back, and
+gets every message it missed from that machine's own log, encrypted, through Firestore. If every
+machine was off for longer than that, those messages are gone: keep them longer with
+`cloud_ttl_hours` in config.json (for example `72`). The design, and why:
 [cloud-sync-design.md](cloud-sync-design.md).
 
 ## Or: one host for every machine
@@ -184,13 +189,22 @@ pair the projects you mean.
 - **Message numbers** gain the machine's letter (`#A12`, `#B7`) so they stay unique without a
   central counter. Agents can write them either way (`BID A12: yes`).
 - **Tasks** are taken by exactly one agent on any machine. Over Tailscale, the machine a task was
-  posted on settles it, so taking it needs that machine to be on.
+  posted on settles who took it; while that machine is off, the coordinator settles it instead, and
+  the posting machine takes over the decision when it is back. If two machines that could not reach
+  each other both gave a task away, the earlier claim stands once they meet again, and the other
+  agent is told to stop.
 - **Roles, assignments and progress** travel like messages, so a lead on one machine can run a
   team across several.
-- **The chat page** works on any linked machine: each has the whole chat.
+- **The chat page** works on any linked machine: each has the whole chat. Its connection line says
+  which machine coordinates now: one machine at a time does what needs one machine to act for the
+  others, and whichever is on takes it over. `crewchat coordinator NAME` names the one you prefer
+  when it is on.
 - **Adding an agent** from the chat page starts it on the machine serving that page.
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
-  a file when someone first opens it. With cloud sync, a file can only be opened on the machine it
-  was shared on, for now.
+  a file when someone first opens it. With cloud sync, a file up to 5 MB travels with its message,
+  encrypted, and is deleted from the cloud with it; a bigger one opens only on the machine it was
+  shared on, and says so. The 5 MB keeps within the free Firebase plan's quota (1 GiB stored,
+  20,000 writes and 50,000 reads a day). On a paid (Blaze) plan, set `cloud_file_mb` in
+  crewchat's `config.json` (up to 20) to let bigger files travel.
 
 Back to the [README](../README.md) · Next: [Your phone](phone.md)

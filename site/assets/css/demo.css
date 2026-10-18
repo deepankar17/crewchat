@@ -1,0 +1,23 @@
+/* The public demo's page around the analytics view (its colours and the view's own styles are in
+   /demo/analytics.css, copied from crewchat.py when the site is built). */
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body { margin: 0; display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.demo-bar { display: flex; align-items: center; gap: 12px; padding: 10px max(18px, calc((100% - 1120px) / 2));
+  border-bottom: 1px solid var(--line); background: var(--panel); }
+.demo-bar .brand { display: flex; align-items: center; gap: 8px; color: var(--ink); font-weight: 700; font-size: 17px;
+  text-decoration: none; }
+.demo-tag { font-size: 13px; color: var(--muted); }
+.demo-bar .pill { margin-left: auto; background: var(--accent); color: var(--on-accent); border-radius: 999px;
+  padding: 6px 14px; font-size: 14px; font-weight: 600; text-decoration: none; }
+#analytics { flex: 1; min-height: 0; }
+.view-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; }
+.view-head h2 { font-size: 16px; margin: 0; color: var(--ink); }
+.meta { font-size: 12.5px; color: var(--muted); }
+.avatar { position: relative; display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 34px; height: 34px; border-radius: 50%; background: var(--tint); }
+.avatar img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; }
+.avatar img.art { border-radius: 0; object-fit: contain; width: 92%; height: 92%; }
+.avatar .initials { color: var(--ink); font-size: 12.5px; font-weight: 700; }
+@media (max-width: 560px) { .demo-tag { display: none; } }

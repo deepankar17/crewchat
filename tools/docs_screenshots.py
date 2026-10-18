@@ -8,6 +8,8 @@ Needs Google Chrome. Everything runs in a throwaway folder; nothing touches ~/.c
 arguments it makes every scene; name scenes to make only those (see SCENES at the bottom).
 """
 import base64
+import functools
+import http.server
 import json
 import os
 import shutil
@@ -441,10 +443,49 @@ def scene_terminals(b):
         subprocess.run(["pkill", "-f", "serve --log %s" % (h / "hub.log")])
 
 
+def scene_analytics(b):
+    """The analytics view on its sample data, as the public demo shows it (site/build.py builds it, and it is served
+    here as crewchat.dev serves it): light and dark pictures, and a short GIF of the crew talking."""
+    sys.path.insert(0, str(ROOT / "site"))
+    import build
+    site = build.build(TMP / "site")
+    quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(site)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/demo/" % server.server_address[1]
+    try:
+        for dark, name in ((False, "analytics-light"), (True, "analytics-dark")):
+            b.size(1280, 900, scale=1, dark=dark)
+            b.open(url, wait=4)
+            b.shoot(name)
+        # The GIF: the crew, as messages fly between them, for about six seconds.
+        b.size(1100, 760, scale=1)
+        b.open(url, wait=4)
+        x, y, w, h = b.js("(() => { const r = document.querySelector('.ax-hero').getBoundingClientRect();"
+                          " return [r.x, r.y, r.width, r.height]; })()")
+        frames = TMP / "frames"
+        frames.mkdir(exist_ok=True)
+        started, count = time.time(), 0
+        while time.time() - started < 6:
+            shot = b.call("Page.captureScreenshot", format="png",
+                          clip={"x": x, "y": y, "width": w, "height": h, "scale": 1})
+            (frames / ("%03d.png" % count)).write_bytes(base64.b64decode(shot["data"]))
+            count += 1
+            time.sleep(0.04)
+        rate = count / (time.time() - started)  # as fast as the frames came, so it plays at the speed it ran
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-framerate", "%.2f" % rate, "-i", str(frames / "%03d.png"),
+                        "-vf", "scale=760:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];"
+                        "[b][p]paletteuse=dither=bayer:bayer_scale=4", "-loop", "0", str(OUT / "analytics-demo.gif")],
+                       check=True)
+        print("  docs/images/analytics-demo.gif (%d frames)" % count)
+    finally:
+        server.shutdown()
+
+
 SCENES = {
     "sign-in": scene_sign_in, "empty-chat": scene_empty_chat, "team": scene_team,
     "agents-joined": scene_agents_joined, "task": scene_task, "add-agent": scene_add_agent,
-    "files": scene_files, "phone": scene_phone, "terminals": scene_terminals,
+    "files": scene_files, "phone": scene_phone, "terminals": scene_terminals, "analytics": scene_analytics,
 }
 
 

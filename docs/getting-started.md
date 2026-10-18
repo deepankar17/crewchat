@@ -392,6 +392,26 @@ crewchat tasks done A12                                # or todo (back on the sh
 
 A message you post as a task also goes on the sheet.
 
+**A task's files.** `--areas` says which files a task changes, as path prefixes. Two tasks over the
+same files never run at once, and in a project with edit tracking on (`crewchat edits`), neither
+do two tasks where one's code imports the other's: crewchat's code map knows (`crewchat map`; for exact
+parsing of Java, Kotlin, JavaScript and TypeScript, add the `map` extra: `uv tool install "crewchat[cloud,map]"`). An
+agent often changes more than its task said. When it marks the task ready for review or done,
+crewchat suggests the folders it changed outside the task's areas (at most five, grouped by folder)
+to the lead, or to you. Accept them with **Accept files** in the task's panel, or:
+
+```bash
+crewchat tasks areas A12 accept           # add the suggested files
+crewchat tasks areas A12 app/login/,docs/ # or set them yourself
+```
+
+A lead accepts them with `hub_task` action `areas`.
+
+When an agent takes a task, or the lead or you give it one, and another agent's task in progress works on
+code this one's files import or are imported by, the agent is told which task and whose, so they agree any
+change to what they share. A guess (a class of the same package, found by name) is only a hint. It never
+stops anyone taking the task.
+
 **When an agent goes silent.** A crashed session would keep its task until someone gave it back,
 so crewchat reclaims it: a task whose holder has shown no sign of life for 60 minutes (no tool
 call, no hook; a hook waiting for messages counts as alive) goes back on the sheet,
@@ -413,6 +433,32 @@ The setting reaches every linked machine. The machine a task was posted on recla
 machine is off, its tasks stay with their holders. Run the same crewchat version on every linked
 machine: an older one does not know reclaims and keeps showing the old holder.
 
+## Analytics
+
+**Analytics**, next to Tasks and Commands, shows the crew at a glance, live:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/analytics-dark.png">
+  <img src="images/analytics-light.png" width="760" alt="The analytics view on its sample data: the day's numbers at the top, then the crew round 'You' with the paths between them wider where they talk more, and a slider to replay the day; below, the task river and the machines.">
+</picture>
+
+- **The crew:** your agents round you, with their pictures, roles and machines. Each message flies from its
+  sender to whoever it is for, and a path grows wider the more two of them talk. Click an agent for its card.
+- **Numbers:** tasks done today, messages today, agents active now, the median time to take a task, the
+  review pass rate and today's tokens.
+- **Tasks**, flowing from posted to done, with how long they take; **the day, agent by agent** (working,
+  waiting for messages, idle); **machines** and their agents; **tokens and cost** per agent and per task,
+  and the cost per day; a **code heat map** of the files agents edit, coloured by who edits each most; and
+  **the code, by who holds it**: the project's files in their folders, each coloured by the agent whose task
+  covers it, with the imports between them (folders only past 500 files: click one to open it).
+- **Replay the day**, or drag the slider, to watch it all again. **Present** shows it full screen, one
+  panel after another, for a demo or a screen on the wall (Esc ends it).
+
+It is worked out on your machine from the chat, and follows the page's light or dark mode. With reduced
+motion set on your device, messages light up their path instead of flying. **Sample data** shows a made-up
+crew and a day of its work instead, the same as the [live demo](https://crewchat.dev/demo/): never mixed with
+your chat, and off again when you leave the view.
+
 ## What agents learn: rules and skills
 
 Every folder of a project gets crewchat's guide in the form each tool reads by itself: a Claude
@@ -428,6 +474,12 @@ carries two things you set per project:
   have, installed in each folder's `.claude/skills/`. Add one on the page, or `crewchat skills add
   PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out everywhere. A
   skill of your own by the same name is never touched.
+
+With edit tracking on, each folder also gets **the code at a glance**, for agents that join: a skill
+(`.claude/skills/crewchat-brief/`) and a Cursor rule its agent reads when it wants, made from the code
+map. They list the main parts, the files most others use, where the code starts, and who works on what
+now, under about 1,500 tokens, stamped with the commit they were made at. They are rewritten when the
+code or the sheet moves on; `AGENTS.md` only gets a line pointing to them.
 
 ## Upgrade and uninstall
 

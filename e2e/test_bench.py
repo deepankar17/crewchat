@@ -1,5 +1,6 @@
 """The benchmark (bench.py, roadmap P0) runs, measures what it says, and catches a regression."""
 import json
+import statistics
 import os
 import tempfile
 import unittest
@@ -12,13 +13,17 @@ class Bench(unittest.TestCase):
         numbers = bench.measure(agents=2, messages=30, runs=2, say=lambda *a: None, log_mb=2)
         self.assertGreater(numbers.pop("messages.jsonl bytes, grown"), 2 * 1024 * 1024 * 0.9)
         self.assertTrue(numbers.pop("server startup, 2 MB log (s)"))
+        self.assertLess(statistics.median(numbers.pop("analytics: answer, 50,000 messages (s)")), 0.2)  # X1's limit
+        self.assertTrue(numbers.pop("analytics: build, 50,000 messages (s)"))
         for k in ("server memory after startup (MB)", "server memory, 2 MB log (MB)"):
             self.assertGreater(numbers.pop(k, 1), 0, k)  # where ps can read it
         self.assertEqual(set(numbers), {
             "messages.jsonl bytes", "hook: tool call, tells the server (s)", "hook: tool call, skipped (s)",
             "hook: prompt (s)", "hook: end of turn, nothing new (s)", "poll: open the chat (s)",
             "poll: open the chat (bytes)", "poll: one new message (s)", "poll: one new message (bytes)",
-            "tools/list (chars)", "hub_inbox, 50 unread (chars)", "server startup (s)"})
+            "page: first load (bytes)", "page: reload (bytes)",
+            "tools/list (chars)", "hub_inbox, 50 unread (chars)", "state.json writes, a busy load (count)",
+            "server startup (s)"})
         for k, v in numbers.items():
             if k.endswith("(s)"):
                 self.assertEqual(len(v), 2, k)

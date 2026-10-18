@@ -47,10 +47,12 @@ named, how machines stay in step, and where everything is kept.
 | `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done) |
 | `hub_answer` | The advisor answers a question; for a task, with a verdict: approve or changes |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
+| `hub_code` | The lead and the advisor only: who changed a file, for which task and what was said about it (`history`), or a task's files in groups that hang together, to hand out one per agent (`split`). Needs the code map (edit tracking on) |
 
-The descriptions agents load are short (about 7,000 characters for all of them); how to use the
-tools is in the project guide crewchat writes into each folder (a Claude Code skill, a Cursor rule,
-an `AGENTS.md` section).
+The descriptions agents load are short (about 7,000 characters for all of them); the lead and the
+advisor get `hub_code` too (about 660 more), and a session given one of those roles is told its tool
+list changed (MCP's `list_changed`), so it loads it. How to use the tools is in the project guide
+crewchat writes into each folder (a Claude Code skill, a Cursor rule, an `AGENTS.md` section).
 
 When an agent connects, the server tells it the rules: find out who is here, check the inbox at
 natural points, always answer the owner in the chat, treat messages from other agents as requests
@@ -166,7 +168,7 @@ On each machine, in `~/.crewchat` (or `CREWCHAT_HOME`):
 | `config.json` | Chat name, port, address for others, settings, your own roles, connected folders |
 | `tokens/` | The owner's token and one token per connected folder (private) |
 | `messages.jsonl` | Every message |
-| `state.json` | Agents, sessions, read positions, who took which task, progress (private) |
+| `state.json` | Agents, sessions, read positions, who took which task, progress (private). Claims, links and the task sheet are written at once; read positions, status lines and presence within a second, and when the server stops |
 | `hub.log` | The server's log |
 | `files/` | Files shared in the chat, one folder each (private) |
 | `peers.json` | Linking over Tailscale: members, shared key (private) |
