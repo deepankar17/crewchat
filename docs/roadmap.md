@@ -39,7 +39,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | Done | none |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
-| [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | To do | S1 |
+| [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
 | [C9](#c9) | Accurate parsers as an optional extra | Code-aware coordination | P3 | M | To do | C1 |
 | [C2](#c2) | Auto-suggest and check task areas | Code-aware coordination | P1 | M | To do | C0 |
 | [C3](#c3) | Interface-change notices | Code-aware coordination | P1 | M | To do | C0, C1 |
@@ -435,9 +435,11 @@ on, off; always off with activity off. Shown and set in the project panel ("File
 
 ### C1
 
-**Built-in code map (stdlib)** · P2 · effort L · To do
+**Built-in code map (stdlib)** · P2 · effort L · Done
 
-> **Decided:** After Python: Java, React, Angular and Kotlin (owner, 17 Oct).
+> **Decided:** After Python: Java, React, Angular and Kotlin (owner, 17 Oct). One map per repository and
+> branch name, not per project (owner, 18 Oct): `projects/<id>/maps/<key>.sqlite`, the key a hash of the
+> repository (its origin remote, else its top folder) and the branch, so checkouts of one branch share a map.
 
 **Goal.** A local map of files, definitions and imports that CrewChat can query, with no dependencies.
 

@@ -59,7 +59,7 @@ class Install(unittest.TestCase):
                                        capture_output=True, text=True).stdout.strip(), version)
         # Cloud sync's libraries came with it.
         py = next((self.home / "uv-tools" / "crewchat" / "bin").glob("python3*"))
-        subprocess.run([str(py), "-c", "import cryptography, crewchat_cloud, crewchat_peers"], check=True)
+        subprocess.run([str(py), "-c", "import cryptography, crewchat_cloud, crewchat_map, crewchat_peers"], check=True)
         # Run a chat with the installed command, as a person would.
         os.environ["CREWCHAT_BIN"] = str(self.exe)
         try:

@@ -29,6 +29,10 @@ What crewchat reads on your machine and keeps there:
   off for others; `crewchat edits on|off|auto`). The hook sends the path of each file an agent edits
   inside the project folder, never what it wrote and never a path outside the project, and it is kept
   on this machine in `events.sqlite`. Other machines only ever see what is worked out from it.
+- **A map of the project's code,** while edits are kept: the server reads the source files of the
+  project's folders (Python, Java, Kotlin, JavaScript and TypeScript, Angular templates) and keeps their
+  paths, the names of the classes and functions in them and which file imports which, in `maps/` in the
+  project's crewchat folder. Never the code itself; it never leaves the machine (`crewchat map`).
 
 - **When each agent was working, waiting for messages or idle,** for the timelines on the analytics
   page: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept

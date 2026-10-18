@@ -64,7 +64,14 @@ class Chrome:
         return out.get("result", {}).get("value")
 
     def until(self, expression, timeout=15, what=None):
-        return eventually(lambda: self.js(expression), timeout, what or expression)
+        def check():
+            try:
+                return self.js(expression)
+            except RuntimeError as e:  # a page still loading after a click navigated: its script is not in yet
+                if "is not defined" in str(e):
+                    return None
+                raise
+        return eventually(check, timeout, what or expression)
 
     def open(self, url):
         self.call("Page.navigate", url=url)

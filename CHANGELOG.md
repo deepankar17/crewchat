@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **A map of your project's code**, for the coming overlap checks and interface-change notices: which
+  file imports which, and the classes and functions in each, for Python, Java, Kotlin, React (JS, JSX, TS,
+  TSX) and Angular (selectors in templates, injected services). Built on your machine with the standard
+  library while edit tracking is on, one per repository and branch, and read again when agents edit files
+  or the branch moves; the crewchat repository maps in about 0.4 s and an edit in under 0.1 s.
+  `crewchat map FILE` shows what a file uses, `--importers` what uses it.
 - **crewchat knows which files your agents edit**, in a project whose team edits code: the path of each
   file an agent edits inside the project (never what it wrote), kept on your machine in `events.sqlite`.
   On by default for a software team and off for others; the project panel's "Files agents edit" and

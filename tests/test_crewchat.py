@@ -3635,6 +3635,44 @@ class Hooks(Base):
             crewchat.save_config(config)
             self.hub.roster.refresh(force=True)
 
+    def test_edits_keep_the_code_map_up_to_date(self):
+        # Roadmap C1: the map of the project's code, built while edit tracking is on, read again after an edit.
+        code = Path(tempfile.mkdtemp(prefix="mapped-", dir=self.folder)).resolve()  # inside the project
+        (code / "shop.py").write_text("def pay():\n    pass\n")
+        (code / "cart.py").write_text("import json\n")
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        status = crewchat.post_json(self.base + "/api/map", self.owner, {})
+        self.assertTrue(status["on"])
+        self.assertEqual(status["maps"][0]["files"], 2)
+        session, name = self.linked("map-turn")
+        (code / "cart.py").write_text("from shop import pay\npay()\n")
+        crewchat.MAP_WAKE.clear()
+        self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Edit",
+                                   "tool_input": {"file_path": str(code / "cart.py")}})  # learns that edits are kept
+        self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Write",
+                                   "tool_input": {"file_path": str(code / "cart.py")}})
+        self.assertTrue(crewchat.MAP_WAKE.is_set())  # the map thread wakes
+        self.assertEqual(self.hub.update_map(), {str(code): ["cart.py"]})
+        out = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "imports", "path": "cart.py"})
+        self.assertEqual([(f["path"], f["kind"]) for f in out["files"]], [("shop.py", "calls"), ("shop.py", "imports")])
+        self.assertIn("commit", out)
+        out = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "importers", "path": str(code / "shop.py")})
+        self.assertEqual({f["path"] for f in out["files"]}, {"cart.py"})
+        self.assertIn("shop.py", cli("map", "cart.py"))
+        self.assertIn("pay", cli("map", "shop.py", "--defs"))
+        self.assertIn("2 files", cli("map"))
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/map", self.token, {})  # the owner's, not an agent's
+        crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "off"})  # no edit tracking: no map
+        try:
+            self.assertEqual(crewchat.post_json(self.base + "/api/map", self.owner, {})["on"], False)
+            self.assertEqual(self.hub.update_map(), {})
+            self.assertIn("edit tracking", cli("map"))
+        finally:
+            crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "auto"})
+
     def test_an_agents_day_is_recorded_for_its_timeline(self):
         # Roadmap X1: working while a turn runs, idle when it ends without listening.
         session, name = self.linked("timeline-turn")

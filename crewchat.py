@@ -1469,6 +1469,8 @@ class Hub:
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
+        self._maps = None  # the code maps of the project's folders (C1), made when first wanted
+        self._map_edited = False  # an agent edited a file since the maps were last brought up to date
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -2240,6 +2242,28 @@ class Hub:
             return False
         setting = self.roster.edit_tracking
         return setting == "on" or setting == "auto" and self.roster.pack == DEFAULT_PACK
+
+    # Code map (C1) -------------------------------------------------------------------------------
+    def code_maps(self):
+        """The code maps of the project's folders (crewchat_map.py), or None: kept only while edit tracking is on,
+        and only when crewchat_map.py is next to crewchat.py (a crewchat.py copied alone works without)."""
+        if not self.edits_on():
+            return None
+        if self._maps is None:
+            try:
+                import crewchat_map
+            except ImportError:
+                return None
+            self._maps = crewchat_map.Maps(self.roster.root)
+        return self._maps
+
+    def update_map(self):
+        """Bring the maps up to date: the files agents edited, and any folder whose HEAD moved."""
+        maps = self.code_maps()
+        if maps is None:
+            return {}
+        edited, self._map_edited = self._map_edited, False
+        return maps.check(self.project_folders(), edited)
 
     # Token usage (X4) ---------------------------------------------------------------------------
     def usage_on(self):
@@ -3344,6 +3368,8 @@ class Hub:
                 clean = clean_edit_path(path) if tracking and path else ""
                 if clean:  # a file it edited, inside its project (C0): kept on this machine only
                     self.events.add_edit(name, clean, self._usage_task(name))
+                    self._map_edited = True  # the code map reads it again (C1)
+                    MAP_WAKE.set()
                 return {"edits": tracking}  # the hook sends edited paths only while this is true
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
@@ -4315,6 +4341,10 @@ COMMANDS = [
         ("edits [show|auto|on|off] [--days N]",
          "Which files this project's agents edit (paths inside the project only, kept on this machine): auto keeps "
          "them for a software team and not for other teams; on or off for any. With show, the files edited lately.", None),
+        ("map [PATH] [--importers|--defs]",
+         "The code map of this project's folders, kept on this machine while edit tracking is on. With no path, what "
+         "it holds and the commit it was built from; with a path, the files it uses, the files that use it "
+         "(--importers), or its classes and functions (--defs).", None),
         ("usage [show|on|off] [--days N]",
          "The tokens this project's agents used (Claude Code, counted at the end of each turn) per agent, day and "
          "task, and roughly what they would cost at API prices. on or off: keep counting them, or not.", None),
@@ -4520,7 +4550,7 @@ def link_info(hub, shared=True):
     return {"via": "none"} if hub.sync is None else dict(hub.sync.link_status(), shared=shared)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -5167,6 +5197,30 @@ class Handler(BaseHTTPRequestHandler):
                 "activity_off": self.hub.machine_config().get("activity") == "off",
                 "files": self.hub.events.files(time.time() - days * 86400)}
 
+    def _map(self, data):
+        """The code map (C1): op status (default), or imports, importers or defs of a path in the project's code.
+        Every answer says the commit it was built from."""
+        op = data.get("op") or "status"
+        if op not in ("status", "imports", "importers", "defs"):
+            raise HubError("op is status, imports, importers or defs")
+        maps = self.hub.code_maps()
+        if maps is None:
+            return {"on": False, "edits_on": self.hub.edits_on()}
+        folders = self.hub.project_folders()
+        if op == "status":
+            maps.check(folders)
+            return {"on": True, "maps": [m.status() for m in maps.all()]}
+        path = str(data.get("path") or "").strip()
+        if not path:
+            raise HubError("give a path")
+        cmap, rel = maps.find(folders, path)
+        if cmap is None:
+            raise HubError("no folder of this project on this machine has that file")
+        if not cmap.meta("built"):
+            maps.check(folders)
+        answer = {"imports": cmap.imports, "importers": cmap.importers, "defs": cmap.definitions}[op](rel)
+        return dict(answer, on=True)
+
     def _analytics(self, data):
         """Everything the analytics page shows, worked out here from the chat (X1): nothing leaves the machine."""
         try:
@@ -5460,7 +5514,8 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
                          "/api/push": self._push, "/api/usage": self._usage,
-                         "/api/analytics": self._analytics, "/api/edits": self._edits}
+                         "/api/analytics": self._analytics, "/api/edits": self._edits,
+                         "/api/map": self._map}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -6479,6 +6534,7 @@ def cmd_serve(args):
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
         threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=map_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=push_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
@@ -8738,6 +8794,25 @@ def flush_all(projects):
             sys.stderr.write("%s could not save %s: %s\n" % (now_iso(), project.name, e))
 
 
+MAP_EVERY = 30  # seconds between looks at whether a project folder's HEAD moved (C1)
+MAP_SETTLE = 2  # seconds an edit waits before the map reads it, so a burst of edits is read once
+MAP_WAKE = threading.Event()  # set when an agent edits a file
+
+
+def map_checks(projects):
+    """Keep the code maps up to date (C1): built at start, read again after agents edit files, and when a folder's
+    HEAD moves (a commit, a pull, another branch)."""
+    while True:
+        for project in projects.all():
+            try:
+                project.hub.update_map()
+            except Exception as e:  # one bad map must not stop the others
+                sys.stderr.write("%s could not update the code map of %s: %s\n" % (now_iso(), project.name, e))
+        if MAP_WAKE.wait(MAP_EVERY):
+            time.sleep(MAP_SETTLE)
+            MAP_WAKE.clear()
+
+
 def reclaim_checks(projects):
     """Every RECLAIM_EVERY seconds, each project puts back the tasks of holders silent too long."""
     while True:
@@ -9679,6 +9754,32 @@ def cmd_edits(args):
     print("Edited in the last %d days, most first:" % args.days)
     for f in out["files"]:
         print("  %-50s %4d  %s" % (f["path"][:50], f["edits"], ", ".join(f["agents"])))
+
+
+def cmd_map(args):
+    op = "status" if not args.path else "importers" if args.importers else "defs" if args.defs else "imports"
+    out = owner_call("/api/map", {"op": op, "path": args.path or ""})
+    if not out["on"]:
+        print("No code map: %s." % ("crewchat_map.py is not next to crewchat.py" if out.get("edits_on") else
+                                    "it is kept only while edit tracking is on (`crewchat edits on`)"))
+        return
+    if op == "status":
+        for m in out["maps"]:
+            print("%s (%s) at %s: %d files, %d links (%d certain), read in %.2f s" % (
+                m["repo"], m["branch"] or "no branch", (m["commit"] or "no commit")[:10], m["files"], m["links"],
+                m["certain"], m["took"]))
+        if not out["maps"]:
+            print("No folder of this project on this machine has code to map.")
+        return
+    print("%s at %s:" % (out["path"], (out["commit"] or "no commit")[:10]))
+    if op == "defs":
+        for d in out["definitions"]:
+            print("  %5d  %-10s %s" % (d["line"], d["kind"], d["name"]))
+        return
+    for f in out["files"]:
+        print("  %-60s %s%s" % (f["path"], f["kind"], "" if f["certain"] else " (a guess)"))
+    if not out["files"]:
+        print("  none")
 
 
 def cmd_usage(args):
@@ -13054,6 +13155,13 @@ def build_parser():
     p.add_argument("--days", type=int, default=7, help="days shown (default 7)")
     p.set_defaults(fn=cmd_edits)
 
+    p = sub.add_parser("map", help="the code map of this project's folders (kept while edit tracking is on): "
+                                   "what a file imports, or what imports it")
+    p.add_argument("path", nargs="?", help="a file, relative to its repository (default: the map's status)")
+    p.add_argument("--importers", action="store_true", help="the files that use this one")
+    p.add_argument("--defs", action="store_true", help="the classes and functions it defines")
+    p.set_defaults(fn=cmd_map)
+
     p = sub.add_parser("usage", help="the tokens this project's agents used, and roughly what that would cost at "
                                      "API prices; or turn keeping them on or off")
     p.add_argument("mode", nargs="?", default="show", choices=["show", "on", "off"])
@@ -13064,7 +13172,7 @@ def build_parser():
     p.set_defaults(fn=cmd_projects)
 
     for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
-                 "rules", "skills", "tasks", "usage", "edits"):
+                 "rules", "skills", "tasks", "usage", "edits", "map"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "
