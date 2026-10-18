@@ -345,6 +345,13 @@ class Sync(unittest.TestCase):
                    message="the parts to be deleted once read")
         self.assertGreater(float(self.b.sync.marks["synced_to"]), time.time() - 3600)  # it will not ask again
 
+    def test_a_catch_up_keeps_the_order_when_times_are_equal(self):
+        # A coarse clock (Windows) gives many messages one time: they come in their writer's order, A9 before A10.
+        with mock.patch("time.time", return_value=1792000000.0):
+            sent = [self.a.say("all", "same instant %d" % i) for i in range(12)]
+        got = [m["id"] for m in self.a.hub.messages_since(1792000000.0 - 1) if m["text"].startswith("same instant")]
+        self.assertEqual(got, [m["id"] for m in sent])
+
     def test_a_machine_away_for_less_than_the_ttl_does_not_ask(self):
         self.b.stop()
         self.b.sync.marks["synced_to"] = time.time() - 3600

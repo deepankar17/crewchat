@@ -1456,6 +1456,12 @@ CATCHUP_SLACK = 200  # a catch-up reads the log back this many messages past the
 CATCHUP_MARGIN = 600  # seconds before the point a cloud catch-up starts from, for machines' clocks that differ
 
 
+def catchup_order(msg):
+    """Where a message comes in a cloud catch-up: by time, then by machine and its running number, as many share a
+    time on a coarse clock (Windows) and ids do not sort as text (A10 before A9)."""
+    return float(msg.get("ts") or 0), str(msg.get("origin") or ""), origin_number(msg.get("id"))
+
+
 def log_from(path, seq):
     """messages.jsonl's messages after a running number, oldest first. Its lines are in the order of their numbers,
     so the place is found by halving the file, and only what follows is read: a page of a catch-up costs about
@@ -3183,7 +3189,7 @@ class Hub:
         since -= CATCHUP_MARGIN  # a few the asker has already are dropped by their ids
         found = self._read_back(lambda m: m.get("origin") and m.get("origin") != skip,
                                 lambda m: float(m.get("ts") or 0) <= since)
-        return sorted(found.values(), key=lambda m: (float(m.get("ts") or 0), m["id"]))
+        return sorted(found.values(), key=catchup_order)
 
     def _read_back(self, wanted, before):
         """The log's messages, newest first, until CATCHUP_SLACK in a row are before the point (messages from
