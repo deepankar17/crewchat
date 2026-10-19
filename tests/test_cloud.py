@@ -401,6 +401,25 @@ class Sync(unittest.TestCase):
                    message="the parts to be deleted once read")
         self.assertGreater(float(self.b.sync.marks["synced_to"]), time.time() - 3600)  # it will not ask again
 
+    def test_a_catch_up_through_the_cloud_goes_back_a_week(self):
+        # The owner's choice: over cloud sync a machine catches up on the last CATCHUP_DAYS (Firestore's free quota);
+        # older messages stay on the machines that have them.
+        self.b.stop()
+        with mock.patch("time.time", return_value=time.time() - 9 * 86400):
+            self.a.say("all", "nine days ago")
+        self.a.say("all", "this morning")
+        wait_until(lambda: len(self.store.list("messages")) >= 2, message="the messages to be in the cloud")
+        for doc_id, _ in self.store.list("messages"):
+            self.store.delete("messages/" + doc_id)
+        self.a.sync.renew_lease()
+        self.b.sync.marks["synced_to"] = time.time() - 10 * 86400  # off for ten days
+        self.b.sync._save_marks()
+        self.b.sync = cloud.CloudSync(self.b.hub, self.b.link, self.b.device, log=lambda text: None).start()
+        wait_until(lambda: self.b.has("this morning"), timeout=30, message="the recent message")
+        wait_until(lambda: not self.store.list("catchups"), message="the catch-up to be done")
+        self.assertFalse(self.b.has("nine days ago"))
+        self.assertTrue(self.a.has("nine days ago"))  # still on the machine that wrote it
+
     def test_a_catch_up_keeps_the_order_when_times_are_equal(self):
         # A coarse clock (Windows) gives many messages one time: they come in their writer's order, A9 before A10.
         with mock.patch("time.time", return_value=1792000000.0):

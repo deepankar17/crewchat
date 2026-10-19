@@ -87,7 +87,8 @@ messages they exchange.
 A message is deleted from Firestore once every trusted device has received it, and in any case
 after 24 hours (`cloud_ttl_hours`). A machine that was off for longer than that asks for a
 **catch-up** when it is back (roadmap Y3): it writes `catchups/{its id}` with the point it had
-read to, and the coordinator (Y1) answers from its own log with the messages written since, by
+read to, and the coordinator (Y1) answers from its own log with the messages written since (the last 7
+days at most, `CATCHUP_DAYS`: Firestore's free quota; over Tailscale a machine gets all of them), by
 every machine but the asker, sealed with the account key like any message, in parts of about
 40 KB under `catchup_parts/`: 25 parts at a time, the next ones once the asker has read and
 deleted those. Only when every machine was off for longer than `cloud_ttl_hours` are messages

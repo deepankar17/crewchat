@@ -122,7 +122,8 @@ Firestore, and the next machine to log in founds the account again.
 Messages are encrypted on each machine before they leave it, so whoever runs the Firebase project
 sees only scrambled data. They are deleted from Firestore once every machine has them, and after
 24 hours at the latest. A machine that was off for longer asks the coordinator when it is back, and
-gets every message it missed from that machine's own log, encrypted, through Firestore. If every
+gets the messages of the last 7 days it missed from that machine's own log, encrypted, through
+Firestore (to keep within the free plan's quota; older ones stay on the machines that have them). If every
 machine was off for longer than that, those messages are gone: keep them longer with
 `cloud_ttl_hours` in config.json (for example `72`). The design, and why:
 [cloud-sync-design.md](cloud-sync-design.md).

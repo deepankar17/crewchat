@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- **Catching up through the cloud goes back a week.** A machine away for longer than the cloud keeps messages gets
+  the last 7 days it missed through Firestore, to keep within the free plan's quota; older messages stay on the
+  machines that have them. Over Tailscale it still gets everything.
+- **A new lead whose agent tool cannot pick up a new tool mid-session** (an MCP protocol before 2025-03-26) is told,
+  in its role message, to start a new session to have `hub_code`.
 - **Indian first names**, 21 more: Aanya, Aarav, Aditya, Anika, Arjun, Dev, Diya, Isha, Ishaan, Kabir, Karan, Kavya,
   Kiran, Meera, Nikhil, Nisha, Pooja, Priya, Riya, Rohan, Vikram. Their faces, and Asha's, Ravi's and Uma's, have
   a warm brown skin tone and black or dark brown hair; a feminine one sometimes a bindi.

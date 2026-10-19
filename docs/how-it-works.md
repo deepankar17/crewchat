@@ -160,7 +160,7 @@ removing a member changes the key.
 listens for the others' in real time. Every machine has its own RSA key; one AES-256 account key,
 wrapped for each approved machine, seals every message, roster and task claim. Messages are
 deleted once every machine has them, and after 24 hours at the latest; a machine away for longer
-gets what it missed from the coordinator. The full design is in
+gets what it missed in the last 7 days from the coordinator. The full design is in
 [cloud-sync-design.md](cloud-sync-design.md).
 
 ## Where things live

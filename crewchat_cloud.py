@@ -65,6 +65,7 @@ CLAIM_TIMEOUT = 20
 LEASE_SECS = 90  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
 LEASE_RENEW = 30  # and any approved machine online takes it once it has run out
 CATCHUP_PART_BYTES = 40000  # messages per catch-up part, as JSON: sealed, it stays under the rules' 60,000 characters
+CATCHUP_DAYS = 7  # how far back a machine catches up through Firestore (Tailscale: all of it)
 CATCHUP_PARTS = 25  # parts the coordinator writes for a machine at a time: more once it has read those
 
 
@@ -1165,7 +1166,10 @@ class CloudSync(crewchat.ProjectLink):
                     continue
                 after = list(doc.get("after") or [float(doc.get("since") or 0) - crewchat.CATCHUP_MARGIN]) + ["", 0]
                 point = (float(after[0] or 0), str(after[1] or ""), int(after[2] or 0))
-                missed = [m for m in self.hub.messages_since(float(doc.get("since") or 0), skip=device_id)
+                # The last CATCHUP_DAYS only, through Firestore (its free plan's quota); older messages stay on
+                # the machines that have them. Over Tailscale a machine gets everything.
+                since = max(float(doc.get("since") or 0), time.time() - CATCHUP_DAYS * 86400)
+                missed = [m for m in self.hub.messages_since(since, skip=device_id)
                           if crewchat.catchup_order(m) > point]
                 parts, part, size = [], [], 0
                 for msg in missed:

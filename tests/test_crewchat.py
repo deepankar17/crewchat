@@ -1178,6 +1178,17 @@ class LeadTools(Base):
     """Owner, 18 Oct: the lead and the advisor get hub_code (C5 history, C7 split); every other agent's tools stay
     as short as they are. A session whose role changes is told its tool list changed (MCP list_changed)."""
 
+    def test_a_new_lead_on_an_older_protocol_is_told_to_start_again_for_hub_code(self):
+        for streams, told in ((False, True), (True, False)):
+            sid = self.hub.open_session("macbook", "claude")
+            name = self.hub.agent_for(sid)
+            with self.hub.lock:
+                self.hub.sessions[sid]["streams"] = streams  # what its initialize said (list_changed from 2025-03-26)
+            msg = self.hub.set_role(crewchat.OWNER, name, "lead")
+            self.assertEqual("start a new session to have it" in msg["text"], told, streams)
+            self.hub.set_role(crewchat.OWNER, name, "")
+            self.hub.remove(name)
+
     def role(self, name, role):
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": role})
 
