@@ -180,6 +180,30 @@ class Linked(unittest.TestCase):
         for m in self.machines:
             eventually(lambda: m.hub.taken.get(task["id"]) == winners[0], what="%s to know the taker" % m.name)
 
+    def test_a_pull_sends_only_the_decisions_the_asker_has_not_had(self):
+        # Each pull's answer carried every claim decision (up to 500), and the asker merged them all again.
+        mesh, sync = self.a.sync.mesh, self.a.sync
+        mesh.claim("only-a-1", "maya")
+        mesh.claim("only-a-2", "teo")
+        everything, last = mesh.decisions_after(0)
+        self.assertEqual(everything, mesh.decisions())
+        pull = lambda **kw: sync._pull(dict(since=self.a.hub.next_seq, wait=0, **kw))  # noqa: E731
+        self.assertEqual(pull(decided=last)["decisions"], {})
+        mesh.claim("only-a-3", "wren")
+        out = pull(decided=last)
+        self.assertEqual((list(out["decisions"]), out["decided"]), (["only-a-3"], last + 1))
+        old = pull()  # an older crewchat asks without a number: it gets them all, as before
+        self.assertEqual((old["decisions"], "decided" in old), (mesh.decisions(), False))
+        self.assertEqual(pull(decided=10 ** 9)["decisions"], mesh.decisions())  # a number from before a reset: all
+        # The others ask after the last they had, and adopted decisions count as changes of their own.
+        for m in (self.b, self.c):
+            eventually(lambda: m.sync.mesh.cursor(m.sync._key(peers.DECIDED + sync.device_id)) == last + 1,
+                       what="%s to have alpha's decisions up to the last" % m.name)
+            self.assertEqual(m.sync.mesh.data["claims"].get("only-a-3"), "wren")
+        theirs, n = self.b.sync.mesh.decisions_after(0)
+        self.assertIn("only-a-3", theirs)
+        self.assertGreater(n, 0)
+
     def test_the_machine_that_posted_a_task_decides_its_claim_key(self):
         x, y, z = self.a.agent(), self.a.agent(), self.c.agent()
         task = self.b.say("all", "handed around", "task")

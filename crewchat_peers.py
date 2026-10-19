@@ -47,7 +47,8 @@ TAGS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TAGS += [a + b for a in TAGS for b in TAGS]
 
 
-MAX_DECISIONS = 500  # claim decisions kept (and sent in pulls), newest first
+MAX_DECISIONS = 500  # claim decisions kept, newest first; a pull sends those the asker has not had
+DECIDED = "decided:"  # the cursor of the decisions had from a member: its key is this and the member's id
 
 
 def tag_rank(tag):
@@ -215,15 +216,32 @@ class Mesh:
                 clock = self.data["clock"] = int(self.data.get("clock") or 0) + 1
                 decided = self.data.setdefault("decided", {})
                 decided[task] = {"agent": agent, "clock": clock, "tag": self.me["tag"], "term": int(term),
-                                 "origin": origin or self.me["id"]}
+                                 "origin": origin or self.me["id"], "n": self._next_n()}
                 for old in sorted(decided, key=lambda k: decided[k]["clock"])[:-MAX_DECISIONS]:
                     del decided[old]
                 self.save()
             return claims[task]
 
+    def _next_n(self):
+        """The number of a change to the decisions here, counted up on this machine: a pull asks for those after
+        the last it got (decisions_after), not for all of them each time. Caller holds the lock."""
+        n = self.data["decided_n"] = int(self.data.get("decided_n") or 0) + 1
+        return n
+
     def decisions(self):
         with self.lock:
             return {k: dict(v) for k, v in self.data.get("decided", {}).items()}
+
+    def decisions_after(self, n):
+        """(the decisions made or adopted here after change number n, the number of the last change): what a member
+        that has had those up to n has not. All of them when n is not one of this machine's (0, or from before its
+        peers.json was made again)."""
+        with self.lock:
+            last = int(self.data.get("decided_n") or 0)
+            decided = self.data.get("decided", {})
+            if not 0 < n <= last:
+                return {k: dict(v) for k, v in decided.items()}, last
+            return {k: dict(v) for k, v in decided.items() if int(v.get("n") or 0) > n}, last
 
     def merge_decisions(self, decisions):
         """Another machine's claim decisions. A claim decided only there is adopted; one decided both here and
@@ -247,11 +265,11 @@ class Mesh:
                 clock = max(clock, theirs["clock"])  # Lamport: the next decision here (+1) comes after all seen
                 holder = claims.get(key)
                 if holder is None:
-                    claims[key], decided[key], touched = theirs["agent"], theirs, True
+                    claims[key], decided[key], touched = theirs["agent"], dict(theirs, n=self._next_n()), True
                 elif holder != theirs["agent"]:
                     mine = decided.get(key) or {"clock": 0, "tag": ""}  # settled before decisions were kept: first
                     if (theirs["clock"], tag_rank(theirs["tag"])) < (int(mine["clock"]), tag_rank(mine["tag"])):
-                        claims[key], decided[key], touched = theirs["agent"], theirs, True
+                        claims[key], decided[key], touched = theirs["agent"], dict(theirs, n=self._next_n()), True
                         if mine["tag"] in ("", self.me["tag"]):
                             changed.append((key, theirs["agent"], holder))
             if touched or clock != start:  # most pulls bring nothing new: peers.json is not rewritten for them
@@ -489,7 +507,8 @@ class PeerSync(crewchat.ProjectLink):
                 return
             try:
                 out = self._call(member, "/peer/pull", {"since": self.mesh.cursor(self._key(mid)), "v": version,
-                                                        "wait": PULL_WAIT})
+                                                        "wait": PULL_WAIT,
+                                                        "decided": self.mesh.cursor(self._key(DECIDED + mid))})
                 if self.chat is not None and out.get("chat") != self.chat:
                     # An older crewchat answers with its first project whatever we ask: not ours.
                     raise PeerError("no project %s there" % self.chat, 404)
@@ -613,6 +632,13 @@ class PeerSync(crewchat.ProjectLink):
         for gone in removed:
             self.hub.drop_remote(gone)
         self._settle(out.get("decisions"))
+        if "decided" in out:  # an older crewchat sends no number: it sends all its decisions each time
+            try:
+                decided = int(out["decided"])
+            except (TypeError, ValueError):
+                decided = 0
+            if decided != self.mesh.cursor(self._key(DECIDED + mid)):
+                self.mesh.set_cursor(self._key(DECIDED + mid), decided)
         cursor = self._key(mid)
         start = last = self.mesh.cursor(cursor)
         for msg in out.get("messages") or []:
@@ -787,7 +813,13 @@ class PeerSync(crewchat.ProjectLink):
         if older:
             own, agents, key = older, hub.local_state(), ""  # "" : the roster comes again with the next pull
         out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
-               "preferred": self.mesh.data.get("preferred"), "decisions": self.mesh.decisions()}
+               "preferred": self.mesh.data.get("preferred")}
+        try:
+            after = int(body.get("decided"))
+        except (TypeError, ValueError):  # an older crewchat asks for none: all of them, as it expects
+            out["decisions"] = self.mesh.decisions()
+        else:  # only those it has not had, and the number to ask after next time
+            out["decisions"], out["decided"] = self.mesh.decisions_after(after)
         if self.chat is None:
             out["members"] = self.mesh.everyone()
         else:
