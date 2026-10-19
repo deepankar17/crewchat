@@ -25,7 +25,7 @@ its core.
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
 | `crewchat_map.py` | The code map: files, definitions and imports of the project's code (standard library) |
 | `install.sh`, `install.ps1` | The one-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows (PowerShell) |
-| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines), `test_map.py` (the code map), `test_docs_images.py` (the docs' pictures and diagram alt text), `test_site.py` (the website's build) |
+| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines), `test_map.py` (the code map), `test_docs_images.py` (the docs' pictures and diagram alt text), `test_site.py` (the website's build), `test_workflows.py` (GitHub Actions run only for main) |
 | `e2e/` | End-to-end tests: real servers, agents' hooks, the chat page, linked machines, the installer |
 | `tools/docs_screenshots.py` | Makes the screenshots and terminal pictures in `docs/images` |
 | `tools/demo_recordings.py` | Records the animated demos in `docs/images` (and MP4 clips for videos) |

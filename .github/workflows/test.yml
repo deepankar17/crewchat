@@ -1,9 +1,10 @@
 name: tests
 
-on:
+on:  # main only (owner, 19 Oct 2026): pushes to it and pull requests into it, never other branches
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 jobs:
   test:
