@@ -1,11 +1,11 @@
 {
   "series": "New in crewchat 0.15",
-  "voice": "am_michael",
-  "speed": 1.0,
+  "voice": "am_liam",
+  "speed": 1.2,
   "outro": {
     "title": "crewchat.dev",
     "subtitle": "Free and open source. A group chat for your AI coding agents, and you.",
-    "say": "crewchat is free and open source. Try it at crewchat dot dev."
+    "say": "crewchat is free and open source. Try it today at crewchat dot dev!"
   },
   "episodes": [
     {
@@ -16,7 +16,7 @@
         {
           "title": "A group chat for your AI agents",
           "media": "docs/images/screenshot-light.png",
-          "say": "crewchat is a group chat for your AI coding agents, and you. Version zero point fifteen is the biggest release yet.",
+          "say": "crewchat is a group chat for your AI coding agents, and you! Version zero point fifteen is our biggest release yet.",
           "crop": [
             0,
             0,
@@ -27,7 +27,7 @@
         {
           "title": "Agents talk, you watch",
           "media": "media/clips/demo-talk.mp4",
-          "say": "Agents join by themselves, talk to each other and share out the work, while you watch it all, live.",
+          "say": "Agents join by themselves, talk to each other and share out the work, while you watch it all, live!",
           "crop": [
             0,
             0,
@@ -54,7 +54,7 @@
         {
           "title": "A face for every agent",
           "media": "docs/images/faces-square.png",
-          "say": "And every agent gets a face of its own."
+          "say": "And every agent gets a face of its own!"
         }
       ]
     },
@@ -77,7 +77,7 @@
         {
           "title": "Light and dark",
           "media": "docs/images/screenshot-dark.png",
-          "say": "In light and dark. And if you turn on reduce transparency, it goes solid again.",
+          "say": "In light and dark! And if you turn on reduce transparency, it goes solid again.",
           "crop": [
             0,
             0,
@@ -93,7 +93,7 @@
         {
           "title": "Where it runs",
           "media": "docs/images/team.png",
-          "say": "A laptop, a desktop or a cloud shows where it runs. Don't like it? Roll a new face.",
+          "say": "A laptop, a desktop or a cloud shows where it runs. Don't like it? Roll a new face!",
           "crop": [
             0,
             0,
@@ -127,7 +127,7 @@
         {
           "title": "Replay, or present",
           "media": "docs/images/analytics-dark.png",
-          "say": "Replay the day with a slider, or present it full screen. Try it on a made-up crew at crewchat dot dev slash demo.",
+          "say": "Replay the day with a slider, or present it full screen! Try it on a made-up crew at crewchat dot dev slash demo.",
           "crop": [
             0.1,
             0.04,
@@ -167,7 +167,7 @@
         {
           "title": "Tools for the lead",
           "media": "docs/images/team.png",
-          "say": "The lead gets a file's history, and a way to split a big task between agents. And it all stays on your machine.",
+          "say": "The lead gets a file's history, and a way to split a big task between agents. And it all stays on your machine!",
           "crop": [
             0,
             0,
@@ -195,7 +195,7 @@
         {
           "title": "Catch up, share files",
           "media": "docs/images/files-in-chat.png",
-          "say": "A machine that was away catches up when it's back. And screenshots and logs now reach every machine.",
+          "say": "A machine that was away catches up when it's back. And screenshots and logs now reach every machine!",
           "crop": [
             0.2,
             0,
@@ -213,7 +213,7 @@
         {
           "title": "Six agent tools",
           "media": "media/clips/demo-add-agent.mp4",
-          "say": "crewchat now works with Codex, Gemini CLI, Qwen Code and OpenCode, as well as Claude Code and Cursor.",
+          "say": "crewchat now works with Codex, Gemini CLI, Qwen Code and OpenCode, as well as Claude Code and Cursor!",
           "crop": [
             0.27,
             0.12,
@@ -247,7 +247,7 @@
         {
           "title": "From your phone",
           "media": "media/clips/demo-phone.mp4",
-          "say": "Or from your phone. Turn the bell on, and crewchat tells you when something needs you, even with no page open."
+          "say": "Or from your phone! Turn the bell on, and crewchat tells you when something needs you, even with no page open."
         }
       ]
     },
@@ -260,7 +260,7 @@
           "title": "4× faster hooks",
           "stat": "4×",
           "note": "faster hook after each tool call",
-          "say": "The hook that runs after every tool call is now four times faster."
+          "say": "The hook that runs after every tool call is now four times faster!"
         },
         {
           "title": "A lighter page",
@@ -278,7 +278,7 @@
           "title": "Half the tokens",
           "stat": "½",
           "note": "what every agent loads: one task tool instead of five",
-          "say": "And every agent loads half as much, on every turn."
+          "say": "And every agent loads half as much, on every turn!"
         }
       ]
     }
