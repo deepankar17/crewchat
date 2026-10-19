@@ -230,11 +230,23 @@ class Sync(unittest.TestCase):
         with self.assertRaises(crewchat.HubError) as e:
             self.b.hub.open_file(small["id"])
         self.assertIn("cannot fetch that file from the cloud", str(e.exception))
-        # Delivered everywhere: the pieces go with the messages.
+        # Delivered everywhere: the messages go, but a file stays for the retention, as nobody may have opened it
+        # yet (it is fetched when someone does).
+        later = self.a.hub.add_file("later.log", b"opened an hour on", "text/plain")
+        self.a.hub.send(crewchat.OWNER, "all", "the log", files=[later])
+        wait_until(lambda: self.b.has("the log") and self.store.get("files/%s-0" % later["id"]), message="the log")
         for m in (self.a, self.b):
             m.sync.marks["synced_to"] = time.time() + 60
             m.sync.housekeeping()
         self.a.sync.housekeeping()
+        self.assertFalse([k for k in self.store.docs if k.startswith("messages/")])
+        self.assertEqual(self.b.hub.open_file(later["id"])[1].read_bytes(), b"opened an hour on")
+        ttl, self.a.sync.ttl = self.a.sync.ttl, 0.001  # past the retention, they go
+        try:
+            time.sleep(0.01)
+            self.a.sync.housekeeping()
+        finally:
+            self.a.sync.ttl = ttl
         self.assertFalse([k for k in self.store.docs if k.startswith("files/")])
         self.assertTrue(msg)
 

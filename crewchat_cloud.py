@@ -1150,9 +1150,10 @@ class CloudSync(crewchat.ProjectLink):
         for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
             if now - float(doc.get("created") or now) > self.ttl:
                 self.store.delete(self.base + "tasks/" + doc_id)
+        # A file stays for the whole retention, even once every machine has its message: it is fetched only when
+        # someone opens it (Hub.open_file), which may be hours later.
         for doc_id, doc in self.store.list(self.base + "files", where=("dev", self.device_id)):
-            created = float(doc.get("created") or now)
-            if created <= everyone_has or now - created > self.ttl:  # as its message is
+            if now - float(doc.get("created") or now) > self.ttl:
                 self.store.delete(self.base + "files/" + doc_id)
         # Catch-ups: answer any waiting (the coordinator may have changed), read this machine's own, and drop
         # parts nobody read within the TTL.

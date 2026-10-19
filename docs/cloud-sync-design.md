@@ -70,7 +70,7 @@ Everything lives under the account's own ID:
 | `users/{uid}/devices/{deviceId}` | Device name, public key, the approval signature, the account key wrapped for this device, last-seen time | Names and public keys are readable; the wrapped key is not usable without the device's private key |
 | `users/{uid}/messages/{id}` | Sending device, key ID, nonce, ciphertext, server timestamp | Only the envelope; the content is encrypted |
 | `users/{uid}/tasks/{taskMessageId}` | Which device took the task, encrypted agent name | Device ID only |
-| `users/{uid}/files/{fileId}-{n}` | Part n of a file shared with a message (5 MB at most, in 32 KB parts, each within the security rules), encrypted; deleted with its message | Device ID, number of parts |
+| `users/{uid}/files/{fileId}-{n}` | Part n of a file shared with a message (5 MB at most, in 32 KB parts, each within the security rules), encrypted; kept for the retention (`cloud_ttl_hours`), as it is fetched only when someone opens it | Device ID, number of parts |
 | `users/{uid}/state/{deviceId}` | That device's roster, statuses and read positions, encrypted | No |
 | `users/{uid}/spaces/{space}/...` | A project besides the first: its own `messages`, `tasks` and `state` as above, and `marks/{deviceId}` (how far each machine has read it) | The space is a hash of the project's name and the account, so the name is not stored |
 
