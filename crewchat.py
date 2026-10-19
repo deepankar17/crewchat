@@ -92,6 +92,8 @@ COOKIE = "crewchat_session"
 MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an agent (config: max_chain)
 MAX_LISTEN = 55 * 60
 SAVE_DELAY = 1.0  # seconds state.json may lag behind read positions, status lines and presence (Hub._save_soon)
+USAGE_FILE = "usage.json"  # the agents' token counts by day, and each task's (X4): out of state.json, which is
+# rewritten on nearly every call, and written only when they change
 PERMISSION_WAIT = 10 * 60  # how long a permission prompt waits for Allow or Deny on the page (then: the agent's own)
 MAX_PERMISSION_TEXT = 2000  # of what the agent asks to run or change, shown with Allow and Deny
 DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
@@ -1705,8 +1707,51 @@ class EventStore:
 
     def __init__(self, path):
         self.path = Path(path)
-        self.lock = threading.Lock()
+        self.lock = threading.Lock()  # the connection: held while writing or reading
         self.db = None
+        # Rows are written by a thread of the store's own, not by the caller: callers hold the hub's lock, and a
+        # commit that waits for the disk (synchronous FULL) must not hold every agent's call up. Reads write
+        # what waits first, so they see every row added before them.
+        self.pending = []  # [(sql, row)] not written yet
+        self.wake = threading.Condition(threading.Lock())
+        self.writer = None
+
+    def _add(self, sql, row):
+        with self.wake:
+            self.pending.append((sql, row))
+            if self.writer is None:
+                self.writer = threading.Thread(target=self._write_loop, name="events-writer", daemon=True)
+                self.writer.start()
+            self.wake.notify()
+
+    def _write_loop(self):
+        while True:
+            with self.wake:
+                while not self.pending:
+                    self.wake.wait()
+            try:
+                with self.lock:
+                    self._write_pending()
+            except Exception as e:  # a full disk or a locked file must not stop the chat; the rows are tried again
+                sys.stderr.write("%s could not write %s: %s\n" % (now_iso(), self.path.name, e))
+                time.sleep(5)
+
+    def _write_pending(self):
+        """Write the rows that wait, in one transaction. Caller holds self.lock."""
+        with self.wake:
+            rows, self.pending = self.pending, []
+        if not rows:
+            return
+        db = self._conn()
+        try:
+            for sql, row in rows:
+                db.execute(sql, row)
+            db.commit()
+        except Exception:
+            db.rollback()
+            with self.wake:
+                self.pending[:0] = rows
+            raise
 
     def _conn(self):
         if self.db is None:
@@ -1731,17 +1776,15 @@ class EventStore:
     def rename(self, name, new):
         """An agent renamed: its edits and states are the new name's."""
         with self.lock:
+            self._write_pending()
             db = self._conn()
             for table in ("edits", "activity"):
                 db.execute("UPDATE %s SET agent = ? WHERE agent = ?" % table, (new, name))
             db.commit()
 
     def add_edit(self, agent, path, task="", ts=None):
-        with self.lock:
-            db = self._conn()
-            db.execute("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)",
-                       (time.time() if ts is None else ts, agent, path, task or ""))
-            db.commit()
+        self._add("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)",
+                  (time.time() if ts is None else ts, agent, path, task or ""))
 
     def edits(self, since=0.0, agent=None, task=None, limit=5000):
         """[{ts, agent, path, task}], oldest first."""
@@ -1751,15 +1794,17 @@ class EventStore:
         if task:
             sql, args = sql + " AND task = ?", args + [task]
         with self.lock:
-            rows = self._conn().execute(sql + " ORDER BY ts LIMIT ?", args + [limit]).fetchall()
+            rows = self._read().execute(sql + " ORDER BY ts LIMIT ?", args + [limit]).fetchall()
         return [{"ts": ts, "agent": a, "path": p, "task": t} for ts, a, p, t in rows]
 
     def add_activity(self, agent, state, ts=None):
-        with self.lock:
-            db = self._conn()
-            db.execute("INSERT INTO activity (ts, agent, state) VALUES (?, ?, ?)",
-                       (time.time() if ts is None else ts, agent, state))
-            db.commit()
+        self._add("INSERT INTO activity (ts, agent, state) VALUES (?, ?, ?)",
+                  (time.time() if ts is None else ts, agent, state))
+
+    def _read(self):
+        """The connection, for a read under self.lock, with every row added so far written."""
+        self._write_pending()
+        return self._conn()
 
     def timelines(self, since, until=None, grace=LISTEN_GRACE):
         """Each agent's states from since to until (now), as [start, end, state] pieces: a state lasts until the
@@ -1767,7 +1812,7 @@ class EventStore:
         listening hook asks again within it). The state at since is the last one recorded before it."""
         until = time.time() if until is None else until
         with self.lock:
-            db = self._conn()
+            db = self._read()
             before = db.execute(BEFORE_STATES, (since,)).fetchall()
             rows = db.execute("SELECT ts, agent, state FROM activity WHERE ts >= ? AND ts <= ? ORDER BY ts",
                               (since, until)).fetchall()
@@ -1796,7 +1841,7 @@ class EventStore:
         """[(agent, task, edits)] for a file, or every file under a folder."""
         folder = like_escape(path.rstrip("/")) + "/%"
         with self.lock:
-            return self._conn().execute(
+            return self._read().execute(
                 "SELECT agent, task, COUNT(*) FROM edits WHERE path = ? OR path LIKE ? ESCAPE '\\' GROUP BY agent, task",
                 (path.rstrip("/"), folder)).fetchall()
 
@@ -1804,7 +1849,7 @@ class EventStore:
         """The files edited since then, most edited first: [{path, edits, agents, top, last}], top being the agent
         that edited it most."""
         with self.lock:
-            db = self._conn()
+            db = self._read()
             rows = db.execute(
                 "SELECT path, COUNT(*), GROUP_CONCAT(DISTINCT agent), MAX(ts) FROM edits WHERE ts >= ? "
                 "GROUP BY path ORDER BY COUNT(*) DESC, MAX(ts) DESC LIMIT ?", (since, limit)).fetchall()
@@ -1817,9 +1862,12 @@ class EventStore:
 
     def close(self):
         with self.lock:
-            if self.db is not None:
-                self.db.close()
-                self.db = None
+            try:
+                self._write_pending()
+            finally:
+                if self.db is not None:
+                    self.db.close()
+                    self.db = None
 
 
 def read_back(path, block=1 << 16):
@@ -1947,6 +1995,7 @@ class Hub:
         self.redeemed = {}  # start key -> {note, until}: a retry after a lost answer gets the same one
         self.chat_key = ""  # the project's key for this machine's folders ("" for the first project)
         self.machine_root = None  # where this machine's settings are, if not in this project's folder
+        self._machine_config = None  # (config.json's (folder, mtime, size), what it held), for machine_config
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
@@ -1959,6 +2008,7 @@ class Hub:
         self._running = {}  # agent -> its session's process running at the server's last look (memory only)
         self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
         self._dirty = False  # state.json is behind memory, by what _save_soon let wait
+        self._usage_dirty = False  # usage.json is behind memory, by what _save_usage_soon let wait
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
@@ -2025,9 +2075,24 @@ class Hub:
         self.owner_cursor = int(data.get("owner_cursor", 0))
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
+        try:
+            kept = json.loads((self.home / USAGE_FILE).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            kept = None
+        if not isinstance(kept, dict):  # before usage.json: the counts were in state.json, the sheet's rows too
+            kept = {"days": data.get("usage"),
+                    "tasks": {mid: row["usage"] for mid, row in self.sheet.items() if isinstance(row.get("usage"), dict)}}
+            self._usage_dirty = bool(kept["days"] or kept["tasks"])  # moved to usage.json at once, below
         self.usage = {str(day): {str(a): {str(m): c for m, c in models.items() if isinstance(c, list)}
                                  for a, models in agents.items() if isinstance(models, dict)}
-                      for day, agents in (data.get("usage") or {}).items() if isinstance(agents, dict)}
+                      for day, agents in (kept.get("days") or {}).items() if isinstance(agents, dict)}
+        tasks = kept.get("tasks") if isinstance(kept.get("tasks"), dict) else {}
+        for mid, row in self.sheet.items():
+            row.pop("usage", None)
+            if isinstance(tasks.get(mid), dict):
+                row["usage"] = {str(m): c for m, c in tasks[mid].items() if isinstance(c, list)}
+        if self._usage_dirty:
+            self._save_usage()
         self._apply_renames()
 
     def _apply_renames(self):
@@ -2052,12 +2117,29 @@ class Hub:
     def _save(self):
         """Write state.json now, with everything in it (what _save_soon let wait too). Caller holds the lock."""
         self._dirty = False
+        sheet = {mid: {k: v for k, v in row.items() if k != "usage"} if "usage" in row else row
+                 for mid, row in self.sheet.items()}  # the tasks' token counts are in usage.json
         write_json(self.home / "state.json", {
             "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
-            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": self.sheet, "claim_gen": self.claim_gen,
+            "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
-            "usage": self.usage,
         }, private=True, indent=None)
+
+    def _save_usage(self):
+        """Write usage.json now: the token counts by day and each task's. Caller holds the lock (or is loading)."""
+        self._usage_dirty = False
+        write_json(self.home / USAGE_FILE, {
+            "days": self.usage,
+            "tasks": {mid: row["usage"] for mid, row in self.sheet.items() if row.get("usage")},
+        }, private=True, indent=None)
+
+    def _save_usage_soon(self):
+        """Write usage.json within SAVE_DELAY, as _save_soon does state.json. Caller holds the lock."""
+        if not self._usage_dirty:
+            self._usage_dirty = True
+            timer = threading.Timer(SAVE_DELAY, self.flush)
+            timer.daemon = True
+            timer.start()
 
     def _save_soon(self):
         """Write state.json within SAVE_DELAY, for what changes on nearly every call and may be lost for that
@@ -2071,10 +2153,15 @@ class Hub:
             timer.start()
 
     def flush(self):
-        """Write what _save_soon let wait (its timer, and the server stopping)."""
+        """Write what _save_soon let wait (its timer, and the server stopping), and the events the store's writer
+        has not written yet."""
         with self.lock:
             if self._dirty:
                 self._save()
+            if self._usage_dirty:
+                self._save_usage()
+        with self.events.lock:
+            self.events._write_pending()
 
     def _changed(self):
         self.version += 1
@@ -2479,6 +2566,7 @@ class Hub:
             for agents in self.usage.values():  # the tokens it used, and its edits and states, go with it
                 if name in agents:
                     add_usage(agents.setdefault(new, {}), agents.pop(name))
+            self._save_usage_soon()
             try:
                 self.events.rename(name, new)
             except Exception as e:  # a locked or broken events.sqlite: the rename still goes
@@ -2904,7 +2992,7 @@ class Hub:
             task = self._usage_task(name)
             if task:
                 add_usage(self.sheet[task].setdefault("usage", {}), usage)
-            self._save_soon()
+            self._save_usage_soon()
             self._changed()
             return {"kept": True, "task": task or ""}
 
@@ -3172,7 +3260,18 @@ class Hub:
     def machine_config(self):
         """This machine's settings (its folders, tools, port), wherever this project is kept."""
         root = getattr(self, "machine_root", None)
-        return self.roster.config if root is None or Path(root) == Path(self.roster.root) else load_config(root)
+        if root is None or Path(root) == Path(self.roster.root):
+            return self.roster.config
+        # Asked on every tool hook and change of an agent's state: read again only when config.json changed.
+        try:
+            st = (Path(root) / "config.json").stat()
+            stamp = (str(root), st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        cached = self._machine_config
+        if stamp is None or cached is None or cached[0] != stamp:
+            cached = self._machine_config = (stamp, load_config(root))
+        return cached[1]
 
     def _named(self, to):
         """A recipient as written, in any case ("maya" for Maya): its name as the chat knows it."""

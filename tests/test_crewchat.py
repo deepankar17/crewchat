@@ -645,6 +645,28 @@ class EditPaths(unittest.TestCase):
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
+    def test_event_rows_are_written_off_the_callers_thread(self):
+        # add_edit and add_activity run under the hub's lock: a commit waiting on the disk (synchronous FULL) must
+        # not hold it. Here the store's connection is busy (a slow disk): adding a row still returns at once.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        self.assertEqual(len(store.edits()), 1)
+        done = threading.Event()
+        with store.lock:
+            threading.Thread(target=lambda: (store.add_edit("teo", "app/b.kt", ts=2),
+                                             store.add_activity("teo", "working", ts=2), done.set()), daemon=True).start()
+            self.assertTrue(done.wait(2), "adding a row waited for the store's connection")
+        self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])  # a read sees every row added before it
+        store.add_edit("lu", "app/d.kt", ts=2.5)
+        for _ in range(200):  # and the writer writes them on its own
+            if not store.pending:
+                break
+            time.sleep(0.01)
+        self.assertEqual(store.pending, [])
+        store.add_edit("ana", "app/c.kt", ts=3)
+        store.close()  # what waits is written before the store closes: the rows cannot be rebuilt
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo", "lu", "ana"])
+
 
 class Faces(unittest.TestCase):
     """A new agent's face, made of parts (a skin, hair, a hat, glasses, clothes, ...) at random, and drawn as SVG."""
@@ -4409,6 +4431,12 @@ class Hooks(Base):
         self.hub.flush()
         saved = (self.hub.home / "state.json").read_text()
         self.assertNotIn("secret plan", saved)  # no conversation text reaches the server
+        # Kept in usage.json, written when the counts change, not in state.json, rewritten on nearly every call.
+        self.assertNotIn("claude-opus-5-5", saved)
+        kept = json.loads((self.hub.home / "usage.json").read_text())
+        self.assertEqual(kept["days"][day][name]["claude-opus-5-5"], [13, 250, 65000, 5300, 100])
+        self.assertEqual(kept["tasks"][str(tid)], self.hub.sheet[str(tid)]["usage"])
+        self.assertNotIn("secret plan", json.dumps(kept))
         self.assertNotIn("secret plan", json.dumps(self.hub.usage_report()))
         report = crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "view"})
         row = report["agents"][name]
@@ -4419,6 +4447,46 @@ class Hooks(Base):
         self.assertEqual(report["prices"], crewchat.PRICES_DATE)
         page_row = next(r for r in self.hub.rows() if r["agent"] == name)["usage"]
         self.assertEqual((page_row["today"], page_row["all"]), (row["all"], row["all"]))
+
+    def test_machine_settings_of_another_project_are_read_when_they_change(self):
+        # machine_config is asked on every tool hook: for a project kept outside the machine's folder it read
+        # config.json from disk each time.
+        root, machine = (Path(tempfile.mkdtemp(prefix="machine-cfg-", dir=TMP)) for _ in range(2))
+        crewchat.save_config({"project": "other", "port": 9}, root)
+        crewchat.save_config({"project": "machine", "port": 9, "activity": "on"}, machine)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        hub.machine_root = machine
+        real, reads = crewchat.load_config, []
+        with mock.patch.object(crewchat, "load_config", side_effect=lambda r=None: reads.append(r) or real(r)):
+            for _ in range(5):
+                self.assertEqual(hub.machine_config()["activity"], "on")
+            self.assertEqual(len(reads), 1)
+            crewchat.save_config({"project": "machine", "port": 9, "activity": "off", "x": "longer"}, machine)
+            self.assertEqual(hub.machine_config()["activity"], "off")  # a change is seen at once
+            self.assertEqual(len(reads), 2)
+        hub.events.close()
+
+    def test_token_usage_moves_out_of_an_older_state_json(self):
+        root = Path(tempfile.mkdtemp(prefix="usage-move-", dir=TMP))
+        crewchat.save_config({"project": "usage-move", "port": 9}, root)
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        crewchat.write_json(root / "state.json", {"agents": {}, "usage": {"2026-01-02": {"maya": counts}},
+                                                  "sheet": {"7": {"title": "t", "order": 1, "depends": [], "areas": [],
+                                                                  "to": "all", "usage": counts}}})
+        hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(hub.usage, {"2026-01-02": {"maya": counts}})
+        self.assertEqual(hub.sheet["7"]["usage"], counts)
+        self.assertEqual(json.loads((root / "usage.json").read_text()),
+                         {"days": {"2026-01-02": {"maya": counts}}, "tasks": {"7": counts}})  # moved at once
+        with hub.lock:
+            hub._save()
+        state = json.loads((root / "state.json").read_text())
+        self.assertNotIn("usage", state)
+        self.assertNotIn("usage", state["sheet"]["7"])
+        again = crewchat.Hub(crewchat.Roster(root))  # read back from usage.json
+        self.assertEqual((again.usage, again.sheet["7"]["usage"]), (hub.usage, counts))
+        hub.events.close()
+        again.events.close()
 
     def test_token_usage_is_off_when_the_owner_says_so(self):
         session, name = self.linked("usage-off")
