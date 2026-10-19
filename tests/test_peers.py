@@ -618,6 +618,37 @@ class OfflineAndRemoval(unittest.TestCase):
         finally:
             m.stop()
 
+    def test_a_long_relay_reads_the_log_about_once(self):
+        # Y3: /peer/relay pages through another machine's messages for a member away a long time. Each page read
+        # the log back from its end to the point asked: a catch-up of n messages read about n^2 / page lines.
+        m = Machine("relayer")
+        try:
+            log, n, page = m.hub.home / "messages.jsonl", 6000, 100
+            with open(log, "w") as f:
+                seq = 0
+                for i in range(1, n + 1):
+                    number = i + 1 if i % 50 == 1 else i - 1 if i % 50 == 2 else i  # a few arrived out of order
+                    for origin, mid in (("other", "B%d" % number), ("third", "C%d" % i)):
+                        seq += 1
+                        f.write(json.dumps({"id": mid, "seq": seq, "origin": origin, "from": "x", "to": "all",
+                                            "ts": 1e9 + seq, "text": "m"}) + "\n")
+            m.hub.messages[:] = [dict(seq=seq, id="Z1", origin="z")]  # memory does not hold them
+            reads, real = [0], crewchat.log_message
+
+            def counting(line):
+                reads[0] += 1
+                return real(line)
+            got, since, more = [], 10, True
+            with mock.patch.object(crewchat, "log_message", counting):
+                while more:
+                    out, more = m.hub.messages_after("other", since, page, by_id=True)
+                    got += [crewchat.origin_number(x["id"]) for x in out]
+                    since = got[-1]
+            self.assertEqual(got, list(range(11, n + 1)))
+            self.assertLess(reads[0], 5 * 2 * n)  # the log has 2n lines; reading back each page, over 25 times that
+        finally:
+            m.stop()
+
     def test_one_bad_message_does_not_stop_the_link(self):
         a = Machine("sender").found()
         b = Machine("receiver").join(a)

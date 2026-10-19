@@ -1894,6 +1894,7 @@ def origin_number(mid):
 
 
 CATCHUP_SLACK = 200  # a catch-up reads the log back this many messages past the point it starts from (Y3)
+MAX_RELAY_MARKS = 64  # catch-ups through /peer/relay whose next page's place in the log is remembered
 CATCHUP_MARGIN = 600  # seconds before the point a cloud catch-up starts from, for machines' clocks that differ
 
 
@@ -1996,6 +1997,7 @@ class Hub:
         self.chat_key = ""  # the project's key for this machine's folders ("" for the first project)
         self.machine_root = None  # where this machine's settings are, if not in this project's folder
         self._machine_config = None  # (config.json's (folder, mtime, size), what it held), for machine_config
+        self._relay_marks = {}  # (origin, number) -> a seq in the log before its messages after it (_relayed_after)
         self.prefix = ""  # this machine's tag in message ids when cloud sync is on
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
@@ -3857,10 +3859,54 @@ class Hub:
                     found.append(msg)
                     if len(found) > limit:
                         break
-        elif not covered:  # another machine's, in the order they arrived: read back to that point
-            found = list(self._read_back(lambda m: m.get("origin") == origin, lambda m: number(m) <= after).values())
+        elif not covered:  # another machine's, in the order they arrived
+            return self._relayed_after(origin, after, limit)
         found.sort(key=number)
         return found[:limit], len(found) > limit
+
+    def _relayed_after(self, origin, after, limit):
+        """Another machine's messages after its own number `after`, from messages.jsonl, as messages_after: a page
+        of a long catch-up (/peer/relay) costs about the page. The log is in the order they arrived, nearly the
+        order of their numbers: the first page reads back to that point once, and remembers where in the log the
+        next one starts (every message of the origin after the page comes after that place)."""
+        log = self.home / "messages.jsonl"
+        with self.lock:
+            start = self._relay_marks.pop((origin, after), None)
+        if start is None:  # back from the end until CATCHUP_SLACK in a row are before the point
+            start, past = 0, 0
+            try:
+                for line in read_back(log):
+                    msg = log_message(line)
+                    if msg is None or msg.get("origin") != origin:
+                        continue
+                    if origin_number(msg["id"]) > after:
+                        past = 0
+                        continue
+                    past += 1
+                    if past >= CATCHUP_SLACK:
+                        start = msg["seq"]
+                        break
+            except OSError:  # no log yet
+                return [], False
+        found, extra = {}, 0
+        for msg in log_from(log, start):  # on from there until the page is full and CATCHUP_SLACK more are past it
+            if msg.get("origin") != origin:
+                continue
+            if origin_number(msg["id"]) > after:
+                found.setdefault(msg["id"], msg)
+            if len(found) > limit:
+                extra += 1
+                if extra > CATCHUP_SLACK:
+                    break
+        page = sorted(found.values(), key=lambda m: origin_number(m["id"]))
+        more = len(page) > limit
+        if more:
+            with self.lock:
+                if len(self._relay_marks) >= MAX_RELAY_MARKS:
+                    self._relay_marks.pop(next(iter(self._relay_marks)))
+                self._relay_marks[(origin, origin_number(page[limit - 1]["id"]))] = \
+                    min(m["seq"] for m in page[limit:]) - 1
+        return page[:limit], more
 
     def messages_since(self, since, skip=""):
         """Every message written after a time, by any linked machine but `skip`, oldest first: what a machine that
