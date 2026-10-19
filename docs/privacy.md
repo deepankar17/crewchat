@@ -31,10 +31,10 @@ What crewchat reads on your machine and keeps there:
   on this machine in `events.sqlite`. Other machines only ever see what is worked out from it.
 - **A map of the project's code,** while edits are kept: the server reads the source files of the
   project's folders (Python, Java, Kotlin, JavaScript and TypeScript, Angular templates) and keeps their
-  paths, the names of the classes and functions in them (with their parameters, for Python) and which
-  file imports which, in `maps/` in the project's crewchat folder. Never the code itself; it never
-  leaves the machine (`crewchat map`).
-
+  paths, the names of the classes and functions in them (with their parameters: for Python, and for
+  Java, Kotlin, JavaScript and TypeScript with the `map` extra) and which file imports which, in
+  `maps/` in the project's crewchat folder. Never the code itself; it never leaves the machine
+  (`crewchat map`).
 - **When each agent was working, waiting for messages or idle,** for the timelines on the analytics
   page: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept
   while `crewchat setup --activity off` keeps what agents do off the page.

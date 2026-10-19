@@ -7,6 +7,7 @@ agents, and the machines are linked: over Tailscale, or through your own Firebas
 - [Over Tailscale](#over-tailscale)
 - [With cloud sync](#with-cloud-sync)
 - [Or: one host for every machine](#or-one-host-for-every-machine)
+- [Projects and linked machines](#projects-and-linked-machines)
 - [What changes across machines](#what-changes-across-machines)
 
 ## Choose how to link

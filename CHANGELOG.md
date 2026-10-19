@@ -2,152 +2,15 @@
 
 ## Unreleased
 
-- **Catching up through the cloud goes back a week.** A machine away for longer than the cloud keeps messages gets
-  the last 7 days it missed through Firestore, to keep within the free plan's quota; older messages stay on the
-  machines that have them. Over Tailscale it still gets everything.
-- **A new lead whose agent tool cannot pick up a new tool mid-session** (an MCP protocol before 2025-03-26) is told,
-  in its role message, to start a new session to have `hub_code`.
-- **Indian first names**, 21 more: Aanya, Aarav, Aditya, Anika, Arjun, Dev, Diya, Isha, Ishaan, Kabir, Karan, Kavya,
-  Kiran, Meera, Nikhil, Nisha, Pooja, Priya, Riya, Rohan, Vikram. Their faces, and Asha's, Ravi's and Uma's, have
-  a warm brown skin tone and black or dark brown hair; a feminine one sometimes a bindi.
-- **A face suits its agent's name**: Maya gets long hair, a bob, a bun or curls, with lashes; Teo short hair or none,
-  sometimes a beard; a name for anyone (Noor, Wren, Kai) any look. A renamed agent whose face no longer suits its
-  name gets a new one, at the same device; a picture you chose stays.
-- **Every new agent gets a face of its own.** Made of parts picked at random: a skin tone, a face shape, an
-  expression, hair and its colour, maybe a hat (a cap, a beanie, a beret, a top hat, headphones, a bandana) and
-  glasses, clothes in a colour, and what it works at, after its machine: a laptop, a desktop or a cloud. Nobody in
-  the chat wears the same one. **🎲 New face** in an agent's picture menu picks again. Drawn on your own server as
-  a small SVG; the 3D pictures, emoji and your own images are still there to choose. A built-in role's picture no
-  longer replaces a new agent's face (one you gave a role still does).
-- **The project's header leaves out "1 machine"**: the count shows once there are several, and a phone has the room.
-- **The open project's tab and the header under it are one surface**, as a browser's tab and its toolbar: the
-  same glass, no seam, its corners flaring into the bar (the header was a separate rounded card under the tab).
-  The task panel's "needs you" card has its red edge back.
-- **A design pass over every page.** Menus are nearly opaque, so what is behind never shows through their words; the
-  thread fades out as it scrolls under the header instead of showing cut off above it; the board's columns lose a
-  clipped shadow band; the task list's buttons stay on one line in the same order in every row, so they line up;
-  the add form puts the task and Add on top and the optional fields below; a role's text reads as paragraphs; the
-  edit tracking menu fits its panel. On a phone the header sits right above the content, search folds to a
-  magnifier until tapped, and what you type into is 16px so the page does not zoom.
-- **Liquid Glass.** The chat page takes the look of macOS 26 and iOS 26: the tabs, the list of agents, the
-  project's header, the message box, the side panel, menus and dialogs are glass, see-through and softly
-  blurred over a colourful backdrop, with rounder, capsule-shaped controls. The chat, the board and the
-  analytics scroll on under the header. What you read (messages, task cards) stays solid. With "Reduce
-  transparency" or "Increase contrast" on in your system settings, or in a browser that cannot blur, it is
-  solid as before. The sign-in page matches, and now fits a phone's width.
-- **The chat page, tried end to end, and what it turned up fixed.**
-  - A task you take off the sheet now asks first, as removing an agent or a role does, and its card in the chat
-    says "Off the sheet" instead of "Open".
-  - Searching from the task board or the analytics view shows the chat, where the matches are (it filtered a
-    hidden chat before).
-  - Your answer to a blocked task shows in the task's history.
-  - An agent's settings in the list have room: each value under its name, so the menus are no longer cut off
-    ("As its folder s…"). The number on an agent's card says, on hover, that it counts messages it has not read.
-  - On a phone, the task list puts each task's buttons on a line of their own instead of off the screen.
-  - Adding a task: with no title it says what is missing; an error says "Task not added"; after adding, the
-    cursor is back in the title for the next one.
-  - Analytics: the review pass rate no longer counts a task still in review as failed (it showed 0%), and the
-    machine card no longer says "this machine" twice.
-- **Fixed: the Tasks button beside Commands and Analytics wrapped onto two lines** once the board had
-  open tasks. The three stay on one line.
-- **The docs' pictures show crewchat as it is now:** every screenshot, demo and diagram made again, with
-  `hub_task`, first names, the Analytics view, files over cloud sync, catch-up and the coordinator; and
-  each diagram's description matches what it plays.
-- **Shared files open on your other machines with cloud sync too**, up to 5 MB: a screenshot or a log
-  travels with its message, encrypted on your machine, and is deleted from the cloud with the message.
-  A bigger file says which machine has it, and why: the free Firebase plan's quota. On a paid (Blaze)
-  plan, `cloud_file_mb` in config.json lets files up to 20 MB travel.
-- **Tasks from a machine that is off can still be taken (Tailscale).** The coordinator settles the claim
-  instead of the agent being told to try again later, and the machine the task came from takes the
-  decision over when it is back. If two machines that could not reach each other gave one task to two
-  agents, the earlier claim stands when they meet again, and the other agent is told to stop.
-- **The lead and the advisor get `hub_code`.** `history` says who changed a file (or a folder), for which
-  task, and what was said about it; `split` gives a task's files in groups that hang together, to hand out
-  one per agent (one big file is split by its sections). Every other agent's tools stay as short as they
-  were; a session given the lead or advisor role is told to load its new tool.
-- **Agents that join get the code at a glance.** With edit tracking on, each project folder gets a skill
-  (and a Cursor rule) made from the code map: the main parts, the files most others use, where the code
-  starts, and who works on what now, stamped with the commit. Under about 1,500 tokens, read when an
-  agent joins rather than every turn.
-- **Exact parsing for Java, Kotlin, JavaScript and TypeScript in the code map**, for those who add the
-  `map` extra (`uv tool install "crewchat[cloud,map]"`, with tree-sitter): calls are linked to what they
-  call, a class of the same package is known for a type, and interface-change notices cover these
-  languages too. Without it, nothing changes: the core still needs no library at all.
-- **The code, by who holds it**, in the analytics view: the project's files in their folders, each coloured
-  by the agent whose task covers it, with the imports between them; past 500 files, folders that open with
-  a click. The live demo has it too.
-- **Agents are told whose work theirs touches.** Taking a task, or being given one, now says which other
-  agents' tasks in progress work on code this task's files import or are imported by, so they agree any
-  change to what they share. Never in the way: a note, not a block.
-- **A machine that was off for days gets every message when it is back.** Over Tailscale, a linked
-  machine now serves what was missed from its log, not only the newest 2,000 in memory, and the
-  messages of a machine that is off by then come from the coordinator. With cloud sync, a machine
-  away for longer than the cloud keeps messages (24 hours, `cloud_ttl_hours`) asks the coordinator,
-  which sends them from its log, encrypted, a page at a time.
-- **Fixed: a burst of messages bigger than memory (2,000) lost its first ones** on the way to a linked
-  machine whose pull was waiting meanwhile. They now come from the log.
-- **A live demo of the analytics view** at [crewchat.dev/demo](https://crewchat.dev/demo/): a made-up crew
-  and a day of its work, played in your browser with no server and no sign-in. The same sample is behind
-  **Sample data** in the view, to see what it does before your crew has a history; it never mixes with
-  your chat. The README links to the demo and shows it in a short GIF.
-- **Analytics: the crew at a glance, live.** A new view on the chat page: your agents round you, with
-  messages flying between them as they are sent; the day's numbers; tasks flowing from posted to done;
-  each agent's day (working, waiting, idle); machines; tokens and cost; and a heat map of the files agents
-  edit. Replay the day with a slider, or present it full screen. It loads only when opened (13 KB), and
-  stays live through the page's own updates.
-- **Agents hear when code they depend on changes its interface.** When an agent changes the
-  parameters of a Python function or class method, or renames or removes one, the agents whose tasks'
-  files import it get one short message once the file has stayed put for a minute, delivered like any
-  message at the end of their turn: "Anya changed paylib/parse.py, which your task #12 uses:
-  read(path) is now read(source)". A change to a body alone sends nothing. Python only for now.
-- **crewchat suggests a task's files, and keeps tasks off code that depends on each other.** When an
-  agent marks a task ready for review or done, the folders it changed outside the task's areas are
-  suggested to the lead (or to you): at most five, grouped by folder. **Accept files** in the task's
-  panel, `crewchat tasks areas ID accept`, or the lead's `hub_task` action `areas` adds them. With the
-  code map, two tasks also wait for each other when one's files import the other's, even with no path
-  in common.
-- **A map of your project's code**, for the coming overlap checks and interface-change notices: which
-  file imports which, and the classes and functions in each, for Python, Java, Kotlin, React (JS, JSX, TS,
-  TSX) and Angular (selectors in templates, injected services). Built on your machine with the standard
-  library while edit tracking is on, one per repository and branch, and read again when agents edit files
-  or the branch moves; the crewchat repository maps in about 0.4 s and an edit in under 0.1 s.
-  `crewchat map FILE` shows what a file uses, `--importers` what uses it.
-- **crewchat knows which files your agents edit**, in a project whose team edits code: the path of each
-  file an agent edits inside the project (never what it wrote), kept on your machine in `events.sqlite`.
-  On by default for a software team and off for others; the project panel's "Files agents edit" and
-  `crewchat edits` show it and turn it on or off. The next roadmap tasks use it to suggest a task's files
-  and warn about overlaps.
-- **`/api/analytics`, the numbers behind the coming analytics page** (owner only). Worked out on this
-  machine from the whole chat, not only the 2,000 messages in memory: messages by hour, day, agent, kind and
-  machine; who writes to whom; tasks posted, taken and done with the median time to take one, cycle time,
-  time blocked and the review pass rate; advisor verdicts, reclaims and files shared; and the agents'
-  tokens with their estimated cost, and each agent's timeline (working, waiting for messages, idle), kept
-  in `events.sqlite`. Nothing leaves the machine.
-- **How many tokens your agents use, and roughly what that would cost.** At the end of each turn a Claude
-  Code agent's hook reads the turn's token counts from its own transcript (numbers only, never the
-  conversation) and adds them to the agent, the day and the task it works on. `crewchat usage` shows them
-  with an estimate at API prices (a Claude subscription does not pay per token), and so does the agent's
-  panel on the page. Not available for Cursor, whose hooks do not say. `crewchat usage off` turns it off
-  for a project.
-- **The chat page loads faster, most of all on a phone.** It is sent compressed (47 KB instead of 170 KB),
-  and the browser keeps it and asks whether it changed: a reload transfers under 1 KB. The chat's messages
-  and settings are still never kept on the device.
-- **state.json is rewritten a third as often under load.** Read positions, status lines and presence are
-  saved within a second instead of on every call; task claims, links and the task sheet still at once.
-  Stopping the server (`crewchat stop`, or its login service) saves what waits first. After a hard crash an
-  agent may be shown up to a second of messages it had already read; nothing is lost.
-- **The chat page's poll carries only what changes.** Roles, task statuses, tools, pictures, models, names
-  and other fixed data come from `/api/boot` once, and again when the poll's `boot` tag changes (an
-  upgraded server, or roles edited): a poll with one new message goes from about 5.7 KB to 2.3 KB. New
-  messages are found by halving instead of a scan of the last 2,000.
-- **A long chat starts as fast as a new one.** The server reads `messages.jsonl` from its end, only the
-  2,000 messages it keeps, instead of the whole file: with a 500 MB log, startup goes from about 4 s to
-  0.1 s and the memory it needs while loading from 2.6 GB to 63 MB. Linking a project with other machines
-  rewrites the log a line at a time. A message whose text held a Unicode line separator (U+2028) is no
-  longer lost when the server restarts.
-- **Breaking: the five task tools are one, `hub_task`, with an `action`.** What every agent loads is
-  half the size (the tool definitions from 13,074 to 6,948 characters), and how to use the tools is in
-  the project guide crewchat writes into each folder instead. Old and new:
+The biggest release yet: agents that know the code, the crew at a glance, a new look with a face for every agent,
+four more agent tools, linked machines that never wait on one that is off, and a lighter, faster crewchat.
+
+### Upgrading
+
+- **Breaking: the five task tools are one, `hub_task`, with an `action`.** What every agent loads is half the size
+  (the tool definitions from 13,074 to 6,948 characters); how to use them is in the guide crewchat writes into each
+  folder. There are no aliases: a session started before the upgrade is told to restart when it calls an old name.
+  The server rewrites every connected folder's guide and allow rules when it starts.
 
   | Before | Now |
   |---|---|
@@ -157,73 +20,140 @@
   | `hub_assign` (`text`, `task`) | `hub_task` `action=assign` (`title` and `parent` for new work, or `id` for a task on the sheet) |
   | `hub_update` | `hub_task` `action=update` |
 
-  There are no aliases: a session started before the upgrade is told to restart when it calls an old
-  name. The server rewrites every connected folder's guide and allow rules when it starts.
-- **`hub_inbox` and `hub_history` answer in at most 6,000 characters of whole messages**, with a shorter
-  time on each (`[#12 14:05]`, UTC). What does not fit stays unread: `hub_inbox` says how many more, and
-  the next call brings them. A message is never cut.
-- **The hook after each tool call is about four times faster.** It runs a small script crewchat writes
-  from its own code, `~/.crewchat/crewchat-hook.py`, instead of loading all of crewchat: about 20 ms
-  instead of 80 for an installed crewchat on a Mac. It talks to this machine's server over a plain socket
-  (urllib for a chat on another machine). The server points connected folders' hooks at it when it starts;
-  Codex and Gemini CLI ask once more to review crewchat's hooks. Other hooks are unchanged.
+- **Run the same version on every linked machine**: the coordinator, claims and catch-up need it on each.
+- **Codex CLI and Gemini CLI ask once more to review crewchat's hooks** (they now run a small script, below).
+- **The classic page is gone.** The page from before 0.14, kept at `/classic` for one release, is removed.
+- **No change to the Firestore security rules**: nothing to publish again for cloud sync.
 
-- **A coordinator among your linked machines, whichever is on.** One machine at a time is the
-  coordinator, so work that needs one machine to act for the others (coming next: claims on a task whose
-  machine is off, catch-up, files) never waits on a machine you switched off. With cloud sync it holds a
-  lease that another machine takes over when it runs out; over Tailscale every machine picks the same one
-  from those it can reach. `crewchat coordinator NAME` names the one you prefer whenever it is on; the
-  page's connection line shows who coordinates now.
-- **Notifications while no chat page is open (Web Push).** With the bell on, the browser subscribes
-  with its push service; when something new needs you and no page of the project is open, the
-  server sends an empty push signed with this machine's VAPID key (`~/.crewchat/push.json`), and the
-  page's service worker fetches what is new from the server and shows it. Nothing from the chat goes
-  through the push service. Works on a computer, and on a phone with the app installed, at an
-  `https` address (`tailscale serve`). Standard library only: the signing is plain Python.
-- **Allow or Deny a Claude Code agent's permission prompts from the page.** When an agent wants to do
-  something it has not been allowed, a new `PermissionRequest` hook puts it first in **Needs you**: the
-  agent, the tool, and the command, file or address in full, with **Allow** and **Deny** (and a
-  notification while the page is in the background). With no answer in 10 minutes, or one given in its
-  terminal, the item goes and Claude Code asks there as before. `crewchat setup --permissions terminal`
-  keeps prompts in the terminal; `/api/permission` answers one. The server adds the hook to folders
-  connected before.
-- **The classic page is gone.** The page from before 0.14, kept at `/classic` for one release, is
-  removed with its link in the project menu.
-- **New agent says what a tool still needs.** Picking a tool shows whether it is installed, signed in
-  (Claude Code, Cursor, Codex and OpenCode by their own status commands; Gemini CLI and Qwen Code by
-  their settings), and what it asks once in the chosen folder (trust; Codex's and Gemini CLI's review of
-  crewchat's hooks; OpenCode's first setup of crewchat's plugin), with the command to run and **Check
-  again** (`/api/tool-check`, the owner's only, for the project's own folders).
-- **Browse for a folder in New agent.** **Browse…** lists the folders on the machine that hosts the
-  chat (hidden ones left out), **New folder** makes one where you are, and Connect offers **Create it
-  and connect** for a path that is not there yet (`/api/folders` ops `list` and `mkdir`, `create` on
-  `connect`).
-- **Fixes from a UI test of every page element.** An answered question in Needs you waits on the agent,
-  not you; a message there takes you to it and starts a reply; a search with no match says so; an
-  agent silent for long no longer shows Working; the Roles list says what each role does; New
-  agent's templates are named after their role and it no longer lists install notes for every tool
-  not here; New project points at New agent's Connect; the message box's hint fits a phone.
-- **More agent tools: Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a
-  folder for each one installed (`--client codex|gemini|qwen|opencode` for one), and **New agent**
-  starts them, with what each may do without asking (Codex its workspace sandbox or none; Gemini and
-  Qwen `auto_edit` or `--yolo`). Gemini CLI and Qwen Code get crewchat in the folder's settings, its
-  tools trusted; OpenCode in its `opencode.json` (not a committed one); Codex once in
-  `~/.codex/config.toml`, as `crewchat stdio --local-only` (it serves only folders connected to this
-  machine's chat, never a server a cloned repository's `.mcp.json` names).
-  Uninstall takes crewchat out of all of them.
-- **Codex CLI, Gemini CLI, Qwen Code and OpenCode get their messages at the end of each turn**, as Claude
-  Code and Cursor do: the first prompt asks the agent to link, a message that arrives starts its next
-  turn, and its tool calls show what it is doing. Codex's hooks go in crewchat's block of
-  `~/.codex/config.toml` (Codex asks once to review them, and keeps that through upgrades); Gemini
-  CLI's and Qwen Code's in the folder's `.gemini/` or `.qwen/settings.json`, beside your own (each
-  asks once to trust them); OpenCode runs them from crewchat's plugin, `.opencode/plugins/crewchat.js`.
-- **Reopen for Codex CLI, Gemini CLI, Qwen Code and OpenCode.** Their hooks now report each session,
-  so **Stop** and **Reopen** work for them as for Claude Code: Codex with `codex resume`, Gemini CLI
-  and Qwen Code with `--resume`, OpenCode with `--session` (it does not send a prompt with a session
-  it continues, so crewchat's plugin does, once). OpenCode's session ids (`ses_…`) are now kept.
-- **Codex's "edit and run commands" permission works with current Codex.** It no longer has
-  `--full-auto`, so New agent refused it; crewchat now asks for what that was, `--sandbox
-  workspace-write --ask-for-approval on-request`.
+### Agents that know the code
+
+- **crewchat knows which files your agents edit**, in a project whose team edits code: the path of each file an
+  agent edits inside the project (never what it wrote), kept on your machine in `events.sqlite`. On by default for
+  a software team; the project panel's "Files agents edit" and `crewchat edits` show it and turn it on or off.
+- **A map of your project's code**: which file imports which, and the classes and functions in each, for Python,
+  Java, Kotlin, React (JS, JSX, TS, TSX) and Angular (selectors in templates, injected services). Built on your
+  machine with the standard library, one per repository and branch, and read again when agents edit files or the
+  branch moves: the crewchat repository maps in about 0.4 s, an edit in under 0.1 s. `crewchat map FILE` shows what
+  a file uses, `--importers` what uses it. The `map` extra (`uv tool install "crewchat[cloud,map]"`, tree-sitter)
+  reads Java, Kotlin, JavaScript and TypeScript exactly; without it the core still needs no library.
+- **Tasks stay off code that depends on each other.** Two tasks wait for each other when one's files import the
+  other's, even with no path in common. When an agent marks a task ready for review or done, the folders it
+  changed outside the task's areas are suggested (at most five): **Accept files** in the task's panel,
+  `crewchat tasks areas ID accept`, or the lead's `hub_task` action `areas` adds them.
+- **Agents hear when code they depend on changes its interface.** When an agent changes a function's or method's
+  parameters, or renames or removes one, the agents whose tasks' files import it get one short message once the
+  file has stayed put for a minute: "Anya changed paylib/parse.py, which your task #12 uses: read(path) is now
+  read(source)". Python always; Java, Kotlin, JavaScript and TypeScript with the `map` extra.
+- **Agents are told whose work theirs touches.** Taking a task, or being given one, says which other agents' tasks
+  in progress work on code this task's files import or are imported by. A note, never a block.
+- **Agents that join get the code at a glance**: a skill (and a Cursor rule) made from the code map, with the main
+  parts, the files most others use, where the code starts and who works on what now. Under about 1,500 tokens,
+  read when an agent joins rather than every turn.
+- **The lead and the advisor get `hub_code`**: `history` says who changed a file (or a folder), for which task, and
+  what was said about it; `split` gives a task's files in groups that hang together, to hand out one per agent.
+  Every other agent's tools stay as short as they were. A session given the role is told to load its new tool; one
+  whose agent tool cannot (an MCP protocol before 2025-03-26) is told to start a new session.
+
+### The crew at a glance: Analytics
+
+- **A new view on the chat page**: your agents round you, with messages flying between them as they are sent; the
+  day's numbers; tasks flowing from posted to done; each agent's day (working, waiting, idle); machines; tokens and
+  cost; a heat map of the files agents edit; and the code, each file coloured by the agent whose task covers it.
+  Replay the day with a slider, or present it full screen. It loads only when opened (13 KB).
+- **Try it with no crew of your own**: a live demo at [crewchat.dev/demo](https://crewchat.dev/demo/) plays a
+  made-up crew's day in your browser, and **Sample data** in the view shows the same, never mixed with your chat.
+- **How many tokens your agents use, and roughly what that would cost.** A Claude Code agent's hook reads each
+  turn's token counts from its transcript (numbers only, never the conversation). `crewchat usage` and the agent's
+  panel show them, with an estimate at API prices. Not for Cursor, whose hooks do not say. `crewchat usage off`
+  turns it off for a project.
+- **`/api/analytics`** (owner only): the numbers behind the view, worked out on this machine from the whole chat.
+  Nothing leaves the machine.
+
+### A new look, and a face for every agent
+
+- **Liquid Glass.** The page takes the look of macOS 26 and iOS 26: the tabs, the list of agents, the header, the
+  message box, the side panel, menus and dialogs are glass over a colourful backdrop, with capsule-shaped controls.
+  The open project's tab and the header under it are one surface, and the chat, the board and the analytics scroll
+  on under it. What you read stays solid. With "Reduce transparency" or "Increase contrast" in your system settings,
+  or a browser that cannot blur, it is solid as before. The sign-in page matches, and fits a phone.
+- **Every new agent gets a face of its own**, made of parts picked at random: a skin tone, a face shape, an
+  expression, hair, maybe a hat and glasses, clothes, and what it works at after its machine (a laptop, a desktop
+  or a cloud). The face suits the agent's first name, and nobody in the chat wears the same one. **🎲 New face**
+  picks again; a renamed agent whose face no longer suits its name gets a new one. Drawn on your own server as a
+  small SVG; the 3D pictures, emoji and your own images are still there. A built-in role's picture no longer
+  replaces a new agent's face (one you gave a role still does).
+- **21 Indian first names** join the names agents get: Aanya, Aarav, Aditya, Anika, Arjun, Dev, Diya, Isha, Ishaan,
+  Kabir, Karan, Kavya, Kiran, Meera, Nikhil, Nisha, Pooja, Priya, Riya, Rohan and Vikram, with faces to suit.
+- **A design pass over every page**: menus readable over the glass; the task list's buttons on one line, lined up;
+  the add form in two rows; a role's text as paragraphs. On a phone the header has room ("1 machine" is left out
+  until there are several), search folds to a magnifier, and what you type into does not zoom the page.
+
+### Four more agent tools
+
+- **Codex CLI, Gemini CLI, Qwen Code and OpenCode.** `crewchat start` connects a folder for each one installed
+  (`--client codex|gemini|qwen|opencode` for one), and **New agent** starts them, with what each may do without
+  asking. They get their messages at the end of each turn as Claude Code and Cursor do, show what they are doing,
+  and **Stop** and **Reopen** work for them (`codex resume`, `--resume`, OpenCode's `--session`). Gemini CLI and
+  Qwen Code get crewchat in the folder's settings; OpenCode in its `opencode.json` and a plugin; Codex once in
+  `~/.codex/config.toml`, as `crewchat stdio --local-only`. Uninstall takes crewchat out of all of them.
+- **New agent says what a tool still needs**: installed, signed in, and what it asks once in the folder, with the
+  command to run and **Check again**. **Browse…** picks a folder on the machine that hosts the chat, **New folder**
+  makes one, and Connect can create a path that is not there yet.
+- **Codex's "edit and run commands" permission works with current Codex** (`--sandbox workspace-write
+  --ask-for-approval on-request`, now that `--full-auto` is gone).
+
+### Answer from anywhere
+
+- **Allow or Deny a Claude Code agent's permission prompts from the page.** A `PermissionRequest` hook puts the
+  request first in **Needs you**, with the tool and the command, file or address in full. With no answer in 10
+  minutes, or one in its terminal, Claude Code asks there as before. `crewchat setup --permissions terminal` keeps
+  prompts in the terminal.
+- **Notifications while no chat page is open (Web Push).** With the bell on, the server sends an empty push signed
+  with this machine's VAPID key when something needs you; the page's service worker fetches what is new from your
+  server. Nothing from the chat goes through the push service. On a computer, and on a phone with the app
+  installed, at an `https` address (`tailscale serve`). Standard library only.
+
+### Linked machines that never wait
+
+- **A coordinator, whichever machine is on.** One machine at a time acts for the others, so nothing waits on a
+  machine you switched off. With cloud sync it holds a lease another machine takes over; over Tailscale every
+  machine picks the same one. `crewchat coordinator NAME` names the one you prefer; the page shows who it is.
+- **Tasks from a machine that is off can still be taken (Tailscale)**: the coordinator settles the claim, and the
+  machine the task came from takes the decision over when it is back. If two machines that could not reach each
+  other gave one task to two agents, the earlier claim stands and the other agent is told to stop.
+- **A machine that was away gets what it missed**, however long it was off: over Tailscale every message, from the
+  logs (the messages of a machine that is off by then come from the coordinator); with cloud sync the last 7 days,
+  sent by the coordinator, encrypted, through Firestore (to keep within its free quota; older ones stay on the
+  machines that have them).
+- **Shared files open on your other machines with cloud sync too**, up to 5 MB, encrypted, deleted from the cloud
+  with their message. A bigger file says which machine has it; on a paid (Blaze) plan `cloud_file_mb` lets files
+  up to 20 MB travel.
+
+### Lighter and faster
+
+- **The hook after each tool call is about four times faster**: a small script crewchat writes from its own code,
+  `~/.crewchat/crewchat-hook.py`, about 20 ms instead of 80 on a Mac.
+- **The chat page loads faster, most of all on a phone**: sent compressed (47 KB instead of 170 KB) and cached, a
+  reload transfers under 1 KB. Its poll carries only what changes, from about 5.7 KB to 2.3 KB for one new message
+  (the fixed data comes from `/api/boot`).
+- **A long chat starts as fast as a new one**: with a 500 MB log, startup goes from about 4 s to 0.1 s and the
+  memory it needs from 2.6 GB to 63 MB.
+- **`hub_inbox` and `hub_history` answer in at most 6,000 characters of whole messages**; what does not fit stays
+  unread for the next call. A message is never cut.
+- **state.json is rewritten a third as often under load**: read positions, status and presence are saved within a
+  second; task claims and the sheet at once.
+
+### Fixes
+
+- A burst of messages bigger than memory (2,000) no longer loses its first ones on the way to a linked machine.
+- A message whose text held a Unicode line separator (U+2028) is no longer lost when the server restarts.
+- From an end-to-end test of every page: taking a task off the sheet asks first, and its card says "Off the sheet";
+  search from the board or the analytics shows the chat; your answer to a blocked task shows in its history; an
+  agent's settings are no longer cut off, and the number on its card says what it counts; the task list fits a
+  phone; adding a task explains what is missing; the review pass rate no longer counts a task still in review as
+  failed; an answered question in Needs you waits on the agent, not you; a search with no match says so; an agent
+  silent for long no longer shows Working; the Tasks button stays on one line.
+- The docs' pictures, demos and diagrams show crewchat as it is now, each diagram's description matching it.
 
 ## 0.14.0
 

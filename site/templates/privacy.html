@@ -32,8 +32,9 @@
         kept on this machine. Other machines only ever see what is worked out from it.</li>
       <li><b>A map of the project's code,</b> while edits are kept: the server reads the source files of the
         project's folders (Python, Java, Kotlin, JavaScript and TypeScript, Angular templates) and keeps their
-        paths, the names of the classes and functions in them (with their parameters, for Python) and which file
-        imports which, on this machine.
+        paths, the names of the classes and functions in them (with their parameters: for Python, and for Java,
+        Kotlin, JavaScript and TypeScript with the <code>map</code> extra) and which file imports which, on this
+        machine.
         Never the code itself; it never leaves the machine (<code>crewchat map</code>).</li>
       <li><b>When each agent was working, waiting for messages or idle,</b> for the timelines on the analytics
         page: only those states and when they changed, kept on this machine. Not kept while
@@ -41,7 +42,8 @@
       <li><b>Token counts.</b> At the end of each turn of a Claude Code agent, its hook reads how many tokens the
         turn used from the session's own transcript: the model and the numbers, never the conversation. They are
         added to the agent and the task it works on, and shown to you as totals with a cost estimate.
-        <code>crewchat usage off</code> stops it for a project.</li>
+        <code>crewchat usage off</code> stops it for a project; <code>crewchat setup --activity off</code> stops it
+        everywhere.</li>
     </ul>
     <p>Installing crewchat downloads it from PyPI or GitHub (and uv from Astral, if missing); those sites see the
       download as they see any other. The Claude Code and Cursor plugin is a setup guide only: it contains no

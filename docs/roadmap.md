@@ -1,17 +1,21 @@
 # Roadmap
 
+> **Every task below is done, and ships in the coming release.** This file stays as the record of
+> what was planned, what was decided and how each task was built.
+
 The plan for crewchat's next releases: speed fixes, storage rules, code-aware coordination,
 multi-machine sync gaps and an analytics page. Each task has a goal, where it lives in the code,
 the approach, what counts as done, risks and dependencies. Decisions the owner has made are marked.
 
-Line references were taken at commit d3c38ea (v0.14.0); `crewchat.py`, `crewchat_peers.py` and
-`crewchat_cloud.py` are unchanged since, so they hold on main. Re-check them if those files change.
+Line references (`crewchat.py:2440` and the like) were taken at commit d3c38ea (v0.14.0), before this
+work began. The files have changed a great deal since, so the numbers no longer hold: find the code
+by the function or constant named next to them.
 
 Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or more.
 
 ## Ground rules for every task
 
-- `crewchat.py` and `crewchat_peers.py` stay standard library only. New dependencies go in an optional extra, loaded lazily, like cloud sync.
+- `crewchat.py`, `crewchat_peers.py` and `crewchat_map.py` stay standard library only. New dependencies go in an optional extra, loaded lazily, like cloud sync.
 - The server listens on 127.0.0.1 only. No telemetry. Code and data stay on the owner's machines.
 - Measure with the benchmark (P0) before and after every speed change.
 - Update this file's status line for a task in the same pull request that changes it.

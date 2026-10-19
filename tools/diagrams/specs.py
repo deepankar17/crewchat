@@ -542,7 +542,7 @@ SPECS["task-states"] = {
 
 SPECS["add-agent"] = {
     "type": "sequence",
-    "title": "Add an agent from the chat",
+    "title": "New agent, from the chat",
     "subtitle": "A new session opens in a terminal window, already linked and briefed",
     "participants": [
         {"id": "you", "label": "You", "icon": "user", "color": "teal"},
@@ -552,7 +552,7 @@ SPECS["add-agent"] = {
     ],
     "cardW": 190,
     "steps": [
-        msg("you", "page", "Add an agent: name, role, task", "You click Add an agent, and fill in a name, role and task"),
+        msg("you", "page", "New agent: name, role, task", "You click New agent, and fill in a name, role and task"),
         msg("page", "srv", "launch", "The page asks crewchat to launch it"),
         msg("srv", "term", "open Claude Code, one-time key", "A terminal window opens Claude Code in the folder", icon="terminal"),
         msg("term", "srv", "hub_link with the key", "The new session links itself, with the one-time key"),

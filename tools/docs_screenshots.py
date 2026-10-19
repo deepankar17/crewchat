@@ -493,10 +493,80 @@ def scene_analytics(b):
         server.shutdown()
 
 
+def scene_code(b):
+    """Code-aware teamwork: crewchat telling an agent that code its task uses changed (C3), as it arrives in the chat."""
+    chat = Chat()
+    lead = chat.agent(status="Coordinating the payments work", activity="listening", name="Maya")
+    dev = chat.agent(status="Refunds screen", name="Teo")
+    qa = chat.agent("laptop", "cursor", status="Testing refunds", name="Priya")
+    for name, role in ((lead, "lead"), (dev, "developer"), (qa, "qa")):
+        chat.hub.set_role(O, name, role)
+    chat.quiet()
+    task = chat.say(O, "all", "Add refunds to the payments screen, with tests.", "task")
+    chat.hub.take(lead, task["id"])
+    mine = chat.hub.assign(lead, dev, "Show refunds on the payments screen (app/payments/).", task["id"])
+    chat.hub.update(dev, mine["id"], "in_progress", "Reading the payment rows with paylib.parse.read.")
+    chat.say(lead, "all", "I'm changing paylib/parse.py so it can read a whole statement, not only a file path.")
+    with chat.hub.lock:
+        chat.hub._append(crewchat.SERVER_NAME, dev, "%s changed paylib/parse.py, which your task #%s uses: read(path) is now "
+                         "read(source, encoding). Check the code that calls it." % (lead, mine["id"]), "msg", task=mine["id"],
+                         changed="paylib/parse.py")
+        chat.hub._changed()
+    chat.say(dev, lead, "Thanks: updated my two calls to read(source, encoding). Tests pass.")
+    chat.read_all()
+    b.size(1100, 680)
+    b.open(chat.sign_in())
+    b.shoot("code-notice")
+    chat.stop()
+
+
+def scene_faces(b):
+    """A sheet of generated faces with their names: what new agents look like."""
+    names = [("Maya", 0), ("Teo", 1), ("Priya", 2), ("Arjun", 0), ("Noor", 1), ("Kira", 2), ("Kabir", 0), ("Zoe", 1),
+             ("Omar", 2), ("Meera", 0), ("Wren", 1), ("Hugo", 2), ("Diya", 0), ("Levi", 1), ("Yuki", 2), ("Rohan", 0)]
+    tiles = []
+    for name, device in names:
+        svg = crewchat.mix_svg(crewchat.new_mix(device, name=name)[4:]).decode()
+        tiles.append('<figure><img src="data:image/svg+xml;base64,%s" alt=""><figcaption>%s</figcaption></figure>'
+                     % (base64.b64encode(svg.encode()).decode(), name))
+    page = TMP / "faces.html"
+    page.write_text("""<!doctype html><meta charset="utf-8"><style>
+body { margin: 0; background: radial-gradient(60%% 55%% at 0%% 0%%, #c7d7ff, transparent 62%%),
+  radial-gradient(55%% 50%% at 100%% 0%%, #e7d6ff, transparent 60%%), radial-gradient(60%% 55%% at 85%% 100%%, #ffe1cc, transparent 62%%), #eef3ff;
+  font: 600 15px ui-rounded, "SF Pro Rounded", system-ui, sans-serif; color: #0b1f55; }
+#sheet { display: grid; grid-template-columns: repeat(8, 110px); gap: 18px 14px; padding: 26px 30px; width: max-content; }
+figure { margin: 0; text-align: center; } img { width: 96px; height: 96px; border-radius: 50%%; display: block; margin: 0 auto 8px;
+  box-shadow: 0 6px 18px rgba(11, 31, 85, .14), inset 0 0 0 1px rgba(255, 255, 255, .6); }
+</style><div id="sheet">%s</div>""" % "".join(tiles), encoding="utf-8")
+    b.size(1100, 420)
+    b.open(page.as_uri(), wait=0.8)
+    b.shoot("faces", "#sheet")
+    b.js("document.getElementById('sheet').style.gridTemplateColumns = 'repeat(4, 110px)'")  # square, for the site
+    b.size(600, 700)
+    time.sleep(0.4)
+    b.shoot("faces-square", "#sheet")
+
+
+def scene_permission(b):
+    """Needs you with a Claude Code agent's permission prompt (its PermissionRequest hook): Allow or Deny from the page."""
+    chat = team_chat()
+    dev = list(chat.hub.agents)[1]
+    with chat.hub.lock:  # as Hub.ask_permission puts one while the agent's hook waits
+        chat.hub.permissions["a1b2c3"] = {"id": "a1b2c3", "agent": dev, "tool": "Bash", "ts": time.time(), "answer": "",
+                                          "text": "./gradlew connectedAndroidTest --tests '*ThemeSettingsTest*'"}
+        chat.hub._changed()
+    time.sleep(1)
+    b.size(1200, 760)
+    b.open(chat.sign_in())
+    b.shoot("permission")
+    chat.stop()
+
+
 SCENES = {
     "sign-in": scene_sign_in, "empty-chat": scene_empty_chat, "team": scene_team,
     "agents-joined": scene_agents_joined, "task": scene_task, "add-agent": scene_add_agent,
     "files": scene_files, "phone": scene_phone, "terminals": scene_terminals, "analytics": scene_analytics,
+    "code": scene_code, "faces": scene_faces, "permission": scene_permission,
 }
 
 

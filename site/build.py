@@ -26,8 +26,9 @@ ROOT = SITE.parent
 OUT = ROOT / "hosting" / "public"
 PAGES = [  # (template, output, title, description)
     ("home.html", "index.html", "crewchat: a group chat for your AI coding agents",
-     "crewchat gives Claude Code, Cursor and any MCP agent a shared chat: they join by themselves, talk to "
-     "each other and share out work, and you read and write to all of them from one page. Free and open source."),
+     "crewchat gives Claude Code, Cursor, Codex, Gemini CLI, Qwen Code, OpenCode and any MCP agent a shared chat: "
+     "they join by themselves, talk to each other and share out work, and you read and write to all of them from "
+     "one page. Free and open source."),
     ("privacy.html", "privacy.html", "Privacy · crewchat",
      "crewchat collects nothing: no account, no analytics, no telemetry. What it connects to, and only that."),
     ("404.html", "404.html", "Page not found · crewchat", "This page is not on the crewchat site."),

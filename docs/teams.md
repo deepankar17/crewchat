@@ -11,8 +11,14 @@ sends bugs straight to the developer.
 - [Give an agent a role](#give-an-agent-a-role)
 - [The built-in roles](#the-built-in-roles)
 - [Working with a lead](#working-with-a-lead)
+- [The advisor](#the-advisor)
+- [The task sheet and the lead](#the-task-sheet-and-the-lead)
+- [The lead's and the advisor's code tool](#the-leads-and-the-advisors-code-tool)
 - [Progress on tasks](#progress-on-tasks)
 - [New agent, from the chat page](#new-agent-from-the-chat-page)
+- [Stop, reopen or switch an agent's model](#stop-reopen-or-switch-an-agents-model)
+- [Pictures and colours](#pictures-and-colours)
+- [Role packs](#role-packs)
 - [Your own roles](#your-own-roles)
 - [A worked example](#a-worked-example)
 - [Limits](#limits)
@@ -119,6 +125,31 @@ With a lead, the lead hands out tasks from the project's [task sheet](getting-st
 agents take the top task they may from the sheet themselves. Either way, the sheet is where every
 task, and who holds it, shows.
 
+**Suggested files.** When a task goes to review or done, crewchat looks at the files its holder
+edited while it held it, and suggests the folders outside the task's areas to the lead (to you,
+without a lead). The lead accepts them with `hub_task` action `areas` and `accept`, or gives the
+areas itself; you accept them with **Accept files** in the task's panel. Other tasks over those
+files then wait for this one ([the task sheet](getting-started.md#the-task-sheet)).
+
+## The lead's and the advisor's code tool
+
+The lead and the advisor get one tool the others do not, `hub_code`:
+
+- `hub_code` history, with a file or folder: who changed it and how often, for which tasks, and
+  what was said in the chat about those tasks.
+- `hub_code` split, with a task's number: the task's files (its areas, or the whole project's
+  without) in groups that hang together, by imports and then by folders, one group per agent, to
+  hand out with `hub_task` assign.
+
+Both work from what crewchat records while edit tracking is on (`crewchat edits`, on by default
+for a software team); split also needs the code map, which is kept while edit tracking is on
+([code-aware coordination](how-it-works.md#code-aware-coordination)).
+
+An agent gets `hub_code` when you make it the lead or the advisor, and loses it when the role goes.
+Its session is told that its tools changed (MCP's `list_changed`) and loads it. A tool on an MCP
+protocol older than 2025-03-26 cannot be told while it runs: its role message says so, and the
+tool comes with its next session.
+
 ## Progress on tasks
 
 An agent working on a task reports with `hub_task` update:
@@ -143,14 +174,23 @@ session for you, in four steps:
 
 <img src="images/add-agent-form.png" width="420" alt="New agent, step 1 of 4, Identity: From a template (start from scratch), Name docs-writer, Role Docs, Picture books, Colour: the tool's own. Cancel and Next.">
 
-1. **Identity:** a name (optional, for example `docs-writer`), a role, and a picture and colour.
-   The role fills in its own picture, colour and tool. **From a template** starts from a role and
-   goes straight to step 2.
+1. **Identity:** a name (optional, for example `docs-writer`; 🎲 picks a first name nobody has),
+   a role, and a picture and colour. A role fills in its colour and tool, and a picture only if it
+   is a role of your own that you gave one: with a built-in role, the new agent gets a
+   [face of its own](#pictures-and-colours). **From a template** starts from a role and goes
+   straight to step 2.
 2. **Workspace:** the project folder. The menu offers folders on the host machine that
-   `crewchat start` has connected to this project.
-3. **Engine:** the tool (Claude Code, or Cursor's agent), its model (Claude Code: Fable, Opus,
-   Sonnet, Haiku, or its default), its own advisor (Claude Code: Fable, Opus, Sonnet, or none;
-   see [the advisor](#the-advisor)), and what it may do **without asking** (below).
+   `crewchat start` has connected to this project. To use another, type its path under **Or
+   connect one**, or **Browse…** the host's folders (and make a **New folder** there), then
+   **Connect**: it runs `crewchat start` in that folder for you. A folder that is not there yet
+   offers **Create it and connect**.
+3. **Engine:** the tool (Claude Code, Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode;
+   one that is not installed shows as such), its model (Claude Code: Fable, Opus, Sonnet, Haiku, or
+   its default), its own advisor (Claude Code: Fable, Opus, Sonnet, or none; see
+   [the advisor](#the-advisor)), and what it may do **without asking** (below). Under the tool, New
+   agent says what it still needs on this machine and in that folder: installed, signed in, and
+   what it asks once there (whether you trust the folder, crewchat's hooks). A step to take first
+   comes with the command to run in a terminal (**Copy**), then **Check again**.
 4. **Briefing:** a first task and extra instructions, both optional.
 
 <img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing: First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">
@@ -162,7 +202,7 @@ name, role, picture and colour, gets your instructions, then the task, already a
 
 What happens when you press **Start**:
 
-![Add an agent from the chat. 1: You click Add an agent, and fill in a name, role and task. 2: The page asks crewchat to launch it. 3: A terminal window opens Claude Code in the folder. 4: The new session links itself, with the one-time key. 5: It learns its name, role and first task. 6: And it appears on your list, ready to work.](images/diagram-add-agent.gif)
+![New agent, from the chat. 1: You click New agent, and fill in a name, role and task. 2: The page asks crewchat to launch it. 3: A terminal window opens Claude Code in the folder. 4: The new session links itself, with the one-time key. 5: It learns its name, role and first task. 6: And it appears on your list, ready to work.](images/diagram-add-agent.gif)
 
 From a terminal on the host:
 
@@ -173,20 +213,23 @@ crewchat agent add tester --role qa --tool cursor --folder ~/code/my-app --permi
 
 **What it may do without asking.** crewchat's own tools do not ask, in any connected folder: its
 folder allows them (`mcp__crewchat__hub_inbox` and the others in `.claude/settings.local.json`,
-`Mcp(crewchat:hub_inbox)` and so on in `.cursor/cli.json`), so an agent does not sit on a
-permission prompt for the chat. That holds under any name the server is registered under (a directory's
+`Mcp(crewchat:hub_inbox)` and so on in `.cursor/cli.json`; Gemini CLI and Qwen Code trust
+crewchat's server in their folder settings), so an agent does not sit on a permission prompt for
+the chat. That holds under any name the server is registered under (a directory's
 `crewchat-mcp`, say, in your user or local scope): crewchat allows its tools under each name it finds
 for the folder, and `crewchat start` says when it finds the server registered twice. `hub_send` is allowed too: the files it shares come only from the
 agent's own project folder, never from credential folders. Cursor's agent is also started with `--trust` and with crewchat's MCP server approved
 (`cursor-agent mcp enable crewchat`), never with every server the folder lists. Beyond that, pick
 one:
 
-| Choice | Claude Code | Cursor's agent |
-|---|---|---|
-| Ask before anything else (default) | | |
-| Also edit files | `--permission-mode acceptEdits` | (not offered) |
-| Also run what it judges safe | `--permission-mode auto` | `--auto-review` |
-| Do anything | `--permission-mode bypassPermissions` | `--force` |
+| Tool | Ask before anything else (default) | Also edit files | Also run what it judges safe | Do anything |
+|---|---|---|---|---|
+| Claude Code | | `--permission-mode acceptEdits` | `--permission-mode auto` | `--permission-mode bypassPermissions` |
+| Cursor's agent | | (not offered) | `--auto-review` | `--force` |
+| Codex CLI | As its own settings say | `--sandbox workspace-write --ask-for-approval on-request` (it also runs commands in the folder) | (not offered) | `--dangerously-bypass-approvals-and-sandbox` |
+| Gemini CLI | | `--approval-mode auto_edit` | (not offered) | `--yolo` |
+| Qwen Code | | `--approval-mode auto-edit` | (not offered) | `--yolo` |
+| OpenCode | As its own settings say | (not offered) | (not offered) | (not offered) |
 
 **Do anything** runs commands and changes files with nobody watching: use it in a folder you can
 restore (git), on a machine without secrets it could leak. From a terminal: `--permissions
@@ -227,10 +270,10 @@ is who.
 
 ## Pictures and colours
 
-Each agent has a picture in the list, in its panel and next to its messages. By default it shows the agent's
-initials on its tool's colour (Claude Code orange, Cursor near-black, and so on), with a small
-badge for the tool. When the chat spans more than one machine, a second badge shows the agent's
-OS: macOS, Windows or Linux.
+Each agent has a picture in the list, in its panel and next to its messages: by default a face of
+its own (below), with a small badge for its tool. When the chat spans more than one machine, a
+second badge shows the agent's OS: macOS, Windows or Linux. Initials, on the tool's colour (Claude
+Code orange, Cursor near-black, and so on), are one of the pictures you can choose instead.
 
 - A new agent gets a face of its own, made of parts picked at random: a skin tone, a face shape, an
   expression, hair and its colour, maybe a hat (a cap, a beanie, a beret, a top hat, headphones, a

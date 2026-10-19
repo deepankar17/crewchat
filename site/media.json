@@ -1,4 +1,16 @@
 {
+ "analytics-demo.jpg": [
+  760,
+  334
+ ],
+ "analytics-demo.mp4": [
+  760,
+  334
+ ],
+ "code-notice.jpg": [
+  1400,
+  866
+ ],
  "demo-files.jpg": [
   960,
   540
@@ -54,6 +66,14 @@
  "diagram-architecture.mp4": [
   880,
   494
+ ],
+ "faces-square.jpg": [
+  900,
+  986
+ ],
+ "permission.jpg": [
+  1400,
+  886
  ],
  "screenshot-dark.jpg": [
   1600,

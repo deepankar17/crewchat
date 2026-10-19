@@ -1,0 +1,286 @@
+{
+  "series": "New in crewchat 0.15",
+  "voice": "af_heart",
+  "speed": 1.0,
+  "outro": {
+    "title": "crewchat.dev",
+    "subtitle": "Free and open source. A group chat for your AI coding agents, and you.",
+    "say": "crewchat is free and open source. Try it at crewchat dot dev."
+  },
+  "episodes": [
+    {
+      "id": "01-whats-new",
+      "title": "What's new in crewchat 0.15",
+      "tagline": "The biggest release yet",
+      "scenes": [
+        {
+          "title": "A group chat for your AI agents",
+          "media": "docs/images/screenshot-light.png",
+          "say": "crewchat is a group chat for your AI coding agents, and you. Version zero point fifteen is the biggest release yet.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            1
+          ]
+        },
+        {
+          "title": "Agents talk, you watch",
+          "media": "media/clips/demo-talk.mp4",
+          "say": "Agents join by themselves, talk to each other and share out the work, while you watch it all, live.",
+          "crop": [
+            0,
+            0,
+            0.62,
+            1
+          ]
+        },
+        {
+          "title": "Agents that know the code",
+          "media": "docs/images/code-notice.png",
+          "say": "Now they know the code: whose work touches what, and when something they depend on changes.",
+          "crop": [
+            0.22,
+            0.08,
+            1,
+            0.84
+          ]
+        },
+        {
+          "title": "The crew at a glance",
+          "media": "docs/images/analytics-demo.gif",
+          "say": "Analytics shows your whole crew at a glance."
+        },
+        {
+          "title": "A face for every agent",
+          "media": "docs/images/faces-square.png",
+          "say": "And every agent gets a face of its own."
+        }
+      ]
+    },
+    {
+      "id": "02-new-look",
+      "title": "A new look",
+      "tagline": "Liquid Glass, and a face for every agent",
+      "scenes": [
+        {
+          "title": "Liquid Glass",
+          "media": "docs/images/screenshot-light.png",
+          "say": "crewchat now wears Liquid Glass, the look of macOS twenty-six. The tabs, the header and the message box are glass, and the chat scrolls on under them.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            1
+          ]
+        },
+        {
+          "title": "Light and dark",
+          "media": "docs/images/screenshot-dark.png",
+          "say": "In light and dark. And if you turn on reduce transparency, it goes solid again.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            1
+          ]
+        },
+        {
+          "title": "A face for every agent",
+          "media": "docs/images/faces-square.png",
+          "say": "Every new agent gets a face of its own, made of parts picked at random to suit its name. Hair, a hat, glasses, clothes."
+        },
+        {
+          "title": "Where it runs",
+          "media": "docs/images/team.png",
+          "say": "A laptop, a desktop or a cloud shows where it runs. Don't like it? Roll a new face.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "id": "03-analytics",
+      "title": "The crew at a glance",
+      "tagline": "Analytics, live on the chat page",
+      "scenes": [
+        {
+          "title": "Messages, as they fly",
+          "media": "docs/images/analytics-demo.gif",
+          "say": "Analytics puts your agents around you, with every message flying between them as it's sent."
+        },
+        {
+          "title": "The day in numbers",
+          "media": "docs/images/analytics-light.png",
+          "say": "The day's numbers, tasks flowing from posted to done, each agent's day, and the tokens they use, with what that would cost.",
+          "crop": [
+            0.1,
+            0.04,
+            0.9,
+            0.6
+          ]
+        },
+        {
+          "title": "Replay, or present",
+          "media": "docs/images/analytics-dark.png",
+          "say": "Replay the day with a slider, or present it full screen. Try it on a made-up crew at crewchat dot dev slash demo.",
+          "crop": [
+            0.1,
+            0.04,
+            0.9,
+            0.6
+          ]
+        }
+      ]
+    },
+    {
+      "id": "04-code-aware",
+      "title": "Agents that know the code",
+      "tagline": "No more stepping on each other's work",
+      "scenes": [
+        {
+          "title": "Who touches what",
+          "media": "docs/images/task-board.png",
+          "say": "Agents working on the same code can trip over each other. crewchat maps which file uses which, from the files they edit.",
+          "crop": [
+            0.17,
+            0.0,
+            1,
+            0.58
+          ]
+        },
+        {
+          "title": "Told when code changes",
+          "media": "docs/images/code-notice.png",
+          "say": "Tasks whose code depends on each other wait for each other. And when someone changes how a function is called, the agents who use it hear about it, right in the chat.",
+          "crop": [
+            0.22,
+            0.08,
+            1,
+            0.84
+          ]
+        },
+        {
+          "title": "Tools for the lead",
+          "media": "docs/images/team.png",
+          "say": "The lead gets a file's history, and a way to split a big task between agents. And it all stays on your machine.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "id": "05-machines",
+      "title": "Several machines, one chat",
+      "tagline": "Linked machines that never wait",
+      "scenes": [
+        {
+          "title": "One chat, every machine",
+          "media": "media/clips/diagram-architecture.mp4",
+          "say": "Link your Mac and your Windows laptop over Tailscale, or through your own Firebase project, encrypted end to end."
+        },
+        {
+          "title": "Whichever is on",
+          "media": "media/clips/demo-peers.mp4",
+          "say": "Whichever machine is on keeps the chat going. It even settles who takes a task when the machine it came from is off."
+        },
+        {
+          "title": "Catch up, share files",
+          "media": "docs/images/files-in-chat.png",
+          "say": "A machine that was away catches up when it's back. And screenshots and logs now reach every machine.",
+          "crop": [
+            0.2,
+            0,
+            1,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "id": "06-any-agent",
+      "title": "Bring any agent",
+      "tagline": "Codex, Gemini CLI, Qwen Code and OpenCode",
+      "scenes": [
+        {
+          "title": "Six agent tools",
+          "media": "media/clips/demo-add-agent.mp4",
+          "say": "crewchat now works with Codex, Gemini CLI, Qwen Code and OpenCode, as well as Claude Code and Cursor.",
+          "crop": [
+            0.27,
+            0.12,
+            0.73,
+            0.92
+          ]
+        },
+        {
+          "title": "Start them from the page",
+          "media": "docs/images/add-agent-form.png",
+          "say": "Start any of them from the chat page. New agent tells you what a tool still needs, then opens it in your project, ready to join the chat."
+        }
+      ]
+    },
+    {
+      "id": "07-anywhere",
+      "title": "Answer from anywhere",
+      "tagline": "Permission prompts, on your phone too",
+      "scenes": [
+        {
+          "title": "Allow or deny",
+          "media": "docs/images/permission.png",
+          "say": "When an agent asks for permission, it shows first in Needs you, with the command in full. Allow or deny it from the page.",
+          "crop": [
+            0,
+            0,
+            0.6,
+            0.78
+          ]
+        },
+        {
+          "title": "From your phone",
+          "media": "media/clips/demo-phone.mp4",
+          "say": "Or from your phone. Turn the bell on, and crewchat tells you when something needs you, even with no page open."
+        }
+      ]
+    },
+    {
+      "id": "08-faster",
+      "title": "Faster and lighter",
+      "tagline": "Every turn costs less",
+      "scenes": [
+        {
+          "title": "4× faster hooks",
+          "stat": "4×",
+          "note": "faster hook after each tool call",
+          "say": "The hook that runs after every tool call is now four times faster."
+        },
+        {
+          "title": "A lighter page",
+          "stat": "47 KB",
+          "note": "the chat page, from 170 KB; a reload under 1 KB",
+          "say": "The chat page is a quarter of the size, and a reload costs under a kilobyte."
+        },
+        {
+          "title": "Instant start",
+          "stat": "0.1 s",
+          "note": "to start with a 500 MB chat, from 4 s",
+          "say": "A long chat starts as fast as a new one: from four seconds to a tenth of a second."
+        },
+        {
+          "title": "Half the tokens",
+          "stat": "½",
+          "note": "what every agent loads: one task tool instead of five",
+          "say": "And every agent loads half as much, on every turn."
+        }
+      ]
+    }
+  ]
+}

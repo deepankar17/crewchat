@@ -13,6 +13,7 @@ stop or uninstall are never run from the page, so a stray tap on a phone cannot 
 - [The server](#the-server)
 - [Talking and agents](#talking-and-agents)
 - [Teams](#teams)
+- [Projects, rules, skills and the task sheet](#projects-rules-skills-and-the-task-sheet)
 - [Project folders](#project-folders)
 - [Several machines](#several-machines)
 - [Settings](#settings)
@@ -27,7 +28,7 @@ the current one) and open the chat page. Safe to run again.
 | Option | |
 |---|---|
 | `--place NAME` | Label for this folder in agent names (default: the machine's name) |
-| `--client all\|claude\|cursor` | Which tools to connect (default: both) |
+| `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode` | Which tools to connect (default: Claude Code, Cursor and the other tools installed here) |
 | `--project NAME` | The chat's name, the first time (default: the folder's name) |
 | `--port PORT` | The local port, the first time (default: 8765, or the next free one) |
 | `--no-service` | Run the server until you log out, instead of at every login |
@@ -82,9 +83,9 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 |---|---|
 | `--role ROLE` | Its role |
 | `--task TEXT` | Its first task |
-| `--tool claude\|cursor` | Claude Code (default) or Cursor's agent |
+| `--tool claude\|cursor\|codex\|gemini\|qwen\|opencode` | Claude Code (default), Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode |
 | `--folder FOLDER` | A connected project folder on this machine (default: the current one) |
-| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (Claude Code), auto (it judges what is safe), or anything ([details](teams.md#add-an-agent-from-the-chat-page)) |
+| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (not Cursor or OpenCode), auto (it judges what is safe: Claude Code and Cursor), or anything ([details](teams.md#new-agent-from-the-chat-page)) |
 | `--accept-edits` | The same as `--permissions edits` |
 
 ## Teams
@@ -138,7 +139,7 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat places` | List the connected folders' labels |
 | `crewchat place remove NAME` | Shut a folder out: its token stops working at once |
 | `crewchat invite [--local] [--place NAME] [--client …] [--url URL]` | Print a `crewchat join` command for a folder, with a single-use code (10 minutes) |
-| `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|generic`, `--project FOLDER`) |
+| `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode\|generic`, `--project FOLDER`) |
 
 `crewchat start` does `invite` and `join` for you on the host. `--client generic` prints MCP
 settings for other tools instead of writing files.
