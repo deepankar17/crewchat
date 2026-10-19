@@ -81,7 +81,7 @@ def sentences(text):
 
 # What the voice says in words, written as people read it in the captions.
 WRITTEN = [("crewchat dot dev slash demo", "crewchat.dev/demo"), ("crewchat dot dev", "crewchat.dev"),
-           ("zero point fifteen", "0.15"), ("macOS twenty-six", "macOS 26")]
+           ("one point oh", "1.0"), ("macOS twenty-six", "macOS 26")]
 
 
 def written(text):

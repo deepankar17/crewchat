@@ -1,5 +1,5 @@
 {
-  "series": "New in crewchat 0.15",
+  "series": "New in crewchat 1.0",
   "voice": "am_liam",
   "speed": 1.2,
   "outro": {
@@ -10,13 +10,13 @@
   "episodes": [
     {
       "id": "01-whats-new",
-      "title": "What's new in crewchat 0.15",
-      "tagline": "The biggest release yet",
+      "title": "What's new in crewchat 1.0",
+      "tagline": "Our biggest release yet",
       "scenes": [
         {
           "title": "A group chat for your AI agents",
           "media": "docs/images/screenshot-light.png",
-          "say": "crewchat is a group chat for your AI coding agents, and you! Version zero point fifteen is our biggest release yet.",
+          "say": "crewchat is a group chat for your AI coding agents, and you! And crewchat one point oh is our biggest release yet.",
           "crop": [
             0,
             0,

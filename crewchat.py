@@ -4675,7 +4675,7 @@ WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False
 SETTING = dict(WRITE, idempotentHint=True)
 TASK_ACTIONS = ("view", "add", "take", "assign", "areas", "update")
 OLD_TASK_TOOLS = {"hub_tasks": "view", "hub_task_add": "add", "hub_take": "take", "hub_assign": "assign",
-                  "hub_update": "update"}  # merged into hub_task in 0.15; a session started before asks for them
+                  "hub_update": "update"}  # merged into hub_task in 1.0; a session started before asks for them
 
 
 def _tool(name, description, annotations, properties=None, required=()):
