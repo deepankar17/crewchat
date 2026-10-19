@@ -22,8 +22,8 @@ def uv_dir(*args):
 @unittest.skipUnless(UV, "needs uv")
 class Install(unittest.TestCase):
     def setUp(self):
-        self.home = H.TMP / ("install-home-%d" % id(self))
-        self.home.mkdir()
+        # A folder of its own: named by id(self), a later test could get an earlier one's id, and its folder.
+        self.home = H.Path(H.tempfile.mkdtemp(prefix="install-home-", dir=H.TMP))
         # uv alone, not the folder it is in: that may hold the owner's own crewchat, which the
         # installer would then take for the one it updates.
         (self.home / "uv-only").mkdir()
