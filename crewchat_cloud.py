@@ -828,7 +828,7 @@ class CloudSync(crewchat.ProjectLink):
     # The coordinator (roadmap Y1) --------------------------------------------------------------
     def coordinator(self):
         """Which machine coordinates now: the holder of a lease that has not run out (meta/coordinator)."""
-        doc = self.lease or {}
+        doc = self.machine.lease or {}  # a project's link asks the machine's, which holds and follows the lease
         live = float(doc.get("expires") or 0) > self.clock()
         names = self._names()
         return {"name": names.get(doc.get("device"), "") if live else "", "me": live and doc.get("device") == self.device.id,

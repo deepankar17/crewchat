@@ -552,6 +552,12 @@ class SharedProjects(unittest.TestCase):
     def hub(self, machine, name):
         return machine.projects.get(crewchat.project_id(name)).hub
 
+    def test_every_projects_page_names_the_coordinator(self):
+        # Machines coordinate as a whole, through the machine's link: a project's page says who, as the first's does.
+        self.a.sync.renew_lease()
+        self.assertTrue(self.hub(self.a, "t3").sync.coordinator()["me"])
+        self.assertEqual(self.hub(self.b, "t3").sync.coordinator()["name"], "mac")
+
     def test_a_project_with_the_same_name_is_one_chat(self):
         a3, b3 = self.hub(self.a, "t3"), self.hub(self.b, "t3")
         writer = a3.agent_for(a3.open_session("mac", "claude"))

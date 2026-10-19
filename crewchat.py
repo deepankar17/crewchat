@@ -1501,6 +1501,7 @@ class Analytics:
     def __init__(self, log):
         self.log = Path(log)
         self.lock = threading.Lock()
+        self.building = threading.Lock()  # one build at a time: a second waits for it, then finds it built
         self.built = threading.Event()
         self.cutoff = 0  # the build counts the log up to this number; newer messages come by add
         self.hours, self.days, self.pairs, self.tasks, self.agents = {}, {}, {}, {}, {}
@@ -1509,17 +1510,18 @@ class Analytics:
 
     def build(self):
         """Count every message in the log (once; new ones arrive by add while it runs)."""
-        if self.built.is_set():
-            return
-        try:
-            with open(self.log, "rb") as f:
-                for raw in f:
-                    msg = log_message(raw.rstrip(b"\n"))
-                    if msg is not None and msg["seq"] <= self.cutoff:
-                        self.add(msg)
-        except OSError:
-            pass
-        self.built.set()
+        with self.building:
+            if self.built.is_set():
+                return
+            try:
+                with open(self.log, "rb") as f:
+                    for raw in f:
+                        msg = log_message(raw.rstrip(b"\n"))
+                        if msg is not None and msg["seq"] <= self.cutoff:
+                            self.add(msg)
+            except OSError:
+                pass
+            self.built.set()
 
     def add(self, msg):
         with self.lock:
@@ -1715,6 +1717,14 @@ class EventStore:
             self.db.execute("CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts)")
             self.db.commit()
         return self.db
+
+    def rename(self, name, new):
+        """An agent renamed: its edits and states are the new name's."""
+        with self.lock:
+            db = self._conn()
+            for table in ("edits", "activity"):
+                db.execute("UPDATE %s SET agent = ? WHERE agent = ?" % table, (new, name))
+            db.commit()
 
     def add_edit(self, agent, path, task="", ts=None):
         with self.lock:
@@ -2456,6 +2466,13 @@ class Hub:
             for row in self.sheet.values():
                 if row.get("reclaimed") == name:
                     row["reclaimed"] = new
+            for agents in self.usage.values():  # the tokens it used, and its edits and states, go with it
+                if name in agents:
+                    add_usage(agents.setdefault(new, {}), agents.pop(name))
+            try:
+                self.events.rename(name, new)
+            except Exception as e:  # a locked or broken events.sqlite: the rename still goes
+                sys.stderr.write("%s could not rename %s's edits and activity: %s\n" % (now_iso(), name, e))
             self._event("%s is now %s" % (name, new))
             if tell:
                 self._append(OWNER, new, "You are now %s.%s" % (new, SESSION_NAME_NOTE % new), "msg")
@@ -2749,7 +2766,10 @@ class Hub:
     def _edited(self, name, path):
         """An agent edited a file of the project (C0): recorded, and the code map reads it again. Caller holds
         the lock."""
-        self.events.add_edit(name, path, self._usage_task(name))
+        try:
+            self.events.add_edit(name, path, self._usage_task(name))
+        except Exception as e:  # a full disk or a locked file must not fail the hook (it would stop sending edits)
+            sys.stderr.write("%s could not record %s's edit: %s\n" % (now_iso(), name, e))
         self._editors[path] = name
         self._map_edited.add(path)  # the code map reads it again (C1)
         MAP_WAKE.set()
@@ -8000,8 +8020,9 @@ SETTINGS_HOOKS = {
 
 
 def is_our_hook(command):
-    return any(" hook %s " % client in command or "%s %s " % (HOOK_SCRIPT_FILE, client) in command
-               for client in HOOK_CLIENTS)
+    """Whether a hook's command (or settings JSON holding it) is crewchat's: `crewchat hook <client> <event>`, or the
+    light hook script, whose path is quoted when it has a space (and the quote escaped in JSON)."""
+    return any(" hook %s " % client in command for client in HOOK_CLIENTS) or bool(OUR_SCRIPT_RE.search(command))
 
 
 def write_mcp_json(project, url, token):
@@ -8036,8 +8057,9 @@ SERVER_NAME_OK = re.compile(r"^[A-Za-z0-9_-]{1,64}$")  # a name a permission rul
 
 
 def crewchat_rules(prefix, names=(SERVER_NAME,), tools=None):
-    """The allow rules for crewchat's tools under each of its names, with Claude Code's or Cursor's prefix."""
-    tools = [t["name"] for t in TOOLS] if tools is None else tools
+    """The allow rules for crewchat's tools under each of its names, with Claude Code's or Cursor's prefix: every
+    agent's, and the lead's (the server gives those to the lead only)."""
+    tools = [t["name"] for t in TOOLS + LEAD_TOOLS] if tools is None else tools
     return [prefix % name + tool + (")" if prefix == CURSOR_ALLOW else "") for name in names for tool in tools]
 
 
@@ -9036,6 +9058,7 @@ def hook_post(url, token, body, timeout=5):
 
 
 HOOK_SCRIPT_FILE = "crewchat-hook.py"  # in the crewchat home: the light hook script (hook_script)
+OUR_SCRIPT_RE = re.compile(r"[/\\]%s(?:\\?\")? (?:%s) " % (re.escape(HOOK_SCRIPT_FILE), "|".join(HOOK_CLIENTS)))
 
 
 def hook_script():

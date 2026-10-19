@@ -386,6 +386,53 @@ class Signatures(Sample):
                          ["Store.__init__(self) is now Store.__init__(self, x)"])  # a constructor is public
 
 
+class Splitting(unittest.TestCase):
+    """C7's last step: the smallest groups join the ones they link to most, quickly even in a big project."""
+
+    @staticmethod
+    def joined_by_hand(groups, links, rel, most):  # what join_small replaced: every link looked at for each pair
+        def weight(a, b):
+            sa, sb = set(groups[a]), set(groups[b])
+            return sum(n for (i, j), n in links.items() if (i in sa and j in sb) or (i in sb and j in sa))
+        folder = crewchat_map.folder_of
+        while len(groups) > most:
+            small = min(groups, key=lambda g: (len(groups[g]), folder(rel[groups[g][0]])))
+            target = max([g for g in groups if g != small], key=lambda g: (
+                weight(small, g), folder(rel[groups[g][0]]) == folder(rel[groups[small][0]]), -len(groups[g])))
+            groups[target] += groups.pop(small)
+
+    @staticmethod
+    def project(rng, files, groups, links):
+        rel = ["f%d/m%d.py" % (rng.randrange(8), i) for i in range(files)]
+        members = {}
+        for i in range(files):
+            members.setdefault(i % groups, []).append(i)
+        pairs = {}
+        for _ in range(links):
+            i, j = sorted(rng.sample(range(files), 2))
+            pairs[(i, j)] = pairs.get((i, j), 0) + 1
+        return members, pairs, rel
+
+    def test_the_same_groups_as_before(self):
+        import random
+        rng = random.Random(7)
+        for _ in range(30):
+            members, links, rel = self.project(rng, 60, rng.randrange(7, 30), rng.randrange(0, 150))
+            expected = {g: list(m) for g, m in members.items()}
+            self.joined_by_hand(expected, links, rel, 6)
+            group_of = crewchat_map.join_small(members, links, rel, 6)
+            self.assertEqual(members, expected)
+            self.assertEqual(group_of, {i: g for g, m in members.items() for i in m})
+
+    def test_a_big_project_splits_quickly(self):
+        import random
+        members, links, rel = self.project(random.Random(1), 5000, 400, 20000)
+        started = time.perf_counter()
+        crewchat_map.join_small(members, links, rel, 6)
+        self.assertLess(time.perf_counter() - started, 5)  # minutes, before
+        self.assertEqual(len(members), 6)
+
+
 class Packaging(unittest.TestCase):
     def test_the_core_needs_no_library_and_the_parsers_are_an_extra(self):
         text = (ROOT / "pyproject.toml").read_text()

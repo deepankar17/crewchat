@@ -325,6 +325,32 @@ class Identity(Base):
             self.assertTrue(other.call("hub_rename", name=bad)["isError"], bad)
         session.call("hub_rename", name=old)
 
+    def test_a_renamed_agent_keeps_its_tokens_and_its_day(self):
+        # hub_rename is what agents are told to do: the tokens it used, and its edits and states, go with it.
+        session, old = self.agent()
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        with self.hub.lock:
+            self.hub.usage.setdefault(day, {})[old] = {"claude-sonnet": [1000, 200, 0, 0, 0]}
+        self.hub.events.add_edit(old, "app/renamed.py")
+        try:
+            session.call("hub_rename", name="tokens-kept")
+            self.assertNotIn(old, self.hub.usage[day])
+            self.assertEqual(self.hub._usage_row("tokens-kept")["today"], 1200)
+            self.assertEqual({e["agent"] for e in self.hub.events.edits() if e["path"] == "app/renamed.py"}, {"tokens-kept"})
+        finally:
+            session.call("hub_rename", name=old)
+            self.hub.usage[day].pop(old, None)
+
+    def test_an_edit_the_event_store_cannot_take_still_reaches_the_code_map(self):
+        # A locked events.sqlite (a checkpoint, a virus scanner) or a full disk: the hook must not fail, or the
+        # agent's hook takes edit tracking as off and stops sending them.
+        import sqlite3
+        with mock.patch.object(self.hub.events, "add_edit", side_effect=sqlite3.OperationalError("database is locked")), \
+                mock.patch("sys.stderr"):
+            with self.hub.lock:
+                self.hub._edited("maya", "app/locked.py")
+        self.assertIn("app/locked.py", self.hub._map_edited)
+
     def test_client_kinds_and_place_labels(self):
         self.assertEqual(crewchat.client_kind({"name": "claude-code"}), "claude")
         self.assertEqual(crewchat.client_kind({"name": "Cursor"}), "cursor")
@@ -578,6 +604,22 @@ class EditPaths(unittest.TestCase):
         self.assertEqual(lines["teo"], [[120, 1000, "working"]])  # one state again is one piece
         self.assertEqual(store.timelines(since=2000, until=3000)["maya"], [[2000, 2015, "listening"],
                                                                           [2015, 3000, "idle"]])
+
+    def test_two_builds_at_once_count_each_message_once(self):
+        # The server builds every project's totals at start; the page may ask for them before that is done.
+        log = Path(tempfile.mkdtemp(prefix="analytics-", dir=TMP)) / "messages.jsonl"
+        log.write_text("".join(json.dumps({"id": "A%d" % n, "seq": n, "ts": 1000 + n, "from": "maya", "to": "all",
+                                           "text": "hi"}) + "\n" for n in range(1, 41)))
+        analytics = crewchat.Analytics(log)
+        analytics.cutoff = 40
+        real = crewchat.log_message
+        with mock.patch.object(crewchat, "log_message", lambda raw: (time.sleep(0.002), real(raw))[1]):
+            builds = [threading.Thread(target=analytics.build) for _ in range(2)]
+            for build in builds:
+                build.start()
+            for build in builds:
+                build.join()
+        self.assertEqual(analytics.total, 40)
 
     def test_the_event_store(self):
         store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
@@ -3610,12 +3652,14 @@ class Joining(Base):
         self.assertEqual(allow[0], "Bash(ls:*)")  # the user's own rule stays
         self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
         self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
+        self.assertIn("mcp__crewchat__hub_code", allow)  # the lead's own tool too: it only reads
         self.assertNotIn("mcp__crewchat", allow)
         cursor_permissions = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]
         cursor_allow = cursor_permissions["allow"]
         self.assertEqual(cursor_permissions["deny"], [])  # Cursor's agent refuses a cli.json without one
         self.assertIn("Mcp(crewchat:hub_task)", cursor_allow)
         self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
+        self.assertIn("Mcp(crewchat:hub_code)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
         stop = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertEqual(stop[0], "echo mine")
@@ -5420,6 +5464,16 @@ class Lifecycle(Base):
             self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
         # A checkout runs its script with this Python, as before.
         self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_hooks_under_a_home_with_a_space_are_still_ours(self):
+        # C:/Users/John Smith: the light hook script's path is quoted, and crewchat must still know its hook (or each
+        # refresh adds another, and uninstalling leaves one behind), in a settings file as in its JSON.
+        for script in ("C:/Users/John Smith/.crewchat/crewchat-hook.py", "/Users/js/.crewchat/crewchat-hook.py"):
+            with mock.patch.object(crewchat, "hook_program", lambda event: ["C:/Python 3/python.exe", script]):
+                command = crewchat.hook_command("claude", "tool")
+            self.assertTrue(crewchat.is_our_hook(command), command)
+            self.assertTrue(crewchat.is_our_hook(json.dumps({"PostToolUse": [{"command": command}]})), command)
+        self.assertFalse(crewchat.is_our_hook('python "/x/my-crewchat-hook.pyc" claude tool'))
 
     def test_a_hook_gives_up_on_a_server_stopped_while_it_listened(self):
         answers = iter([{"text": ""}])

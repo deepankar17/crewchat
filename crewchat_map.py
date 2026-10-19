@@ -1113,31 +1113,24 @@ class CodeMap:
                 if home is not None and home != root and home in groups:
                     groups[home] += groups.pop(root)
 
-        def weight(a, b):
-            sa, sb = set(groups[a]), set(groups[b])
-            return sum(n for (i, j), n in links.items() if (i in sa and j in sb) or (i in sb and j in sa))
-        while len(groups) > most:  # the smallest joins the group it links to most, else its folder's, else the next
-            small = min(groups, key=lambda g: (len(groups[g]), folder_of(rel[groups[g][0]])))
-            others = [g for g in groups if g != small]
-            target = max(others, key=lambda g: (weight(small, g), folder_of(rel[groups[g][0]]) ==
-                                                folder_of(rel[groups[small][0]]), -len(groups[g])))
-            groups[target] += groups.pop(small)
+        group_of = join_small(groups, links, rel, most)
         order = sorted(groups, key=lambda g: -len(groups[g]))
         number = {g: n + 1 for n, g in enumerate(order)}
+        inside_links, outside = {g: 0 for g in order}, {g: {} for g in order}
+        for (i, j), n in links.items():  # one pass over the links: within a group, or from one to another
+            gi, gj = group_of[i], group_of[j]
+            if gi == gj:
+                inside_links[gi] += n
+            else:
+                for g, other in ((gi, gj), (gj, gi)):
+                    outside[g][number[other]] = outside[g].get(number[other], 0) + n
         out = []
         for g in order:
-            members = set(groups[g])
-            inside_links = sum(n for (i, j), n in links.items() if i in members and j in members)
-            outside = {}
-            for (i, j), n in links.items():
-                if (i in members) != (j in members):
-                    other = next(h for h in order if (j if i in members else i) in groups[h])
-                    outside[number[other]] = outside.get(number[other], 0) + n
             folders = {}
-            for i in members:
+            for i in groups[g]:
                 folders[folder_of(rel[i])] = folders.get(folder_of(rel[i]), 0) + 1
-            out.append({"files": sorted(rel[i] for i in members), "folder": max(folders, key=folders.get),
-                        "inside": inside_links, "out": outside, "parts": {}})
+            out.append({"files": sorted(rel[i] for i in groups[g]), "folder": max(folders, key=folders.get),
+                        "inside": inside_links[g], "out": outside[g], "parts": {}})
         return out
 
     def definitions(self, path):
@@ -1160,6 +1153,30 @@ class CodeMap:
 # --------------------------------------------------------------------------------------------
 # A project's maps
 # --------------------------------------------------------------------------------------------
+def join_small(groups, links, rel, most):
+    """CodeMap.groups' last step, in place: while there are more than `most` groups ({root: [file]}), the smallest
+    joins the one it links to most (links: {(file, file): count}), else its folder's, else the next. Returns
+    {file: its group}. Each join counts only the smallest group's own links: a big project's split stays quick."""
+    group_of = {i: g for g, members in groups.items() for i in members}
+    touching = {}
+    for (i, j), n in links.items():
+        touching.setdefault(i, []).append((j, n))
+        touching.setdefault(j, []).append((i, n))
+    while len(groups) > most:
+        small = min(groups, key=lambda g: (len(groups[g]), folder_of(rel[groups[g][0]])))
+        weight = {}
+        for i in groups[small]:
+            for j, n in touching.get(i, ()):
+                weight[group_of[j]] = weight.get(group_of[j], 0) + n
+        home = folder_of(rel[groups[small][0]])
+        target = max((g for g in groups if g != small), key=lambda g: (weight.get(g, 0), folder_of(rel[groups[g][0]])
+                                                                        == home, -len(groups[g])))
+        for i in groups[small]:
+            group_of[i] = target
+        groups[target] += groups.pop(small)
+    return group_of
+
+
 class Maps:
     """The maps of a project's connected folders on this machine: one per repository and branch, shared by every
     folder that is a checkout of it. check() brings them up to date; the server calls it when agents edit
