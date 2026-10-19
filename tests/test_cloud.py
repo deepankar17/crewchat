@@ -200,15 +200,17 @@ class Sync(unittest.TestCase):
         meta = self.a.hub.add_file("screenshot.png", data, "image/png")
         msg = self.a.hub.send(crewchat.OWNER, "all", "see the screenshot", files=[meta])
         wait_until(lambda: self.b.has("see the screenshot"), message="the message")
-        wait_until(lambda: self.store.get("files/%s-9" % meta["id"]), message="the file's last piece")
+        parts = -(-len(data) // cloud.FILE_PART)
+        wait_until(lambda: self.store.get("files/%s-%d" % (meta["id"], parts - 1)), message="the file's last piece")
         got, path = self.b.hub.open_file(meta["id"])
         self.assertEqual((got["name"], path.read_bytes()), ("screenshot.png", data))
         # Firestore holds ciphertext only: neither the bytes, nor the name, nor the message.
         stored = json.dumps(self.store.docs, default=str)
         self.assertNotIn("screenshot", stored)
         self.assertNotIn(base64.b64encode(data[:300]).decode()[:200], stored)
-        self.assertEqual(self.store.get("files/%s-0" % meta["id"])["parts"], 10)
-        self.assertTrue(all(len(json.dumps(d)) < 1024 * 1024 for k, d in self.store.docs.items() if k.startswith("files/")))
+        self.assertEqual(self.store.get("files/%s-0" % meta["id"])["parts"], parts)
+        # Each piece within what the security rules let through (MemoryStore refuses more, as Firestore does).
+        self.assertTrue(all(len(d["ct"]) <= 60000 for k, d in self.store.docs.items() if k.startswith("files/")))
         # A file too big to travel stays on its machine, and says so.
         big = self.a.hub.add_file("video.mov", os.urandom(cloud.CLOUD_FILE_MAX + 1), "video/quicktime")
         self.a.hub.send(crewchat.OWNER, "all", "the video", files=[big])
@@ -243,7 +245,8 @@ class Sync(unittest.TestCase):
         meta = self.a.hub.add_file("recording.mov", data, "video/quicktime")
         self.a.hub.send(crewchat.OWNER, "all", "the recording", files=[meta])
         wait_until(lambda: self.b.has("the recording"), message="the message")
-        wait_until(lambda: self.store.get("files/%s-11" % meta["id"]), message="the last piece")
+        wait_until(lambda: self.store.get("files/%s-%d" % (meta["id"], -(-len(data) // cloud.FILE_PART) - 1)),
+                   message="the last piece")
         self.assertEqual(self.b.hub.open_file(meta["id"])[1].read_bytes(), data)
         self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
                          crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file

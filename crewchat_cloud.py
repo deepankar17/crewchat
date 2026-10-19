@@ -77,12 +77,14 @@ COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_par
 SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts", "files")  # in each spaces/{space}
 CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (config cloud_file_mb)
 # Why the cap: the free (Spark) plan of a Firebase project allows 1 GiB stored, 20,000 writes and 50,000 reads a
-# day, and 10 GiB a month downloaded; a file is a write per 512 KB part on the way in and a read per part for
-# each machine that opens it. On a paid (Blaze) plan the owner can raise it, up to crewchat's 20 MB for a file.
+# day, and 10 GiB a month downloaded; a file is a write per 32 KB part on the way in (160 for 5 MB) and a read per
+# part for each machine that opens it. On a paid (Blaze) plan the owner can raise it, up to crewchat's 20 MB for a file.
 QUOTA_NOTE = ("files over %s stay on the machine they were shared on, to keep within the free Firebase plan's "
               "quota (1 GiB stored, 20,000 writes a day); on a paid (Blaze) plan, raise cloud_file_mb in crewchat's "
               "config.json (up to 20)")
-FILE_PART = 512 * 1024  # bytes of a file in one document: sealed and in base64 twice, under Firestore's 1 MB
+# Bytes of a file in one document: in base64 twice and sealed, 58,292 characters, under the 60,000 the security rules
+# (RULES) allow for a document's ciphertext.
+FILE_PART = 32 * 1024
 NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
                  "or: pip install \"crewchat[cloud]\"")
 
@@ -281,6 +283,14 @@ class Device:
 SERVER_TIME = object()  # stands for "the database's own clock" in a write
 
 
+def allowed(doc):
+    """What the security rules' small() lets through (RULES), for MemoryStore: a test meets the limits the real
+    Firestore keeps. Returns the document."""
+    if len(doc) > 16 or len(str(doc.get("ct", ""))) > 60000 or len(str(doc.get("pub", ""))) > 2000:
+        raise CloudError("PERMISSION_DENIED: the document is larger than the security rules allow")
+    return doc
+
+
 class MemoryStore:
     """Firestore's behaviour for crewchat, in memory: one account, shared by devices in a test.
 
@@ -348,6 +358,7 @@ class MemoryStore:
             old = self.docs.get(path)
             new = dict(old) if (merge and old) else {}
             new.update(self._fill(data, old if merge else None))
+            allowed(new)
             self.docs[path] = new
             self._notify(path, "modified" if old is not None else "added", new)
 
@@ -356,7 +367,7 @@ class MemoryStore:
         with self.lock:
             if path in self.docs:
                 return False
-            self.docs[path] = self._fill(data)
+            self.docs[path] = allowed(self._fill(data))
             self._notify(path, "added", self.docs[path])
             return True
 

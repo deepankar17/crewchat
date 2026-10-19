@@ -868,7 +868,7 @@ decisions for two agents keep the earlier one: the machine whose holder changes 
 **Depends on:** [Y1](#y1)
 
 **Status.** Done for files up to 5 MB (`CLOUD_FILE_MAX`): the machine that writes the message seals the file in
-512 KB parts (`files/{fid}-{n}`, bound to the account, project, file, part and device), deleted with its message;
+32 KB parts (`files/{fid}-{n}`, bound to the account, project, file, part and device), deleted with its message;
 another machine's `fetch_file` reads and checks them. A bigger file, or one gone from the cloud, says which machine
 has it. Larger files: cloud mode has no route between machines except Firestore, so (owner, 18 Oct) they stay on
 their machine and the message says why (the free Firebase plan's quota) and how to change it: on a paid plan,
