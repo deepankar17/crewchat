@@ -9129,11 +9129,9 @@ def run_hook(client, event):
     ignored = int(state.get("ignored", 0))  # prompts at which it was asked to link and did not
 
     def save(chain, pending, asks):
-        state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps({"key": key, "chain": chain, "pending": pending, "asks": asks,
-                                          "ignored": ignored, "alive": state.get("alive", 0),
-                                          "doing": state.get("doing", ""), "doing_at": state.get("doing_at", 0),
-                                          "usage": state.get("usage") or {}}))
+        # The whole state, so what the tool hook keeps there (edits on, the last edit) survives the turn.
+        state.update(key=key, chain=chain, pending=pending, asks=asks, ignored=ignored)
+        save_hook_state(state_file, state)
 
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
@@ -9210,11 +9208,15 @@ def report_usage(base, token, key, state, state_file, path):
     except (OSError, ValueError, urllib.error.URLError):
         return
     state["usage"] = {"path": path, "offset": offset, "last": last}
+    save_hook_state(state_file, state)
+
+
+def save_hook_state(state_file, state):
+    """Keep a session's hook state for its next hook call; a disk that will not take it only costs a repeat."""
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        saved = json.loads(state_file.read_text()) if state_file.exists() else {}
-        state_file.write_text(json.dumps(dict(saved, usage=state["usage"])))
-    except (OSError, ValueError):
+        state_file.write_text(json.dumps(state))
+    except OSError:
         pass
 
 
@@ -11485,6 +11487,8 @@ body:has(#tabs .tab:first-child[aria-current="page"]) #space-head { border-top-l
 #log, #space > #tasks, #space > #analytics {
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--over));
   mask-image: linear-gradient(to bottom, transparent 0, #000 var(--over)); }
+/* Presenting, the analytics fill the screen with no header over them. */
+body.ax-present #space > #analytics { padding-top: 22px; -webkit-mask-image: none; mask-image: none; }
 .pillbox { border-color: var(--glass-line); border-radius: 999px; }
 .pillbox:focus-within { border-color: var(--accent-2); box-shadow: var(--glass-rim), var(--glass-shadow), 0 0 0 3px rgba(91, 140, 255, 0.22); }
 #search { border-radius: 999px; background: var(--glass-hover); border-color: var(--glass-line); }

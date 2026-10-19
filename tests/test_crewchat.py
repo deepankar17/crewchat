@@ -4130,6 +4130,18 @@ class Hooks(Base):
         self.light_hook("cursor", {"conversation_id": "light-first", "command": "ls"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[cursor.me]["seen"], time.time() - 30)
 
+    def test_an_edit_just_after_a_turn_boundary_is_still_sent(self):
+        # The prompt and stop hooks rewrite the state file: they must keep what the tool hook learned there
+        # (that edits are kept), or the edits of the next minute go unsent.
+        session, name = self.linked("edits-boundary")
+        edit = lambda path: self.light_hook("claude", {  # noqa: E731
+            "session_id": "edits-boundary", "tool_name": "Edit", "tool_input": {"file_path": path}})
+        edit(str(self.folder / "app" / "First.kt"))  # learns that edits are kept here
+        self.hook("claude", "prompt", {"session_id": "edits-boundary"})  # the user's next prompt
+        before = len(self.hub.events.edits())
+        edit(str(self.folder / "app" / "Second.kt"))  # within the minute
+        self.assertEqual([r["path"] for r in self.hub.events.edits()[before:]], ["app/Second.kt"])
+
     def test_edited_files_are_kept_for_a_software_team_paths_only(self):
         # Roadmap C0: the path of each file an agent edits, inside its project, while edit tracking is on.
         session, name = self.linked("edits-turn")

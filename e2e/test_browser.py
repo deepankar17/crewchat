@@ -889,6 +889,9 @@ class NewPage(Signed):
             # Presenting: one panel at a time, under the numbers; Esc ends it.
             c.click("#ax-present")
             self.assertEqual(c.js("document.querySelectorAll('#analytics .ax-current').length"), 1)
+            # Full screen, with no header over it: no room left for one, and nothing faded under it.
+            style = "getComputedStyle($('analytics'))"
+            self.assertEqual(c.js("[%s.paddingTop, %s.maskImage]" % (style, style)), ["22px", "none"])
             c.js("document.dispatchEvent(new KeyboardEvent('keydown', {key: 'Escape'}))")
             c.until("!document.body.classList.contains('ax-present')", what="the end of presenting")
             # Reduced motion: a message lights its path for a moment; nothing flies.
