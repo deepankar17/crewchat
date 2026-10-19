@@ -562,6 +562,28 @@ class Advisor(Base):
         self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
 
 
+class NoConsoleWindows(unittest.TestCase):
+    def test_programs_run_for_their_output_open_no_window(self):
+        # On Windows the server has no console: a program it runs without CREATE_NO_WINDOW gets a console window of
+        # its own, which flashes up and closes (the agents' process check every few seconds, git for the code map).
+        import crewchat_map
+        flag = {"creationflags": 0x08000000}
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        folder = Path(tempfile.mkdtemp(prefix="hidden-", dir=TMP))
+        with mock.patch.object(crewchat, "HIDDEN", flag), mock.patch.object(crewchat_map, "HIDDEN", flag), \
+                mock.patch.object(subprocess, "run", return_value=done) as ran:
+            crewchat.process_table([os.getpid()])
+            crewchat.run(["tailscale", "status", "--json"])
+            crewchat.tracked_by_git(folder, "a.py")
+            crewchat.git_exclude(folder, ["x"])
+            crewchat.tool_help("some-tool")
+            crewchat.status_of(["some-tool", "--version"])
+            crewchat_map.git(folder, "rev-parse", "HEAD")
+        self.assertGreaterEqual(ran.call_count, 7)
+        for call in ran.call_args_list:
+            self.assertEqual(call.kwargs.get("creationflags"), 0x08000000, call.args[0][:3])
+
+
 class PollAfter(unittest.TestCase):
     def test_the_messages_after_a_number_are_found_by_halving(self):
         hub = crewchat.Hub.__new__(crewchat.Hub)

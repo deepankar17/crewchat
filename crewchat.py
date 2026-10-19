@@ -91,6 +91,9 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = "crewchat_session"
 MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an agent (config: max_chain)
 MAX_LISTEN = 55 * 60
+# A program the server (or a hook) runs for its output, on Windows: CREATE_NO_WINDOW. The server runs with no console
+# of its own, so without it Windows opens a console window for each one (git, PowerShell, tailscale), and closes it.
+HIDDEN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 SAVE_DELAY = 1.0  # seconds state.json may lag behind read positions, status lines and presence (Hub._save_soon)
 USAGE_FILE = "usage.json"  # the agents' token counts by day, and each task's (X4): out of state.json, which is
 # rewritten on nearly every call, and written only when they change
@@ -7106,7 +7109,7 @@ def ready_item(state, text, fix=""):
 def status_of(command):
     """(exit code, what it printed) of a tool's own status command, or (None, "") if it did not run."""
     try:
-        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL)
+        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, **HIDDEN)
     except (OSError, subprocess.SubprocessError):
         return None, ""
     return out.returncode, out.stdout + out.stderr
@@ -7309,7 +7312,7 @@ def macos_script(folder, command, key, title="", env=None):
 def tool_help(exe):
     """What an agent's command line says it takes (its --help), or '' if it does not say."""
     try:
-        out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=20)
+        out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=20, **HIDDEN)
         return out.stdout + out.stderr
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -7353,7 +7356,7 @@ def agent_tool(tool, folder, permissions, root=None):
     if tool == "cursor":
         for name in registered_names(folder, "cursor", root):  # crewchat's MCP server alone (not
             try:  # every server the folder lists, --approve-mcps), under each name it has
-                subprocess.run([exe, "mcp", "enable", name], cwd=str(folder), capture_output=True, timeout=30)
+                subprocess.run([exe, "mcp", "enable", name], cwd=str(folder), capture_output=True, timeout=30, **HIDDEN)
             except (OSError, subprocess.SubprocessError):
                 pass  # it asks in its window instead
     return exe, base
@@ -7716,7 +7719,7 @@ def detect_url():
     if not exe:
         return ""
     try:
-        out = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run([exe, "status", "--json"], capture_output=True, text=True, timeout=10, **HIDDEN).stdout
         name = json.loads(out)["Self"]["DNSName"].rstrip(".")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         return ""
@@ -8128,7 +8131,7 @@ def git_exclude(project, paths):
     """Keep machine-specific files out of git without touching the project's .gitignore."""
     try:
         out = subprocess.run(["git"] + GIT_SAFE + ["-C", str(project), "rev-parse", "--git-path", "info/exclude"],
-                             capture_output=True, text=True, timeout=10)
+                             capture_output=True, text=True, timeout=10, **HIDDEN)
     except (OSError, subprocess.SubprocessError):
         return False
     if out.returncode != 0 or not out.stdout.strip():
@@ -8692,7 +8695,7 @@ def tracked_by_git(folder, rel):
     it, not an upgrade behind the owner's back."""
     try:
         return subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "ls-files", "--error-unmatch", rel],
-                              capture_output=True, timeout=10).returncode == 0
+                              capture_output=True, timeout=10, **HIDDEN).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -8912,7 +8915,7 @@ def process_table(pids=None):
             out = subprocess.run(["powershell", "-NoProfile", "-Command",
                                   "Get-CimInstance Win32_Process%s | Select-Object ProcessId,ParentProcessId,"
                                   "@{n='Started';e={$_.CreationDate.ToString('o')}},CommandLine | ConvertTo-Json -Compress"
-                                  % where], capture_output=True, text=True, timeout=30).stdout
+                                  % where], capture_output=True, text=True, timeout=30, **HIDDEN).stdout
             rows = json.loads(out or "[]")
             return {int(r["ProcessId"]): (int(r["ParentProcessId"] or 0), str(r.get("Started") or ""),
                                           str(r.get("CommandLine") or "")) for r in (rows if isinstance(rows, list) else [rows])}
@@ -8920,7 +8923,7 @@ def process_table(pids=None):
         # service) write a process's start time the same way.
         which = ["-p", ",".join(str(int(p)) for p in pids)] if pids else ["-A"]
         out = subprocess.run(["ps"] + which + ["-o", "pid=,ppid=,lstart=,args="], capture_output=True, text=True,
-                             timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC0")).stdout
+                             timeout=10, env=dict(os.environ, LC_ALL="C", TZ="UTC0"), **HIDDEN).stdout
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
     table = {}
@@ -9013,7 +9016,8 @@ def stop_process(pid):
     """Ask a process (and on Windows its children) to end. Returns whether the signal was sent."""
     try:
         if os.name == "nt":
-            return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30).returncode == 0
+            return subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, timeout=30,
+                                  **HIDDEN).returncode == 0
         os.kill(pid, signal.SIGTERM)
         return True
     except (OSError, subprocess.SubprocessError):
@@ -9717,7 +9721,7 @@ def systemd_unit():
 
 
 def run(command):
-    return subprocess.run(command, capture_output=True, text=True)
+    return subprocess.run(command, capture_output=True, text=True, **HIDDEN)
 
 
 def windows_command():
