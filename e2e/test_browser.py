@@ -477,6 +477,9 @@ class NewPage(Signed):
         c.until("state.needs.some(n => n.task === %s)" % json.dumps(mid), what="Needs you")
         c.js("openPanel('task', %s)" % json.dumps(mid))
         c.until("!!document.querySelector('#panel .needs-card textarea')", what="the answer box")
+        self.assertEqual(c.js("getComputedStyle(document.querySelector('#panel .needs-card')).borderLeftColor"),
+                         c.js("(() => { const i = document.createElement('i'); i.style.color = 'var(--err)'; document.body.append(i);"
+                              " const v = getComputedStyle(i).color; i.remove(); return v; })()"))  # its red edge
         c.js("const t = document.querySelector('#panel .needs-card textarea'); t.value = 'Follow the system setting.'")
         c.js("[...document.querySelectorAll('#panel .needs-card button')].find(b => b.textContent === 'Send').click()")
         c.until("$('panel-body').innerText.includes('You: Re #%s: Follow the system setting.')" % mid,
@@ -1004,6 +1007,23 @@ class NewPage(Signed):
         finally:
             c.js("showView('chat')")
             c.size(1280, 900)
+
+    def test_the_open_tab_flows_into_the_header(self):
+        # The open project's tab and the header under it are one surface, as a browser's tab and its toolbar: the
+        # same colour and glass, touching, with no corner or edge where they meet, and flares into the bar.
+        c = self.chrome
+        tab = "document.querySelector('#tabs .tab[aria-current=page]')"
+        c.until("!!" + tab, what="the open tab")
+        same = c.js("(() => { const t = getComputedStyle(%s), h = getComputedStyle($('space-head'));"
+                    " return [t.backgroundColor === h.backgroundColor, t.backdropFilter === h.backdropFilter]; })()" % tab)
+        self.assertEqual(same, [True, True])
+        self.assertAlmostEqual(c.js("%s.getBoundingClientRect().bottom" % tab),
+                               c.js("$('space-head').getBoundingClientRect().top"), delta=0.5)  # no gap, no margin
+        if c.js("%s === document.querySelector('#tabs .tab')" % tab):  # the first: square where it sits
+            self.assertEqual(c.js("getComputedStyle($('space-head')).borderTopLeftRadius"), "0px")
+            self.assertEqual(c.js("getComputedStyle($('space')).borderTopLeftRadius"), "0px")
+        self.assertNotEqual(c.js("getComputedStyle(%s, '::after').content" % tab), "none")  # its flare into the bar
+        self.assertEqual(c.errors, [])
 
     def test_design_review_details(self):
         # What a design review of the page found, kept: menus readable over glass, the scroll edge under the header,

@@ -11103,7 +11103,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   --glass-hover: rgba(255, 255, 255, 0.7); --glass-filter: blur(22px) saturate(180%);
   --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.85), inset 0 0 0 1px rgba(255, 255, 255, 0.45);
   --glass-shadow: 0 1px 1px rgba(11, 31, 85, 0.05), 0 10px 30px rgba(11, 31, 85, 0.12);
-  --glass-line: rgba(11, 31, 85, 0.09); --menu: rgba(255, 255, 255, 0.96);
+  --glass-line: rgba(11, 31, 85, 0.09); --menu: rgba(255, 255, 255, 0.96); --bar: rgba(255, 255, 255, 0.82);
   --backdrop: radial-gradient(60% 55% at 0% 0%, #c7d7ff 0%, transparent 62%),
     radial-gradient(55% 50% at 100% 0%, #e7d6ff 0%, transparent 60%),
     radial-gradient(60% 55% at 85% 100%, #ffe1cc 0%, transparent 62%),
@@ -11115,7 +11115,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
     --glass-hover: rgba(40, 56, 110, 0.6);
     --glass-rim: inset 0 1px 0 rgba(255, 255, 255, 0.16), inset 0 0 0 1px rgba(255, 255, 255, 0.07);
     --glass-shadow: 0 1px 1px rgba(0, 0, 0, 0.25), 0 12px 32px rgba(0, 0, 0, 0.35);
-    --glass-line: rgba(255, 255, 255, 0.08); --menu: rgba(22, 32, 70, 0.97);
+    --glass-line: rgba(255, 255, 255, 0.08); --menu: rgba(22, 32, 70, 0.97); --bar: rgba(22, 33, 72, 0.84);
     --backdrop: radial-gradient(60% 55% at 0% 0%, rgba(70, 105, 230, 0.35) 0%, transparent 62%),
       radial-gradient(55% 50% at 100% 0%, rgba(140, 80, 220, 0.28) 0%, transparent 60%),
       radial-gradient(60% 55% at 85% 100%, rgba(230, 120, 70, 0.18) 0%, transparent 62%),
@@ -11123,7 +11123,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   }
 }
 body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
-.glassy, .tab[aria-current="page"], #needs-you, .agent.on, .rail-tools, #space-head, .pillbox, .menu-list, .mentions,
+.glassy, #needs-you, .agent.on, .rail-tools, .pillbox, .menu-list, .mentions,
 #panel .card, dialog, .col, #give {
   background: var(--glass); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
   box-shadow: var(--glass-rim), var(--glass-shadow);
@@ -11134,13 +11134,30 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
    through again: nearly opaque, as a Mac's menus are, so what is behind never shows through their words. */
 .menu-list, .mentions { background: var(--menu); -webkit-backdrop-filter: none; backdrop-filter: none; }
 .menu-list, .mentions, dialog, #panel .card { border-color: var(--glass-line); }
+#panel .card.needs-card { border-left-color: var(--err); }  /* what needs you keeps its red edge */
 /* The project's space: a plate the thread sits on, the header and the message box floating on it. */
-#space { background: var(--plate); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
-  box-shadow: var(--glass-rim), var(--glass-shadow); border-radius: 26px 26px 0 0; }
-#space-head { margin: 10px 10px 0; border: 0; border-radius: 20px; padding: 10px 14px; }
+/* The open project's tab, and the header under it, are one surface (as a browser's tab and its toolbar): the same
+   glass, no edge between them, and where the tab meets the bar its corners flare out into it. The space's own tint
+   starts under the header, so both sit on the same backdrop and come out the same colour. */
+#space { background: linear-gradient(to bottom, transparent var(--over), var(--plate) var(--over));
+  border-radius: 22px 22px 0 0; box-shadow: 0 18px 40px -18px rgba(11, 31, 85, 0.18); }
+#space-head, .tab[aria-current="page"] {
+  background: var(--bar); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter); }
+#space-head { margin: 0; border: 0; border-radius: 22px 22px 0 0; padding: 12px 18px;
+  box-shadow: inset 0 -1px 0 var(--glass-line); }
+.tab[aria-current="page"] { position: relative; border-radius: 14px 14px 0 0; box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.7); }
+.tab[aria-current="page"]::before, .tab[aria-current="page"]::after {
+  content: ""; position: absolute; bottom: 0; width: 14px; height: 14px; pointer-events: none; }
+.tab[aria-current="page"]::before { right: 100%; background: radial-gradient(circle at 0 0, transparent 13.5px, var(--bar) 14px); }
+.tab[aria-current="page"]::after { left: 100%; background: radial-gradient(circle at 100% 0, transparent 13.5px, var(--bar) 14px); }
+/* The first tab sits on the space's left edge: no corner there, and no flare outside it. */
+body:has(#tabs .tab:first-child[aria-current="page"]) #space,
+body:has(#tabs .tab:first-child[aria-current="page"]) #space-head { border-top-left-radius: 0; }
+#tabs .tab:first-child[aria-current="page"]::before { display: none; }
+#tabs { padding-right: 14px; }  /* room for the last tab's flare (the strip still scrolls) */
 /* The thread, the board and the analytics scroll on under the header, seen through its glass. --over: how far the
    header reaches down (its margin and height); what scrolls starts below it, and a message jumped to stops there. */
-#space { --over: 74px; }
+#space { --over: 68px; }  /* the header's height */
 #space-head { position: relative; z-index: 3; margin-bottom: calc(-1 * var(--over)); }
 #update, #banner { order: -1; }  /* a notice stays above the header, not under it */
 #log { padding-top: calc(18px + var(--over)); scroll-padding-top: calc(12px + var(--over)); }
@@ -11158,7 +11175,6 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
 /* The rail: its tools a segmented capsule; the agent open, a glass card. */
 .rail-tools { padding: 3px; border-radius: 999px; }
 .rail-tools button { border-radius: 999px; }
-.tab[aria-current="page"] { box-shadow: var(--glass-rim); }
 .tab:hover, button.icon:hover, button.icon.on, .agent:hover, .menu-list button:hover, .menu-list a:hover,
 #space-menu > summary:hover, #bell > summary:hover, #tab-add > summary:hover, #plus > summary:hover { background: var(--glass-hover); }
 .agent.on { border-radius: 18px; }
@@ -11178,10 +11194,11 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
 /* Solid again: the system asks for less transparency or more contrast, or the browser cannot blur. */
 @media (prefers-reduced-transparency: reduce), (prefers-contrast: more) {
   :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint);
-    --glass-filter: none; --backdrop: none; --glass-line: var(--line); --menu: var(--panel); }
+    --glass-filter: none; --backdrop: none; --glass-line: var(--line); --menu: var(--panel); --bar: var(--panel); }
 }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-  :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint); --backdrop: none; }
+  :root { --glass: var(--panel); --glass-strong: var(--panel); --plate: var(--panel); --glass-hover: var(--tint); --backdrop: none;
+    --bar: var(--panel); }
 }
 @media (max-width: 760px) {
   body, body.panel-open { grid-template-areas: "top" "space"; grid-template-columns: minmax(0, 1fr); }
@@ -11223,9 +11240,9 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
 /* Glass on a phone: a lighter blur (it costs the most there), the plate and drawer denser. */
 @media (max-width: 760px) {
   :root { --glass-filter: blur(14px) saturate(160%); }
-  #space { border-radius: 0; background: var(--panel); -webkit-backdrop-filter: none; backdrop-filter: none; }
-  #space { --over: 64px; }  /* the header's margin and height here */
-  #space-head { margin: 6px 6px calc(-1 * var(--over)); }
+  #space { border-radius: 0; background: linear-gradient(to bottom, transparent var(--over), var(--panel) var(--over)); }
+  #space { --over: 58px; }  /* the header's height here */
+  #space-head { margin: 0 0 calc(-1 * var(--over)); border-radius: 0; }
   /* Search folds to a magnifier until tapped, so the project's line keeps its room. */
   #search:not(:focus):placeholder-shown { width: 40px; padding: 0; cursor: pointer; color: transparent;
     background: var(--glass-hover) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%235d6a8f' stroke-width='2.4' stroke-linecap='round'%3E%3Ccircle cx='11' cy='11' r='6.5'/%3E%3Cpath d='m16 16 4.5 4.5'/%3E%3C/svg%3E") center / 17px no-repeat; }

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **The open project's tab and the header under it are one surface**, as a browser's tab and its toolbar: the
+  same glass, no seam, its corners flaring into the bar (the header was a separate rounded card under the tab).
+  The task panel's "needs you" card has its red edge back.
 - **A design pass over every page.** Menus are nearly opaque, so what is behind never shows through their words; the
   thread fades out as it scrolls under the header instead of showing cut off above it; the board's columns lose a
   clipped shadow band; the task list's buttons stay on one line in the same order in every row, so they line up;
