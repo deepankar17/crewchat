@@ -781,7 +781,9 @@ class NewPage(Signed):
         self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, True])
         c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
         self.assertEqual(c.js(step), 1)  # a template skips to the workspace
-        self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", "art:scientist"])
+        # A built-in role keeps its picture to itself: the new agent gets a face of its own ("").
+        self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", ""])
+        self.assertEqual(c.js("$('l-picture').selectedOptions[0].text"), "A new face, made for it")
         c.click("#l-next")
         c.click("#l-next")
         self.assertEqual(c.js(step), 3)
@@ -1008,6 +1010,19 @@ class NewPage(Signed):
         finally:
             c.js("showView('chat')")
             c.size(1280, 900)
+
+    def test_an_agent_wears_a_face_of_its_own_and_the_dice_change_it(self):
+        c = self.chrome
+        img = "%s.querySelector('img')" % self.card()
+        c.until("!!%s && %s.src.includes('/pictures/mix/')" % (img, img), what="its face on its card")
+        c.until("%s.complete && %s.naturalWidth > 0" % (img, img), what="the face drawn")
+        before = c.js("%s.src" % img)
+        c.js(self.card() + ".click()")
+        c.until("!$('agent-pane').hidden", what="the agent's settings")
+        c.js("[...$('agent-pane').querySelectorAll('.picmenu button')].find(b => b.textContent.includes('New face')).click()")
+        c.until("%s.src !== %s && %s.src.includes('/pictures/mix/')" % (img, json.dumps(before), img), what="a new face")
+        c.js("closeAgent()")
+        self.assertEqual(c.errors, [])
 
     def test_the_open_tab_flows_into_the_header(self):
         # The open project's tab and the header under it are one surface, as a browser's tab and its toolbar: the

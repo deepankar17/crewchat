@@ -593,6 +593,73 @@ class EditPaths(unittest.TestCase):
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
 
+class Faces(unittest.TestCase):
+    """A new agent's face, made of parts (a skin, hair, a hat, glasses, clothes, ...) at random, and drawn as SVG."""
+
+    def test_every_part_draws_a_well_formed_picture(self):
+        import xml.etree.ElementTree as ET
+        codes = []
+        for i, (_, n) in enumerate(crewchat.MIX_PARTS):  # each option of each part, the others at their first
+            for option in range(n):
+                parts = [0] * len(crewchat.MIX_PARTS)
+                parts[i] = option
+                codes.append(".".join(map(str, parts)))
+        codes += [crewchat.new_mix()[4:] for _ in range(300)]
+        for code in codes:
+            svg = crewchat.mix_svg(code)
+            root = ET.fromstring(svg)
+            self.assertEqual((root.tag, root.get("viewBox")), ("{http://www.w3.org/2000/svg}svg", "0 0 128 128"), code)
+            self.assertNotIn(b"<script", svg)
+
+    def test_a_code_is_one_number_per_part_in_its_range(self):
+        last = ".".join(str(n - 1) for _, n in crewchat.MIX_PARTS)
+        self.assertIsNotNone(crewchat.mix_parts(last))
+        too_far = ".".join(str(n) for _, n in crewchat.MIX_PARTS)
+        for bad in ("", "1.2.3", too_far, last + ".0", "a" + last[1:], "0" + last, "<svg>", "-" + last):
+            self.assertIsNone(crewchat.mix_parts(bad), bad)
+            self.assertIsNone(crewchat.mix_svg(bad), bad)
+        self.assertEqual(crewchat.clean_picture("mix:" + last), "mix:" + last)
+        self.assertEqual(crewchat.clean_picture("mix:" + too_far), "")  # another machine's odd one: initials
+
+    def test_a_new_face_works_at_the_machines_device_and_is_nobody_elses(self):
+        for device in range(3):
+            self.assertEqual(crewchat.mix_parts(crewchat.new_mix(device)[4:])[-1], device)
+        taken = {crewchat.new_mix(0) for _ in range(50)}
+        self.assertNotIn(crewchat.new_mix(0, taken), taken)
+        self.assertIn(crewchat.device_kind(), (0, 1, 2))
+        kept = list(crewchat._DEVICE_KIND)
+        try:
+            crewchat._DEVICE_KIND.clear()
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE": "true"}):
+                self.assertEqual(crewchat.device_kind(), 2)  # a cloud session sits on a cloud
+        finally:
+            crewchat._DEVICE_KIND[:] = kept
+
+
+class FacesOnThePage(Base):
+    """The server draws a face from its code, for the page; the dice on the page give an agent a new one."""
+
+    def test_the_server_draws_a_face_and_refuses_a_bad_code(self):
+        code = crewchat.new_mix()[4:]
+        with urllib.request.urlopen(self.base + "/pictures/mix/%s.svg" % code) as r:
+            self.assertEqual(r.headers["Content-Type"], "image/svg+xml")
+            self.assertEqual(r.headers["Content-Security-Policy"], "default-src 'none'")
+            self.assertEqual(r.read(), crewchat.mix_svg(code))
+        for bad in ("9.9.9", "..%2Fart"):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(self.base + "/pictures/mix/%s.svg" % bad)
+            self.assertEqual(e.exception.code, 404)
+
+    def test_the_dice_give_an_agent_a_new_face(self):
+        name = self.hub.agent_for(self.hub.open_session("macbook", "claude"))
+        before = self.hub.agents[name]["picture"]
+        self.hub.set_profile(name, "mix:new")
+        after = self.hub.agents[name]["picture"]
+        self.assertTrue(after.startswith("mix:") and crewchat.mix_parts(after[4:]) and after != before)
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_profile(name, "mix:1.2")
+
+
 class AnalyticsTotals(unittest.TestCase):
     """/api/analytics' numbers, worked out from the whole message log (roadmap X1)."""
 
@@ -2144,10 +2211,10 @@ class Launching(Base):
         session.text("hub_link", key=self.launched[-1][2])
         return session.me
 
-    def test_a_new_agent_gets_a_random_3d_picture_unless_initials_are_asked_for(self):
+    def test_a_new_agent_gets_a_face_of_its_own_unless_initials_are_asked_for(self):
         pictures = [self.hub.agents[self.linked()]["picture"] for _ in range(4)]
-        self.assertTrue(all(p.startswith("art:") and p[4:] in crewchat.ART_PICTURES for p in pictures), pictures)
-        self.assertEqual(len(set(pictures)), 4)  # one nobody here has, while any is free
+        self.assertTrue(all(p.startswith("mix:") and crewchat.mix_parts(p[4:]) for p in pictures), pictures)
+        self.assertEqual(len(set(pictures)), 4)  # one nobody here wears
         self.assertEqual(self.hub.agents[self.linked(picture="initials")]["picture"], "")
         self.assertEqual(self.hub.agents[self.linked(picture="art:owl")]["picture"], "art:owl")
 
@@ -2923,7 +2990,7 @@ class Profiles(Base):
 
     def test_owner_sets_a_preset_and_a_colour(self):
         _, name = self.agent()
-        self.assertTrue(self.row(name)["picture"].startswith("art:"))  # a random 3D picture to begin with
+        self.assertTrue(self.row(name)["picture"].startswith("mix:"))  # a face of its own to begin with
         self.assertEqual(self.row(name)["colour"], "")
         self.assertEqual(self.row(name)["os"], crewchat.os_name())
         self.assertEqual(self.op(op="profile", agent=name, picture="preset:rocket", colour="#FF8800"), {"ok": True})

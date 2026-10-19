@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- **Every new agent gets a face of its own.** Made of parts picked at random: a skin tone, a face shape, an
+  expression, hair and its colour, maybe a hat (a cap, a beanie, a beret, a top hat, headphones, a bandana) and
+  glasses, clothes in a colour, and what it works at, after its machine: a laptop, a desktop or a cloud. Nobody in
+  the chat wears the same one. **🎲 New face** in an agent's picture menu picks again. Drawn on your own server as
+  a small SVG; the 3D pictures, emoji and your own images are still there to choose. A built-in role's picture no
+  longer replaces a new agent's face (one you gave a role still does).
 - **The project's header leaves out "1 machine"**: the count shows once there are several, and a phone has the room.
 - **The open project's tab and the header under it are one surface**, as a browser's tab and its toolbar: the
   same glass, no seam, its corners flaring into the bar (the header was a separate rounded card under the tab).

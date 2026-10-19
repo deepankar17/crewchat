@@ -331,13 +331,241 @@ def os_name():
 COLOUR_RE = re.compile(r"#[0-9a-fA-F]{6}")
 
 
+# Faces made of parts (what a new agent wears): a background, a skin tone, a face shape, an expression, hair and its
+# colour, a hat, glasses, clothes and their colour, and what it works at (a laptop, a desktop or the cloud: where its
+# machine is). A face is stored as "mix:" and one number per part (MIX_PARTS), and drawn as SVG by mix_svg, here and on
+# every linked machine; an older crewchat shows initials for it.
+MIX_SKINS = [("#f9d9c0", "#ecbf9f"), ("#f1c38e", "#dfa871"), ("#e0a872", "#c98d55"), ("#c58447", "#a86a32"),
+         ("#8d5a2f", "#744722"), ("#5d3a21", "#4a2d18")]
+MIX_HAIRS = ["#2b1d14", "#5a3620", "#a4512b", "#e8c16f", "#a9a9b4", "#7a5be0"]
+MIX_CLOTHES = [("#2f5fd6", "#2148ad"), ("#1f8a52", "#17703f"), ("#d24a32", "#ad3622"), ("#7a48b8", "#5f3794"),
+           ("#f0a23a", "#cf8420"), ("#3a4458", "#28303f")]
+MIX_BACKS = [("#e3ebff", "#c8d7ff"), ("#ece3ff", "#d6c6ff"), ("#ffe6d8", "#ffcdb3"), ("#dcf3ec", "#bde8da"),
+         ("#fff2cc", "#ffe39a"), ("#ffe0ea", "#ffc2d4"), ("#e0f2ff", "#bfe3ff"), ("#eceff4", "#d6dbe5")]
+# A face's parts, in the order its code lists them: (part, how many options).
+MIX_PARTS = [("back", 8), ("skin", 6), ("face", 3), ("mood", 4), ("hair", 8), ("haircolour", 6), ("hat", 7), ("glasses", 5),
+         ("clothes", 6), ("colour", 6), ("device", 3)]
+MIX_DEVICES = ("laptop", "desktop", "cloud")
+
+
+def _mix_face(i, skin):
+    s, shade = skin
+    ears = ('<circle cx="40" cy="64" r="6" fill="%s"/><circle cx="88" cy="64" r="6" fill="%s"/>' % (shade, shade))
+    head = ['<ellipse cx="64" cy="60" rx="24" ry="26" fill="%s"/>',
+            '<ellipse cx="64" cy="61" rx="22" ry="28" fill="%s"/>',
+            '<rect x="40" y="34" width="48" height="53" rx="21" fill="%s"/>'][i] % s
+    return ears + head
+
+
+def _mix_mood(i):
+    eyes = '<ellipse cx="55" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/><ellipse cx="73" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/>'
+    shine = '<circle cx="56.2" cy="59.6" r="1.1" fill="#fff"/><circle cx="74.2" cy="59.6" r="1.1" fill="#fff"/>'
+    cheeks = '<circle cx="49" cy="70" r="4" fill="#ff7a7a" opacity=".22"/><circle cx="79" cy="70" r="4" fill="#ff7a7a" opacity=".22"/>'
+    if i == 3:  # a wink
+        eyes = ('<path d="M51.5 61.5 Q55 58.5 58.5 61.5" stroke="#2a2230" stroke-width="2.4" fill="none" stroke-linecap="round"/>'
+                '<ellipse cx="73" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/>')
+        shine = '<circle cx="74.2" cy="59.6" r="1.1" fill="#fff"/>'
+    mouth = ['<path d="M57 72 Q64 78 71 72" stroke="#7a3b2e" stroke-width="2.4" fill="none" stroke-linecap="round"/>',
+             '<path d="M56 71 Q64 81 72 71 Z" fill="#7a3b2e"/><path d="M58 71.6 Q64 74 70 71.6 L70 72.8 Q64 75 58 72.8 Z" fill="#fff"/>',
+             '<path d="M59 74 L69 74" stroke="#7a3b2e" stroke-width="2.4" stroke-linecap="round"/>',
+             '<path d="M58 72 Q65 77 71 71" stroke="#7a3b2e" stroke-width="2.4" fill="none" stroke-linecap="round"/>'][i]
+    return eyes + shine + cheeks + mouth
+
+
+def _mix_hair(i, colour, back):
+    """The hair behind the head (back=True) or over it."""
+    c = colour
+    if back:
+        return {4: '<path d="M38 56 Q36 98 44 104 L84 104 Q92 98 90 56 Z" fill="%s"/>' % c,
+                7: '<path d="M38 52 Q37 84 44 86 L84 86 Q91 84 90 52 Z" fill="%s"/>' % c}.get(i, "")
+    return ["",
+            '<path d="M40 54 Q40 30 64 30 Q88 30 88 54 Q82 42 64 41 Q46 42 40 54 Z" fill="%s"/>' % c,  # short crop
+            '<path d="M39 56 Q38 29 64 29 Q90 29 89 56 Q86 44 76 40 Q66 46 50 44 Q42 46 39 56 Z" fill="%s"/>' % c,  # side part
+            ''.join('<circle cx="%d" cy="%d" r="%d" fill="%s"/>' % (x, y, r, c) for x, y, r in
+                    ((44, 46, 8), (52, 37, 9), (64, 33, 10), (76, 37, 9), (84, 46, 8), (41, 56, 6), (87, 56, 6))),  # curls
+            '<path d="M39 58 Q38 29 64 29 Q90 29 89 58 Q84 42 64 42 Q44 42 39 58 Z" fill="%s"/>' % c,  # long (front)
+            '<circle cx="64" cy="26" r="9" fill="%s"/><path d="M40 54 Q40 31 64 31 Q88 31 88 54 Q80 41 64 41 Q48 41 40 54 Z" fill="%s"/>' % (c, c),  # bun
+            '<path d="M44 46 L50 26 L56 40 L64 22 L72 40 L78 26 L84 46 Q74 40 64 40 Q54 40 44 46 Z" fill="%s"/>' % c,  # spikes
+            '<path d="M38 60 Q37 29 64 29 Q91 29 90 60 Q88 46 80 42 L48 42 Q40 46 38 60 Z" fill="%s"/>' % c][i]  # bob
+
+
+def _mix_hat(i, colour):
+    c, dark = colour
+    return ["",
+            # a cap, its brim to one side
+            '<path d="M40 50 Q40 28 64 28 Q88 28 88 50 Z" fill="%s"/><path d="M60 48 Q88 44 100 52 Q86 54 60 52 Z" fill="%s"/>'
+            '<circle cx="64" cy="29" r="2.5" fill="%s"/>' % (c, dark, dark),
+            # a beanie with a fold and a bobble
+            '<path d="M39 52 Q39 26 64 26 Q89 26 89 52 Z" fill="%s"/><rect x="37" y="46" width="54" height="9" rx="4.5" fill="%s"/>'
+            '<circle cx="64" cy="24" r="5" fill="#ffffff"/>' % (c, dark),
+            # a beret
+            '<ellipse cx="60" cy="36" rx="28" ry="10" fill="%s" transform="rotate(-10 60 36)"/><circle cx="58" cy="26" r="2.5" fill="%s"/>' % (c, dark),
+            # a top hat
+            '<rect x="34" y="40" width="60" height="7" rx="3.5" fill="#23232b"/><rect x="45" y="12" width="38" height="31" rx="4" fill="#2d2d36"/>'
+            '<rect x="45" y="33" width="38" height="6" fill="%s"/>' % c,
+            # headphones
+            '<path d="M38 60 Q38 24 64 24 Q90 24 90 60" stroke="#2d2d36" stroke-width="5" fill="none"/>'
+            '<rect x="31" y="54" width="11" height="18" rx="5" fill="%s"/><rect x="86" y="54" width="11" height="18" rx="5" fill="%s"/>' % (c, c),
+            # a bandana with its knot
+            '<path d="M39 50 Q64 38 89 50 L89 44 Q64 33 39 44 Z" fill="%s"/><path d="M89 46 L99 40 L97 50 Z" fill="%s"/>' % (c, dark)][i]
+
+
+def _mix_glasses(i):
+    frame = "#2d2d36"
+    return ["",
+            '<circle cx="55" cy="61" r="7" stroke="%s" stroke-width="2.2" fill="#ffffff" fill-opacity=".18"/>'
+            '<circle cx="73" cy="61" r="7" stroke="%s" stroke-width="2.2" fill="#ffffff" fill-opacity=".18"/>'
+            '<path d="M62 61 L66 61" stroke="%s" stroke-width="2.2"/>' % (frame, frame, frame),
+            '<rect x="47" y="55" width="15" height="12" rx="3" stroke="%s" stroke-width="2.2" fill="#ffffff" fill-opacity=".18"/>'
+            '<rect x="66" y="55" width="15" height="12" rx="3" stroke="%s" stroke-width="2.2" fill="#ffffff" fill-opacity=".18"/>'
+            '<path d="M62 60 L66 60" stroke="%s" stroke-width="2.2"/>' % (frame, frame, frame),
+            '<path d="M46 56 L62 56 L60 66 Q55 69 49 66 Z M66 56 L82 56 L79 66 Q73 69 68 66 Z" fill="#1d1d26"/>'
+            '<path d="M62 57 L66 57" stroke="#1d1d26" stroke-width="2.2"/><path d="M49 58.5 L53 58.5" stroke="#ffffff" stroke-opacity=".5" stroke-width="1.6"/>',
+            '<rect x="43" y="55" width="42" height="11" rx="5.5" fill="#5b8cff" fill-opacity=".75" stroke="%s" stroke-width="2"/>'
+            '<path d="M48 58 L58 58" stroke="#ffffff" stroke-opacity=".7" stroke-width="1.6" stroke-linecap="round"/>' % frame][i]
+
+
+def _mix_body(i, colour, skin):
+    c, dark = colour
+    s, shade = skin
+    shoulders = '<path d="M20 128 Q22 98 64 96 Q106 98 108 128 Z" fill="%s"/>' % c
+    neck = '<path d="M56 82 L72 82 L72 98 Q64 103 56 98 Z" fill="%s"/>' % shade
+    return neck + shoulders + [
+        # a hoodie: its hood round the neck, and the strings
+        '<path d="M44 98 Q64 112 84 98 Q78 92 64 92 Q50 92 44 98 Z" fill="%s"/><path d="M59 104 L58 116 M69 104 L70 116" stroke="#ffffff" stroke-width="2" stroke-linecap="round"/>' % dark,
+        # a T-shirt's round neck
+        '<path d="M53 97 Q64 106 75 97" stroke="%s" stroke-width="3" fill="none" stroke-linecap="round"/>' % dark,
+        # a shirt and tie
+        '<path d="M52 96 L64 106 L76 96 L76 128 L52 128 Z" fill="#f5f7fb"/><path d="M52 96 L60 110 L64 104 Z M76 96 L68 110 L64 104 Z" fill="#ffffff" stroke="#d9deea" stroke-width="1"/>'
+        '<path d="M61 105 L67 105 L69 122 L64 127 L59 122 Z" fill="%s"/>' % dark,
+        # a turtleneck
+        '<rect x="53" y="88" width="22" height="13" rx="6" fill="%s"/>' % dark,
+        # a jacket over a tee
+        '<path d="M53 97 L64 128 L75 97 Z" fill="#f5f7fb"/><path d="M50 97 L64 128 L56 128 L44 100 Z M78 97 L64 128 L72 128 L84 100 Z" fill="%s"/>' % dark,
+        # overalls over a tee
+        '<path d="M50 104 L78 104 L80 128 L48 128 Z" fill="#3d63a8"/><path d="M50 104 L44 98 M78 104 L84 98" stroke="#3d63a8" stroke-width="5" stroke-linecap="round"/>'
+        '<circle cx="53" cy="108" r="2" fill="#e8c16f"/><circle cx="75" cy="108" r="2" fill="#e8c16f"/>'][i]
+
+
+def _mix_device(i):
+    """What it works at, in front, narrow enough that the clothes show either side."""
+    if i == 0:  # a laptop's open lid, seen from behind, glowing at its edge
+        return ('<path d="M42 113 L86 113 L89 128 L39 128 Z" fill="#cdd2dc"/><path d="M42 113 L86 113 L86.5 115.5 L41.5 115.5 Z" fill="#eef0f5"/>'
+                '<circle cx="64" cy="121" r="3" fill="#ffffff"/><circle cx="64" cy="121" r="6" fill="#9fc0ff" fill-opacity=".35"/>')
+    if i == 1:  # a desktop monitor from behind, its screen's light round the edge
+        return ('<rect x="38" y="109" width="52" height="21" rx="5" fill="#9fc0ff" fill-opacity=".45"/>'
+                '<rect x="40" y="111" width="48" height="19" rx="4" fill="#5a6378"/><circle cx="64" cy="116" r="2" fill="#9fe0ff"/>')
+    # a cloud to sit on
+    return ('<g fill="#ffffff"><circle cx="46" cy="124" r="8"/><circle cx="58" cy="119" r="10"/><circle cx="72" cy="120" r="9"/>'
+            '<circle cx="84" cy="125" r="7"/><rect x="38" y="122" width="52" height="6"/></g>'
+            '<path d="M40 127 Q64 131 88 127" stroke="#cfdaf3" stroke-width="2" fill="none"/>')
+
+
+def _mix_draw(parts):
+    back, skin, face, mood_i, hair_i, hair_c, hat_i, glasses_i, clothes, colour, dev = parts
+    b1, b2 = MIX_BACKS[back]
+    sk = MIX_SKINS[skin]
+    hc = MIX_HAIRS[hair_c]
+    cc = MIX_CLOTHES[colour]
+    hat_colour = MIX_CLOTHES[(colour + 2) % len(MIX_CLOTHES)]
+    covered = hat_i in (1, 2, 4)  # what covers the top of the head hides the hair there
+    out = ['<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">',
+           '<defs><radialGradient id="b" cx=".5" cy=".38" r=".7"><stop offset="0" stop-color="%s"/><stop offset="1" stop-color="%s"/></radialGradient></defs>' % (b1, b2),
+           '<rect width="128" height="128" fill="url(#b)"/>',
+           # A portrait: the character larger than its parts, its head filling the circle the page shows it in.
+           '<g transform="translate(64 70) scale(1.2) translate(-64 -66)">',
+           _mix_hair(hair_i, hc, True), _mix_body(clothes, cc, sk), _mix_face(face, sk), _mix_mood(mood_i),
+           "" if covered and hair_i in (5, 6) else _mix_hair(hair_i, hc, False), _mix_glasses(glasses_i), _mix_hat(hat_i, hat_colour),
+           "</g>", _mix_device(dev), "</svg>"]
+    return "".join(out)
+
+
+# How often each option comes up, where it matters: most faces wear no glasses and no hat, so those that do stand out.
+MIX_WEIGHTS = {"hat": [5, 1, 1, 1, 1, 1, 1], "glasses": [6, 2, 2, 1, 1]}
+
+
+def _mix_random(rng):
+    return [rng.choices(range(n), MIX_WEIGHTS[k])[0] if k in MIX_WEIGHTS else rng.randrange(n) for k, n in MIX_PARTS]
+
+
+MIX_RE = re.compile(r"(?:0|[1-9]\d?)(?:\.(?:0|[1-9]\d?)){%d}" % (len(MIX_PARTS) - 1))
+
+
+def mix_parts(code):
+    """A face's parts from its code ("2.5.1.3.0.4.2.1.3.0.1"), or None if it is not one."""
+    if not MIX_RE.fullmatch(str(code or "")):
+        return None
+    parts = [int(n) for n in code.split(".")]
+    return parts if all(p < n for p, (_, n) in zip(parts, MIX_PARTS)) else None
+
+
+def mix_svg(code):
+    """A face as an SVG image (bytes), or None if the code is not one."""
+    parts = mix_parts(code)
+    return None if parts is None else _mix_draw(parts).encode()
+
+
+def new_mix(device=None, taken=()):
+    """A new face, "mix:<code>": its parts at random, at this machine's kind of device unless one is given, and one
+    nobody in taken wears (while there is one: there are millions)."""
+    rng = secrets.SystemRandom()
+    device = device_kind() if device is None else device
+    for _ in range(100):
+        parts = _mix_random(rng)
+        parts[-1] = device
+        picture = "mix:" + ".".join(map(str, parts))
+        if picture not in taken:
+            return picture
+    return picture
+
+
+_DEVICE_KIND = []
+
+
+def device_kind():
+    """What this machine is, for a new agent's face: 0 a laptop, 1 a desktop, 2 the cloud (a container, or a cloud
+    session or dev environment). A laptop has a battery; a desktop or a server does not."""
+    if _DEVICE_KIND:
+        return _DEVICE_KIND[0]
+    env = os.environ
+    kind = 0
+    if any(env.get(k) for k in ("CLAUDE_CODE_REMOTE", "CODESPACES", "GITPOD_WORKSPACE_ID", "KUBERNETES_SERVICE_HOST")) \
+            or os.path.exists("/.dockerenv"):
+        kind = 2
+    elif sys.platform == "darwin":
+        try:
+            out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=3).stdout
+            kind = 0 if "InternalBattery" in out else 1
+        except (OSError, subprocess.SubprocessError):
+            kind = 0
+    elif sys.platform.startswith("linux"):
+        try:
+            kind = 0 if any(n.startswith("BAT") for n in os.listdir("/sys/class/power_supply")) else 1
+        except OSError:
+            kind = 1
+    elif sys.platform == "win32":
+        try:
+            import ctypes
+
+            class Power(ctypes.Structure):
+                _fields_ = [("ac", ctypes.c_ubyte), ("flag", ctypes.c_ubyte), ("percent", ctypes.c_ubyte),
+                            ("saver", ctypes.c_ubyte), ("left", ctypes.c_ulong), ("full", ctypes.c_ulong)]
+            power = Power()
+            ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(power))
+            kind = 1 if power.flag & 128 else 0  # 128: no battery
+        except (OSError, AttributeError, ValueError):
+            kind = 0
+    _DEVICE_KIND.append(kind)
+    return kind
+
+
 def clean_picture(value):
-    """A picture as the page may draw it: "" (initials), "preset:<id>", "art:<id>" or "file:<id>";
+    """A picture as the page may draw it: "" (initials), "preset:<id>", "art:<id>", "mix:<code>" or "file:<id>";
     anything else (a hand-edited state file, another machine's roster) reads as initials."""
     value = str(value or "")
     kind, _, rest = value.partition(":")
     if (kind == "preset" and rest in PICTURE_PRESETS) or (kind == "art" and rest in ART_PICTURES) \
-            or (kind == "file" and FILE_ID_RE.match(rest)):
+            or (kind == "mix" and mix_parts(rest)) or (kind == "file" and FILE_ID_RE.match(rest)):
         return value
     return ""
 
@@ -372,9 +600,14 @@ def check_profile(hub, picture=None, colour=None):
 
 
 def check_picture(hub, value):
-    """A picture the owner or the agent chose, checked; returns it as stored ("initials" is "")."""
+    """A picture the owner or the agent chose, checked; returns it as stored ("initials" is "", "mix:new" a new face)."""
     value = "" if value == "initials" else str(value or "")
+    if value == "mix:new":
+        with hub.lock:
+            return hub._random_picture()
     kind, _, rest = value.partition(":")
+    if kind == "mix" and not mix_parts(rest):
+        raise HubError("no face with the code %s" % rest)
     if kind == "preset" and rest not in PICTURE_PRESETS:
         raise HubError("no picture preset called %s" % rest)
     if kind == "art" and rest not in ART_PICTURES:
@@ -1964,12 +2197,11 @@ class Hub:
         return self._free_name("%s-%s" % (client, place))
 
     def _random_picture(self):
-        """A 3D picture for a new agent, one nobody here or on a linked machine has while any is free.
-        Caller holds the lock."""
+        """A face of its own for a new agent (new_mix): its parts at random, working at what this machine is (a
+        laptop, a desktop or the cloud), and one nobody here or on a linked machine wears. Caller holds the lock."""
         used = {a.get("picture") for a in self.agents.values()}
         used.update(row.get("picture") for dev in self.remote.values() for row in dev["agents"])
-        pictures = ["art:" + p for p in ART_PICTURES]
-        return secrets.choice([p for p in pictures if p not in used] or pictures)
+        return new_mix(taken=used)
 
     def _new_agent(self, place, client):
         now = time.time()
@@ -5581,6 +5813,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._sign_in(query["code"][0], query.get("chat", [""])[0])
             else:
                 self._login_page(200)
+        elif url.path.startswith("/pictures/mix/") and url.path.endswith(".svg"):  # a face: drawn from its code
+            image = mix_svg(url.path[len("/pictures/mix/"):-len(".svg")])
+            if image is None:
+                self._reply(404, b"")
+            else:
+                # Drawn from fixed parts and numbers only; and an SVG opened by itself may still run nothing.
+                self._reply(200, image, ctype="image/svg+xml",
+                            extra={"Cache-Control": "public, max-age=86400", "Content-Security-Policy": "default-src 'none'"})
         elif url.path.startswith("/pictures/"):  # the built-in 3D pictures: not secret, cached
             name = url.path[len("/pictures/"):]
             pid = name[:-len(".webp")] if name.endswith(".webp") else ""
@@ -12148,11 +12388,13 @@ function showStep(n) {
   if (first && $("launch").open) first.focus();
 }
 function roleRow(name) { return state.roles.find((r) => r.name === name); }
-// A role pre-fills the picture, the colour and the tool.
+// A role pre-fills the picture, the colour and the tool. Only a picture you gave a role: a built-in role's picture
+// stays the role's, and the new agent gets a face of its own ("").
 function applyRole(name) {
   const r = roleRow(name);
   if (!r) return;
-  $("l-picture").value = r.picture && [...$("l-picture").options].some((o) => o.value === r.picture) ? r.picture : "";
+  const own = r.source === "yours" && r.picture && [...$("l-picture").options].some((o) => o.value === r.picture);
+  $("l-picture").value = own ? r.picture : "";
   $("l-colour-tool").checked = !r.colour;
   if (r.colour) $("l-colour").value = r.colour;
   if (r.tool && launchTools.some((t) => t.id === r.tool && !t.missing)) $("l-tool").value = r.tool;
@@ -12611,8 +12853,8 @@ const missingPictures = new Set();  // pictures this page could not load: initia
 function avatar(a, cls) {
   const tool = own(state.tools, a.client) || own(state.tools, "agent") || { colour: "#6b7280", mark: "", label: "" };
   const [kind, id] = (a.picture || "").split(":");
-  // A 3D picture sits on a soft tint unless a colour was chosen; anything else on the tool's colour.
-  const fill = a.colour || (kind === "art" ? "" : tool.colour);
+  // A 3D picture or a face sits on a soft tint unless a colour was chosen; anything else on the tool's colour.
+  const fill = a.colour || (kind === "art" || kind === "mix" ? "" : tool.colour);
   const box = el("span", "avatar" + (cls ? " " + cls : ""));
   box.dataset.who = a.agent;
   box.style.setProperty("--av", fill || "var(--tint)");
@@ -12625,6 +12867,10 @@ function avatar(a, cls) {
     box.append(img);
   } else if (kind === "art" && own(state.art, id)) {
     const img = el("img", "art"); img.alt = ""; img.src = "/pictures/" + id + ".webp";
+    box.append(img);
+  } else if (kind === "mix" && /^[\d.]+$/.test(id || "")) {  // a face made of parts, drawn by the server
+    const img = el("img"); img.alt = ""; img.src = "/pictures/mix/" + id + ".svg";
+    img.addEventListener("error", () => img.replaceWith(letters()));
     box.append(img);
   } else if (kind === "preset" && own(state.presets, id)) {
     box.append(el("span", "emoji", state.presets[id]));
@@ -12651,7 +12897,7 @@ function manyMachines() {
 // The pictures to choose from in a menu: a random one ("", what every new agent gets), the 3D
 // pictures, the emoji presets.
 function pictureOptions() {
-  return [new Option("A random 3D picture", ""),
+  return [new Option("A new face, made for it", ""),
           ...Object.entries(state.art || {}).map(([id, label]) => new Option(label + " (3D)", "art:" + id)),
           ...Object.entries(state.presets || {}).map(([id, emoji]) => new Option(emoji + " " + id, "preset:" + id))];
 }
@@ -12664,6 +12910,8 @@ function pictureMenu(a, agentOp) {
   const picks = el("div", "picks");
   const set = (body, control) => agentOp(Object.assign({ op: "profile", agent: a.agent }, body), "Picture not changed", control)
     .then(() => { menu.hidden = true; menu.dispatchEvent(new Event("close")); });
+  // A new face: its parts picked again at random (the server makes one nobody here wears).
+  actButton(picks, "🎲 New face", "A new face for " + a.agent, (b) => set({ picture: "mix:new" }, b)).classList.add("reroll");
   for (const [id, label] of Object.entries(state.art || {})) {
     const b = actButton(picks, "", "Picture: " + label, (b) => set({ picture: "art:" + id }, b));
     const img = el("img"); img.alt = ""; img.src = "/pictures/" + id + ".webp"; b.append(img);
@@ -14142,7 +14390,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   function picture(a) {
     const [kind, id] = (a.picture || "").split(":");
     if (kind === "preset" && own(state.presets, id)) return { emoji: state.presets[id] };
-    const src = kind === "art" && own(state.art, id) ? PICTURES + id + ".webp" : kind === "file" && id ? "/files/" + id : "";
+    const src = kind === "art" && own(state.art, id) ? PICTURES + id + ".webp" : kind === "file" && id ? "/files/" + id
+      : kind === "mix" && /^[\d.]+$/.test(id || "") ? "/pictures/mix/" + id + ".svg" : "";
     if (!src) return null;
     let img = ax.imgs.get(src);
     if (!img) {
