@@ -776,11 +776,12 @@ class CodeMap:
 
     def _index(self):
         """What the map defines, in memory, for resolving references."""
-        ix = {"files": {}, "defs": {}, "package_of": {}, "packages": {}, "types": {}, "names": {}, "selectors": {},
-              "jvm_paths": {}}
+        ix = {"files": {}, "path_of": {}, "defs": {}, "package_of": {}, "packages": {}, "types": {}, "names": {},
+              "selectors": {}, "jvm_paths": {}}
         for i, kind, path, name, lang in self.db.execute("SELECT id, kind, path, name, lang FROM nodes ORDER BY id"):
             if kind == "file":
                 ix["files"][path] = i
+                ix["path_of"][i] = path
                 continue
             bare, _, selector = name.partition("|")
             ix["defs"].setdefault(path, {}).setdefault(bare, i)
@@ -844,7 +845,7 @@ class CodeMap:
         files, kind = ix["files"], target[0]
         if kind == "py":
             module, name = target[1], target[2]
-            here = path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+            here = folder_of(path)
             for root in dict.fromkeys(PY_ROOTS + (here,)):
                 base = (root + module.replace(".", "/")) if module else root.rstrip("/")
                 if not base:
@@ -883,7 +884,7 @@ class CodeMap:
             found = self._resolve(path, ["jvm", target[1], False], ix)
             if not found:
                 return []
-            where = next((p for p, i in files.items() if i == found[0][0]), None)
+            where = ix["path_of"].get(found[0][0])  # None for a definition (a Kotlin top-level function)
             member = ix["defs"].get(where, {}).get(target[2]) if where else None
             return [(member or found[0][0], True)]
         if kind == "jsname":  # a call to a name imported from a file: that name's definition in it (C9)
@@ -1216,12 +1217,17 @@ class Maps:
     def find(self, folders, path=""):
         """The map a path belongs to, and the path relative to that map's repository: (CodeMap, rel), or
         (None, path) when no folder has one. An absolute path picks the folder it is in; a relative one is
-        taken as relative to the first folder's repository."""
+        taken as relative to the first folder's repository. A folder check() has seen runs no git: its map is the one
+        check() found (and finds again when the folder's HEAD moves)."""
         for folder in folders:
-            try:
-                cmap, _ = self.for_folder(folder)
-            except (OSError, sqlite3.Error):
-                continue
+            seen = self.seen.get(str(folder))
+            if seen and seen[1].path.exists():
+                cmap = seen[1]
+            else:
+                try:
+                    cmap, _ = self.for_folder(folder)
+                except (OSError, sqlite3.Error):
+                    continue
             if not path:
                 return cmap, ""
             p = Path(path)

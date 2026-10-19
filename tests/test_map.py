@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -322,6 +323,12 @@ class Updates(Sample):
         (self.top / "c.py").unlink()
         self.assertEqual(self.maps.check([self.top], edited=True, paths=["c.py"]), {str(self.top): []})
         self.assertFalse(self.map.linked("new.py", "c.py"))  # gone
+
+    def test_finding_a_checked_folders_map_runs_no_git(self):
+        # The analytics view and hub_code ask often: a folder check() has seen answers from what it found.
+        with mock.patch.object(crewchat_map, "repo_of", side_effect=AssertionError("git run")):
+            cmap, rel = self.maps.find([self.top], "a.py")
+        self.assertEqual((cmap.top, rel), (self.map.top, "a.py"))
 
     def test_a_check_reads_nothing_while_nothing_moved(self):
         self.assertEqual(self.maps.check([self.top]), {})

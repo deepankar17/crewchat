@@ -92,16 +92,10 @@ class Mesh:
         self.lock = threading.RLock()
         self.data = {}
         if self.path.exists():
-            for attempt in range(6):
-                try:
-                    self.data = json.loads(self.path.read_text(encoding="utf-8"))
-                    break
-                except PermissionError:  # Windows: the server is replacing it this moment
-                    if sys.platform != "win32" or attempt == 5:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
-                except ValueError:
-                    raise PeerError("%s is damaged; remove it and join again" % self.path)
+            try:  # on Windows the server may be replacing it this moment
+                self.data = crewchat.retry_on_windows(lambda: json.loads(self.path.read_text(encoding="utf-8")))
+            except ValueError:
+                raise PeerError("%s is damaged; remove it and join again" % self.path)
 
     @property
     def exists(self):
@@ -411,8 +405,9 @@ class PeerSync(crewchat.ProjectLink):
 
     # The hub's side --------------------------------------------------------------------------
     def publish(self, msg):
-        self.log_clear = float("inf")  # a message of its own: once out of memory, it is in the log only
-        pass  # members pull; the hub's change notification wakes their waiting pulls
+        # Members pull; the hub's change notification wakes their waiting pulls. A message of its own: once out
+        # of memory, it is in the log only.
+        self.log_clear = float("inf")
 
     def state_changed(self):
         pass
@@ -698,7 +693,7 @@ class PeerSync(crewchat.ProjectLink):
             if key != task and not re.match(r"^%s@\d{1,6}$" % re.escape(task), key):
                 return 400, {"error": "bad claim key"}
             with self.hub.lock:
-                ours = any(m["id"] == task and m.get("origin") == self.device_id for m in self.hub.messages) or (
+                ours = (self.hub.by_id.get(task) or {}).get("origin") == self.device_id or (
                     (getattr(self.hub, "sheet", {}).get(task) or {}).get("origin") == self.device_id)
             agent = str(body.get("agent") or "")
             if not crewchat.NAME_RE.match(agent):
@@ -778,7 +773,7 @@ class PeerSync(crewchat.ProjectLink):
         if not older:
             with hub.lock:
                 while True:
-                    own = [m for m in hub.messages if m["seq"] > since and m.get("origin") == self.device_id]
+                    own = [m for m in hub.messages[hub._after(since):] if m.get("origin") == self.device_id]
                     agents = hub.local_state()
                     key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock")])
                     if own or key != known or time.time() >= deadline or self.stopped.is_set():

@@ -776,6 +776,15 @@ class Account:
         self.accept_account({"key_id": kid})
 
 
+def wire(msg, origin=False):
+    """A message as it travels through the cloud: live (from the machine that wrote it), or in a catch-up from
+    the coordinator, where it keeps the machine it came from."""
+    keys = ("id", "ts", "from", "to", "text", "kind") + (("origin",) if origin else ())
+    payload = {k: msg[k] for k in keys if k in msg}
+    payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
+    return payload
+
+
 # --------------------------------------------------------------------------------------------
 # Sync: the Hub on one side, the store on the other
 # --------------------------------------------------------------------------------------------
@@ -991,8 +1000,7 @@ class CloudSync(crewchat.ProjectLink):
     def _send_message(self, msg):
         if not self.marked:
             self._mark_space()
-        payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind") if k in msg}
-        payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
+        payload = wire(msg)
         doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._scope(), msg["id"], self.device_id), payload)
         doc["created"] = SERVER_TIME
         self.store.set(self.base + "messages/" + msg["id"], doc)
@@ -1003,8 +1011,9 @@ class CloudSync(crewchat.ProjectLink):
             self._save_marks()
 
     # Shared files (roadmap Y4) ----------------------------------------------------------------
-    def _file_aad(self, fid, part):
-        return "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, part, self.device_id)
+    def _file_aad(self, fid, part, by=None):
+        """What a file's piece is bound to: this project, the file, the piece, and the machine that shared it."""
+        return "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, part, by or self.device_id)
 
     def _send_file(self, info):
         """A file shared with a message written here, into the cloud beside it: encrypted, in FILE_PART pieces,
@@ -1039,8 +1048,7 @@ class CloudSync(crewchat.ProjectLink):
                 doc = first if n == 0 else self.store.get(self.base + "files/%s-%d" % (fid, n))
                 if not doc or doc.get("dev") != origin:
                     raise ValueError("part %d is missing" % n)
-                aad = "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, n, origin)
-                pieces.append(unb64(self._open(aad, doc)["data"]))
+                pieces.append(unb64(self._open(self._file_aad(fid, n, origin), doc)["data"]))
         except Exception as e:  # missing, tampered with, or sealed with a key this machine lacks
             raise crewchat.HubError("cannot fetch that file from the cloud (%s); open it on %s" % (e, name))
         return b"".join(pieces)
@@ -1176,12 +1184,12 @@ class CloudSync(crewchat.ProjectLink):
                 # The last CATCHUP_DAYS only, through Firestore (its free plan's quota); older messages stay on
                 # the machines that have them. Over Tailscale a machine gets everything.
                 since = max(float(doc.get("since") or 0), time.time() - CATCHUP_DAYS * 86400)
+                since = max(since, point[0])  # a later page starts where the last one stopped
                 missed = [m for m in self.hub.messages_since(since, skip=device_id)
                           if crewchat.catchup_order(m) > point]
                 parts, part, size = [], [], 0
                 for msg in missed:
-                    payload = {k: msg[k] for k in ("id", "ts", "from", "to", "text", "kind", "origin") if k in msg}
-                    payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
+                    payload = wire(msg, origin=True)
                     n = len(json.dumps(payload))
                     if part and size + n > CATCHUP_PART_BYTES:
                         parts.append(part)

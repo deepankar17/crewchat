@@ -443,7 +443,7 @@ class SharingEdges(unittest.TestCase):
         recovered = crewchat.Hub(a2.roster)
         row = next(m for m in recovered.messages if m["id"] == new)
         self.assertEqual((row["origin"], row["history"]), (a2.sync.device_id, "1"))
-        self.assertNotIn(old, recovered.ids)
+        self.assertNotIn(old, recovered.by_id)
 
     def test_a_machine_that_joins_later_is_followed_by_every_shared_project(self):
         for m in self.machines:

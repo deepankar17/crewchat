@@ -29,6 +29,7 @@ See README.md for the full guide.
 """
 import argparse
 import base64
+import functools
 import gzip
 import hashlib
 import itertools
@@ -369,7 +370,6 @@ MIX_PARTS = [("back", 8), ("skin", 6), ("face", 3), ("mood", 4), ("hair", 8), ("
 MIX_HAIR_FOR = {"f": (3, 4, 5, 7), "m": (0, 1, 2, 3, 6)}
 MIX_LOOK_FOR = {"f": (1,), "m": (0, 0, 0, 2)}
 MIX_INDIAN = {"skin": (2, 3, 4), "haircolour": (0, 1), "f": (1, 3)}
-MIX_DEVICES = ("laptop", "desktop", "cloud")
 
 
 def _mix_face(i, skin):
@@ -499,8 +499,7 @@ def _mix_device(i):
 
 
 def _mix_draw(parts):
-    back, skin, face, mood_i, hair_i, hair_c, hat_i, glasses_i, clothes, colour, dev = parts[:11]
-    look = parts[11] if len(parts) > 11 else 0  # a code from before looks: none
+    back, skin, face, mood_i, hair_i, hair_c, hat_i, glasses_i, clothes, colour, dev, look = parts
     b1, b2 = MIX_BACKS[back]
     sk = MIX_SKINS[skin]
     hc = MIX_HAIRS[hair_c]
@@ -531,10 +530,12 @@ MIX_RE = re.compile(r"(?:0|[1-9]\d?)(?:\.(?:0|[1-9]\d?)){%d,%d}" % (len(MIX_PART
 
 
 def mix_parts(code):
-    """A face's parts from its code ("2.5.1.3.0.4.2.1.3.0.1"), or None if it is not one."""
+    """A face's parts from its code ("2.5.1.3.0.4.2.1.3.0.1.0"), or None if it is not one. A code from before looks
+    (eleven parts) has none."""
     if not MIX_RE.fullmatch(str(code or "")):
         return None
     parts = [int(n) for n in code.split(".")]
+    parts += [0] * (len(MIX_PARTS) - len(parts))
     return parts if all(p < n for p, (_, n) in zip(parts, MIX_PARTS)) else None
 
 
@@ -560,7 +561,6 @@ def _looks_for(name):
 def mix_fits(parts, name):
     """Whether a face suits a name (_looks_for: its hair, its look, an Indian name's skin and hair); any face suits a
     name for anyone that is not an Indian one."""
-    parts = list(parts) + [0] * (len(MIX_PARTS) - len(parts))  # a code from before looks: none
     return all(parts[i] in allowed for i, allowed in _looks_for(name).items())
 
 
@@ -581,14 +581,10 @@ def new_mix(device=None, taken=(), name=None):
     return picture
 
 
-_DEVICE_KIND = []
-
-
+@functools.lru_cache(maxsize=None)
 def device_kind():
     """What this machine is, for a new agent's face: 0 a laptop, 1 a desktop, 2 the cloud (a container, or a cloud
     session or dev environment). A laptop has a battery; a desktop or a server does not."""
-    if _DEVICE_KIND:
-        return _DEVICE_KIND[0]
     env = os.environ
     kind = 0
     if any(env.get(k) for k in ("CLAUDE_CODE_REMOTE", "CODESPACES", "GITPOD_WORKSPACE_ID", "KUBERNETES_SERVICE_HOST")) \
@@ -617,7 +613,6 @@ def device_kind():
             kind = 1 if power.flag & 128 else 0  # 128: no battery
         except (OSError, AttributeError, ValueError):
             kind = 0
-    _DEVICE_KIND.append(kind)
     return kind
 
 
@@ -1246,6 +1241,11 @@ def split_list(text):
     return [part.strip().lstrip("#") for part in str(text or "").split(",") if part.strip() and part.strip() != "-"]
 
 
+def like_escape(text):
+    """Text for a LIKE pattern (ESCAPE '\\'): its \\, % and _ match only themselves."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def area_key(area):
     return area.strip().strip("/").lower() + "/"
 
@@ -1662,7 +1662,7 @@ class History:
                 " ORDER BY seq DESC LIMIT ?"
             if not tasks and not word:
                 return []
-            args = list(tasks) + (["%" + word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"]
+            args = list(tasks) + (["%" + like_escape(word) + "%"]
                                   if word else []) + [limit]
             rows = self._conn().execute(sql, args).fetchall()
         return [{"id": i, "ts": ts, "sender": f, "recipient": t, "kind": k, "status": st, "text": tx}
@@ -1701,10 +1701,15 @@ class EventStore:
         if self.db is None:
             import sqlite3
             self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+            # Written a row at a time on the hook path: WAL syncs once a row rather than three times, and with
+            # synchronous FULL (some builds lower it under WAL) a row written survives a power cut: it cannot be rebuilt.
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=FULL")
             self.db.execute("CREATE TABLE IF NOT EXISTS edits (ts REAL NOT NULL, agent TEXT NOT NULL, "
                             "path TEXT NOT NULL, task TEXT NOT NULL DEFAULT '')")
             self.db.execute("CREATE INDEX IF NOT EXISTS edits_ts ON edits (ts)")
             self.db.execute("CREATE INDEX IF NOT EXISTS edits_path ON edits (path)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS edits_task ON edits (task)")  # a task's edits (C2)
             self.db.execute("CREATE TABLE IF NOT EXISTS activity (ts REAL NOT NULL, agent TEXT NOT NULL, "
                             "state TEXT NOT NULL)")
             self.db.execute("CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts)")
@@ -1769,7 +1774,7 @@ class EventStore:
 
     def edits_under(self, path):
         """[(agent, task, edits)] for a file, or every file under a folder."""
-        folder = path.rstrip("/").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
+        folder = like_escape(path.rstrip("/")) + "/%"
         with self.lock:
             return self._conn().execute(
                 "SELECT agent, task, COUNT(*) FROM edits WHERE path = ? OR path LIKE ? ESCAPE '\\' GROUP BY agent, task",
@@ -1901,8 +1906,7 @@ class Hub:
         self.home = roster.root
         self.lock = threading.Condition()
         self.messages = []  # {id, seq, ts, from, to, text, kind[, task, origin]}; kind: msg|task|take|event
-        self.ids = {}  # message id -> seq, for the messages in memory
-        self.by_id = {}  # message id -> the message, for the same ones (_index, _store)
+        self.by_id = {}  # message id -> the message, for the messages in memory (_index, _store)
         self.agents = {}  # name -> {place, client, created, seen, active, cursor, status, checked, role, listen}
         self.sessions = {}  # MCP session id -> {agent (None until first tool call), place, client, created}
         self.links = {}  # hook link key -> agent name
@@ -1942,6 +1946,7 @@ class Hub:
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
         self._map_edited = set()  # the files agents edited since the maps were last brought up to date
+        self._briefed = None  # what the briefs were last made from (write_briefs)
         self._editors = {}  # a path in the project -> the agent that edited it last (memory only)
         self._iface = {}  # (map, path) -> a Python file's interface change not told yet (C3): before, after, when
         self._iface_told = {}  # (map, path) -> when agents were last told of a change to it
@@ -2020,9 +2025,8 @@ class Hub:
             self._index()
 
     def _index(self):
-        """Hub.ids and Hub.by_id again, from the messages in memory (after a load or a rename). Ids are
-        unique: ingest and _store never add one that is here."""
-        self.ids = {m["id"]: m["seq"] for m in self.messages}
+        """Hub.by_id again, from the messages in memory (after a load or a rename). Ids are unique: ingest and
+        _store never add one that is here."""
         self.by_id = {m["id"]: m for m in self.messages}
 
     def _save(self):
@@ -2062,11 +2066,9 @@ class Hub:
         """Add a message to memory and to messages.jsonl. Caller holds the lock."""
         self.analytics.add(msg)
         self.messages.append(msg)
-        self.ids[msg["id"]] = msg["seq"]
         self.by_id[msg["id"]] = msg
         if len(self.messages) > KEEP_MESSAGES:
             for old in self.messages[:-KEEP_MESSAGES]:
-                self.ids.pop(old["id"], None)
                 self.by_id.pop(old["id"], None)
                 if old["id"] not in self.sheet:  # a task on the sheet keeps its state
                     self.progress.pop(old["id"], None)
@@ -2098,7 +2100,7 @@ class Hub:
         """A message from another machine (cloud sync). Returns False if it was already here."""
         with self.lock:
             mid = str(msg.get("id", ""))
-            if not mid or mid in self.ids:
+            if not mid or mid in self.by_id:
                 return False
             seq = self.next_seq
             self.next_seq += 1
@@ -2214,7 +2216,7 @@ class Hub:
 
     def seq_of(self, mid):
         """This server's running number for a message id, or 0 if it is not here."""
-        return self.ids.get(str(mid), 0)
+        return (self.by_id.get(str(mid)) or {}).get("seq", 0)
 
     def id_at(self, seq):
         """The id of the newest message at or before a running number, or ""."""
@@ -2523,11 +2525,10 @@ class Hub:
         """An agent's tokens today and in all, with their estimated cost, for its row on the page ({} if none).
         Caller holds the lock."""
         today, total = {}, {}
-        for day, agents in self.usage.items():
+        for agents in self.usage.values():
             if name in agents:
                 add_usage(total, agents[name])
-                if day == time.strftime("%Y-%m-%d", time.gmtime()):
-                    add_usage(today, agents[name])
+        add_usage(today, self.usage.get(time.strftime("%Y-%m-%d", time.gmtime()), {}).get(name) or {})
         if not total:
             return {}
         return {"today": usage_tokens(today), "all": usage_tokens(total), "cost_today": round(usage_cost(today)[0], 4),
@@ -2762,18 +2763,24 @@ class Hub:
         edited, self._map_edited = self._map_edited, set()
         done = maps.check(self.project_folders(), bool(edited), sorted(edited))
         self.interface_notices(maps)
-        self.write_briefs(maps)
+        self.write_briefs(maps, bool(done))
         return done
 
-    def write_briefs(self, maps):
+    def write_briefs(self, maps, mapped=True):
         """Each folder's brief for joining agents (C6), from its code map and the task sheet: written when it changed
-        (a new commit, another holder). Returns the folders written."""
+        (a new commit, another holder). mapped: whether a map may have changed since last time; when not, and the
+        sheet has not either, nothing is made again. Returns the folders written."""
         with self.lock:
-            rows = [r for r in self.sheet_rows() if r["status"] in ("doing", "review", "blocked") and r["holder"]]
-            tasks = [{"id": r["id"], "title": r["title"], "holder": r["holder"], "areas": r["areas"],
-                      "status": STATUSES.get(r["status"], r["status"]) if r["status"] != "doing" else "in progress"}
-                     for r in rows]
-            waiting = sum(1 for r in self.sheet_rows() if r["status"] in ("todo", "waiting"))
+            sheet = self.sheet_rows()
+        rows = [r for r in sheet if r["status"] in ("doing", "review", "blocked") and r["holder"]]
+        tasks = [{"id": r["id"], "title": r["title"], "holder": r["holder"], "areas": r["areas"],
+                  "status": STATUSES.get(r["status"], r["status"]) if r["status"] != "doing" else "in progress"}
+                 for r in rows]
+        waiting = sum(1 for r in sheet if r["status"] in ("todo", "waiting"))
+        made_from = (sorted(maps.tops), tasks, waiting)
+        if not mapped and made_from == self._briefed and all((Path(f) / BRIEF_SKILL).exists() for f in maps.tops):
+            return []
+        self._briefed = made_from
         written = []
         for folder, (cmap, inside) in list(maps.tops.items()):
             try:
@@ -3537,18 +3544,23 @@ class Hub:
         for other, holder, areas in others:
             how = max((maps.link(x, y) for x in row["areas"] for y in areas), default=0)
             if how == 2 or areas_overlap(row["areas"], areas):
-                firm.append("#%s (%s)" % (other, holder))
+                firm.append((other, holder))
             elif how == 1:
-                maybe.append("#%s (%s)" % (other, holder))
+                maybe.append((other, holder))
+        named = lambda pairs: ", ".join("#%s (%s)" % pair for pair in pairs)  # noqa: E731
         notes = []
         if firm:
             notes.append("%s works on code that this task's files import or are imported by: agree any change to "
-                         "what they share with %s first." % (", ".join(firm), "them" if len(firm) > 1 else
-                                                              firm[0].split("(")[1].rstrip(")")))
+                         "what they share with %s first." % (named(firm), "them" if len(firm) > 1 else firm[0][1]))
         if maybe:
             notes.append("%s may touch code this task uses (a guess from names): worth a word before changing it."
-                         % ", ".join(maybe))
+                         % named(maybe))
         return " ".join(notes)
+
+    def heads_up(self, agent, mid):
+        """blast_radius as the end of a line for whoever takes or is given the task, or "" when there is nothing."""
+        radius = self.blast_radius(agent, mid)
+        return "\nHeads up: " + radius if radius else ""
 
     def _suggest_areas(self, mid):
         """C2: when a task goes to review or done, the folders its holder edited while holding it (C0) that its
@@ -3947,10 +3959,9 @@ class Hub:
                     self._save()
                     self._changed()
                 raise HubError("task #%s was just taken by %s" % (mid, settled))
-        radius = self.blast_radius(to, mid)
+        note = self.heads_up(to, mid)
         with self.lock:
-            msg = self._append(lead, to, "Task #%s is yours: %s%s" % (mid, self.sheet[mid]["title"],
-                                                                    "\nHeads up: " + radius if radius else ""),
+            msg = self._append(lead, to, "Task #%s is yours: %s%s" % (mid, self.sheet[mid]["title"], note),
                                "assign", task=mid)
             self._changed()
             return msg
@@ -4761,6 +4772,14 @@ def tools_for(hub, sid, owner=False):
     return TOOLS + LEAD_TOOLS if kind == "lead" else TOOLS
 
 
+def days_arg(data, default=7):
+    """The days a report covers, from a request: 1 to USAGE_DAYS."""
+    try:
+        return max(1, min(USAGE_DAYS, int(data.get("days") or default)))
+    except (TypeError, ValueError):
+        raise HubError("days is a number")
+
+
 def int_arg(args, key, default, low, high):
     value = args.get(key, default)
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -4857,10 +4876,9 @@ def call_tool(hub, sid, name, args, owner=False):
             raise HubError("the owner posts tasks; agents take them")
         mid = clean_id(args.get("id"))
         hub.take(me, mid)
-        radius = hub.blast_radius(me, mid)
         return ("Task #%s is yours and everyone has been told. Before any other work, send hub_task "
                 "action=update id=%s status=in_progress with one line on your plan; then start.%s%s"
-                % (mid, mid, hub.reclaim_note(mid), "\nHeads up: " + radius if radius else ""))
+                % (mid, mid, hub.reclaim_note(mid), hub.heads_up(me, mid)))
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -4875,9 +4893,8 @@ def call_tool(hub, sid, name, args, owner=False):
         to, text = args.get("to"), args.get("text")
         if not text and args.get("task"):
             hub.assign_row(me, to, args.get("task"))
-            radius = hub.blast_radius(to, clean_id(args["task"]))
             return "Gave task #%s to %s. They report back to you with hub_task update.%s" % (
-                clean_id(args["task"]), to, "\nHeads up: " + radius if radius else "")
+                clean_id(args["task"]), to, hub.heads_up(to, clean_id(args["task"])))
         msg = hub.assign(me, to, clean_text(to, text, me), args.get("task"))
         return "Assigned task #%s to %s. They report back to you with hub_task update." % (msg["id"], to)
     if name == "task:view":
@@ -4896,10 +4913,8 @@ def call_tool(hub, sid, name, args, owner=False):
         msg = hub.add_row(me, args.get("title"), args.get("depends", ""), args.get("areas", ""), args.get("where", ""))
         if args.get("take") and not owner:
             hub.take(me, msg["id"])
-            radius = hub.blast_radius(me, msg["id"])
             return ("Task #%s is on the sheet and yours. Send hub_task action=update id=%s status=in_progress with your plan, "
-                    "then start.%s%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"]),
-                                         "\nHeads up: " + radius if radius else ""))
+                    "then start.%s%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"]), hub.heads_up(me, msg["id"])))
         return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if name == "hub_answer":
         msg = hub.answer(me, args.get("id"), args.get("text"), args.get("verdict") or "")
@@ -5711,10 +5726,11 @@ class Handler(BaseHTTPRequestHandler):
         """The chat page: the same for everyone (its data comes from the API), so the browser may keep it and
         ask whether it changed (ETag: 304, a few hundred bytes); compressed when the browser takes gzip.
         Only after the sign-in check, as before."""
-        self._kept(PAGE_BYTES, PAGE_GZIP, PAGE_ETAG, "text/html; charset=utf-8")
+        self._kept(CHAT_PAGE, "text/html; charset=utf-8")
 
-    def _kept(self, body, packed, etag, ctype):
+    def _kept(self, text, ctype):
         """A file the same for everyone that the browser keeps and asks about (ETag), gzipped when it may be."""
+        body, packed, etag = served(text)
         headers = dict(PAGE_HEADERS, **{"Cache-Control": "private, no-cache", "ETag": etag, "Vary": "Accept-Encoding"})
         asked = [t.strip() for t in self.headers.get("If-None-Match", "").split(",")]
         if etag in asked or "W/" + etag in asked:
@@ -5881,7 +5897,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._reply(303, b"", extra={"Location": "/login"})
         elif url.path == "/analytics.js":  # the analytics view (X2): fetched by the chat page when first opened
             if self._owner_session():
-                self._kept(ANALYTICS_BYTES, ANALYTICS_GZIP, ANALYTICS_ETAG, "text/javascript; charset=utf-8")
+                self._kept(ANALYTICS_JS, "text/javascript; charset=utf-8")
             else:
                 self._json(401, {"error": "sign in"})
         elif url.path == "/login":
@@ -6091,19 +6107,10 @@ class Handler(BaseHTTPRequestHandler):
         edited in the last days. Only paths inside the project, kept on this machine."""
         op = data.get("op") or "show"
         if op in ("auto", "on", "off"):
-            config = load_config(self.roster.root)
-            if op == "auto":
-                config.pop("edit_tracking", None)
-            else:
-                config["edit_tracking"] = op
-            save_config(config, self.roster.root)
-            self.roster.refresh(force=True)
+            self._set_project("edit_tracking", None if op == "auto" else op)
         elif op != "show":
             raise HubError("op is show, auto, on or off")
-        try:
-            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
-        except (TypeError, ValueError):
-            raise HubError("days is a number")
+        days = days_arg(data)
         return {"setting": self.roster.edit_tracking, "on": self.hub.edits_on(), "pack": self.roster.pack,
                 "activity_off": self.hub.machine_config().get("activity") == "off",
                 "files": self.hub.events.files(time.time() - days * 86400)}
@@ -6142,30 +6149,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _analytics(self, data):
         """Everything the analytics page shows, worked out here from the chat (X1): nothing leaves the machine."""
-        try:
-            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
-        except (TypeError, ValueError):
-            raise HubError("days is a number")
-        return self.hub.analytics.report(self.hub, days)
+        return self.hub.analytics.report(self.hub, days_arg(data))
 
     def _usage(self, data):
         """The agents' tokens and estimated cost (op view), or the project's switch for keeping them (on, off)."""
         op = data.get("op") or "view"
         if op in ("on", "off"):
-            config = load_config(self.roster.root)
-            if op == "off":
-                config["usage"] = "off"
-            else:
-                config.pop("usage", None)
-            save_config(config, self.roster.root)
-            self.roster.refresh(force=True)
+            self._set_project("usage", "off" if op == "off" else None)
         elif op != "view":
             raise HubError("op is view, on or off")
-        try:
-            days = max(1, min(USAGE_DAYS, int(data.get("days") or 7)))
-        except (TypeError, ValueError):
-            raise HubError("days is a number")
-        return self.hub.usage_report(days)
+        return self.hub.usage_report(days_arg(data))
+
+    def _set_project(self, key, value):
+        """Set one of the project's settings (None: back to its default), and let the roster read it again."""
+        config = load_config(self.roster.root)
+        if value is None:
+            config.pop(key, None)
+        else:
+            config[key] = value
+        save_config(config, self.roster.root)
+        self.roster.refresh(force=True)
 
     def _coordinator(self, data):
         """Which linked machine coordinates (roadmap Y1), and the owner's choice of the one that should when it
@@ -7925,14 +7928,17 @@ def write_json(path, data, private=False, indent=2):
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=indent) + "\n")
-    for attempt in range(6):
+    retry_on_windows(lambda: os.replace(tmp, path))
+
+
+def retry_on_windows(fn, attempts=6):
+    """fn(), tried again shortly when Windows refuses it because another process has the file open for a moment
+    (a reader such as `crewchat status`, the virus scanner, the search indexer). Anywhere else, at once."""
+    for attempt in range(attempts):
         try:
-            os.replace(tmp, path)
-            return
+            return fn()
         except PermissionError:
-            # Windows refuses to replace a file another process has open for a moment (a reader such as
-            # `crewchat status`, the virus scanner, the search indexer): try again shortly.
-            if sys.platform != "win32" or attempt == 5:
+            if sys.platform != "win32" or attempt == attempts - 1:
                 raise
             time.sleep(0.05 * (attempt + 1))
 
@@ -11441,8 +11447,7 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
   }
 }
 body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
-.glassy, #needs-you, .agent.on, .rail-tools, .pillbox, .menu-list, .mentions,
-#panel .card, dialog, .col, #give {
+#needs-you, .agent.on, .rail-tools, .pillbox, #panel .card, dialog, .col, #give {
   background: var(--glass); -webkit-backdrop-filter: var(--glass-filter); backdrop-filter: var(--glass-filter);
   box-shadow: var(--glass-rim), var(--glass-shadow);
 }
@@ -11450,7 +11455,7 @@ body { background: var(--backdrop), var(--bg); background-attachment: fixed; }
 #needs-you, #panel .card, dialog { background: var(--glass-strong); }
 /* Menus and the @ suggestions sit inside the header's or the message box's glass, which a browser does not blur
    through again: nearly opaque, as a Mac's menus are, so what is behind never shows through their words. */
-.menu-list, .mentions { background: var(--menu); -webkit-backdrop-filter: none; backdrop-filter: none; }
+.menu-list, .mentions { background: var(--menu); box-shadow: var(--glass-rim), var(--glass-shadow); }
 .menu-list, .mentions, dialog, #panel .card { border-color: var(--glass-line); }
 #panel .card.needs-card { border-left-color: var(--err); }  /* what needs you keeps its red edge */
 /* The project's space: a plate the thread sits on, the header and the message box floating on it. */
@@ -11551,14 +11556,11 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
   .task-form #t-add { grid-column: 3; }
   .task-form #t-areas { grid-column: 2 / 4; }
   .task-form #t-where { grid-column: 1 / -1; }
-  #sheet td:last-child .acts { flex-wrap: wrap; }
+  #sheet td:last-child .acts { flex-wrap: wrap; justify-content: flex-start; }
   #sheet td { border: 0; padding: 0; }
   #sheet td:nth-child(2) { flex: 1 1 calc(100% - 48px); min-width: 0; overflow-wrap: anywhere; }
   #sheet td:last-child { flex-basis: 100%; }
-  #sheet td:last-child .acts { justify-content: flex-start; }
-}
-/* Glass on a phone: a lighter blur (it costs the most there), the plate and drawer denser. */
-@media (max-width: 760px) {
+  /* Glass on a phone: a lighter blur (it costs the most there), the plate and drawer denser. */
   :root { --glass-filter: blur(14px) saturate(160%); }
   #space { border-radius: 0; background: linear-gradient(to bottom, transparent var(--over), var(--panel) var(--over)); }
   #space { --over: 58px; }  /* the header's height here */
@@ -15388,12 +15390,15 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
 })();
 """
 ANALYTICS_BYTES = ANALYTICS_JS.encode("utf-8")
-ANALYTICS_GZIP = gzip.compress(ANALYTICS_BYTES, 9, mtime=0)
-ANALYTICS_ETAG = '"%s"' % hashlib.sha256(ANALYTICS_BYTES).hexdigest()[:20]
-# The chat page as served (Handler._chat_page): made once, compressed once, and named by its contents.
 PAGE_BYTES = CHAT_PAGE.encode("utf-8")
-PAGE_GZIP = gzip.compress(PAGE_BYTES, 9, mtime=0)
-PAGE_ETAG = '"%s"' % hashlib.sha256(PAGE_BYTES).hexdigest()[:20]
+
+
+@functools.lru_cache(maxsize=None)
+def served(text):
+    """The chat page or the analytics script as Handler._kept serves it: its bytes, compressed, and an ETag naming its
+    contents. Made once, at its first request rather than at import: every hook and command loads crewchat."""
+    body = text.encode("utf-8")
+    return body, gzip.compress(body, 9, mtime=0), '"%s"' % hashlib.sha256(body).hexdigest()[:20]
 
 
 # --------------------------------------------------------------------------------------------

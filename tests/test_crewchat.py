@@ -589,6 +589,13 @@ class EditPaths(unittest.TestCase):
         self.assertEqual(store.files(), [  # top: who edited it most (on a tie, last)
             {"path": "app/a.kt", "edits": 2, "agents": ["maya", "teo"], "top": "teo", "last": 200},
             {"path": "app/b.kt", "edits": 1, "agents": ["maya"], "top": "maya", "last": 300}])
+        # Written on the hook path, under the hub's lock: one sync per row (WAL, still durable), and a task's
+        # edits found by index rather than by reading them all.
+        db = store._conn()
+        self.assertEqual((db.execute("PRAGMA journal_mode").fetchone()[0], db.execute("PRAGMA synchronous").fetchone()[0]),
+                         ("wal", 2))  # 2: FULL, as the records cannot be rebuilt
+        plan = db.execute("EXPLAIN QUERY PLAN SELECT ts FROM edits WHERE ts >= 0 AND task = '12'").fetchall()
+        self.assertIn("edits_task", " ".join(str(row) for row in plan))
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
@@ -666,13 +673,12 @@ class Faces(unittest.TestCase):
         taken = {crewchat.new_mix(0) for _ in range(50)}
         self.assertNotIn(crewchat.new_mix(0, taken), taken)
         self.assertIn(crewchat.device_kind(), (0, 1, 2))
-        kept = list(crewchat._DEVICE_KIND)
         try:
-            crewchat._DEVICE_KIND.clear()
+            crewchat.device_kind.cache_clear()
             with mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE": "true"}):
                 self.assertEqual(crewchat.device_kind(), 2)  # a cloud session sits on a cloud
         finally:
-            crewchat._DEVICE_KIND[:] = kept
+            crewchat.device_kind.cache_clear()
 
 
 class FacesOnThePage(Base):
@@ -1133,6 +1139,9 @@ class TaskAreas(Base):
         self.assertIn("alwaysApply: false", (code / crewchat.BRIEF_RULE).read_text())
         self.assertIn("read %s when you join" % crewchat.BRIEF_SKILL, (code / "AGENTS.md").read_text())
         self.assertNotIn("used by 1", (code / "AGENTS.md").read_text())  # a pointer, not the brief
+        with mock.patch.object(crewchat_map.CodeMap, "overview") as overview:
+            self.assertEqual(self.hub.update_map(), {})
+        self.assertFalse(overview.called)  # no edit, no commit, the same sheet: not even made again
         self.assertEqual(self.hub.write_briefs(self.hub._maps), [])  # nothing new: nothing written
         a.text("hub_task", action="update", id=mid, status="done", note="faster")
         self.assertEqual(self.hub.write_briefs(self.hub._maps), [str(code)])  # the sheet moved: written again
@@ -4852,7 +4861,7 @@ class LogLoading(unittest.TestCase):
             expected = self.old_load(root / "messages.jsonl")
             self.assertEqual(hub.messages, expected, name)
             self.assertEqual(hub.next_seq, expected[-1]["seq"] + 1 if expected else 1, name)
-            self.assertEqual(hub.ids, {m["id"]: m["seq"] for m in expected}, name)
+            self.assertEqual({i: m["seq"] for i, m in hub.by_id.items()}, {m["id"]: m["seq"] for m in expected}, name)
         # The last line half written by a crash, with no newline after it: skipped, as before.
         root = self.project([msg(1)], raw=b"")
         with open(root / "messages.jsonl", "ab") as f:
@@ -4985,7 +4994,7 @@ class MessageIndex(unittest.TestCase):
     def assertIndexed(self, hub):
         self.assertEqual(hub.by_id, {m["id"]: m for m in hub.messages})
         self.assertTrue(all(hub.by_id[m["id"]] is m for m in hub.messages))  # the same objects, not copies
-        self.assertEqual(hub.ids, {m["id"]: m["seq"] for m in hub.messages})
+        self.assertTrue(all(hub.seq_of(m["id"]) == m["seq"] for m in hub.messages))
 
     def test_loaded_sent_trimmed_and_ingested(self):
         hub = self.hub([{"id": str(i), "seq": i, "ts": 1, "from": "Owner", "to": "all", "text": "x"} for i in range(1, 6)])
