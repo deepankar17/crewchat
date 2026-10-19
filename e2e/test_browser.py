@@ -145,6 +145,7 @@ class NewPage(Signed):
         self.assertIn(["D\nDemo", "page"], tabs)  # (and one for each other project, not current)
         self.assertEqual([t for t in tabs if t[1] == "page"], [["D\nDemo", "page"]])
         self.assertIn("1 agent", c.js("$('space-meta').textContent"))
+        self.assertNotIn("machine", c.js("$('space-meta').textContent"))  # one machine: not said
         self.assertTrue(c.js("$('panel').hidden"))
         self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])

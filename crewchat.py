@@ -13600,7 +13600,9 @@ function renderHeader() {
   const machines = new Set(state.agents.map((a) => a.device).concat(state.device ? [state.device] : [])).size || 1;
   const open = state.sheet.filter((r) => r.status !== "done").length;
   const plural = (n, one) => n + " " + one + (n === 1 ? "" : "s");
-  $("space-meta").textContent = [plural(state.agents.length, "agent"), plural(machines, "machine"), plural(open, "open task")].join(" · ");
+  // The machine count only once there are several: "1 machine" says nothing, and a phone needs the room.
+  $("space-meta").textContent = [plural(state.agents.length, "agent"), machines > 1 ? plural(machines, "machine") : "",
+    plural(open, "open task")].filter(Boolean).join(" · ");
 }
 
 // What changes only with the server or the project's roles: fetched at load, and again when the poll's tag

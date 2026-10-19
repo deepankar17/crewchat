@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- **The project's header leaves out "1 machine"**: the count shows once there are several, and a phone has the room.
 - **The open project's tab and the header under it are one surface**, as a browser's tab and its toolbar: the
   same glass, no seam, its corners flaring into the bar (the header was a separate rounded card under the tab).
   The task panel's "needs you" card has its red edge back.
