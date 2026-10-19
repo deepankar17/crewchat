@@ -269,6 +269,10 @@ a Windows laptop. What has been tried for real, and what has not yet:
   - starting at login on Linux and Windows;
   - the phone app on a real phone (it was checked in Chrome);
   - agents following role instructions in long sessions;
-  - **+ New agent** with a real Claude Code or Cursor session.
+  - **+ New agent** with a real Claude Code or Cursor session;
+  - everything new in this release, beyond the test suite: the code map and the checks and notices
+    built on it, `hub_code`, Analytics with a real crew, Codex CLI, Gemini CLI, Qwen Code and OpenCode
+    in a chat, permission prompts from the page, Web Push, the coordinator, catch-up and files over
+    cloud sync.
 
 Back to the [README](../README.md)
