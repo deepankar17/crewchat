@@ -42,6 +42,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [P5](#p5) | Coalesce state.json writes | Speed and efficiency | P3 | S | Done | P0 |
 | [P6](#p6) | Index messages by id | Speed and efficiency | P3 | S | Done | none |
 | [P7](#p7) | Compress and cache the chat page | Speed and efficiency | P3 | S | Done | none |
+| [P8](#p8) | Speed fixes parked by the 1.0 review | Speed and efficiency | P3 | M | Done | P0 |
 | [S1](#s1) | Storage decision record | Storage rules | P1 | S | Done | none |
 | [C0](#c0) | Opt-in full-path edit events | Code-aware coordination | P1 | S | Done | P1 |
 | [C1](#c1) | Built-in code map (stdlib) | Code-aware coordination | P2 | L | Done | S1 |
@@ -358,6 +359,32 @@ at load when there are renames.
 never asked again with an ETag. Owner's choice (18 Oct): the page's HTML (the same for everyone, no chat data)
 is `private, no-cache` with an ETag, so a reload is a 304 of 491 bytes; the first load is gzipped (47 KB). The
 API stays `no-store`, the sign-in check comes before any 304, and the CSP is unchanged.
+
+### P8
+
+**Speed fixes parked by the 1.0 review** · P3 · effort M · Done
+
+**Goal.** The seven speed findings of the 1.0 pre-merge reviews that needed larger changes than a review fix.
+
+**Done when**
+
+- Each is fixed with a test that fails without it; the benchmark is no worse.
+
+**Depends on:** [P0](#p0)
+
+**Status.** Done (branch `perf-after-1-0`, on dev):
+1. The code map's `link()` answers from an index of each file's links made once per map update
+   (`CodeMap._link_index`), not a `LIKE` query over the edges per pair of task areas under the hub's lock.
+2. `events.sqlite` rows are written by the store's own thread, still `synchronous=FULL`; reads, renames and the
+   server stopping write what waits first.
+3. Token counts (by day, and each task's) are in `usage.json`, written only when they change; an older
+   `state.json`'s move there on load.
+4. A Tailscale pull asks for the claim decisions after the last change number it had from that member, and
+   gets only those (an older crewchat, asking without one, still gets them all).
+5. The cloud coordinator's lease is renewed every 100 s for 300 s, and a machine that knows of another's live
+   lease neither reads nor writes it.
+6. A `/peer/relay` catch-up reads the log back to its point once, then a page at a time (`Hub._relayed_after`).
+7. `Hub.machine_config()` reads another folder's `config.json` again only when it changed.
 
 ## Storage rules
 
