@@ -17,6 +17,7 @@ expressions. A link that resolves to a file of the repository is certain; a gues
 package, a class name defined in more than one file) is stored with certain = 0 and only ever used as a hint.
 """
 import ast
+import bisect
 import hashlib
 import json
 import os
@@ -612,6 +613,7 @@ class CodeMap:
             self.db.commit()
         self.base_url, self.aliases = self._ts_paths()
         self._linked = {}  # (a, b) -> linked(a, b), until the next update changes something
+        self._link_idx = None  # (sorted files that use others, {file: {each file and folder it uses: certain}}), lowercase
         self.changes = []  # [(path, signatures before, after)] since pop_changes, for C3's notices
 
     def close(self):
@@ -679,6 +681,7 @@ class CodeMap:
             if changed or gone or not self.meta("built"):
                 self._apply([rel for rel, _ in changed], gone, dict(changed))
                 self._linked = {}
+                self._link_idx = self._link_index()
             self._set_meta("commit", commit)
             self._set_meta("repo", self.repo)
             self._set_meta("branch", self.branch)
@@ -968,18 +971,41 @@ class CodeMap:
             return self._linked.get((a, b), 0)
         try:
             if (a, b) not in self._linked:
-                under = "(%s = ? OR %s LIKE ? ESCAPE '\\')"
-                sa, da, sb, db = under % ("s.path", "s.path"), under % ("d.path", "d.path"), \
-                    under % ("s.path", "s.path"), under % ("d.path", "d.path")
-                va, vb = [a, like_prefix(a)], [b, like_prefix(b)]
-                row = self.db.execute(
-                    "SELECT MAX(e.certain) FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
-                    "WHERE (%s AND %s) OR (%s AND %s)" % (sa, db, sb, da), va + vb + vb + va).fetchone()
-                how = 0 if row is None or row[0] is None else CERTAIN if row[0] else GUESS
+                if self._link_idx is None:
+                    self._link_idx = self._link_index()
+                how = max(self._link_from(a.lower(), b.lower()), self._link_from(b.lower(), a.lower()))
                 self._linked[(a, b)] = self._linked[(b, a)] = how
             return self._linked[(a, b)]
         finally:
             self.lock.release()
+
+    def _link_index(self):
+        """Every file's links, read once per update so link() asks no SQL (it runs for each pair of task areas, under
+        the hub's lock): ([files that use others], {file: {each file it uses, and each folder above it: certain}}).
+        Lowercase, as LIKE matches."""
+        out = {}
+        for src, dst, certain in self.db.execute(
+                "SELECT s.path, d.path, MAX(e.certain) FROM edges e JOIN nodes s ON s.id = e.src "
+                "JOIN nodes d ON d.id = e.dst GROUP BY s.path, d.path"):
+            uses = out.setdefault(src.lower(), {})
+            how = CERTAIN if certain else GUESS
+            parts = dst.lower().split("/")
+            for i in range(len(parts), -1, -1):
+                above = "/".join(parts[:i])
+                if uses.get(above, 0) < how:
+                    uses[above] = how
+        return sorted(out), out
+
+    def _link_from(self, a, b):
+        """The strongest link from a file at or under area a to one at or under area b (lowercase, no trailing /)."""
+        files, uses = self._link_idx
+        best = uses.get(a, {}).get(b, 0)
+        prefix = a + "/" if a else ""
+        i = bisect.bisect_left(files, prefix)
+        while best < CERTAIN and i < len(files) and files[i].startswith(prefix):
+            best = max(best, uses[files[i]].get(b, 0))
+            i += 1
+        return best
 
     def graph(self, inside="", limit=MAX_GRAPH_FILES):
         """The files under a folder of the repository (paths relative to it) and the certain links between them,

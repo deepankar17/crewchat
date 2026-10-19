@@ -102,6 +102,18 @@ class PythonRepo(Sample):
         self.assertFalse(self.map.linked("scripts/", "app/"))
         self.assertFalse(self.map.linked("scripts/", "app_other/"))
 
+    def test_links_are_answered_without_sql(self):
+        # The hub asks for every pair of task areas under its lock: from an index made once per update, not a query
+        # that scans the edges each time.
+        self.map._linked = {}
+        real, self.map.db = self.map.db, mock.Mock(execute=mock.Mock(side_effect=AssertionError("SQL in link()")))
+        try:
+            self.assertTrue(self.map.linked("app/api/", "app/views.py"))
+            self.assertTrue(self.map.linked("App/Models.py", "main.py"))  # LIKE's case, as before
+            self.assertFalse(self.map.linked("scripts/", "app/"))
+        finally:
+            self.map.db = real
+
 
 class JavaRepo(Sample):
     FILES = {
