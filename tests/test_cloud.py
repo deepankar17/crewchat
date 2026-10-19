@@ -248,6 +248,19 @@ class Sync(unittest.TestCase):
         self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
                          crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file
 
+    def test_the_page_names_the_coordinator_without_asking_the_cloud(self):
+        # The page asks at every poll: the names come from the machines the account approved, kept on each
+        # machine, and a renewal reads the lease once, in its conditional write.
+        self.a.sync.renew_lease()
+        self.b.sync.renew_lease()
+        self.a.link.online = self.b.link.online = False
+        self.assertEqual((self.b.sync.coordinator()["name"], self.a.sync.coordinator()["me"]), ("mac", True))
+        self.a.link.online = self.b.link.online = True
+        with mock.patch.object(self.a.link, "get", wraps=self.a.link.get) as get:
+            self.a.sync.renew_lease()
+        self.assertEqual(get.call_count, 0)
+        self.assertTrue(self.a.sync.coordinator()["me"])
+
     def test_whichever_machine_is_on_holds_the_coordinators_lease(self):
         # Roadmap Y1: a lease in meta/coordinator, renewed by its holder, taken over once it runs out.
         now = [time.time()]

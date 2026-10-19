@@ -821,9 +821,14 @@ class CloudSync(crewchat.ProjectLink):
         """Which machine coordinates now: the holder of a lease that has not run out (meta/coordinator)."""
         doc = self.lease or {}
         live = float(doc.get("expires") or 0) > self.clock()
-        names = {i: d.get("name", i) for i, d in self.store.list("devices")} if doc else {}
+        names = self._names()
         return {"name": names.get(doc.get("device"), "") if live else "", "me": live and doc.get("device") == self.device.id,
                 "term": int(doc.get("term") or 0), "preferred": names.get(doc.get("preferred") or "", "")}
+
+    def _names(self):
+        """The approved machines' names, by id, from the account's trust list kept on this machine: no cloud read
+        (the page asks at every poll). Only an approved machine holds the lease or shares a file."""
+        return {i: e.get("name") or i for i, e in self.device.trust.get("devices", {}).items()}
 
     def renew_lease(self):
         """Hold the coordinator's lease, or take it: when this machine holds it, when it has run out, or when
@@ -833,8 +838,10 @@ class CloudSync(crewchat.ProjectLink):
             return self.lease
         now = self.clock()
 
+        seen = {}
+
         def update(doc):
-            doc = dict(doc or {})
+            doc = seen["doc"] = dict(doc or {})  # what the write found, or what it wrote
             mine = doc.get("device") == self.device.id
             if mine or float(doc.get("expires") or 0) <= now or doc.get("preferred") == self.device.id:
                 doc.update(device=self.device.id, term=int(doc.get("term") or 0) + (0 if mine else 1),
@@ -843,7 +850,7 @@ class CloudSync(crewchat.ProjectLink):
             return None
         try:
             self.store.transact("meta/coordinator", update)
-            self.lease = self.store.get("meta/coordinator") or {}
+            self.lease = seen.get("doc") or {}
         except Exception as e:  # offline for now: the lease runs out, and someone online takes it
             self.log("could not renew the coordinator's lease (%s)" % e)
         return self.lease
@@ -1017,7 +1024,7 @@ class CloudSync(crewchat.ProjectLink):
         """The bytes of a file shared on another machine (Hub.open_file), from the cloud: what that machine
         sealed with the message. A file too big to travel, or gone (delivered and deleted, or past the
         retention), is on that machine only."""
-        name = next((d.get("name") for i, d in self.store.list("devices") if i == origin), "") or "another machine"
+        name = self._names().get(origin) or "another machine"
         first = self.store.get(self.base + "files/%s-0" % fid)
         if not first or first.get("dev") != origin:
             raise crewchat.HubError("that file is on %s only: open it there. With cloud sync, %s; and the cloud keeps "
