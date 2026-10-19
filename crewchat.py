@@ -7963,10 +7963,15 @@ def retry_on_windows(fn, attempts=6):
             time.sleep(0.05 * (attempt + 1))
 
 
+# Git as crewchat runs it in a project folder: never running a command the repository's config names (an agent that
+# may only edit files could write one into .git/config). Reading the index (ls-files) runs core.fsmonitor.
+GIT_SAFE = ["-c", "core.fsmonitor=false"]
+
+
 def git_exclude(project, paths):
     """Keep machine-specific files out of git without touching the project's .gitignore."""
     try:
-        out = subprocess.run(["git", "-C", str(project), "rev-parse", "--git-path", "info/exclude"],
+        out = subprocess.run(["git"] + GIT_SAFE + ["-C", str(project), "rev-parse", "--git-path", "info/exclude"],
                              capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return False
@@ -8521,8 +8526,8 @@ def tracked_by_git(folder, rel):
     """Is this file committed in the folder's repository? Then only `crewchat start` there changes
     it, not an upgrade behind the owner's back."""
     try:
-        return subprocess.run(["git", "-C", str(folder), "ls-files", "--error-unmatch", rel], capture_output=True,
-                              timeout=10).returncode == 0
+        return subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "ls-files", "--error-unmatch", rel],
+                              capture_output=True, timeout=10).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 

@@ -386,6 +386,29 @@ class Signatures(Sample):
                          ["Store.__init__(self) is now Store.__init__(self, x)"])  # a constructor is public
 
 
+@unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs git and a POSIX shell")
+class PlantedGitConfig(unittest.TestCase):
+    """An agent that may edit files but not run commands could write a command into .git/config: the map's own git
+    calls, which run by themselves every 30 s, must never run it."""
+
+    def test_a_planted_fsmonitor_never_runs(self):
+        folder = Path(tempfile.mkdtemp(prefix="crewchat-fsmonitor-"))
+        self.addCleanup(shutil.rmtree, folder, True)
+        top, ran = folder / "repo", folder / "ran"
+        write(top, {"a.py": "import b\n", "b.py": "x = 1\n"})
+        for args in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "one"]):
+            subprocess.run(["git", "-C", str(top)] + args, check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(top), "config", "core.fsmonitor", "touch %s; false" % ran], check=True)
+        maps = crewchat_map.Maps(folder / "project")
+        self.addCleanup(maps.close)
+        maps.check([top])
+        cmap, _ = maps.for_folder(top)
+        self.assertTrue(cmap.importers("b.py")["files"])  # mapped
+        import crewchat  # and the upgrade's own look at what is committed
+        self.assertTrue(crewchat.tracked_by_git(top, "a.py"))
+        self.assertFalse(ran.exists())
+
+
 class Splitting(unittest.TestCase):
     """C7's last step: the smallest groups join the ones they link to most, quickly even in a big project."""
 

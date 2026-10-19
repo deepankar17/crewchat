@@ -62,10 +62,15 @@ MAP_VERSION = "2"  # what the tables hold; a map of another version is built aga
 # --------------------------------------------------------------------------------------------
 # Which repository and branch a folder is
 # --------------------------------------------------------------------------------------------
+# What git runs by itself must not run anything a repository's own config names: an agent allowed only to edit files
+# could write a command there. core.fsmonitor is the one that commands reading the index (ls-files) run.
+GIT_SAFE = ["-c", "core.fsmonitor=false"]
+
+
 def git(folder, *args):
     try:
-        out = subprocess.run(["git", "-C", str(folder)] + list(args), capture_output=True, text=True, timeout=20,
-                             stdin=subprocess.DEVNULL)
+        out = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder)] + list(args), capture_output=True, text=True,
+                             timeout=20, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return ""
     return out.stdout.strip() if out.returncode == 0 else ""
