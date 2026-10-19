@@ -638,6 +638,10 @@ class EditPaths(unittest.TestCase):
                          ("wal", 2))  # 2: FULL, as the records cannot be rebuilt
         plan = db.execute("EXPLAIN QUERY PLAN SELECT ts FROM edits WHERE ts >= 0 AND task = '12'").fetchall()
         self.assertIn("edits_task", " ".join(str(row) for row in plan))
+        # The analytics view's "state before the window", every 15 s: found through the index, never a scan of a
+        # year of activity.
+        plan = " ".join(str(row[3]) for row in db.execute("EXPLAIN QUERY PLAN " + crewchat.BEFORE_STATES, (5,)))
+        self.assertNotIn("SCAN activity", plan)
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
@@ -1184,6 +1188,11 @@ class TaskAreas(Base):
         with mock.patch.object(crewchat_map.CodeMap, "overview") as overview:
             self.assertEqual(self.hub.update_map(), {})
         self.assertFalse(overview.called)  # no edit, no commit, the same sheet: not even made again
+        (code / "NOTES.md").write_text("not code\n")
+        self.hub._map_edited.add("NOTES.md")
+        with mock.patch.object(crewchat_map.CodeMap, "overview") as overview:
+            self.assertEqual(list(self.hub.update_map().values()), [[]])  # an edit the map does not read
+        self.assertFalse(overview.called)
         self.assertEqual(self.hub.write_briefs(self.hub._maps), [])  # nothing new: nothing written
         a.text("hub_task", action="update", id=mid, status="done", note="faster")
         self.assertEqual(self.hub.write_briefs(self.hub._maps), [str(code)])  # the sheet moved: written again
@@ -4183,6 +4192,32 @@ class Hooks(Base):
         self.light_hook("cursor", {"conversation_id": "light-first", "command": "ls"}, env_extra={"CREWCHAT_LINK_KEY": key})
         self.assertGreater(self.hub.agents[cursor.me]["seen"], time.time() - 30)
 
+    def test_parallel_hooks_never_read_the_state_half_written(self):
+        # Parallel tool calls run their hooks at once: one reading while another writes must get it whole.
+        state_file = Path(self.state) / "crewchat-hooks" / "claude-parallel"
+        state = {"key": "k" * 12, "pad": "x" * 400000}
+        crewchat.save_hook_state(state_file, state)
+        bad, done = [], threading.Event()
+
+        def read():
+            while not done.is_set():
+                try:
+                    json.loads(state_file.read_text())
+                except ValueError:
+                    bad.append(1)
+                except OSError:
+                    pass
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            for n in range(150):
+                crewchat.save_hook_state(state_file, dict(state, n=n))
+        finally:
+            done.set()
+            reader.join()
+        self.assertEqual(bad, [])
+        self.assertIn("save_hook_state", crewchat.hook_script())  # the light hook script writes it the same way
+
     def test_an_edit_just_after_a_turn_boundary_is_still_sent(self):
         # The prompt and stop hooks rewrite the state file: they must keep what the tool hook learned there
         # (that edits are kept), or the edits of the next minute go unsent.
@@ -5464,6 +5499,19 @@ class Lifecycle(Base):
             self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
         # A checkout runs its script with this Python, as before.
         self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_the_tool_hook_runs_the_console_python_whoever_writes_it(self):
+        # Windows: the server runs windowless (pythonw.exe), `crewchat start` in a console (python.exe). Both must
+        # write the same hook, or they rewrite each other's settings at every start.
+        folder = Path(tempfile.mkdtemp(prefix="pythons-", dir=TMP))
+        for name in ("python.exe", "pythonw.exe"):
+            (folder / name).write_text("")
+        commands = set()
+        for python in ("python.exe", "pythonw.exe"):
+            with mock.patch.object(sys, "executable", str(folder / python)):
+                commands.add(crewchat.hook_command("claude", "tool"))
+        self.assertEqual(len(commands), 1, commands)
+        self.assertIn("/python.exe", commands.pop())
 
     def test_hooks_under_a_home_with_a_space_are_still_ours(self):
         # C:/Users/John Smith: the light hook script's path is quoted, and crewchat must still know its hook (or each

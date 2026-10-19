@@ -318,8 +318,13 @@ class Updates(Sample):
         os.utime(self.top / "a.py", (later, later))  # changed too, but not said: left for the next full look
         self.assertEqual(self.map.update(paths=["c.py", "./new.py", "notes.md"]), ["c.py", "new.py"])
         self.assertTrue(self.map.linked("new.py", "c.py"))
-        self.assertIsNone(self.map.update(paths=["elsewhere/x.py"]))  # not this folder's file: look at all
-        self.assertEqual(self.maps.check([self.top], edited=True, paths=["elsewhere/x.py"]), {str(self.top): ["a.py"]})
+        self.assertIsNone(self.map.update(paths=["elsewhere/x.py"]))  # not this folder's file
+        # Another folder of the project's edits (none of its paths here): this folder is not looked at again, as it
+        # would be after every edit burst there.
+        with mock.patch.object(crewchat_map, "source_files", side_effect=AssertionError("looked at everything")):
+            self.assertEqual(self.maps.check([self.top], edited=True, paths=["elsewhere/x.py"]), {})
+        # Some of them here, one not: everything is looked at, as before.
+        self.assertEqual(self.maps.check([self.top], edited=True, paths=["elsewhere/x.py", "b.py"]), {str(self.top): ["a.py"]})
         (self.top / "c.py").unlink()
         self.assertEqual(self.maps.check([self.top], edited=True, paths=["c.py"]), {str(self.top): []})
         self.assertFalse(self.map.linked("new.py", "c.py"))  # gone
@@ -329,6 +334,18 @@ class Updates(Sample):
         with mock.patch.object(crewchat_map, "repo_of", side_effect=AssertionError("git run")):
             cmap, rel = self.maps.find([self.top], "a.py")
         self.assertEqual((cmap.top, rel), (self.map.top, "a.py"))
+
+    def test_reading_the_maps_meta_waits_for_an_update(self):
+        # One SQLite connection, shared with the map thread: a page's question waits while an update holds it.
+        import threading
+        got = []
+        with self.map.lock:
+            reader = threading.Thread(target=lambda: got.append(self.map.meta("commit")))
+            reader.start()
+            reader.join(0.2)
+            self.assertEqual(got, [])
+        reader.join(5)
+        self.assertEqual(len(got), 1)
 
     def test_a_check_reads_nothing_while_nothing_moved(self):
         self.assertEqual(self.maps.check([self.top]), {})

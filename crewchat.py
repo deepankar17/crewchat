@@ -1689,6 +1689,15 @@ def clean_edit_path(path):
     return "/".join(parts)
 
 
+# Each agent's last state before a time, as (agent, state, ts): the agents found by stepping through the
+# (agent, ts) index, then each one's row by it, so a year of activity costs no more than a day's. Read every 15 s
+# while the analytics view is open.
+BEFORE_STATES = """WITH RECURSIVE agents(name) AS (SELECT MIN(agent) FROM activity
+  UNION ALL SELECT (SELECT MIN(agent) FROM activity WHERE agent > name) FROM agents WHERE name IS NOT NULL)
+SELECT name, state, ts FROM agents JOIN activity ON rowid = (SELECT rowid FROM activity WHERE agent = name AND ts < ?1
+  ORDER BY ts DESC LIMIT 1)"""
+
+
 class EventStore:
     """What happened on this machine that the message log does not hold, and so cannot be rebuilt from it
     (docs/storage.md): the files agents edit (C0). One SQLite file per project, in its crewchat folder, written
@@ -1715,6 +1724,7 @@ class EventStore:
             self.db.execute("CREATE TABLE IF NOT EXISTS activity (ts REAL NOT NULL, agent TEXT NOT NULL, "
                             "state TEXT NOT NULL)")
             self.db.execute("CREATE INDEX IF NOT EXISTS activity_ts ON activity (ts)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS activity_agent_ts ON activity (agent, ts)")  # BEFORE_STATES
             self.db.commit()
         return self.db
 
@@ -1758,7 +1768,7 @@ class EventStore:
         until = time.time() if until is None else until
         with self.lock:
             db = self._conn()
-            before = db.execute("SELECT agent, state, MAX(ts) FROM activity WHERE ts < ? GROUP BY agent", (since,)).fetchall()
+            before = db.execute(BEFORE_STATES, (since,)).fetchall()
             rows = db.execute("SELECT ts, agent, state FROM activity WHERE ts >= ? AND ts <= ? ORDER BY ts",
                               (since, until)).fetchall()
         changes = {}
@@ -2780,10 +2790,11 @@ class Hub:
         maps = self.code_maps()
         if maps is None:
             return {}
-        edited, self._map_edited = self._map_edited, set()
+        with self.lock:  # _edited adds to it under the lock, from the hooks' threads
+            edited, self._map_edited = self._map_edited, set()
         done = maps.check(self.project_folders(), bool(edited), sorted(edited))
         self.interface_notices(maps)
-        self.write_briefs(maps, bool(done))
+        self.write_briefs(maps, any(done.values()))  # something read (a README edit reads nothing)
         return done
 
     def write_briefs(self, maps, mapped=True):
@@ -8005,7 +8016,16 @@ def hook_program(event):
     """What a hook runs, before its tool's name and the event: the light hook script for the tool event (if
     it can be written), else crewchat's `hook` command."""
     script = write_hook_script() if event == "tool" else None
-    return [Path(sys.executable).as_posix(), script.as_posix()] if script else run_command() + ["hook"]
+    return [console_python().as_posix(), script.as_posix()] if script else run_command() + ["hook"]
+
+
+def console_python():
+    """This Python as a hook runs it: on Windows the console python.exe, also when the windowless server
+    (pythonw.exe) writes the hooks, so it and `crewchat start` write the same command."""
+    python = Path(sys.executable)
+    if python.name.lower() == "pythonw.exe" and python.with_name("python.exe").exists():
+        return python.with_name("python.exe")
+    return python
 
 
 HOOK_CLIENTS = ("claude", "cursor", "codex", "gemini", "qwen", "opencode")  # the tools whose hooks hand messages over
@@ -8997,15 +9017,14 @@ def tool_hook(client, data):
         state["doing"], state["doing_at"] = doing, now
     if edit:
         state["edit"], state["edit_at"] = edit, now
-    state_file.parent.mkdir(parents=True, exist_ok=True)
-    state_file.write_text(json.dumps(state))
+    save_hook_state(state_file, state)
     body = {"key": state["key"], "event": "tool", "doing": doing}
     if edit:
         body["path"] = edit
     answer = hook_post(config[0] + "/api/hook", config[1], body)
     if bool(answer.get("edits")) != bool(state.get("edits")):  # the owner turned edit tracking on or off
         state["edits"] = bool(answer.get("edits"))
-        state_file.write_text(json.dumps(state))
+        save_hook_state(state_file, state)
 
 
 def edited_path(client, data, project):
@@ -9076,7 +9095,7 @@ def hook_script():
     names = ("SERVER_NAME", "KEY_RE", "EDIT_TOOLS", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
              "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS")
     functions = (sha, find_project, connection_entry, client_config, hooks_off, claim_launch_key, tool_summary,
-                 edited_path, hook_post, tool_hook)
+                 edited_path, hook_post, save_hook_state, tool_hook)
     return ('"""crewchat %s\'s hook after each tool call, written by crewchat from its own code (`crewchat hooks\n'
             'refresh` writes it again). Edits are not kept."""\n'
             "import hashlib\nimport json\nimport os\nimport re\nimport shlex\nimport socket\nimport sys\n"
@@ -9246,10 +9265,14 @@ def report_usage(base, token, key, state, state_file, path):
 
 
 def save_hook_state(state_file, state):
-    """Keep a session's hook state for its next hook call; a disk that will not take it only costs a repeat."""
+    """Keep a session's hook state for its next hook call, whole and in one step (a temporary file, then a rename):
+    the hooks of parallel tool calls run at once, and one must never read it half written. A disk that will not
+    take it only costs a repeat. In the light hook script too (hook_script)."""
     try:
         state_file.parent.mkdir(parents=True, exist_ok=True)
-        state_file.write_text(json.dumps(state))
+        temp = state_file.with_name("%s.%d.tmp" % (state_file.name, os.getpid()))
+        temp.write_text(json.dumps(state))
+        os.replace(str(temp), str(state_file))
     except OSError:
         pass
 

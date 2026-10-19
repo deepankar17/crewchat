@@ -619,7 +619,8 @@ class CodeMap:
             self.db.close()
 
     def meta(self, key, default=""):
-        row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        with self.lock:  # the connection is shared with the map thread, which may be updating it
+            row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         return row[0] if row else default
 
     def _set_meta(self, key, value):
@@ -1226,6 +1227,8 @@ class Maps:
                         if read is not None:
                             done[folder] = read
                             continue
+                        if not any((Path(folder) / p).exists() for p in paths):
+                            continue  # another folder's edits: nothing of this one's changed
                 cmap, commit = self.for_folder(folder)
                 done[folder] = cmap.update(commit)
                 inside = git(folder, "rev-parse", "--show-prefix")  # where the folder is in its repository

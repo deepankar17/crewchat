@@ -736,6 +736,10 @@ class OfflineAndRemoval(unittest.TestCase):
         self.assertEqual(mesh.merge_decisions({"13": {"agent": "teo", "clock": same, "tag": "A"},
                                                "14": {"agent": "wren", "clock": 1, "tag": "C"}}), [])
         self.assertEqual((mesh.claim("13", "x"), mesh.claim("14", "x")), ("maya", "wren"))
+        # Three machines: #14 was decided on C (adopted here), and B's earlier decision overturns it. This machine
+        # switches too, but C, which made the decision, is the one that says so: the news is given once.
+        self.assertEqual(mesh.merge_decisions({"14": {"agent": "teo", "clock": 0, "tag": "B"}}), [])
+        self.assertEqual(mesh.claim("14", "x"), "teo")
         mesh.claim("17", "maya")
         self.assertGreater(mesh.decisions()["17"]["clock"], clock + 5)  # Lamport: after every clock it has seen
         self.assertEqual(mesh.merge_decisions({"15": {"agent": "not a name!", "clock": 1, "tag": "C"}, "16": "x"}), [])

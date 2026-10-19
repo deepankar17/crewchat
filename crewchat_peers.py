@@ -228,8 +228,9 @@ class Mesh:
     def merge_decisions(self, decisions):
         """Another machine's claim decisions. A claim decided only there is adopted; one decided both here and
         there for two agents keeps the earlier (Lamport clock, then tag). Returns [(key, winner, loser)] for
-        the claims whose holder changed here: this machine tells the others (the one that switched, so the
-        news is given once)."""
+        the claims whose holder changed here from a decision made here: this machine tells the others. One that
+        only adopted the losing decision switches quietly, so the news is given once, by the machine whose
+        decision lost."""
         changed, touched = [], False
         with self.lock:
             claims = self.data.setdefault("claims", {})
@@ -251,7 +252,8 @@ class Mesh:
                     mine = decided.get(key) or {"clock": 0, "tag": ""}  # settled before decisions were kept: first
                     if (theirs["clock"], tag_rank(theirs["tag"])) < (int(mine["clock"]), tag_rank(mine["tag"])):
                         claims[key], decided[key], touched = theirs["agent"], theirs, True
-                        changed.append((key, theirs["agent"], holder))
+                        if mine["tag"] in ("", self.me["tag"]):
+                            changed.append((key, theirs["agent"], holder))
             if touched or clock != start:  # most pulls bring nothing new: peers.json is not rewritten for them
                 self.data["clock"] = clock
                 self.save()
