@@ -240,7 +240,9 @@ OS: macOS, Windows or Linux.
   SVG.
 - The face suits the agent's first name: Maya, Kira or Zoe get long hair, a bob, a bun or curls,
   with lashes; Teo, Omar or Hugo short hair, spikes, curls or none, sometimes a beard; a name for
-  anyone (Noor, Wren, Kai...) or one you chose any look. Renamed, an agent whose face no longer
+  anyone (Noor, Wren, Kai...) or one you chose any look. An Indian name (Priya, Meera, Arjun, Kabir,
+  Kiran...) gets a warm brown skin tone and black or dark brown hair, and for Priya or Meera sometimes
+  a bindi. Renamed, an agent whose face no longer
   suits its name gets a new one; a picture you chose stays.
 - Click its picture in its settings for **🎲 New face**, another 3D picture (a robot, a coder, an
   artist, an owl...), an emoji (a rocket, a camera...), initials, or an image of your own (PNG,

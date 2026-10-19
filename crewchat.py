@@ -292,15 +292,25 @@ AGENT_NAMES = (
     "Lars", "Levi", "Lina", "Luca", "Maya", "Mika", "Milo", "Nadia", "Nia", "Nico", "Noor", "Odin", "Omar",
     "Otto", "Pia", "Quinn", "Ravi", "Remy", "Rhea", "Rosa", "Sami", "Sana", "Selin", "Tara", "Teo", "Uma",
     "Vera", "Wren", "Yara", "Yuki", "Zara", "Zeke", "Zoe",
+    # Indian names
+    "Aanya", "Aarav", "Aditya", "Anika", "Arjun", "Dev", "Diya", "Isha", "Ishaan", "Kabir", "Karan", "Kavya", "Kiran",
+    "Meera", "Nikhil", "Nisha", "Pooja", "Priya", "Riya", "Rohan", "Vikram",
 )
 # The look a first name suggests, for the face its agent gets: "f", "m", or neither (a name for anyone, or one the
 # owner chose that is not here: any look).
 NAME_LOOKS = dict(
     [(n, "f") for n in ("Ada", "Amara", "Anya", "Asha", "Bea", "Cleo", "Esme", "Faye", "Gia", "Hana", "Ines", "Iris",
                         "Jade", "Juno", "Kira", "Lina", "Maya", "Nadia", "Nia", "Pia", "Rhea", "Rosa", "Sana", "Selin",
-                        "Tara", "Uma", "Vera", "Yara", "Zara", "Zoe")]
+                        "Tara", "Uma", "Vera", "Yara", "Zara", "Zoe", "Aanya", "Anika", "Diya", "Isha", "Kavya",
+                        "Meera", "Nisha", "Pooja", "Priya", "Riya")]
     + [(n, "m") for n in ("Arlo", "Bodhi", "Elio", "Emre", "Ezra", "Finn", "Hugo", "Ivo", "Joon", "Lars", "Levi", "Luca",
-                          "Milo", "Nico", "Odin", "Omar", "Otto", "Ravi", "Teo", "Zeke")])
+                          "Milo", "Nico", "Odin", "Omar", "Otto", "Ravi", "Teo", "Zeke", "Aarav", "Aditya", "Arjun",
+                          "Dev", "Ishaan", "Kabir", "Karan", "Nikhil", "Rohan", "Vikram")])
+# Indian names (Kiran is one for anyone): a face of a warm brown skin tone and black or dark brown hair, and for "f"
+# sometimes a bindi.
+INDIAN_NAMES = frozenset(("Aanya", "Aarav", "Aditya", "Anika", "Arjun", "Asha", "Dev", "Diya", "Isha", "Ishaan", "Kabir",
+                          "Karan", "Kavya", "Kiran", "Meera", "Nikhil", "Nisha", "Pooja", "Priya", "Ravi", "Riya",
+                          "Rohan", "Uma", "Vikram"))
 # Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
 TOOLS_INFO = {
     tool: {"label": label, "colour": colour, "mark": mark}
@@ -352,11 +362,13 @@ MIX_BACKS = [("#e3ebff", "#c8d7ff"), ("#ece3ff", "#d6c6ff"), ("#ffe6d8", "#ffcdb
          ("#fff2cc", "#ffe39a"), ("#ffe0ea", "#ffc2d4"), ("#e0f2ff", "#bfe3ff"), ("#eceff4", "#d6dbe5")]
 # A face's parts, in the order its code lists them: (part, how many options).
 MIX_PARTS = [("back", 8), ("skin", 6), ("face", 3), ("mood", 4), ("hair", 8), ("haircolour", 6), ("hat", 7), ("glasses", 5),
-         ("clothes", 6), ("colour", 6), ("device", 3), ("look", 3)]
+         ("clothes", 6), ("colour", 6), ("device", 3), ("look", 4)]
 # The hair that goes with a look ("f", "m"; a name for anyone may have any), and what the look adds: 1 lashes, 2 a beard
-# (or 0, nothing: a "m" face is clean-shaven three times in four).
+# (or 0, nothing: a "m" face is clean-shaven three times in four), 3 lashes and a bindi (an Indian "f" name's, half
+# the time).
 MIX_HAIR_FOR = {"f": (3, 4, 5, 7), "m": (0, 1, 2, 3, 6)}
 MIX_LOOK_FOR = {"f": (1,), "m": (0, 0, 0, 2)}
+MIX_INDIAN = {"skin": (2, 3, 4), "haircolour": (0, 1), "f": (1, 3)}
 MIX_DEVICES = ("laptop", "desktop", "cloud")
 
 
@@ -377,15 +389,17 @@ def _mix_mood(i, look=0):
         eyes = ('<path d="M51.5 61.5 Q55 58.5 58.5 61.5" stroke="#2a2230" stroke-width="2.4" fill="none" stroke-linecap="round"/>'
                 '<ellipse cx="73" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/>')
         shine = '<circle cx="74.2" cy="59.6" r="1.1" fill="#fff"/>'
-    lips = "#b0475a" if look == 1 else "#7a3b2e"
+    lips = "#b0475a" if look in (1, 3) else "#7a3b2e"
     mouth = ['<path d="M57 72 Q64 78 71 72" stroke="%s" stroke-width="2.4" fill="none" stroke-linecap="round"/>' % lips,
              '<path d="M56 71 Q64 81 72 71 Z" fill="%s"/><path d="M58 71.6 Q64 74 70 71.6 L70 72.8 Q64 75 58 72.8 Z" fill="#fff"/>' % lips,
              '<path d="M59 74 L69 74" stroke="%s" stroke-width="2.4" stroke-linecap="round"/>' % lips,
              '<path d="M58 72 Q65 77 71 71" stroke="%s" stroke-width="2.4" fill="none" stroke-linecap="round"/>' % lips][i]
     lashes = ""
-    if look == 1:  # lashes at the eyes' outer corners
+    if look in (1, 3):  # lashes at the eyes' outer corners
         lashes = ('<path d="M52.2 58.6 L49.8 56.8 M53.6 57.6 L52.4 55.4 M75.8 58.6 L78.2 56.8 M74.4 57.6 L75.6 55.4" '
                   'stroke="#2a2230" stroke-width="1.5" stroke-linecap="round"/>')
+    if look == 3:  # a bindi
+        lashes += '<circle cx="64" cy="52.5" r="2" fill="#c8283c"/><circle cx="63.4" cy="51.9" r=".6" fill="#ffffff" fill-opacity=".6"/>'
     return eyes + shine + lashes + cheeks + mouth
 
 
@@ -506,7 +520,7 @@ def _mix_draw(parts):
 
 
 # How often each option comes up, where it matters: most faces wear no glasses and no hat, so those that do stand out.
-MIX_WEIGHTS = {"hat": [5, 1, 1, 1, 1, 1, 1], "glasses": [6, 2, 2, 1, 1], "look": [4, 2, 1]}
+MIX_WEIGHTS = {"hat": [5, 1, 1, 1, 1, 1, 1], "glasses": [6, 2, 2, 1, 1], "look": [4, 2, 1, 0]}  # a bindi: by name only
 
 
 def _mix_random(rng):
@@ -530,11 +544,24 @@ def mix_svg(code):
     return None if parts is None else _mix_draw(parts).encode()
 
 
+def _looks_for(name):
+    """What a face may have for a name: {part index: allowed options}, from its look and whether it is Indian."""
+    name = str(name or "")
+    want, out = NAME_LOOKS.get(name), {}
+    if want:
+        out[4], out[11] = MIX_HAIR_FOR[want], MIX_LOOK_FOR[want]
+    if name in INDIAN_NAMES:
+        out[1], out[5] = MIX_INDIAN["skin"], MIX_INDIAN["haircolour"]
+        if want == "f":
+            out[11] = MIX_INDIAN["f"]
+    return out
+
+
 def mix_fits(parts, name):
-    """Whether a face suits a name: the hair and the look its name suggests (NAME_LOOKS); any face suits a name for anyone."""
-    want = NAME_LOOKS.get(str(name or ""))
-    look = parts[11] if len(parts) > 11 else 0
-    return not want or (parts[4] in MIX_HAIR_FOR[want] and look in MIX_LOOK_FOR[want])
+    """Whether a face suits a name (_looks_for: its hair, its look, an Indian name's skin and hair); any face suits a
+    name for anyone that is not an Indian one."""
+    parts = list(parts) + [0] * (len(MIX_PARTS) - len(parts))  # a code from before looks: none
+    return all(parts[i] in allowed for i, allowed in _looks_for(name).items())
 
 
 def new_mix(device=None, taken=(), name=None):
@@ -542,12 +569,12 @@ def new_mix(device=None, taken=(), name=None):
     unless one is given, and one nobody in taken wears (while there is one: there are millions)."""
     rng = secrets.SystemRandom()
     device = device_kind() if device is None else device
-    want = NAME_LOOKS.get(str(name or ""))
+    looks = _looks_for(name)
     for _ in range(100):
         parts = _mix_random(rng)
         parts[10] = device
-        if want:
-            parts[4], parts[11] = rng.choice(MIX_HAIR_FOR[want]), rng.choice(MIX_LOOK_FOR[want])
+        for i, allowed in looks.items():
+            parts[i] = rng.choice(allowed)
         picture = "mix:" + ".".join(map(str, parts))
         if picture not in taken:
             return picture

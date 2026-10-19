@@ -628,14 +628,37 @@ class Faces(unittest.TestCase):
             for _ in range(5):
                 parts = crewchat.mix_parts(crewchat.new_mix(0, name=name)[4:])
                 self.assertIn(parts[4], crewchat.MIX_HAIR_FOR[want], name)  # hair that goes with the name
-                self.assertIn(parts[11], crewchat.MIX_LOOK_FOR[want], name)  # lashes for "f"; a beard maybe for "m"
                 self.assertTrue(crewchat.mix_fits(parts, name))
+                if name not in crewchat.INDIAN_NAMES:
+                    self.assertIn(parts[11], crewchat.MIX_LOOK_FOR[want], name)  # lashes for "f"; a beard maybe for "m"
         self.assertIn("Maya", crewchat.NAME_LOOKS)
         self.assertNotIn("Noor", crewchat.NAME_LOOKS)  # a name for anyone: any face
         self.assertTrue(set(crewchat.NAME_LOOKS) <= set(crewchat.AGENT_NAMES))
         maya = crewchat.mix_parts(crewchat.new_mix(0, name="Maya")[4:])
         self.assertFalse(crewchat.mix_fits(maya, "Teo"))
         self.assertTrue(crewchat.mix_fits(maya, "Noor") and crewchat.mix_fits(maya, "Someone"))
+
+    def test_an_indian_name_gets_an_indian_face(self):
+        self.assertTrue(crewchat.INDIAN_NAMES <= set(crewchat.AGENT_NAMES))
+        self.assertEqual(len(set(crewchat.AGENT_NAMES)), len(crewchat.AGENT_NAMES))
+        bindis = 0
+        for name in crewchat.INDIAN_NAMES:
+            for _ in range(8):
+                parts = crewchat.mix_parts(crewchat.new_mix(0, name=name)[4:])
+                self.assertIn(parts[1], crewchat.MIX_INDIAN["skin"], name)  # a warm brown skin
+                self.assertIn(parts[5], crewchat.MIX_INDIAN["haircolour"], name)  # black or dark brown hair
+                if crewchat.NAME_LOOKS.get(name) == "f":
+                    self.assertIn(parts[11], (1, 3), name)  # lashes, and half the time a bindi
+                    bindis += parts[11] == 3
+                else:
+                    self.assertNotEqual(parts[11], 3, name)
+        self.assertGreater(bindis, 0)
+        self.assertIn(b"#c8283c", crewchat.mix_svg("0.0.0.0.0.0.0.0.0.0.0.3"))  # the bindi drawn
+        for _ in range(200):  # never on a face whose name does not call for it
+            self.assertNotEqual(crewchat.mix_parts(crewchat.new_mix(0, name="Noor")[4:])[11], 3)
+        light = [0] * 12
+        light[11] = 1
+        self.assertFalse(crewchat.mix_fits(light, "Priya"))  # the lightest skin tone is not one an Indian name gets
 
     def test_a_new_face_works_at_the_machines_device_and_is_nobody_elses(self):
         for device in range(3):

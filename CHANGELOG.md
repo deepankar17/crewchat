@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **Indian first names**, 21 more: Aanya, Aarav, Aditya, Anika, Arjun, Dev, Diya, Isha, Ishaan, Kabir, Karan, Kavya,
+  Kiran, Meera, Nikhil, Nisha, Pooja, Priya, Riya, Rohan, Vikram. Their faces, and Asha's, Ravi's and Uma's, have
+  a warm brown skin tone and black or dark brown hair; a feminine one sometimes a bindi.
 - **A face suits its agent's name**: Maya gets long hair, a bob, a bun or curls, with lashes; Teo short hair or none,
   sometimes a beard; a name for anyone (Noor, Wren, Kai) any look. A renamed agent whose face no longer suits its
   name gets a new one, at the same device; a picture you chose stays.
