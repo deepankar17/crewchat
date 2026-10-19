@@ -62,8 +62,9 @@ SEEN_EVERY = 300  # "last seen" alone is published at most this often
 HEARTBEAT = 15 * 60  # an otherwise quiet machine with agents says it is alive this often
 HOUSEKEEPING = 10 * 60  # delete delivered messages this often
 CLAIM_TIMEOUT = 20
-LEASE_SECS = 90  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
-LEASE_RENEW = 30  # and any approved machine online takes it once it has run out
+LEASE_SECS = 300  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
+LEASE_RENEW = 100  # and any approved machine online takes it once it has run out (a machine that stops lets it
+# go at once). About 860 writes a day by the holder, and no reads by the others while its lease is live.
 CATCHUP_PART_BYTES = 40000  # messages per catch-up part, as JSON: sealed, it stays under the rules' 60,000 characters
 CATCHUP_DAYS = 7  # how far back a machine catches up through Firestore (Tailscale: all of it)
 CATCHUP_PARTS = 25  # parts the coordinator writes for a machine at a time: more once it has read those
@@ -857,6 +858,10 @@ class CloudSync(crewchat.ProjectLink):
         if not self.device.ready:
             return self.lease
         now = self.clock()
+        known = self.lease or {}
+        if known.get("device") not in (None, self.device.id) and float(known.get("expires") or 0) > now \
+                and known.get("preferred") != self.device.id:
+            return self.lease  # another machine's live lease, as last read or heard: no write, and no read, until it runs out
 
         seen = {}
 

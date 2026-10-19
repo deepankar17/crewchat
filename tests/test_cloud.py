@@ -263,6 +263,33 @@ class Sync(unittest.TestCase):
         self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
                          crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file
 
+    def test_the_lease_costs_few_writes_and_no_reads_while_another_holds_it(self):
+        # On the free plan's 20,000 writes and 50,000 reads a day: renewing every 30 s was 2,880 writes a day by
+        # the holder, and as many reads by every other machine.
+        self.assertLessEqual(86400 / cloud.LEASE_RENEW, 1000)
+        self.assertGreaterEqual(cloud.LEASE_SECS, 2.5 * cloud.LEASE_RENEW)  # a late renewal or two still holds
+        now = [time.time()]
+        for m in (self.a, self.b):
+            m.sync.clock = lambda: now[0]
+        self.a.sync.renew_lease()
+        self.b.sync.renew_lease()
+        self.assertEqual(self.b.sync.coordinator()["name"], "mac")
+        with mock.patch.object(self.b.link, "transact", wraps=self.b.link.transact) as write, \
+                mock.patch.object(self.b.link, "get", wraps=self.b.link.get) as read:
+            for _ in range(3):
+                now[0] += cloud.LEASE_RENEW
+                self.a.sync.renew_lease()  # its listener hears each renewal, with the lease's new end
+                wait_until(lambda: float(self.b.sync.lease.get("expires") or 0) == now[0] + cloud.LEASE_SECS,
+                           message="the renewal to be heard")
+                self.b.sync.renew_lease()
+            self.assertEqual((write.call_count, read.call_count), (0, 0))
+            self.a.link.online = False  # the holder is gone: once its lease has run out, the other takes it
+            now[0] += cloud.LEASE_SECS + 1
+            self.b.sync.renew_lease()
+            self.assertEqual(write.call_count, 1)
+        self.a.link.online = True
+        self.assertTrue(self.b.sync.coordinator()["me"])
+
     def test_the_page_names_the_coordinator_without_asking_the_cloud(self):
         # The page asks at every poll: the names come from the machines the account approved, kept on each
         # machine, and a renewal reads the lease once, in its conditional write.
@@ -297,6 +324,7 @@ class Sync(unittest.TestCase):
         self.assertFalse(self.a.sync.coordinator()["me"])  # back, but the lease is someone else's now
         # The owner prefers the mac: it takes the role back at its next renewal, and the other lets go.
         self.assertEqual(self.b.sync.set_preferred("mac")["preferred"], "mac")
+        wait_until(lambda: self.a.sync.lease.get("preferred") == self.a.device.id, message="the mac to hear it")
         self.a.sync.renew_lease()
         self.assertEqual(self.a.sync.coordinator()["term"], term + 2)
         self.assertTrue(self.a.sync.coordinator()["me"])
@@ -304,6 +332,7 @@ class Sync(unittest.TestCase):
         self.assertFalse(self.b.sync.coordinator()["me"])
         # Stopping hands it on at once rather than after LEASE_SECS.
         self.a.sync.release_lease()
+        wait_until(lambda: float(self.b.sync.lease.get("expires") or 0) <= now[0], message="the other to hear it")
         self.b.sync.renew_lease()
         self.assertTrue(self.b.sync.coordinator()["me"])
         self.b.sync.set_preferred("none")

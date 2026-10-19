@@ -750,7 +750,7 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 
 - The coordinator has three jobs only: settle claims for tasks whose posting machine is off (Y2), serve catch-up history (Y3) and serve files (Y4).
 - It never orders messages. Messages stay leaderless, so a hand-over never loses or reorders the chat.
-- Cloud mode: a lease document meta/coordinator {device, term, expires}. The holder renews about every 30 s with a 90 s lease; any online machine takes over an expired lease in a Firestore transaction and increments term.
+- Cloud mode: a lease document meta/coordinator {device, term, expires}. The holder renews about every 100 s with a 300 s lease, and the others leave a live lease they know of alone, without a read; any online machine takes over an expired lease in a Firestore transaction and increments term.
 - Tailscale mode has no referee, so every machine applies the same rule to the members it can reach: the owner's preferred machine if online, else the one with the lowest tag. Term goes up on every change.
 - The owner can mark a preferred machine; it takes the role back whenever it comes online.
 - Every decision the coordinator makes carries its term and device, so later conflicts can be settled.
@@ -770,7 +770,7 @@ No fixed primary. Whichever machine is online coordinates: offline claims, catch
 **Depends on:** nothing
 
 **Status.** In progress: the coordinator itself is done (docs/cloud-sync-design.md section 8a). Cloud sync:
-the lease `meta/coordinator`, renewed every 30 s for 90 s, taken with the conditional write `transact` (a
+the lease `meta/coordinator`, renewed every 100 s for 300 s, taken with the conditional write `transact` (a
 client transaction needs permissions a signed-in user lacks), handed on at a clean stop, cleared with the
 account. Tailscale: the preferred machine if reachable, else the lowest reachable tag; the preference
 travels in pull answers (newest wins). `crewchat coordinator [NAME|none]`, `/api/coordinator`, and the
