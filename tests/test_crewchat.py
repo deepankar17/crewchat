@@ -4147,11 +4147,11 @@ class Hooks(Base):
         agent(op="listen", agent=name, mode="default")
         self.assertEqual(self.hub.agents[name]["listen"], "")
 
-    def light_hook(self, client, payload, env_extra=None):
+    def light_hook(self, client, payload, env_extra=None, project=None):
         """The tool-call hook as the client runs it now: Python and the light hook script, nothing of crewchat."""
         command = crewchat.hook_command(client, "tool")
         self.assertNotIn("crewchat.py", command)
-        env = dict(os.environ, CREWCHAT_PROJECT=str(self.folder), TMPDIR=self.state, TEMP=self.state, TMP=self.state,
+        env = dict(os.environ, CREWCHAT_PROJECT=str(project or self.folder), TMPDIR=self.state, TEMP=self.state, TMP=self.state,
                    **(env_extra or {}))
         env.pop("CLAUDE_PROJECT_DIR", None)
         out = subprocess.run(shlex.split(command), input=json.dumps(payload), capture_output=True, text=True,
@@ -4275,7 +4275,8 @@ class Hooks(Base):
 
     def test_edits_keep_the_code_map_up_to_date(self):
         # Roadmap C1: the map of the project's code, built while edit tracking is on, read again after an edit.
-        code = Path(tempfile.mkdtemp(prefix="mapped-", dir=self.folder)).resolve()  # inside the project
+        code = Path(tempfile.mkdtemp(prefix="mapped-", dir=TMP)).resolve()  # a folder connected to the project
+        shutil.copy(self.folder / ".mcp.json", code / ".mcp.json")
         (code / "shop.py").write_text("def pay():\n    pass\n")
         (code / "cart.py").write_text("import json\n")
         folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
@@ -4288,9 +4289,9 @@ class Hooks(Base):
         (code / "cart.py").write_text("from shop import pay\npay()\n")
         crewchat.MAP_WAKE.clear()
         self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Edit",
-                                   "tool_input": {"file_path": str(code / "cart.py")}})  # learns that edits are kept
+                                   "tool_input": {"file_path": str(code / "cart.py")}}, project=code)  # learns edits are kept
         self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Write",
-                                   "tool_input": {"file_path": str(code / "cart.py")}})
+                                   "tool_input": {"file_path": str(code / "cart.py")}}, project=code)
         self.assertTrue(crewchat.MAP_WAKE.is_set())  # the map thread wakes
         self.assertEqual(self.hub.update_map(), {str(code): ["cart.py"]})
         out = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "imports", "path": "cart.py"})
