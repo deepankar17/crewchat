@@ -293,6 +293,14 @@ AGENT_NAMES = (
     "Otto", "Pia", "Quinn", "Ravi", "Remy", "Rhea", "Rosa", "Sami", "Sana", "Selin", "Tara", "Teo", "Uma",
     "Vera", "Wren", "Yara", "Yuki", "Zara", "Zeke", "Zoe",
 )
+# The look a first name suggests, for the face its agent gets: "f", "m", or neither (a name for anyone, or one the
+# owner chose that is not here: any look).
+NAME_LOOKS = dict(
+    [(n, "f") for n in ("Ada", "Amara", "Anya", "Asha", "Bea", "Cleo", "Esme", "Faye", "Gia", "Hana", "Ines", "Iris",
+                        "Jade", "Juno", "Kira", "Lina", "Maya", "Nadia", "Nia", "Pia", "Rhea", "Rosa", "Sana", "Selin",
+                        "Tara", "Uma", "Vera", "Yara", "Zara", "Zoe")]
+    + [(n, "m") for n in ("Arlo", "Bodhi", "Elio", "Emre", "Ezra", "Finn", "Hugo", "Ivo", "Joon", "Lars", "Levi", "Luca",
+                          "Milo", "Nico", "Odin", "Omar", "Otto", "Ravi", "Teo", "Zeke")])
 # Each agent tool's label, brand colour and lettermark for the chat page (never its logo).
 TOOLS_INFO = {
     tool: {"label": label, "colour": colour, "mark": mark}
@@ -344,7 +352,11 @@ MIX_BACKS = [("#e3ebff", "#c8d7ff"), ("#ece3ff", "#d6c6ff"), ("#ffe6d8", "#ffcdb
          ("#fff2cc", "#ffe39a"), ("#ffe0ea", "#ffc2d4"), ("#e0f2ff", "#bfe3ff"), ("#eceff4", "#d6dbe5")]
 # A face's parts, in the order its code lists them: (part, how many options).
 MIX_PARTS = [("back", 8), ("skin", 6), ("face", 3), ("mood", 4), ("hair", 8), ("haircolour", 6), ("hat", 7), ("glasses", 5),
-         ("clothes", 6), ("colour", 6), ("device", 3)]
+         ("clothes", 6), ("colour", 6), ("device", 3), ("look", 3)]
+# The hair that goes with a look ("f", "m"; a name for anyone may have any), and what the look adds: 1 lashes, 2 a beard
+# (or 0, nothing: a "m" face is clean-shaven three times in four).
+MIX_HAIR_FOR = {"f": (3, 4, 5, 7), "m": (0, 1, 2, 3, 6)}
+MIX_LOOK_FOR = {"f": (1,), "m": (0, 0, 0, 2)}
 MIX_DEVICES = ("laptop", "desktop", "cloud")
 
 
@@ -357,7 +369,7 @@ def _mix_face(i, skin):
     return ears + head
 
 
-def _mix_mood(i):
+def _mix_mood(i, look=0):
     eyes = '<ellipse cx="55" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/><ellipse cx="73" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/>'
     shine = '<circle cx="56.2" cy="59.6" r="1.1" fill="#fff"/><circle cx="74.2" cy="59.6" r="1.1" fill="#fff"/>'
     cheeks = '<circle cx="49" cy="70" r="4" fill="#ff7a7a" opacity=".22"/><circle cx="79" cy="70" r="4" fill="#ff7a7a" opacity=".22"/>'
@@ -365,11 +377,22 @@ def _mix_mood(i):
         eyes = ('<path d="M51.5 61.5 Q55 58.5 58.5 61.5" stroke="#2a2230" stroke-width="2.4" fill="none" stroke-linecap="round"/>'
                 '<ellipse cx="73" cy="61" rx="3.2" ry="3.8" fill="#2a2230"/>')
         shine = '<circle cx="74.2" cy="59.6" r="1.1" fill="#fff"/>'
-    mouth = ['<path d="M57 72 Q64 78 71 72" stroke="#7a3b2e" stroke-width="2.4" fill="none" stroke-linecap="round"/>',
-             '<path d="M56 71 Q64 81 72 71 Z" fill="#7a3b2e"/><path d="M58 71.6 Q64 74 70 71.6 L70 72.8 Q64 75 58 72.8 Z" fill="#fff"/>',
-             '<path d="M59 74 L69 74" stroke="#7a3b2e" stroke-width="2.4" stroke-linecap="round"/>',
-             '<path d="M58 72 Q65 77 71 71" stroke="#7a3b2e" stroke-width="2.4" fill="none" stroke-linecap="round"/>'][i]
-    return eyes + shine + cheeks + mouth
+    lips = "#b0475a" if look == 1 else "#7a3b2e"
+    mouth = ['<path d="M57 72 Q64 78 71 72" stroke="%s" stroke-width="2.4" fill="none" stroke-linecap="round"/>' % lips,
+             '<path d="M56 71 Q64 81 72 71 Z" fill="%s"/><path d="M58 71.6 Q64 74 70 71.6 L70 72.8 Q64 75 58 72.8 Z" fill="#fff"/>' % lips,
+             '<path d="M59 74 L69 74" stroke="%s" stroke-width="2.4" stroke-linecap="round"/>' % lips,
+             '<path d="M58 72 Q65 77 71 71" stroke="%s" stroke-width="2.4" fill="none" stroke-linecap="round"/>' % lips][i]
+    lashes = ""
+    if look == 1:  # lashes at the eyes' outer corners
+        lashes = ('<path d="M52.2 58.6 L49.8 56.8 M53.6 57.6 L52.4 55.4 M75.8 58.6 L78.2 56.8 M74.4 57.6 L75.6 55.4" '
+                  'stroke="#2a2230" stroke-width="1.5" stroke-linecap="round"/>')
+    return eyes + shine + lashes + cheeks + mouth
+
+
+def _mix_beard(colour):
+    """A beard round the jaw and a moustache, in the hair's colour, the mouth left clear."""
+    return ('<path d="M40 60 Q40 93 64 93 Q88 93 88 60 Q87 77 77 81 Q64 86 51 81 Q41 77 40 60 Z" fill="%s"/>'
+            '<path d="M55 70 Q64 66 73 70 Q68 72 64 70.6 Q60 72 55 70 Z" fill="%s"/>' % (colour, colour))
 
 
 def _mix_hair(i, colour, back):
@@ -462,7 +485,8 @@ def _mix_device(i):
 
 
 def _mix_draw(parts):
-    back, skin, face, mood_i, hair_i, hair_c, hat_i, glasses_i, clothes, colour, dev = parts
+    back, skin, face, mood_i, hair_i, hair_c, hat_i, glasses_i, clothes, colour, dev = parts[:11]
+    look = parts[11] if len(parts) > 11 else 0  # a code from before looks: none
     b1, b2 = MIX_BACKS[back]
     sk = MIX_SKINS[skin]
     hc = MIX_HAIRS[hair_c]
@@ -474,21 +498,22 @@ def _mix_draw(parts):
            '<rect width="128" height="128" fill="url(#b)"/>',
            # A portrait: the character larger than its parts, its head filling the circle the page shows it in.
            '<g transform="translate(64 70) scale(1.2) translate(-64 -66)">',
-           _mix_hair(hair_i, hc, True), _mix_body(clothes, cc, sk), _mix_face(face, sk), _mix_mood(mood_i),
+           _mix_hair(hair_i, hc, True), _mix_body(clothes, cc, sk), _mix_face(face, sk),
+           _mix_beard(hc) if look == 2 else "", _mix_mood(mood_i, look),
            "" if covered and hair_i in (5, 6) else _mix_hair(hair_i, hc, False), _mix_glasses(glasses_i), _mix_hat(hat_i, hat_colour),
            "</g>", _mix_device(dev), "</svg>"]
     return "".join(out)
 
 
 # How often each option comes up, where it matters: most faces wear no glasses and no hat, so those that do stand out.
-MIX_WEIGHTS = {"hat": [5, 1, 1, 1, 1, 1, 1], "glasses": [6, 2, 2, 1, 1]}
+MIX_WEIGHTS = {"hat": [5, 1, 1, 1, 1, 1, 1], "glasses": [6, 2, 2, 1, 1], "look": [4, 2, 1]}
 
 
 def _mix_random(rng):
     return [rng.choices(range(n), MIX_WEIGHTS[k])[0] if k in MIX_WEIGHTS else rng.randrange(n) for k, n in MIX_PARTS]
 
 
-MIX_RE = re.compile(r"(?:0|[1-9]\d?)(?:\.(?:0|[1-9]\d?)){%d}" % (len(MIX_PARTS) - 1))
+MIX_RE = re.compile(r"(?:0|[1-9]\d?)(?:\.(?:0|[1-9]\d?)){%d,%d}" % (len(MIX_PARTS) - 2, len(MIX_PARTS) - 1))  # 11: no look
 
 
 def mix_parts(code):
@@ -505,14 +530,24 @@ def mix_svg(code):
     return None if parts is None else _mix_draw(parts).encode()
 
 
-def new_mix(device=None, taken=()):
-    """A new face, "mix:<code>": its parts at random, at this machine's kind of device unless one is given, and one
-    nobody in taken wears (while there is one: there are millions)."""
+def mix_fits(parts, name):
+    """Whether a face suits a name: the hair and the look its name suggests (NAME_LOOKS); any face suits a name for anyone."""
+    want = NAME_LOOKS.get(str(name or ""))
+    look = parts[11] if len(parts) > 11 else 0
+    return not want or (parts[4] in MIX_HAIR_FOR[want] and look in MIX_LOOK_FOR[want])
+
+
+def new_mix(device=None, taken=(), name=None):
+    """A new face, "mix:<code>": its parts at random, suiting its name (mix_fits), at this machine's kind of device
+    unless one is given, and one nobody in taken wears (while there is one: there are millions)."""
     rng = secrets.SystemRandom()
     device = device_kind() if device is None else device
+    want = NAME_LOOKS.get(str(name or ""))
     for _ in range(100):
         parts = _mix_random(rng)
-        parts[-1] = device
+        parts[10] = device
+        if want:
+            parts[4], parts[11] = rng.choice(MIX_HAIR_FOR[want]), rng.choice(MIX_LOOK_FOR[want])
         picture = "mix:" + ".".join(map(str, parts))
         if picture not in taken:
             return picture
@@ -2196,12 +2231,13 @@ class Hub:
                 return secrets.choice(free)
         return self._free_name("%s-%s" % (client, place))
 
-    def _random_picture(self):
-        """A face of its own for a new agent (new_mix): its parts at random, working at what this machine is (a
-        laptop, a desktop or the cloud), and one nobody here or on a linked machine wears. Caller holds the lock."""
+    def _random_picture(self, name=None):
+        """A face of its own for an agent (new_mix): its parts at random, suiting its name, working at what this
+        machine is (a laptop, a desktop or the cloud), and one nobody here or on a linked machine wears. Caller holds
+        the lock."""
         used = {a.get("picture") for a in self.agents.values()}
         used.update(row.get("picture") for dev in self.remote.values() for row in dev["agents"])
-        return new_mix(taken=used)
+        return new_mix(taken=used, name=name)
 
     def _new_agent(self, place, client):
         now = time.time()
@@ -2209,7 +2245,7 @@ class Hub:
         self.agents[name] = {
             "place": place, "client": client, "created": now, "seen": now, "active": now,
             "cursor": self.next_seq - 1,  # a newcomer does not inherit the backlog as unread
-            "status": "", "checked": now, "role": "", "picture": self._random_picture(),
+            "status": "", "checked": now, "role": "", "picture": self._random_picture(name),
         }
         self._event("%s joined (%s on %s)" % (name, client, place))
         return name
@@ -2379,6 +2415,10 @@ class Hub:
             if new.lower() in {n.lower() for n in list(self.agents) + self._remote_names() if n != name}:
                 raise HubError("the name %s is taken" % new)
             self.agents = {(new if n == name else n): a for n, a in self.agents.items()}
+            # A face made for it that does not suit the new name: a new one that does (a picture chosen stays).
+            agent, (kind, _, code) = self.agents[new], str(self.agents[new].get("picture") or "").partition(":")
+            if kind == "mix" and mix_parts(code) and not mix_fits(mix_parts(code), new):
+                agent["picture"] = new_mix(mix_parts(code)[10], {a.get("picture") for a in self.agents.values()}, new)
             for row in self.sessions.values():
                 if row["agent"] == name:
                     row["agent"] = new
@@ -4395,7 +4435,10 @@ class Hub:
 
     def set_profile(self, name, picture=None, colour=None):
         """An agent's picture and colour on the chat page, set by the owner or the agent itself.
-        None leaves one as it is; "" is initials, or the tool's own colour."""
+        None leaves one as it is; "" is initials, or the tool's own colour; "mix:new" a new face that suits its name."""
+        if picture == "mix:new":
+            with self.lock:
+                picture = self._random_picture(name)
         picture, colour = check_profile(self, picture, colour)
         with self.lock:
             agent = self._local_agent(name, "change")

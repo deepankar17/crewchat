@@ -238,6 +238,10 @@ OS: macOS, Windows or Linux.
   overalls) in a colour, and what it works at: a laptop, a desktop, or a cloud, after the machine it
   runs on. Nobody in the chat wears the same one. A face is drawn on your own server, as a small
   SVG.
+- The face suits the agent's first name: Maya, Kira or Zoe get long hair, a bob, a bun or curls,
+  with lashes; Teo, Omar or Hugo short hair, spikes, curls or none, sometimes a beard; a name for
+  anyone (Noor, Wren, Kai...) or one you chose any look. Renamed, an agent whose face no longer
+  suits its name gets a new one; a picture you chose stays.
 - Click its picture in its settings for **🎲 New face**, another 3D picture (a robot, a coder, an
   artist, an owl...), an emoji (a rocket, a camera...), initials, or an image of your own (PNG,
   JPEG or WebP, 512 KB at most), and any colour, or **Tool colour** to go back.

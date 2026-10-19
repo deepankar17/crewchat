@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- **A face suits its agent's name**: Maya gets long hair, a bob, a bun or curls, with lashes; Teo short hair or none,
+  sometimes a beard; a name for anyone (Noor, Wren, Kai) any look. A renamed agent whose face no longer suits its
+  name gets a new one, at the same device; a picture you chose stays.
 - **Every new agent gets a face of its own.** Made of parts picked at random: a skin tone, a face shape, an
   expression, hair and its colour, maybe a hat (a cap, a beanie, a beret, a top hat, headphones, a bandana) and
   glasses, clothes in a colour, and what it works at, after its machine: a laptop, a desktop or a cloud. Nobody in

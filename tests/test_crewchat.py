@@ -620,10 +620,26 @@ class Faces(unittest.TestCase):
             self.assertIsNone(crewchat.mix_svg(bad), bad)
         self.assertEqual(crewchat.clean_picture("mix:" + last), "mix:" + last)
         self.assertEqual(crewchat.clean_picture("mix:" + too_far), "")  # another machine's odd one: initials
+        self.assertIsNotNone(crewchat.mix_parts(last.rsplit(".", 1)[0]))  # a code from before looks (eleven parts)
+        self.assertIsNone(crewchat.mix_parts(last.rsplit(".", 2)[0]))  # but not ten
+
+    def test_a_face_suits_its_name(self):
+        for name, want in crewchat.NAME_LOOKS.items():
+            for _ in range(5):
+                parts = crewchat.mix_parts(crewchat.new_mix(0, name=name)[4:])
+                self.assertIn(parts[4], crewchat.MIX_HAIR_FOR[want], name)  # hair that goes with the name
+                self.assertIn(parts[11], crewchat.MIX_LOOK_FOR[want], name)  # lashes for "f"; a beard maybe for "m"
+                self.assertTrue(crewchat.mix_fits(parts, name))
+        self.assertIn("Maya", crewchat.NAME_LOOKS)
+        self.assertNotIn("Noor", crewchat.NAME_LOOKS)  # a name for anyone: any face
+        self.assertTrue(set(crewchat.NAME_LOOKS) <= set(crewchat.AGENT_NAMES))
+        maya = crewchat.mix_parts(crewchat.new_mix(0, name="Maya")[4:])
+        self.assertFalse(crewchat.mix_fits(maya, "Teo"))
+        self.assertTrue(crewchat.mix_fits(maya, "Noor") and crewchat.mix_fits(maya, "Someone"))
 
     def test_a_new_face_works_at_the_machines_device_and_is_nobody_elses(self):
         for device in range(3):
-            self.assertEqual(crewchat.mix_parts(crewchat.new_mix(device)[4:])[-1], device)
+            self.assertEqual(crewchat.mix_parts(crewchat.new_mix(device)[4:])[10], device)  # the device part
         taken = {crewchat.new_mix(0) for _ in range(50)}
         self.assertNotIn(crewchat.new_mix(0, taken), taken)
         self.assertIn(crewchat.device_kind(), (0, 1, 2))
@@ -649,6 +665,24 @@ class FacesOnThePage(Base):
             with self.assertRaises(urllib.error.HTTPError) as e:
                 urllib.request.urlopen(self.base + "/pictures/mix/%s.svg" % bad)
             self.assertEqual(e.exception.code, 404)
+
+    def test_a_renamed_agent_gets_a_face_that_suits_its_new_name(self):
+        name = self.hub.agent_for(self.hub.open_session("macbook", "claude"))
+        self.hub.rename(name, "Maya")
+        self.hub.set_profile("Maya", "mix:new")
+        face = self.hub.agents["Maya"]["picture"]
+        self.assertTrue(crewchat.mix_fits(crewchat.mix_parts(face[4:]), "Maya"))
+        self.hub.rename("Maya", "Teo")
+        after = self.hub.agents["Teo"]["picture"]
+        self.assertNotEqual(after, face)
+        self.assertTrue(crewchat.mix_fits(crewchat.mix_parts(after[4:]), "Teo"))
+        self.assertEqual(crewchat.mix_parts(after[4:])[10], crewchat.mix_parts(face[4:])[10])  # at the same device
+        self.hub.rename("Teo", "Noor")
+        self.assertEqual(self.hub.agents["Noor"]["picture"], after)  # it suits a name for anyone: kept
+        self.hub.set_profile("Noor", "art:owl")
+        self.hub.rename("Noor", "Maya")
+        self.assertEqual(self.hub.agents["Maya"]["picture"], "art:owl")  # a picture chosen stays
+        self.hub.remove("Maya")
 
     def test_the_dice_give_an_agent_a_new_face(self):
         name = self.hub.agent_for(self.hub.open_session("macbook", "claude"))
