@@ -28,7 +28,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 4. X4 token tracking and X1 endpoint, then X2 analytics page and X3 public demo.
 5. Y1 coordinator design, then Y2 to Y4.
 6. C4 to C9 as time allows.
-7. Process learning: L1 notes (after your decisions on its two questions), L2 recording, L3 asking at the right moment, L4 delivery to every agent; then L5 to L7.
+7. Process learning: L1 notes, L2 recording, L3 asking at the right moment, L4 delivery to every agent; then L5 to L7.
 
 ## All tasks
 
@@ -61,7 +61,7 @@ Priority: P1 is highest. Effort: S is a day or less, M a few days, L a week or m
 | [X4](#x4) | Token and cost tracking | Analytics page | P1 | M | Done | P1 |
 | [X2](#x2) | Analytics show-off page | Analytics page | P1 | L | Done | X1 |
 | [X3](#x3) | Demo mode with sample data | Analytics page | P2 | S | Done | X2 |
-| [L1](#l1) | Process notes: stored, synced, versioned | Process learning | P1 | M | Needs a decision | none |
+| [L1](#l1) | Process notes: stored, synced, versioned, approved | Process learning | P1 | M | To do | none |
 | [L2](#l2) | Agents record what they learned | Process learning | P1 | M | To do | L1 |
 | [L3](#l3) | Ask for a note at the right moment | Process learning | P1 | S | To do | L2 |
 | [L4](#l4) | Every agent, old and new, gets the right note | Process learning | P1 | M | To do | L1 |
@@ -1057,9 +1057,10 @@ When one agent works out how to do something (a build, a release, a fix for a re
 
 ### L1
 
-**Process notes: stored, synced, versioned** · P1 · effort M · Needs a decision
+**Process notes: stored, synced, versioned, approved** · P1 · effort M · To do
 
-> **Open question:** Who approves a note: you only, or also an agent with the lead role? Are notes per project, or can a note be shared across all your projects (for example a release process you use everywhere)?
+> **Decided:** Approval depends on the note: some need you, others the lead approves automatically.
+> Notes can be per project or shared across all your projects (owner, 19 Oct).
 
 **Goal.** One place where the crew's learned processes live, the same on every machine, so a process learned once is never lost or relearned.
 
@@ -1072,20 +1073,27 @@ When one agent works out how to do something (a build, a release, a fix for a re
 **Approach**
 
 - A process note is a message of a new kind, process, in messages.jsonl, so it syncs over Tailscale and cloud sync with no new sync code. Today's shared skills are local files only and never reach other machines.
-- Each note has a name, a version, and fields: when to use it, steps, commands, pitfalls, files and areas it touches, who wrote it, and the commit it was last checked on.
+- Each note has a name, a version, a scope (project or shared), and fields: when to use it, steps, commands, pitfalls, files and areas it touches, who wrote it, and the commit it was last checked on.
 - The newest version of a name wins; older ones stay in the log as history.
 - States: proposed, approved, retired. Only approved notes reach agents' folders.
+- Who approves, by rule: the owner must approve a note that is shared across projects, that has commands which release, deploy, publish, delete data or touch credentials or production, or that will become a project command (L6). Every other note is approved by the lead agent; in a project with no lead, by the owner.
+- The owner can change the rule per project: owner approves everything, lead approves everything except the cases above (the default), or lead approves everything.
+- The server checks the rule, not the agent: a lead approving a note that needs the owner gets it queued in Needs you instead, with the reason.
+- Scope: a project note lives in that project's log. A shared note lives in one shared log for all the owner's projects (a reserved project, carried by Tailscale and cloud sync like any other), and every project's guide lists it. Making a project note shared is an owner approval.
 - Each approved note is written into every connected folder as a generated skill (.claude/skills/crewchat-process-NAME/SKILL.md, plus the Cursor rule and AGENTS.md index), the same way write_guides does today. Generated files are rebuilt from the log, never edited by hand.
 
 **Done when**
 
 - A note approved on one machine appears in every folder on a second, linked machine.
-- Deleting the generated skill files and restarting writes them again from messages.jsonl.
+- A lead approving an ordinary note makes it live at once; a lead approving a note with a deploy command puts it in the owner's Needs you instead.
+- A shared note approved by the owner appears in the folders of two different projects.
+- Deleting the generated skill files and restarting writes them again from the log.
 - Two versions of the same name: agents see only the newest.
 
 **Risks**
 
-- Bad notes spread to every agent, so approval matters (see questions).
+- Telling sensitive commands apart by pattern can miss some; the owner can mark a note owner-only by hand, and the lead can always ask for owner approval.
+- The shared log must not leak one project's details into another; only notes the owner made shared go there.
 
 **Depends on:** nothing
 
@@ -1163,7 +1171,7 @@ When one agent works out how to do something (a build, a release, a fix for a re
 
 **Approach**
 
-- New agents: the generated guide lists every approved note with its one-line "when to use it", so the agent reads a note only when it applies.
+- New agents: the generated guide lists every approved note with its one-line "when to use it", the project's notes first, then the notes shared across all projects, so the agent reads a note only when it applies.
 - Taking a task: the answer names notes whose areas overlap the task's areas or whose words match its title (a derived SQLite search index, rebuilt from the log).
 - Agents already running: when a note is approved or updated, a short notice goes to agents whose current task touches its areas, through the stop hook; others see it in the guide on their next session.
 - hub_process find WORDS for an agent that is stuck.
@@ -1198,6 +1206,7 @@ When one agent works out how to do something (a build, a release, a fix for a re
 - A note is flagged as possibly stale when files it names change a lot, a command in it starts failing, or it has not been checked for a long time.
 - A failed report or a stale flag asks the reporting agent, or the lead, to update the note.
 - The owner sees all notes on the chat page: approved, proposed, stale, unused, with approve and retire buttons.
+- The page's list shows each note's scope (project or shared) and who approved it.
 
 **Done when**
 
@@ -1223,7 +1232,7 @@ When one agent works out how to do something (a build, a release, a fix for a re
 
 **Approach**
 
-- The owner can promote a note's commands into a named project command with fixed parameters.
+- The owner promotes a note's commands into a named project command with fixed parameters; this always needs the owner, whatever the project's approval rule (L1).
 - Agents run it in their own shell (the server never runs it), and it prints a short result.
 - The command's exact text is shown to the owner before approval and whenever it changes.
 
