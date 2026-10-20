@@ -248,8 +248,9 @@ the project's tab turns red (on any project, so you see it from the others too):
 
 The ones that hold up the most other tasks come first ("holds up 3 tasks"). Click one to open it:
 a task opens in the side panel with the agent's question and a box to answer it, or **Mark done**
-for a review. An item leaves the list once it is handled: the agent carries on, the task is done
-or taken, the message is read.
+for a review. An item leaves the list once it is handled: you answered it (then it is the agent's
+turn, until it asks again or sends the task back for review), the task is done or taken, the
+message is read.
 
 <img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up one other task, above a task ready for review. The blocked task is open in the side panel with the question and a box to answer it.">
 

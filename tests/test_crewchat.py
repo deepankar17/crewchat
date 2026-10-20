@@ -2124,8 +2124,10 @@ class NeedsYou(Base):
         review = self.add("Polish the icons")
         a.text("hub_task", action="take", id=review)
         a.text("hub_task", action="update", id=review, status="review", note="Have a look")
-        self.hub.send(crewchat.OWNER, a_name, "Re #%s: thanks" % review)
-        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])  # a review waits for Mark done
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: one more test, then fine" % review)
+        self.assertNotIn(review, [n.get("task") for n in self.hub.needs_you()])  # answered: the agent's turn, as asked
+        a.text("hub_task", action="update", id=review, status="review", note="Test added")  # back for review: owner again
+        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])
         for t in (mid, review):
             crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": t, "status": "done"})
 
@@ -2844,6 +2846,7 @@ class Launching(Base):
         self.assertTrue(text.startswith(crewchat.OPENCODE_PLUGIN_MARK))
         self.assertIn(json.dumps(crewchat.run_command() + ["hook", "opencode"]), text)
         self.assertIn("const REOPEN_PROMPT = %s;" % json.dumps(crewchat.REOPEN_PROMPT), text)  # what Reopen asks
+        self.assertIn('REOPEN_PROMPT.replace("%s", process.env.CREWCHAT_LINK_KEY', text)  # with its own key
         self.assertIn(crewchat.OPENCODE_PLUGIN_FILE, (folder / ".git" / "info" / "exclude").read_text())  # never committed
         if shutil.which("node"):  # the plugin is a module OpenCode can load
             check = subprocess.run(["node", "--check", "--input-type=module"], input=text, capture_output=True, text=True)
@@ -2957,7 +2960,7 @@ class Launching(Base):
         self.assertEqual(out, {"ok": True})
         folder, command, used, title = opened[0]
         self.assertEqual((folder, used, title), (str(self.folder), key, name))  # its own key: same name, no relink
-        self.assertEqual(command[-2:], ["--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])  # one argument; it gets to work
+        self.assertEqual(command[-2:], ["--resume=sess-0003-abc", crewchat.reopen_prompt(key)])  # one argument; it gets to work
         self.assertIn("acceptEdits", command)  # the permissions it was started with
         self.assertIn("Owner reopened %s" % name, self.hub_history())
         # Until the reopened session reports, a second click does not open a second copy.
@@ -2970,11 +2973,28 @@ class Launching(Base):
         _, opened = self.reopened(agent=name)
         self.assertEqual(self.hub.links[opened[0][2]], name)
 
+    def test_a_reopened_conversation_comes_back_as_itself(self):
+        # The owner's 1.0 test: reopened conversations joined as new agents (Luca, Ines, Lina) under new names, because the
+        # prompt never told them to link again; Start again on those names then made two of each.
+        name = self.closed_session()
+        key = next(k for k, v in self.hub.links.items() if v == name)
+        _, opened = self.reopened(agent=name)
+        prompt = opened[0][1][-1]
+        self.assertIn("hub_link", prompt)
+        self.assertIn(key, prompt)
+        before = set(self.hub.agents)
+        session = Session(self.base, self.token)  # the reopened conversation: a new connection to the chat
+        found = re.search(r"hub_link with key (\S+?)[:.,]?\s", prompt + " ")
+        session.call("hub_link", key=found.group(1))
+        self.assertEqual(self.hub.agent_for(session.sid), name)
+        self.assertEqual(set(self.hub.agents), before)  # no new agent
+
     def test_the_other_tools_reopen_their_own_conversations(self):
+        PROMPT = "{its reopen prompt}"
         for tool, resume in (("codex", ["resume", "--sandbox", "workspace-write", "--ask-for-approval", "on-request",
-                                        "sess-0003-abc", crewchat.REOPEN_PROMPT]),
-                             ("gemini", ["--approval-mode", "auto_edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
-                             ("qwen", ["--approval-mode", "auto-edit", "--resume=sess-0003-abc", "-i", crewchat.REOPEN_PROMPT]),
+                                        "sess-0003-abc", PROMPT]),
+                             ("gemini", ["--approval-mode", "auto_edit", "--resume=sess-0003-abc", "-i", PROMPT]),
+                             ("qwen", ["--approval-mode", "auto-edit", "--resume=sess-0003-abc", "-i", PROMPT]),
                              ("opencode", ["--session=sess-0003-abc"])):
             name = self.closed_session(tool=tool)
             if tool == "opencode":
@@ -2982,6 +3002,7 @@ class Launching(Base):
             self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["reopen"], tool)
             out, opened = self.reopened(agent=name)
             self.assertEqual(out, {"ok": True})
+            resume = [crewchat.reopen_prompt("link-" + name) if a == PROMPT else a for a in resume]
             self.assertEqual(opened[0][1], ["/usr/local/bin/" + tool] + resume, tool)
             env = self.opened_env[-1] or {}
             if tool == "opencode":  # OpenCode does not send a prompt with the session it continues: its plugin does
@@ -3032,7 +3053,7 @@ class Launching(Base):
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "model", "agent": name, "model": "sonnet"})
         self.assertEqual(steps[0], "stop")
-        self.assertEqual(steps[1][-4:], ["--model", "sonnet", "--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])
+        self.assertEqual(steps[1][-4:], ["--model", "sonnet", "--resume=sess-0003-abc", crewchat.reopen_prompt("link-" + name)])
         self.assertEqual(self.hub.taken.get(task), name)  # still its task
         self.assertIn("Owner reopened %s on sonnet" % name, self.hub_history())
 
@@ -3058,7 +3079,7 @@ class Launching(Base):
             out = crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
         self.assertEqual(out, {"ok": True})
         self.assertEqual(steps[0], "stop")
-        self.assertEqual(steps[1][-2:], ["--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])  # the same conversation
+        self.assertEqual(steps[1][-2:], ["--resume=sess-0003-abc", crewchat.reopen_prompt("link-" + name)])  # the same conversation
         self.assertEqual(self.hub.taken.get(task), name)  # still its task
         self.assertIn("Owner reconnected %s" % name, self.hub_history())
         # A session already closed is just reopened.
