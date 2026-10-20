@@ -260,21 +260,17 @@ laptop. What has been tried for real, and what has not yet:
   all three name the same coordinator and the next when it goes down, one that was down catches up
   on both others, and removing one leaves the other two linked. It also runs both installers as a user would, then `crewchat start` with the
   installed copy.
-- **Used live:** automatic naming, hooks and waiting for messages, with Claude Code sessions on
-  one Mac. Cloud sync against a real Firebase project, and linking over Tailscale, each with
-  several servers on one Mac. **+ New agent** through a real Terminal window, with a stand-in
-  for Claude Code.
-- **Not tried yet:**
-  - linking two physical machines;
-  - Cursor's hooks and waiting;
-  - the automatic `tailscale serve` setup;
+- **Used live:** automatic naming, hooks and waiting for messages, with Claude Code sessions. For 1.0, its
+  author went through the release's test plan by hand on a Mac and a Windows laptop: the two linked
+  over Tailscale (`crewchat peers invite` setting up `tailscale serve` by itself, and `peers join`),
+  agents on both sharing a project, **+ New agent**, **Reopen** and **Reconnect** with real Claude Code
+  sessions, the new page, the task sheet and Analytics. Cloud sync against a real Firebase project,
+  with several servers on one Mac. Two fixes came from that test: no console windows flashing up on
+  Windows, and joining while cloud sync still ran.
+- **Not tried by hand yet** (covered by the test suite):
+  - Cursor's hooks and waiting, and Codex CLI, Gemini CLI, Qwen Code and OpenCode in a chat;
+  - cloud sync between two physical machines: the coordinator, catch-up and files over it;
   - starting at login on Linux and Windows;
-  - the phone app on a real phone (it was checked in Chrome);
-  - agents following role instructions in long sessions;
-  - **+ New agent** with a real Claude Code or Cursor session;
-  - everything new in this release, beyond the test suite: the code map and the checks and notices
-    built on it, `hub_code`, Analytics with a real crew, Codex CLI, Gemini CLI, Qwen Code and OpenCode
-    in a chat, permission prompts from the page, Web Push, the coordinator, catch-up and files over
-    cloud sync.
+  - agents following role instructions in long sessions.
 
 Back to the [README](../README.md)
