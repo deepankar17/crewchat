@@ -116,6 +116,37 @@ def status_of(url, body, token=None, device=""):
         return e.code
 
 
+class JoiningAfterCloudSync(unittest.TestCase):
+    """The owner's Windows laptop, 20 Oct: `crewchat cloud logout` takes effect only when the server restarts. A join
+    before then used the one-time code, so the Mac counted the laptop in, and then the laptop could not link."""
+
+    def test_the_server_says_it_still_runs_cloud_sync(self):
+        root = Path(tempfile.mkdtemp(prefix="ready-", dir=TMP))
+        with self.assertRaises(peers.PeerError) as e:
+            peers.admin(mock.Mock(sync=object()), root, "peers-ready", {})  # a server syncing another way
+        self.assertIn("crewchat restart", str(e.exception))
+        self.assertEqual(peers.admin(mock.Mock(sync=None), root, "peers-ready", {}), {"ok": True})
+
+    def test_a_join_then_stops_before_it_uses_the_code(self):
+        home = Path(tempfile.mkdtemp(prefix="join-home-", dir=TMP))
+        crewchat.save_config({"project": "Demo", "port": 1}, home)  # cloud sync is off in the config already
+        refused = urllib.error.HTTPError("http://127.0.0.1:1/api/admin", 400, "Bad Request", {}, None)
+        refused.read = lambda: json.dumps({"error": "this server still syncs through the cloud: run `crewchat "
+                                                    "restart`, then join again; the code still works"}).encode()
+        import argparse
+        args = argparse.Namespace(action="join", target="http://mac.example:8795", code="ABCD-EFGH",
+                                  url="http://127.0.0.1:1", name="windows")
+        with mock.patch.dict(os.environ, {"CREWCHAT_HOME": str(home)}), \
+                mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(crewchat, "owner_token", return_value="owner-token"), \
+                mock.patch.object(crewchat, "post_json", side_effect=refused), \
+                mock.patch.object(urllib.request, "urlopen", side_effect=AssertionError("the code was used")):
+            with self.assertRaises(peers.PeerError) as e:
+                peers._cmd_peers(args)
+        self.assertIn("crewchat restart", str(e.exception))
+        self.assertFalse((home / "peers.json").exists())
+
+
 class Linked(unittest.TestCase):
     """Three machines: alpha founds, beta joins through alpha, gamma joins through beta."""
 

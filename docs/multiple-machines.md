@@ -120,6 +120,10 @@ crewchat cloud logout
 When the last machine logs out, no one holds the account key any more: its data is cleared from
 Firestore, and the next machine to log in founds the account again.
 
+To move a machine from cloud sync to Tailscale, run `crewchat cloud logout`, then `crewchat restart`
+(the running server syncs through the cloud until it restarts), then `crewchat peers join`. A join
+before the restart says so, and its code still works.
+
 Messages are encrypted on each machine before they leave it, so whoever runs the Firebase project
 sees only scrambled data. They are deleted from Firestore once every machine has them, and after
 24 hours at the latest. A machine that was off for longer asks the coordinator when it is back, and

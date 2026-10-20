@@ -870,6 +870,11 @@ class PeerSync(crewchat.ProjectLink):
 def admin(hub, root, op, data):
     """The owner's peer operations, run inside the server (see crewchat.Handler._admin)."""
     sync = hub.sync if isinstance(hub.sync, PeerSync) else None
+    if op == "peers-ready":  # before a join uses its one-time code (ready_to_link)
+        if hub.sync is not None and sync is None:
+            raise PeerError("this server still syncs through the cloud: `crewchat cloud logout` takes effect when it "
+                            "restarts. Run `crewchat restart`, then join again; the code still works.")
+        return {"ok": True}
     if op == "peers-start":
         if sync is None:
             if hub.sync is not None:
@@ -978,6 +983,24 @@ def server_call(op, **body):
     return crewchat.owner_call("/api/admin", dict(body, op=op))
 
 
+def ready_to_link():
+    """Before a join uses its one-time code: the running server must be able to link now. One still running cloud sync
+    (`crewchat cloud logout` takes effect only at a restart) would let the code be used, the other machine count this
+    one in, and then fail to link."""
+    try:
+        crewchat.post_json(crewchat.local_url() + "/api/admin", crewchat.owner_token(), {"op": "peers-ready"})
+    except urllib.error.HTTPError as e:
+        try:
+            reason = json.loads(e.read().decode("utf-8")).get("error", "")
+        except ValueError:
+            reason = ""
+        # A server from before this check does not know the question: it links as before.
+        if reason not in ("unknown operation", "this server is not linked to other machines"):
+            raise PeerError(reason or "the server here answered HTTP %d" % e.code)
+    except (urllib.error.URLError, OSError) as e:
+        raise PeerError("cannot reach the server here (%s); the code still works" % getattr(e, "reason", e))
+
+
 def turn_on(config):
     """Mark peers on and start them in the running server (no restart needed)."""
     if config.get("cloud"):
@@ -1036,6 +1059,7 @@ def _cmd_peers(args):
             # Before the code is used: the other machine would count this one in, and it could not start.
             raise PeerError("the server is not running here. Start it with `crewchat start` in your project "
                             "folder, then run this again; the code still works.")
+        ready_to_link()
         url = my_address(config, args.url)
         target = clean_url(args.target)
         body = json.dumps({"code": args.code, "device": {"name": args.name or machine_name(), "url": url}})
