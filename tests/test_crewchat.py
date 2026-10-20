@@ -2124,8 +2124,10 @@ class NeedsYou(Base):
         review = self.add("Polish the icons")
         a.text("hub_task", action="take", id=review)
         a.text("hub_task", action="update", id=review, status="review", note="Have a look")
-        self.hub.send(crewchat.OWNER, a_name, "Re #%s: thanks" % review)
-        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])  # a review waits for Mark done
+        self.hub.send(crewchat.OWNER, a_name, "Re #%s: one more test, then fine" % review)
+        self.assertNotIn(review, [n.get("task") for n in self.hub.needs_you()])  # answered: the agent's turn, as asked
+        a.text("hub_task", action="update", id=review, status="review", note="Test added")  # back for review: owner again
+        self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])
         for t in (mid, review):
             crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": t, "status": "done"})
 

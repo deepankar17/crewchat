@@ -2808,8 +2808,8 @@ class Hub:
                     else "given_back" if r["status"] in ("todo", "waiting") and r["id"] in given else "")
             if kind in ("blocked", "review") and r.get("note") == OWNER:
                 continue  # the owner set it so: nothing waits on the owner
-            if kind == "blocked" and answered.get((r["id"], said.get("from") or r["holder"]), 0) > said.get("seq", 0):
-                continue  # the agent that asked has its answer since: its turn (a review waits for Mark done)
+            if kind in ("blocked", "review") and answered.get((r["id"], said.get("from") or r["holder"]), 0) > said.get("seq", 0):
+                continue  # the agent that asked has its answer since: its turn, until it asks or sends it for review again
             if kind:
                 # Named after whoever wrote the note (any agent may update a task), so an answer goes back
                 # to the agent that asked; a reclaimed task, after the agent it was taken from.
