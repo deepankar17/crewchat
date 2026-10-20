@@ -1750,16 +1750,17 @@ class EventStore:
             rows, self.pending = self.pending, []
         if not rows and not (commit and self.uncommitted):
             return
-        db = self._conn()
+        done = 0  # rows of this batch dealt with: written (unsaved until committed) or dropped
         try:
+            db = self._conn()
             for sql, row in rows:
                 try:
                     db.execute(sql, row)
+                    self.unsaved.append((sql, row))
                 except (sqlite3.IntegrityError, sqlite3.InterfaceError, sqlite3.ProgrammingError) as e:
                     # A row that can never be written: dropped, said in the log, and the others go on.
                     sys.stderr.write("%s dropped a row %s could not take: %s\n" % (now_iso(), self.path.name, e))
-                    continue
-                self.unsaved.append((sql, row))
+                done += 1
             if commit:
                 db.commit()
                 self.unsaved, self.uncommitted = [], False
@@ -1768,8 +1769,9 @@ class EventStore:
                     self.uncommitted = True
                     self.wake.notify()
         except Exception:
-            db.rollback()  # everything since the last commit: queued again, in its order
-            back, self.unsaved, self.uncommitted = self.unsaved, [], False
+            if self.db is not None:
+                self.db.rollback()  # everything since the last commit, and what this batch did not reach: queued again
+            back, self.unsaved, self.uncommitted = self.unsaved + rows[done:], [], False
             with self.wake:
                 self.pending[:0] = back
             raise
@@ -2113,10 +2115,12 @@ class Hub:
                                  for a, models in agents.items() if isinstance(models, dict)}
                       for day, agents in (kept.get("days") or {}).items() if isinstance(agents, dict)}
         tasks = kept.get("tasks") if isinstance(kept.get("tasks"), dict) else {}
+        old_of = {new: old for old, new in self.renamed.items()}  # a crash in adopt_open_tasks: saved under the old number
         for mid, row in self.sheet.items():
             row.pop("usage", None)
-            if isinstance(tasks.get(mid), dict):
-                row["usage"] = {str(m): c for m, c in tasks[mid].items() if isinstance(c, list)}
+            counts = tasks.get(mid) if isinstance(tasks.get(mid), dict) else tasks.get(old_of.get(mid))
+            if isinstance(counts, dict):
+                row["usage"] = {str(m): c for m, c in counts.items() if isinstance(c, list)}
         if self._usage_dirty:
             self._save_usage()
         self._apply_renames()
@@ -2142,7 +2146,6 @@ class Hub:
 
     def _save(self):
         """Write state.json now, with everything in it (what _save_soon let wait too). Caller holds the lock."""
-        self._dirty = False
         sheet = {mid: {k: v for k, v in row.items() if k != "usage"} if "usage" in row else row
                  for mid, row in self.sheet.items()}  # the tasks' token counts are in usage.json
         write_json(self.home / "state.json", {
@@ -2150,14 +2153,15 @@ class Hub:
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
         }, private=True, indent=None)
+        self._dirty = False  # only once written: a failed write is tried again
 
     def _save_usage(self):
         """Write usage.json now: the token counts by day and each task's. Caller holds the lock (or is loading)."""
-        self._usage_dirty = False
         write_json(self.home / USAGE_FILE, {
             "days": self.usage,
             "tasks": {mid: row["usage"] for mid, row in self.sheet.items() if row.get("usage")},
         }, private=True, indent=None)
+        self._usage_dirty = False
 
     def _save_usage_soon(self):
         """Write usage.json within SAVE_DELAY, as _save_soon does state.json. Caller holds the lock."""
@@ -2185,11 +2189,16 @@ class Hub:
         has not written yet."""
         with self.lock:
             self._flush_due = False
-            if self._dirty:
-                self._save()
-            if self._usage_dirty:
-                self._save_usage()
-        self.events.flush()
+            for dirty, save in (("_dirty", self._save), ("_usage_dirty", self._save_usage)):
+                if getattr(self, dirty):
+                    try:
+                        save()
+                    except OSError as e:  # a full disk: the others are still written, and this is tried again
+                        sys.stderr.write("%s could not save %s: %s\n" % (now_iso(), self.home, e))
+        try:
+            self.events.flush()
+        except Exception as e:  # the writer tries again
+            sys.stderr.write("%s could not write %s: %s\n" % (now_iso(), EVENTS_FILE, e))
 
     def _changed(self):
         self.version += 1
@@ -4551,6 +4560,11 @@ class Hub:
             doing = self._activity(name, time.time())
         if doing in ("working", "listening"):
             raise HubError("%s is %s: Reconnect is for an agent whose window sleeps" % (name, doing))
+        with self.lock:
+            seen = float((self.agents.get(name) or {}).get("seen") or 0)
+        if not doing and time.time() - seen < DEFAULT_LISTEN:  # unknown (the server restarted): as the page's asleep()
+            raise HubError("%s was heard from %d minutes ago and may be working: wait, or Stop it first"
+                           % (name, (time.time() - seen) // 60))
         self._restart_session(name, None, "reconnected")
 
     def _restart_session(self, name, model, done):

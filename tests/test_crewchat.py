@@ -585,6 +585,46 @@ class UsageAcrossRenames(unittest.TestCase):
         again.events.close()
 
 
+class UsageAfterACrashMidRename(unittest.TestCase):
+    def test_counts_saved_under_the_old_numbers_are_found_under_the_new(self):
+        # Review: a crash between state.json (new numbers) and usage.json (old) dropped the tasks' token counts.
+        root = Path(tempfile.mkdtemp(prefix="usage-crash-", dir=TMP))
+        crewchat.save_config({"project": "usage-crash", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        old = hub.add_row(crewchat.OWNER, "counted")["id"]
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        with hub.lock:
+            hub.sheet[old]["usage"] = counts
+            hub._save_usage()
+        with mock.patch.object(hub, "_save_usage"):  # the crash: usage.json not written again
+            new = hub.adopt_open_tasks("A", "device-1")[old]
+        self.assertEqual(crewchat.Hub(crewchat.Roster(root)).sheet[new].get("usage"), counts)
+        hub.events.close()
+
+
+class FlushKeepsGoing(unittest.TestCase):
+    def test_one_failed_save_does_not_skip_the_others(self):
+        root = Path(tempfile.mkdtemp(prefix="flush-", dir=TMP))
+        crewchat.save_config({"project": "flush", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        hub.events.add_edit("maya", "a.py", ts=1)
+        with hub.lock:
+            hub._dirty = True
+        real = crewchat.write_json
+
+        def failing(path, *a, **kw):
+            if str(path).endswith("state.json"):
+                raise OSError(28, "No space left on device")
+            return real(path, *a, **kw)
+        with mock.patch.object(crewchat, "write_json", failing), contextlib.redirect_stderr(io.StringIO()):
+            hub.flush()
+        self.assertTrue(hub._dirty)  # still to write: the next flush tries again
+        self.assertEqual(len(crewchat.EventStore(root / crewchat.EVENTS_FILE).edits()), 1)  # the events were written
+        hub.flush()
+        self.assertFalse(hub._dirty)
+        hub.events.close()
+
+
 class ReconnectOnThePage(unittest.TestCase):
     def test_asleep_means_idle_or_not_heard_from_for_its_listening_time(self):
         page = crewchat.CHAT_PAGE
@@ -721,6 +761,34 @@ class EditPaths(unittest.TestCase):
             store.db = db
         store.close()
         self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo"])
+
+    def test_a_failed_write_mid_batch_keeps_the_rest_of_the_batch(self):
+        # Review: an error on one row (a full disk) lost it and every row after it in the batch.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        db = store._conn()
+        calls = [0]
+
+        class Flaky:
+            def __getattr__(self, name):
+                return getattr(db, name)
+
+            def execute(self, sql, row=()):
+                if sql.startswith("INSERT"):
+                    calls[0] += 1
+                    if calls[0] == 2:
+                        raise crewchat_sqlite().OperationalError("database or disk is full")
+                return db.execute(sql, row)
+        with store.lock:
+            for i, agent in enumerate(("teo", "ana", "lu")):
+                store.add_edit(agent, "app/x.kt", ts=2 + i)
+            store.db = Flaky()
+            with self.assertRaises(crewchat_sqlite().OperationalError):
+                store._write_pending()
+            store.db = db
+        store.close()
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo", "ana", "lu"])
 
     def test_a_row_that_cannot_be_written_does_not_block_the_others(self):
         # Review: one bad row was put back at the front every time, and every later row waited behind it.
@@ -3002,6 +3070,17 @@ class Launching(Base):
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
         self.assertEqual(len(steps), 1)
+
+    def test_reconnect_is_refused_for_an_agent_heard_from_lately_whose_state_is_unknown(self):
+        # Review: after a restart its state is unknown (''): the server must keep the page's rule, not stop it mid-turn.
+        name = self.closed_session()
+        self.hub.activity.pop(name, None)
+        self.hub.agents[name]["seen"] = time.time() - 60
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
+                mock.patch.object(crewchat, "stop_process", lambda pid: self.fail("stopped an agent heard from lately")):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertIn("heard from", json.loads(caught.exception.read())["error"])
 
     def test_reconnect_is_refused_while_the_agent_works_or_listens(self):
         # Review: after a restart the page offered Reconnect for every running agent, a busy one too.
