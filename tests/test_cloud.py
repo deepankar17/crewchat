@@ -535,6 +535,117 @@ class Sync(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class ThreeMachines(unittest.TestCase):
+    """Three machines on one account: what two do, with a third that sees all of it, or is away."""
+
+    def setUp(self):
+        self.store = cloud.MemoryStore()
+        self.a, self.b, self.c = (Machine(self.store, n) for n in ("mac", "windows", "laptop"))
+        for m in (self.b, self.c):
+            self.a.account.approve(m.device.name, expect_fp=m.device.fp)
+            wait_until(lambda: m.device.ready, message="the approval")
+        self.machines = (self.a, self.b, self.c)
+
+    def tearDown(self):
+        for m in self.machines:
+            m.stop()
+
+    def count(self, machine, text):
+        with machine.hub.lock:
+            return sum(m["text"] == text for m in machine.hub.messages)
+
+    def test_every_message_reaches_both_others_once(self):
+        agents = [m.agent() for m in self.machines]
+        wait_until(lambda: any(r["agent"] == agents[0] for r in self.c.hub.rows()), message="the laptop to see the mac's agent")
+        for m, agent in zip(self.machines, agents):
+            m.hub.send(agent, "all", "hello from %s" % m.device.name)
+        self.c.hub.send(agents[2], agents[0], "laptop to mac only")
+        for m in self.machines:
+            for text in ["hello from %s" % n for n in ("mac", "windows", "laptop")] + ["laptop to mac only"]:
+                wait_until(lambda: self.count(m, text) == 1, message="%s to have %r" % (m.device.name, text))
+        time.sleep(0.5)
+        for m in self.machines:
+            self.assertEqual(self.count(m, "hello from mac"), 1)  # never twice, however many machines pass it on
+        ids = [{msg["id"] for msg in m.hub.messages} for m in self.machines]
+        self.assertEqual(ids[0], ids[1])
+        self.assertEqual(ids[1], ids[2])
+
+    def test_exactly_one_agent_of_three_machines_takes_a_task(self):
+        racers = [(m, m.agent()) for m in self.machines for _ in range(2)]
+        for origin in self.machines:
+            task = origin.say("all", "the build, from %s" % origin.device.name, "task")
+            for m in self.machines:
+                wait_until(lambda: m.has(task["text"]), message="the task everywhere")
+            results = {}
+
+            def take(machine, name):
+                try:
+                    machine.hub.take(name, task["id"])
+                    results[name] = "won"
+                except crewchat.HubError as e:
+                    results[name] = str(e)
+            threads = [threading.Thread(target=take, args=r) for r in racers]
+            [t.start() for t in threads]
+            [t.join() for t in threads]
+            winners = [n for n, r in results.items() if r == "won"]
+            self.assertEqual(len(winners), 1, results)
+            wait_until(lambda: all(m.hub.taken.get(task["id"]) == winners[0] for m in self.machines),
+                       message="all three to agree")
+
+    def test_when_the_coordinator_goes_offline_one_of_the_other_two_takes_over(self):
+        now = [time.time()]
+        for m in self.machines:
+            m.sync.clock = lambda: now[0]
+        self.a.sync.renew_lease()
+        for m in (self.b, self.c):
+            m.sync.renew_lease()  # a live lease is left alone
+            wait_until(lambda: m.sync.coordinator()["name"] == "mac", message="%s to name the mac" % m.device.name)
+        self.a.link.online = False
+        now[0] += cloud.LEASE_SECS + 1
+        self.b.sync.renew_lease()
+        self.c.sync.renew_lease()  # the windows machine was first: the laptop leaves its new lease alone
+        for m in (self.b, self.c):
+            wait_until(lambda: m.sync.coordinator()["name"] == "windows", message="%s to name windows" % m.device.name)
+        self.assertEqual([m.sync.coordinator()["me"] for m in (self.b, self.c)], [True, False])
+        self.a.link.online = True
+        self.a.sync.renew_lease()
+        wait_until(lambda: self.a.sync.coordinator()["name"] == "windows", message="the mac, back, to name windows")
+        self.assertFalse(self.a.sync.coordinator()["me"])
+
+    def test_the_third_machine_away_catches_up_on_both_others_through_the_coordinator(self):
+        self.c.stop()  # the laptop is off
+        texts = []
+        for i in range(10):
+            for m in (self.a, self.b):
+                texts.append("%s, while the laptop was off: %d" % (m.device.name, i))
+                m.say("all", texts[-1])
+        wait_until(lambda: all(self.a.has(t) and self.b.has(t) for t in texts), message="the other two to have them")
+        for doc_id, _ in self.store.list("messages"):  # three days on: the cloud has dropped them
+            self.store.delete("messages/" + doc_id)
+        self.a.sync.renew_lease()  # the mac coordinates: it has the windows machine's messages too, and serves them
+        self.assertTrue(self.a.sync.coordinator()["me"])
+        self.c.sync.marks["synced_to"] = time.time() - 3 * 86400
+        self.c.sync._save_marks()
+        self.c.sync = cloud.CloudSync(self.c.hub, self.c.link, self.c.device, log=lambda text: None).start()
+        wait_until(lambda: all(self.c.has(t) for t in texts), timeout=30, message="the laptop to catch up")
+        with self.c.hub.lock:
+            got = [m for m in self.c.hub.messages if m["text"] in texts]
+        self.assertEqual(sorted(m["text"] for m in got), sorted(texts))  # each once
+        self.assertEqual({m["origin"] for m in got}, {self.a.device.id, self.b.device.id})  # each from its own machine
+
+    def test_a_file_shared_on_one_opens_on_both_others(self):
+        data = os.urandom(200 * 1024)
+        meta = self.a.hub.add_file("trace.log", data, "text/plain")
+        self.a.hub.send(crewchat.OWNER, "all", "the trace", files=[meta])
+        for m in (self.b, self.c):
+            wait_until(lambda: m.has("the trace"), message="%s to get the message" % m.device.name)
+        wait_until(lambda: self.store.get("files/%s-%d" % (meta["id"], -(-len(data) // cloud.FILE_PART) - 1)),
+                   message="the last piece")
+        for m in (self.b, self.c):
+            self.assertEqual(m.hub.open_file(meta["id"])[1].read_bytes(), data)
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
 class FreshStart(unittest.TestCase):
     def test_when_the_last_machine_leaves_the_next_one_founds_the_account_afresh(self):
         store = cloud.MemoryStore()

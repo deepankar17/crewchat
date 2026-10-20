@@ -251,12 +251,14 @@ repository has committed is left alone: the token would go into a commit.
 
 ## Status
 
-crewchat is early. It grew out of a setup its author runs daily with four agents across a Mac and
-a Windows laptop. What has been tried for real, and what has not yet:
+crewchat grew out of a setup its author runs daily with four agents across a Mac and a Windows
+laptop. What has been tried for real, and what has not yet:
 
 - **Tested everywhere:** CI runs the test suite on Linux, macOS and Windows, on Python 3.9 and
-  3.13, including several linked machines in one process (over Tailscale and with an in-memory
-  Firestore). It also runs both installers as a user would, then `crewchat start` with the
+  3.13, including two and three linked machines: over Tailscale, each with a server of its own, and
+  through an in-memory Firestore. With three, a task has one taker whichever machine it was posted on,
+  all three name the same coordinator and the next when it goes down, one that was down catches up
+  on both others, and removing one leaves the other two linked. It also runs both installers as a user would, then `crewchat start` with the
   installed copy.
 - **Used live:** automatic naming, hooks and waiting for messages, with Claude Code sessions on
   one Mac. Cloud sync against a real Firebase project, and linking over Tailscale, each with

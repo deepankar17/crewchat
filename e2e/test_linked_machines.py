@@ -362,5 +362,165 @@ class ThreeMachines(unittest.TestCase):
                 m.stop()
 
 
+
+def race(agents, tid):
+    """Every agent tries to take the task at once: {agent name: its answer, or the ToolError it got}."""
+    results = {}
+
+    def take(agent):
+        try:
+            results[agent.name] = agent.call("hub_task", action="take", id=tid)
+        except ToolError as e:
+            results[agent.name] = e
+    threads = [threading.Thread(target=take, args=(a,)) for a in agents]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
+
+
+def coordinating(machine):
+    """Who the machine says coordinates now (`crewchat coordinator`), by name."""
+    line = machine.cli("coordinator").splitlines()[0]
+    return line.split(": ", 1)[1].split(" (")[0].rstrip(".")
+
+
+def link_three(cleanup, names=("one", "two", "three")):
+    """Three machines, the second and third joining the first; an agent on each, seen by all three. cleanup: the
+    test's (or its class's) addCleanup, which stops them."""
+    machines = [H.Machine(name, agent_names="place") for name in names]
+    for m in machines:
+        cleanup(m.stop)
+        m.start()
+    for m in machines[1:]:
+        m.link_to(machines[0])
+    agents = [m.agent() for m in machines]
+    for agent in agents:
+        agent.link()
+    for m in machines:
+        for agent in agents:
+            eventually(lambda: m.owner.sees(agent.name), timeout=60, what="%s to see %s" % (m.name, agent.name))
+    for agent in agents:
+        agent.stop_hook()
+    return machines, agents
+
+
+class ThreeMachinesLinked(unittest.TestCase):
+    """Three machines over Tailscale, all on: tasks, files and the coordinator agree everywhere."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.machines, cls.agents = link_three(cls.addClassCleanup)
+
+    def setUp(self):
+        for a in self.agents:
+            a.stop_hook()
+
+    def test_a_task_has_one_taker_among_agents_on_three_machines(self):
+        extra = [m.agent() for m in self.machines]
+        for a in extra:
+            a.link()
+        racers = self.agents + extra
+        for origin in self.machines:
+            tid = origin.owner.task("all", "race from %s" % origin.name)
+            for a in racers:
+                eventually(lambda: tid in a.call("hub_history", limit=50), timeout=60, what="the task on every machine")
+            results = race(racers, tid)
+            winners = [n for n, r in results.items() if isinstance(r, str)]
+            self.assertEqual(len(winners), 1, results)
+            for m in self.machines:
+                eventually(lambda: m.owner.poll()["taken"].get(tid) == winners[0], timeout=60, what="all three to agree")
+        same_chat(*self.machines)
+
+    def test_a_file_shared_on_one_opens_on_both_others(self):
+        one, two, three = self.agents
+        report = self.machines[0].folder / "trace.txt"
+        report.write_text("stack trace from one\n")
+        one.call("hub_send", to="all", text="the trace", files=[str(report)])
+        for agent in (two, three):
+            got = eventually(agent.stop_hook, timeout=60, what="%s to get the file" % agent.name)
+            fid = re.search(r"\[file (\w+): trace.txt", got).group(1)
+            self.assertIn("stack trace from one", agent.call("hub_file", id=fid))
+
+    def test_all_three_name_the_same_coordinator_and_the_owners_choice(self):
+        for m in self.machines:
+            eventually(lambda: coordinating(m) == "one", timeout=60, what="%s to name the first machine" % m.name)
+        self.machines[1].cli("coordinator", "three")  # chosen on the second, about the third
+        try:
+            for m in self.machines:
+                eventually(lambda: coordinating(m) == "three", timeout=60, what="%s to follow the choice" % m.name)
+        finally:
+            self.machines[1].cli("coordinator", "none")
+        for m in self.machines:
+            eventually(lambda: coordinating(m) == "one", timeout=60, what="%s back to the first" % m.name)
+
+
+class ThreeMachineOutages(unittest.TestCase):
+    """One of three machines going down, coming back, or being removed: the other two carry on together."""
+
+    def setUp(self):
+        self.machines, self.agents = link_three(self.addCleanup)
+
+    def test_when_the_coordinator_goes_down_the_other_two_agree_on_the_next(self):
+        one, two, three = self.machines
+        one.kill(hard=True)
+        for m in (two, three):
+            eventually(lambda: coordinating(m) == "two", timeout=90, what="%s to name the second machine" % m.name)
+
+    def test_a_task_from_a_machine_that_is_down_has_one_taker_on_the_other_two(self):
+        one, two, three = self.machines
+        tid = one.owner.task("all", "a task from the first machine")
+        for agent in self.agents[1:]:
+            eventually(lambda: tid in agent.call("hub_history", limit=50), timeout=60, what="the task everywhere")
+        one.kill(hard=True)
+        results = race(self.agents[1:], tid)  # no "try again when it is back": the coordinator settles it
+        winners = [n for n, r in results.items() if isinstance(r, str)]
+        self.assertEqual(len(winners), 1, results)
+        for m in (two, three):
+            eventually(lambda: m.owner.poll()["taken"].get(tid) == winners[0], timeout=60, what="the two to agree")
+        one.cli("start", "--no-service", "--no-open")
+        one.wait_up()
+        eventually(lambda: one.owner.poll()["taken"].get(tid) == winners[0], timeout=90, what="the first to adopt it")
+        late = one.agent()
+        late.link()
+        with self.assertRaises(ToolError) as e:
+            late.call("hub_task", action="take", id=tid)
+        self.assertIn("taken by %s" % winners[0], str(e.exception))
+
+    def test_a_machine_back_after_a_crash_catches_up_from_both_others(self):
+        one, two, three = self.machines
+        a, b, c = self.agents
+        three.kill(hard=True)
+        eventually(lambda: not one.owner.row(c.name)["online"], timeout=90, what="the third machine's agent offline")
+        for i in range(3):
+            a.call("hub_send", to=c.name, text="from one %d" % i)
+            b.call("hub_send", to=c.name, text="from two %d" % i)
+        three.cli("start", "--no-service", "--no-open")
+        three.wait_up()
+        def caught_up():
+            text = str(three.owner.messages())
+            return all("from %s %d" % (w, i) in text for w in ("one", "two") for i in range(3))
+        eventually(caught_up, timeout=90, what="the third machine to catch up")
+        got = c.stop_hook()
+        for w in ("one", "two"):
+            for i in range(3):
+                self.assertEqual(got.count("from %s %d" % (w, i)), 1, got)
+        same_chat(one, two, three, timeout=60)
+
+    def test_removing_one_keeps_the_other_two_together(self):
+        one, two, three = self.machines
+        a, b, c = self.agents
+        one.cli("peers", "remove", "three")
+        for m in (one, two):
+            eventually(lambda: "three" not in m.peers_status(), timeout=60, what="%s to forget the third" % m.name)
+        b.call("hub_send", to=a.name, text="two to one after the removal")
+        self.assertIn("two to one after the removal", eventually(a.stop_hook, timeout=60, what="one to hear two"))
+        a.call("hub_send", to="all", text="one to all after the removal")
+        self.assertIn("one to all after the removal", eventually(b.stop_hook, timeout=60, what="two to hear one"))
+        time.sleep(3)
+        self.assertNotIn("after the removal", str(three.owner.messages()))
+
+
 if __name__ == "__main__":
     unittest.main()
