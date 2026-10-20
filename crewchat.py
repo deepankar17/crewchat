@@ -54,7 +54,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -4540,8 +4540,10 @@ class Hub:
             model = None
         if advisor not in [m for m, _ in tool_advisors(tool)]:
             advisor = ""
+        with self.lock:
+            key = self._link_key(name)  # the one _open_again gives its hooks: the prompt links with it too
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor)
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor, key)
 
     def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
@@ -7424,8 +7426,15 @@ def agent_tool(tool, folder, permissions, root=None):
 
 
 REOPEN_WAIT = 120  # seconds a reopened session has to report before Reopen may be clicked again
-REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. Check hub_inbox, then carry on with "
-                 "your task.")
+# A reopened conversation connects to the chat afresh: it links again with its own key, or its first call would
+# make it a new agent under a new name (the owner's 1.0 test: two of each after Start again).
+REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. First call the crewchat tool hub_link with key "
+                 "%s: it ties this session to you again, under your own name. Then check hub_inbox and carry on "
+                 "with your task.")
+
+
+def reopen_prompt(key):
+    return REOPEN_PROMPT % key
 # How each tool resumes a conversation by the id its hooks report (checked with each tool: Codex's is
 # a subcommand). Cursor's agent: resuming a chat by id is not checked yet, so Stop only.
 RESUME_ARGS = {"claude": lambda session: ["--resume=" + session], "gemini": lambda session: ["--resume=" + session],
@@ -7450,17 +7459,18 @@ def tool_advisors(tool):
     return CLAUDE_ADVISORS if tool == "claude" else []
 
 
-def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor=""):
-    """The command line that reopens an agent's own conversation (Reopen, Switch model)."""
+def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor="", key=""):
+    """The command line that reopens an agent's own conversation (Reopen, Switch model, Reconnect); key: its link key,
+    which the prompt asks it to link again with."""
     if not SESSION_RE.fullmatch(str(session)) or tool not in REOPEN_TOOLS:
         raise HubError("that session cannot be reopened")
     options = tool_options(tool, permissions, base, model or "", advisor or "")
     if tool == "codex":  # codex resume [options] <id> <prompt>; an id never starts with "-" (SESSION_RE)
-        return [exe, "resume"] + options + [session, REOPEN_PROMPT]
+        return [exe, "resume"] + options + [session, reopen_prompt(key)]
     # The id in one argument with its option, so it can never be taken for an option of its own.
-    if tool == "opencode":  # its plugin sends REOPEN_PROMPT (see _open_again)
+    if tool == "opencode":  # its plugin sends the reopen prompt, with the key it was started with (see _open_again)
         return [exe] + options + RESUME_ARGS[tool](session)
-    return [exe] + options + RESUME_ARGS[tool](session) + PROMPT_OPTION.get(tool, []) + [REOPEN_PROMPT]
+    return [exe] + options + RESUME_ARGS[tool](session) + PROMPT_OPTION.get(tool, []) + [reopen_prompt(key)]
 
 
 def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
@@ -8531,7 +8541,8 @@ function reopened() {
 export const CrewchatPlugin = async ({client, directory}) => {
   const session = reopened();
   if (session) setTimeout(() => client.session.promptAsync(
-    {path: {id: session}, body: {parts: [{type: "text", text: REOPEN_PROMPT}]}}).catch(() => {}), 1000);
+    {path: {id: session}, body: {parts: [{type: "text", text: REOPEN_PROMPT.replace("%%s", process.env.CREWCHAT_LINK_KEY || "")}]}})
+    .catch(() => {}), 1000);
   return {
   "chat.message": async (input, output) => {
     const text = await hook("prompt", {session_id: input.sessionID}, directory);
