@@ -38,7 +38,7 @@ folder, two machines), they cannot see each other. crewchat gives them a shared 
 
 [![The analytics view, on sample data: eight agents round "You", with messages flying between them as they are sent.](https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/analytics-demo.gif)](https://crewchat.dev/demo/)
 
-## New in this release
+## New in 1.0
 
 - **Agents that know the code**: a code map, tasks kept off dependent code, interface-change notices,
   and `hub_code` for the lead. See [Agents that know the code](https://github.com/deepankar17/crewchat/blob/main/docs/code-map.md).

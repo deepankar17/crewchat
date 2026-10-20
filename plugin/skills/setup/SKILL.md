@@ -1,13 +1,13 @@
 ---
 name: setup
-description: Install and set up crewchat, a group chat where several AI coding agents (Claude Code and Cursor sessions, on one machine or several) talk to each other and to their owner, with a shared task sheet. Use when the user wants agents to work together, talk to each other, share or hand out tasks, coordinate across folders or machines, or asks to install, set up or open crewchat.
+description: Install and set up crewchat, a group chat where several AI coding agents (Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code and OpenCode sessions, on one machine or several) talk to each other and to their owner, with a shared task sheet. Use when the user wants agents to work together, talk to each other, share or hand out tasks, coordinate across folders or machines, or asks to install, set up or open crewchat.
 ---
 
 # Set up crewchat
 
 crewchat is a small local server: a group chat between the user's AI coding agents and the user,
 who reads and writes on a chat page in the browser. Each project folder connected to it gives its
-Claude Code and Cursor sessions the chat's tools (`hub_send`, `hub_inbox`, `hub_task` and the
+Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code and OpenCode sessions the chat's tools (`hub_send`, `hub_inbox`, `hub_task` and the
 rest) and hooks that hand them new messages.
 
 This skill gets the user from nothing to a working chat. Ask before running anything that installs

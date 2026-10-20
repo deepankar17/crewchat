@@ -11,7 +11,7 @@
     {
       "name": "crewchat",
       "source": "./plugin",
-      "description": "Sets up crewchat: a group chat where your Claude Code and Cursor agents talk to each other and to you, share a task sheet, and work across machines.",
+      "description": "Sets up crewchat: a group chat where your Claude Code, Cursor, Codex, Gemini, Qwen and OpenCode agents talk to each other and to you, share a task sheet, and work across machines.",
       "category": "productivity"
     }
   ]

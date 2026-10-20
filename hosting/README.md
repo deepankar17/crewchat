@@ -23,6 +23,7 @@ The domain is registered with Cloudflare, whose DNS points it at Firebase, every
 | Page | Template |
 |------|----------|
 | `/` | `site/templates/home.html`: what crewchat is, demos, install, which agents work |
+| `/demo/` | `site/templates/demo.html`: the Analytics view on sample data (cut from the chat page's own code) |
 | `/privacy.html` | `site/templates/privacy.html`: what crewchat connects to (from `docs/privacy.md`) |
 | `/404.html` | `site/templates/404.html` |
 

@@ -9,8 +9,9 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Deepankar" }]
-keywords = ["mcp", "agents", "claude-code", "cursor", "multi-agent", "chat"]
+keywords = ["mcp", "agents", "claude-code", "cursor", "codex", "gemini-cli", "qwen-code", "opencode", "multi-agent", "chat"]
 classifiers = [
+  "Development Status :: 5 - Production/Stable",
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
