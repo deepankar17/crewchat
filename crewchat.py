@@ -4520,7 +4520,7 @@ class Hub:
 
     def _reopen_plan(self, name, model=None):
         """What reopening an agent takes, all checked before anything is stopped: (its session,
-        its folder, the command). HubError if it cannot be reopened."""
+        its folder, the command, its link key). HubError if it cannot be reopened."""
         with self.lock:
             session = dict(self._session_of(name, "reopen"))
         if time.time() - float(session.get("reopening") or 0) < REOPEN_WAIT:
@@ -4532,6 +4532,7 @@ class Hub:
         if not self._connected_folder(folder):
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
         with self.lock:
+            key = self._link_key(name)  # the prompt and its hooks (_open_again) both link with this one
             permissions = (self.agents.get(name) or {}).get("permissions", "ask")
             model = model or (self.agents.get(name) or {}).get("model") or None
             advisor = (self.agents.get(name) or {}).get("advisor") or ""
@@ -4540,19 +4541,17 @@ class Hub:
             model = None
         if advisor not in [m for m, _ in tool_advisors(tool)]:
             advisor = ""
-        with self.lock:
-            key = self._link_key(name)  # the one _open_again gives its hooks: the prompt links with it too
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor, key)
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor, key), key
 
     def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
         memory, same name (its hooks get its own link key), same permissions. It is told to carry
         on, so its hooks report the new process and read the chat."""
-        session, folder, command = self._reopen_plan(name)
+        session, folder, command, key = self._reopen_plan(name)
         if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
-        self._open_again(name, None, session, folder, command)
+        self._open_again(name, None, session, folder, command, key)
 
     def reconnect_agent(self, name):
         """The owner wakes an agent whose session is open but asleep (past its listening time, it only reads the chat at
@@ -4572,10 +4571,10 @@ class Hub:
     def _restart_session(self, name, model, done):
         """Stop an agent's session if it runs and reopen its conversation (on model): everything reopening needs is
         checked first, so a failure never leaves it stopped. Its tasks stay its own."""
-        session, folder, command = self._reopen_plan(name, model)
+        session, folder, command, key = self._reopen_plan(name, model)
         if process_running(session):
             end_session(name, session)
-        self._open_again(name, model, session, folder, command, done)
+        self._open_again(name, model, session, folder, command, key, done)
 
     def startable(self, name):
         """Can the owner start a new session for this local agent (Start again)? Its tool can be
@@ -4640,9 +4639,8 @@ class Hub:
             self._save()
         return key
 
-    def _open_again(self, name, model, session, folder, command, done="reopened"):
-        with self.lock:
-            key = self._link_key(name)
+    def _open_again(self, name, model, session, folder, command, key, done="reopened"):
+        """Open the reopened conversation's window, its hooks given key: the one its prompt links with (_reopen_plan)."""
         # OpenCode does not send a prompt given with the session it continues: crewchat's plugin does,
         # once (the nonce), to that session.
         env = {"CREWCHAT_REOPEN": "%s:%s" % (session["id"], secrets.token_hex(8))} if session.get("tool") == "opencode" else {}
@@ -7435,6 +7433,8 @@ REOPEN_PROMPT = ("You were reopened from the crewchat by your owner. First call 
 
 def reopen_prompt(key):
     return REOPEN_PROMPT % key
+
+
 # How each tool resumes a conversation by the id its hooks report (checked with each tool: Codex's is
 # a subcommand). Cursor's agent: resuming a chat by id is not checked yet, so Stop only.
 RESUME_ARGS = {"claude": lambda session: ["--resume=" + session], "gemini": lambda session: ["--resume=" + session],
