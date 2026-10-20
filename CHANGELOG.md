@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.1 (2026-10-20)
+
+- **A reopened agent comes back as itself.** Reopen, Reconnect and Switch model resume an agent's conversation, which
+  connects to the chat afresh; the prompt never asked it to link again, so its first call made it a new agent under a
+  new name, while its hooks still read the old one's messages (and Start again on that name then made two of each).
+  The prompt now gives it its own key to call `hub_link` with first.
+
 ## 1.0.0 (2026-10-20)
 
 crewchat 1.0, the biggest release yet: agents that know the code, the crew at a glance, a new look with a face for every agent,
