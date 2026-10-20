@@ -1,0 +1,104 @@
+name: release assets
+
+# Every release is published to PyPI (what the installers and `crewchat update` install) and
+# carries its package files on GitHub too (the installers' fallback).
+#
+# PyPI publishing uses trusted publishing: no token is stored. On pypi.org the project crewchat
+# trusts this repository's workflow `release-assets.yml` in the environment `pypi`.
+#
+# Then the release is listed in the official MCP Registry (server.json), signed in with this
+# workflow's own GitHub identity (OIDC): no token either. The registry checks that the PyPI
+# release's description (README.md) names io.github.deepankar17/crewchat.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, e.g. v0.9.10"
+        required: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: uv build --wheel --sdist
+      - name: Check the version matches the tag
+        run: ls dist/crewchat-${TAG#v}-py3-none-any.whl dist/crewchat-${TAG#v}.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  attach:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Attach what is missing
+        run: |
+          have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
+          for f in dist/*.whl dist/*.tar.gz; do
+            if echo "$have" | grep -qx "$(basename "$f")"; then echo "already there: $f"
+            else gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"; fi
+          done
+
+  pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  mcp-registry:
+    needs: pypi
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Wait for PyPI to serve the release
+        run: |
+          for i in $(seq 60); do
+            curl -sf "https://pypi.org/pypi/crewchat/${TAG#v}/json" >/dev/null && exit 0
+            sleep 10
+          done
+          echo "PyPI does not serve ${TAG#v} after 10 minutes"; exit 1
+      - name: Check server.json is this release
+        run: test "$(jq -r .version server.json)" = "${TAG#v}"
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz" | tar xz mcp-publisher
+      - name: Publish to the MCP Registry
+        run: |
+          ./mcp-publisher login github-oidc
+          ./mcp-publisher publish

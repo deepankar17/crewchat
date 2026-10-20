@@ -1,0 +1,1753 @@
+"""crewchat cloud sync: machines signed in to the same Google account share one chat.
+
+Optional add-on to crewchat.py. Every machine runs its own crewchat server for its local agents;
+servers exchange messages through the owner's own Firebase project (Firestore), pushed in real
+time. Everything is encrypted on the machine before it is sent. Design: docs/cloud-sync-design.md.
+
+Needs:  pip install google-cloud-firestore cryptography   (Python 3.10+ recommended)
+
+How the pieces fit:
+- Device: this machine's identity. An RSA key pair (the private key never leaves the machine),
+  the account keys it has been given, and the list of devices it trusts.
+- Store: the database. FirestoreStore talks to Firestore as the signed-in person; MemoryStore is
+  the same thing in memory, for tests.
+- Account: the protocol on top: the first device founds the account, later devices are approved
+  by a trusted one, removing a device rotates the account key.
+- CloudSync: plugs into the Hub. Publishes what happens here, applies what arrives from elsewhere.
+
+Firestore layout, all under users/{uid}/ (the security rules confine an account to its own):
+  meta/account      {founder, key_id}                 the account key currently in use
+  meta/trust        {devices, version, signer, sig}   the trusted devices, signed by one of them
+  meta/coordinator  {device, term, expires, preferred} which machine coordinates, on a lease (Y1)
+  devices/{id}      {name, tag, pub, fp, keys, key_sigs, wrapped_by, seen, synced_to}
+  messages/{msgid}  {dev, key_id, nonce, ct, created}  one chat message, encrypted
+  state/{id}        {dev, key_id, nonce, ct, updated}  one machine's agents, encrypted
+  tasks/{msgid}     {dev, key_id, nonce, ct, created}  who took a task: the first create wins
+  files/{fid}-{n}   {dev, key_id, nonce, ct, created, parts}  part n of a shared file (5 MB at most), encrypted
+  catchups/{id}     {since, after, state, parts, more, by}  a machine back after more than the TTL asks (Y3)
+  catchup_parts/{id}-{n}  {for, dev, key_id, nonce, ct, created}  the messages it missed, sealed by the
+                                                     coordinator, deleted once it has read them
+  spaces/{space}    {created}                          a project besides the first, shared by name:
+    messages/, state/, tasks/, files/, catchups/, catchup_parts/  as above, for that project only
+    marks/{id}        {seen, synced_to}                how far each machine has read it
+The first projects of all machines use the top-level collections, whatever their names. Another
+project's space is a hash of its name (space_id), so the name itself never reaches the cloud.
+"""
+import base64
+import hashlib
+import json
+import os
+import queue
+import secrets
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import warnings
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+import crewchat
+
+warnings.filterwarnings("ignore", module="google")
+warnings.filterwarnings("ignore", message=".*OpenSSL.*")
+warnings.filterwarnings("ignore", message=".*Python version.*")
+
+TTL_HOURS = 24  # messages are deleted from Firestore once delivered, and after this at the latest
+STATE_DEBOUNCE = 5  # seconds between publishing roster changes
+SEEN_EVERY = 300  # "last seen" alone is published at most this often
+HEARTBEAT = 15 * 60  # an otherwise quiet machine with agents says it is alive this often
+HOUSEKEEPING = 10 * 60  # delete delivered messages this often
+CLAIM_TIMEOUT = 20
+LEASE_SECS = 300  # the coordinator's lease (meta/coordinator): it renews it about every LEASE_RENEW seconds,
+LEASE_RENEW = 100  # and any approved machine online takes it once it has run out (a machine that stops lets it
+# go at once). About 860 writes a day by the holder, and no reads by the others while its lease is live.
+CATCHUP_PART_BYTES = 40000  # messages per catch-up part, as JSON: sealed, it stays under the rules' 60,000 characters
+CATCHUP_DAYS = 7  # how far back a machine catches up through Firestore (Tailscale: all of it)
+CATCHUP_PARTS = 25  # parts the coordinator writes for a machine at a time: more once it has read those
+
+
+class CloudError(Exception):
+    pass
+
+
+COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts", "files")  # the layout above, but meta, spaces
+SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts", "files")  # in each spaces/{space}
+CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (config cloud_file_mb)
+# Why the cap: the free (Spark) plan of a Firebase project allows 1 GiB stored, 20,000 writes and 50,000 reads a
+# day, and 10 GiB a month downloaded; a file is a write per 32 KB part on the way in (160 for 5 MB) and a read per
+# part for each machine that opens it. On a paid (Blaze) plan the owner can raise it, up to crewchat's 20 MB for a file.
+QUOTA_NOTE = ("files over %s stay on the machine they were shared on, to keep within the free Firebase plan's "
+              "quota (1 GiB stored, 20,000 writes a day); on a paid (Blaze) plan, raise cloud_file_mb in crewchat's "
+              "config.json (up to 20)")
+# Bytes of a file in one document: in base64 twice and sealed, 58,292 characters, under the 60,000 the security rules
+# (RULES) allow for a document's ciphertext.
+FILE_PART = 32 * 1024
+NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
+                 "or: pip install \"crewchat[cloud]\"")
+
+
+def space_id(root, name):
+    """The Firestore folder of a project besides the first, from its name (lower case) and the
+    account's own folder (root), so the same name is the same space on every machine."""
+    return crewchat.sha("crewchat|space|%s|%s" % (root, name))[:24]
+
+
+def need_crypto():
+    try:
+        import cryptography  # noqa: F401
+    except ImportError:
+        raise CloudError("cloud sync needs the cryptography library, " + NOT_INSTALLED)
+
+
+# --------------------------------------------------------------------------------------------
+# Cryptography (all primitives from the `cryptography` library)
+# --------------------------------------------------------------------------------------------
+def b64(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def unb64(text):
+    return base64.b64decode(text.encode("ascii"))
+
+
+def new_private_key():
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    return rsa.generate_private_key(public_exponent=65537, key_size=3072)
+
+
+def private_pem(key):
+    from cryptography.hazmat.primitives import serialization
+    return key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                             serialization.NoEncryption()).decode("ascii")
+
+
+def load_private(pem):
+    from cryptography.hazmat.primitives import serialization
+    return serialization.load_pem_private_key(pem.encode("ascii"), password=None)
+
+
+def public_pem(key):
+    from cryptography.hazmat.primitives import serialization
+    return key.public_key().public_bytes(serialization.Encoding.PEM,
+                                         serialization.PublicFormat.SubjectPublicKeyInfo).decode("ascii")
+
+
+def load_public(pem):
+    from cryptography.hazmat.primitives import serialization
+    return serialization.load_pem_public_key(pem.encode("ascii"))
+
+
+def fingerprint(pub_pem):
+    """What a person compares between two machines: 16 hex digits in groups of four."""
+    digest = hashlib.sha256(pub_pem.strip().encode("ascii")).hexdigest()[:16]
+    return " ".join(digest[i:i + 4] for i in range(0, 16, 4))
+
+
+def key_id(key):
+    return hashlib.sha256(key).hexdigest()[:16]
+
+
+def wrap(pub_pem, key):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    return b64(load_public(pub_pem).encrypt(key, padding.OAEP(
+        mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None)))
+
+
+def unwrap(private_key, wrapped):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    return private_key.decrypt(unb64(wrapped), padding.OAEP(
+        mgf=padding.MGF1(hashes.SHA256()), algorithm=hashes.SHA256(), label=None))
+
+
+def sign(private_key, data):
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    return b64(private_key.sign(data, padding.PSS(mgf=padding.MGF1(hashes.SHA256()),
+                                                  salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256()))
+
+
+def verify(pub_pem, signature, data):
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    try:
+        load_public(pub_pem).verify(unb64(signature), data, padding.PSS(
+            mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH), hashes.SHA256())
+        return True
+    except (InvalidSignature, ValueError, TypeError):
+        return False
+
+
+def seal(key, aad, payload):
+    """Encrypt a JSON-able payload with AES-256-GCM. Returns (nonce, ciphertext) in base64."""
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return b64(nonce), b64(AESGCM(key).encrypt(nonce, data, aad.encode("utf-8")))
+
+
+def unseal(key, aad, nonce, ciphertext):
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    data = AESGCM(key).decrypt(unb64(nonce), unb64(ciphertext), aad.encode("utf-8"))
+    return json.loads(data.decode("utf-8"))
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+# --------------------------------------------------------------------------------------------
+# This machine's identity
+# --------------------------------------------------------------------------------------------
+def cloud_dir(root=None):
+    return Path(root or crewchat.home()) / "cloud"
+
+
+def write_private(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        os.chmod(path.parent, 0o700)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
+class Device:
+    """This machine: its keys, the account keys it holds, and the devices it trusts."""
+
+    def __init__(self, root=None):
+        self.dir = cloud_dir(root)
+        info = read_json(self.dir / "device.json", {})
+        self.id = info.get("id", "")
+        self.name = info.get("name", "")
+        self.tag = info.get("tag", "")
+        self.private = None
+        self.pub = ""
+        if (self.dir / "device_key.pem").exists():
+            self.private = load_private((self.dir / "device_key.pem").read_text(encoding="ascii"))
+            self.pub = public_pem(self.private)
+        keys = read_json(self.dir / "keys.json", {})
+        self.keys = {k: unb64(v) for k, v in keys.get("keys", {}).items()}
+        self.current = keys.get("current", "")
+        self.trust = read_json(self.dir / "trust.json", {"devices": {}, "version": 0})
+        self.lock = threading.RLock()
+
+    @property
+    def fp(self):
+        return fingerprint(self.pub) if self.pub else ""
+
+    @property
+    def exists(self):
+        return bool(self.id and self.private)
+
+    @property
+    def ready(self):
+        """Approved and holding the account key in use."""
+        return self.exists and self.id in self.trust.get("devices", {}) and self.current in self.keys
+
+    def create(self, name):
+        self.id = secrets.token_hex(6)
+        self.name = name
+        self.private = new_private_key()
+        self.pub = public_pem(self.private)
+        write_private(self.dir / "device_key.pem", private_pem(self.private))
+        self.save()
+
+    def save(self):
+        with self.lock:
+            write_private(self.dir / "device.json",
+                          json.dumps({"id": self.id, "name": self.name, "tag": self.tag}, indent=2))
+            write_private(self.dir / "keys.json", json.dumps(
+                {"keys": {k: b64(v) for k, v in self.keys.items()}, "current": self.current}, indent=2))
+            write_private(self.dir / "trust.json", json.dumps(self.trust, indent=2))
+
+    def trusted(self, device_id):
+        return self.trust.get("devices", {}).get(device_id)
+
+
+# --------------------------------------------------------------------------------------------
+# The database
+# --------------------------------------------------------------------------------------------
+SERVER_TIME = object()  # stands for "the database's own clock" in a write
+
+
+def allowed(doc):
+    """What the security rules' small() lets through (RULES), for MemoryStore: a test meets the limits the real
+    Firestore keeps. Returns the document."""
+    if len(doc) > 16 or len(str(doc.get("ct", ""))) > 60000 or len(str(doc.get("pub", ""))) > 2000:
+        raise CloudError("PERMISSION_DENIED: the document is larger than the security rules allow")
+    return doc
+
+
+class MemoryStore:
+    """Firestore's behaviour for crewchat, in memory: one account, shared by devices in a test.
+
+    Listeners are called on a background thread, as Firestore does. `online` can be switched off
+    to simulate a machine without network: every call then raises CloudError.
+    """
+
+    def __init__(self):
+        self.docs = {}
+        self.lock = threading.RLock()
+        self.listeners = []  # (collection, callback, since)
+        self.events = queue.Queue()
+        self.online = True
+        self.clock = 0.0
+        threading.Thread(target=self._dispatch, daemon=True).start()
+
+    def _dispatch(self):
+        while True:
+            callback, changes = self.events.get()
+            try:
+                callback(changes)
+            except Exception:  # a listener's bug must not stop the others
+                import traceback
+                traceback.print_exc()
+
+    def _check(self):
+        if not self.online:
+            raise CloudError("offline")
+
+    def _now(self):
+        self.clock = max(self.clock + 0.001, time.time())
+        return self.clock
+
+    def _fill(self, data, old=None):
+        out = {}
+        for k, v in data.items():
+            if v is SERVER_TIME:
+                out[k] = self._now()
+            elif isinstance(v, dict) and isinstance((old or {}).get(k), dict):
+                merged = dict(old[k])
+                merged.update(v)
+                out[k] = merged
+            else:
+                out[k] = v
+        return out
+
+    def _notify(self, path, kind, data):
+        collection, doc_id = path.rsplit("/", 1)
+        for coll, callback, since in list(self.listeners):
+            if coll != collection:
+                continue
+            if since and kind != "removed" and data.get(since[0], 0) < since[1]:
+                continue
+            self.events.put((callback, [(kind, doc_id, dict(data))]))
+
+    def get(self, path):
+        self._check()
+        with self.lock:
+            doc = self.docs.get(path)
+            return dict(doc) if doc is not None else None
+
+    def set(self, path, data, merge=False):
+        self._check()
+        with self.lock:
+            old = self.docs.get(path)
+            new = dict(old) if (merge and old) else {}
+            new.update(self._fill(data, old if merge else None))
+            allowed(new)
+            self.docs[path] = new
+            self._notify(path, "modified" if old is not None else "added", new)
+
+    def create(self, path, data):
+        self._check()
+        with self.lock:
+            if path in self.docs:
+                return False
+            self.docs[path] = allowed(self._fill(data))
+            self._notify(path, "added", self.docs[path])
+            return True
+
+    def delete(self, path):
+        self._check()
+        with self.lock:
+            old = self.docs.pop(path, None)
+            if old is not None:
+                self._notify(path, "removed", old)
+
+    def list(self, collection, where=None):
+        self._check()
+        with self.lock:
+            out = []
+            for path, doc in self.docs.items():
+                coll, doc_id = path.rsplit("/", 1)
+                if coll == collection and (not where or doc.get(where[0]) == where[1]):
+                    out.append((doc_id, dict(doc)))
+            return out
+
+    def listen(self, collection, callback, since=None):
+        with self.lock:
+            entry = (collection, callback, since)
+            self.listeners.append(entry)
+            initial = [("added", doc_id, doc) for doc_id, doc in self.list(collection)
+                       if not since or doc.get(since[0], 0) >= since[1]]
+            if initial:
+                self.events.put((callback, initial))
+        return lambda: self.listeners.remove(entry) if entry in self.listeners else None
+
+    def transact(self, path, fn):
+        self._check()
+        with self.lock:
+            new = fn(self.get(path))
+            if new is None:
+                return False
+            self.set(path, new)
+            return True
+
+    def close(self):
+        self.listeners.clear()
+
+
+class FirestoreStore:
+    """Firestore, as the signed-in person: the security rules apply to everything it does."""
+
+    def __init__(self, auth):
+        from google.auth.credentials import Credentials
+        from google.cloud import firestore
+
+        self.firestore = firestore
+        self.auth = auth
+
+        class UserCredentials(Credentials):
+            def refresh(self, request):
+                self.token = auth.id_token()
+                self.expiry = None
+
+            @property
+            def valid(self):
+                return bool(self.token) and auth.fresh()
+
+        creds = UserCredentials()
+        creds.token = auth.id_token()
+        self.db = firestore.Client(project=auth.project, credentials=creds)
+        self.root = "users/%s/" % auth.uid
+        self.watches = []
+
+    def _ref(self, path):
+        return self.db.document(self.root + path)
+
+    def _out(self, data):
+        return {k: (self.firestore.SERVER_TIMESTAMP if v is SERVER_TIME else v) for k, v in data.items()}
+
+    @staticmethod
+    def _in(snapshot_dict):
+        out = {}
+        for k, v in (snapshot_dict or {}).items():
+            out[k] = v.timestamp() if hasattr(v, "timestamp") and not isinstance(v, (int, float)) else v
+        return out
+
+    def _call(self, fn, *args, **kwargs):
+        from google.api_core import exceptions
+        try:
+            return fn(*args, **kwargs)
+        except exceptions.PermissionDenied as e:
+            raise CloudError("Firestore refused: check the security rules and the sign-in (%s)" % e.message)
+        except (exceptions.ServiceUnavailable, exceptions.DeadlineExceeded, exceptions.RetryError) as e:
+            raise CloudError("cannot reach Firestore (%s)" % type(e).__name__)
+
+    def get(self, path):
+        snap = self._call(self._ref(path).get, timeout=CLAIM_TIMEOUT)
+        return self._in(snap.to_dict()) if snap.exists else None
+
+    def set(self, path, data, merge=False):
+        self._call(self._ref(path).set, self._out(data), merge=merge, timeout=CLAIM_TIMEOUT)
+
+    def create(self, path, data):
+        from google.api_core import exceptions
+        try:
+            self._call(self._ref(path).create, self._out(data), timeout=CLAIM_TIMEOUT)
+            return True
+        except (exceptions.Conflict, exceptions.AlreadyExists):
+            return False
+
+    def delete(self, path):
+        self._call(self._ref(path).delete, timeout=CLAIM_TIMEOUT)
+
+    def list(self, collection, where=None):
+        query = self.db.collection(self.root + collection)
+        if where:
+            query = query.where(where[0], "==", where[1])
+        return [(d.id, self._in(d.to_dict())) for d in self._call(lambda: list(query.stream(timeout=CLAIM_TIMEOUT)))]
+
+    def listen(self, collection, callback, since=None):
+        import datetime
+        query = self.db.collection(self.root + collection)
+        if since:
+            query = query.where(since[0], ">=", datetime.datetime.fromtimestamp(since[1], datetime.timezone.utc))
+
+        def on_snapshot(docs, changes, read_time):
+            out = []
+            for change in changes:
+                kind = change.type.name.lower()
+                out.append((kind, change.document.id, self._in(change.document.to_dict())))
+            if out:
+                callback(out)
+
+        watch = query.on_snapshot(on_snapshot)
+        self.watches.append(watch)
+        return watch.unsubscribe
+
+    def transact(self, path, fn):
+        """Read-modify-write that loses no concurrent change.
+
+        Client transactions need permissions an ordinary signed-in user does not have, so this
+        uses a conditional write instead: write only if the document is still exactly what was
+        read (or still absent), and try again if someone else got there first.
+        """
+        from google.api_core import exceptions
+        ref = self._ref(path)
+        for _ in range(8):
+            snap = self._call(ref.get, timeout=CLAIM_TIMEOUT)
+            new = fn(self._in(snap.to_dict()) if snap.exists else None)
+            if new is None:
+                return False
+            try:
+                if snap.exists:
+                    option = self.db.write_option(last_update_time=snap.update_time)
+                    self._call(ref.update, self._out(new), option=option, timeout=CLAIM_TIMEOUT)
+                else:
+                    self._call(ref.create, self._out(new), timeout=CLAIM_TIMEOUT)
+                return True
+            except (exceptions.FailedPrecondition, exceptions.Conflict, exceptions.AlreadyExists):
+                time.sleep(0.2)
+        raise CloudError("%s kept changing; try again" % path)
+
+    def close(self):
+        for watch in self.watches:
+            try:
+                watch.unsubscribe()
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------------------------
+# The account protocol: founding, approving, receiving keys, removing
+# --------------------------------------------------------------------------------------------
+def trust_payload(devices, version):
+    return canonical({"devices": devices, "version": version})
+
+
+def sign_trust(device, devices, version):
+    return {"devices": devices, "version": version, "signer": device.id,
+            "sig": sign(device.private, trust_payload(devices, version))}
+
+
+def wrap_for(device, target_id, target_pub, kid):
+    wrapped = wrap(target_pub, device.keys[kid])
+    sig = sign(device.private, ("%s|%s|%s" % (target_id, kid, wrapped)).encode("ascii"))
+    return wrapped, sig
+
+
+class Account:
+    """The protocol between devices of one account, on top of a store."""
+
+    def __init__(self, store, device):
+        self.store = store
+        self.device = device
+
+    # Joining -------------------------------------------------------------------------------
+    def _free_tag(self, docs):
+        used = {d.get("tag") for i, d in docs if i != self.device.id}
+        letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+        for size in (1, 2, 3):
+            for n in range(len(letters) ** size):
+                tag, k = "", n
+                for _ in range(size):
+                    tag, k = letters[k % len(letters)] + tag, k // len(letters)
+                if tag not in used:
+                    return tag
+        raise CloudError("no free device tag")
+
+    def register(self):
+        """Publish this device's public key. Returns "founded", "ready" or "pending"."""
+        device = self.device
+        trust = self.store.get("meta/trust")
+        if trust is not None and not trust.get("devices"):
+            # The last trusted device left, but the account was not cleared: its reset was cut off,
+            # or it left on crewchat 0.11.0 or older. Clear it now, so that this device founds it.
+            self._reset()
+        docs = self.store.list("devices")
+        if not device.tag:
+            device.tag = self._free_tag(docs)
+            device.save()
+        self.store.set("devices/" + device.id, {
+            "name": device.name, "tag": device.tag, "pub": device.pub, "fp": device.fp,
+            "seen": SERVER_TIME}, merge=True)
+        if self.store.create("meta/account", {"founder": device.id, "created": SERVER_TIME}):
+            self._found()
+            return "founded"
+        self.refresh()
+        return "ready" if device.ready else "pending"
+
+    def _found(self):
+        device = self.device
+        key = os.urandom(32)
+        kid = key_id(key)
+        with device.lock:
+            device.keys[kid] = key
+            device.current = kid
+            entry = {"fp": device.fp, "name": device.name, "tag": device.tag, "pub": device.pub}
+            device.trust = sign_trust(device, {device.id: entry}, 1)
+            device.save()
+        wrapped, sig = wrap_for(device, device.id, device.pub, kid)
+        self.store.set("devices/" + device.id, {"keys": {kid: wrapped}, "key_sigs": {kid: sig},
+                                               "wrapped_by": {kid: device.id}}, merge=True)
+        self.store.set("meta/trust", device.trust)
+        self.store.set("meta/account", {"key_id": kid}, merge=True)
+
+    # Keeping up to date ----------------------------------------------------------------------
+    def accept_trust(self, doc):
+        """Adopt a newer trusted-device list if it is signed by a device this machine trusts.
+
+        A device that trusts nobody yet (it is waiting for approval) accepts the first list that
+        includes its own key and is correctly signed by one of the devices in it. The person
+        confirms that step by comparing fingerprints (see `crewchat cloud status`).
+        """
+        device = self.device
+        if not doc or not isinstance(doc.get("devices"), dict):
+            return False
+        version, signer = int(doc.get("version", 0)), doc.get("signer")
+        with device.lock:
+            mine = device.trust.get("devices", {})
+            if version <= int(device.trust.get("version", 0)):
+                return False
+            if mine:
+                signer_entry = mine.get(signer)
+            else:
+                ours = doc["devices"].get(device.id)
+                if not ours or ours.get("pub", "").strip() != device.pub.strip():
+                    return False
+                signer_entry = doc["devices"].get(signer)
+            if not signer_entry or not verify(signer_entry["pub"], doc.get("sig", ""),
+                                              trust_payload(doc["devices"], version)):
+                return False
+            device.trust = {"devices": doc["devices"], "version": version, "signer": signer,
+                            "sig": doc["sig"]}
+            device.save()
+            return True
+
+    def accept_keys(self, doc):
+        """Take account keys wrapped for this device by a trusted device. True if any were new."""
+        device = self.device
+        new = False
+        if not doc:
+            return False
+        for kid, wrapped in (doc.get("keys") or {}).items():
+            if kid in device.keys:
+                continue
+            by = (doc.get("wrapped_by") or {}).get(kid)
+            entry = device.trusted(by) if by else None
+            sig = (doc.get("key_sigs") or {}).get(kid, "")
+            if not entry or not verify(entry["pub"], sig, ("%s|%s|%s" % (device.id, kid, wrapped)).encode("ascii")):
+                continue
+            try:
+                key = unwrap(device.private, wrapped)
+            except ValueError:
+                continue
+            if key_id(key) != kid:
+                continue
+            with device.lock:
+                device.keys[kid] = key
+                new = True
+        if new:
+            device.save()
+        return new
+
+    def accept_account(self, doc):
+        """Switch to the account key in use, once this device holds it."""
+        device = self.device
+        kid = (doc or {}).get("key_id")
+        if kid and kid in device.keys and kid != device.current:
+            with device.lock:
+                device.current = kid
+                device.save()
+            return True
+        return False
+
+    def refresh(self):
+        self.accept_trust(self.store.get("meta/trust"))
+        self.accept_keys(self.store.get("devices/" + self.device.id))
+        self.accept_account(self.store.get("meta/account"))
+
+    # Changing who is trusted -----------------------------------------------------------------
+    def devices(self):
+        """Every registered device: (id, doc, trusted entry or None)."""
+        return [(i, d, self.device.trusted(i)) for i, d in self.store.list("devices")]
+
+    def find(self, name_or_id):
+        matches = [(i, d) for i, d in self.store.list("devices")
+                   if i == name_or_id or d.get("name") == name_or_id or d.get("tag") == name_or_id]
+        if not matches:
+            raise CloudError("no device called %s; `crewchat cloud devices` lists them" % name_or_id)
+        if len(matches) > 1:
+            raise CloudError("several devices are called %s; use its id from `crewchat cloud devices`" % name_or_id)
+        return matches[0]
+
+    def _change_trust(self, change):
+        """Change the trusted devices and return them as written."""
+        device = self.device
+        written = {}
+
+        def update(current):
+            base = current if current and self._valid_trust(current) else device.trust
+            written["devices"] = change(dict(base.get("devices", {})))
+            return sign_trust(device, written["devices"],
+                              max(int(base.get("version", 0)), int(device.trust.get("version", 0))) + 1)
+
+        if not self.store.transact("meta/trust", update):
+            raise CloudError("could not update the trusted devices")
+        self.accept_trust(self.store.get("meta/trust"))
+        return written["devices"]
+
+    def _valid_trust(self, doc):
+        entry = self.device.trusted(doc.get("signer"))
+        return bool(entry) and verify(entry["pub"], doc.get("sig", ""),
+                                      trust_payload(doc.get("devices", {}), int(doc.get("version", 0))))
+
+    def approve(self, name_or_id, expect_fp=None):
+        device = self.device
+        if not device.ready:
+            raise CloudError("this machine is not approved itself yet")
+        target_id, doc = self.find(name_or_id)
+        pub = doc.get("pub", "")
+        fp = fingerprint(pub) if pub else ""
+        if not pub or fp != doc.get("fp"):
+            raise CloudError("that device's key is damaged; ask it to run `crewchat cloud login` again")
+        if expect_fp is not None and "".join(expect_fp.split()).lower() != fp.replace(" ", ""):
+            raise CloudError("fingerprint mismatch: the device shows %s. Do not approve it if that is "
+                             "not what the new machine displays." % fp)
+        entry = {"fp": fp, "name": doc.get("name", ""), "tag": doc.get("tag", ""), "pub": pub}
+        self._change_trust(lambda devices: dict(devices, **{target_id: entry}))
+        keys, sigs, by = {}, {}, {}
+        for kid in device.keys:
+            keys[kid], sigs[kid] = wrap_for(device, target_id, pub, kid)
+            by[kid] = device.id
+        self.store.set("devices/" + target_id, {"keys": keys, "key_sigs": sigs, "wrapped_by": by}, merge=True)
+        return doc.get("name", target_id)
+
+    def remove(self, name_or_id):
+        """Drop a device and switch everyone else to a new account key it never sees."""
+        device = self.device
+        if not device.ready:
+            raise CloudError("this machine is not approved itself yet")
+        target_id, doc = self.find(name_or_id)
+        left = self._change_trust(lambda devices: {k: v for k, v in devices.items() if k != target_id})
+        self.store.delete("devices/" + target_id)
+        self.store.delete("state/" + target_id)
+        for space, _ in self.store.list("spaces"):
+            self.store.delete("spaces/%s/state/%s" % (space, target_id))
+            self.store.delete("spaces/%s/marks/%s" % (space, target_id))
+        if not left:
+            self._reset()
+        elif target_id != device.id:
+            self.rotate()
+        return doc.get("name", target_id)
+
+    def _reset(self):
+        """The last trusted device left. No one holds the account key any more, so what is left in
+        the cloud can never be read again: clear it, so that the next machine to set up founds the
+        account afresh instead of waiting for an approval no one can give."""
+        for space, _ in self.store.list("spaces"):
+            for collection in SPACE_COLLECTIONS:
+                for doc_id, _ in self.store.list("spaces/%s/%s" % (space, collection)):
+                    self.store.delete("spaces/%s/%s/%s" % (space, collection, doc_id))
+            self.store.delete("spaces/" + space)
+        for collection in COLLECTIONS:
+            for doc_id, _ in self.store.list(collection):
+                self.store.delete("%s/%s" % (collection, doc_id))
+        self.store.delete("meta/trust")
+        self.store.delete("meta/account")
+        self.store.delete("meta/coordinator")
+
+    def rotate(self):
+        device = self.device
+        key = os.urandom(32)
+        kid = key_id(key)
+        with device.lock:
+            device.keys[kid] = key
+            device.save()
+        for other_id, entry in device.trust.get("devices", {}).items():
+            wrapped, sig = wrap_for(device, other_id, entry["pub"], kid)
+            self.store.set("devices/" + other_id, {"keys": {kid: wrapped}, "key_sigs": {kid: sig},
+                                                  "wrapped_by": {kid: device.id}}, merge=True)
+        self.store.set("meta/account", {"key_id": kid}, merge=True)
+        self.accept_account({"key_id": kid})
+
+
+def wire(msg, origin=False):
+    """A message as it travels through the cloud: live (from the machine that wrote it), or in a catch-up from
+    the coordinator, where it keeps the machine it came from."""
+    keys = ("id", "ts", "from", "to", "text", "kind") + (("origin",) if origin else ())
+    payload = {k: msg[k] for k in keys if k in msg}
+    payload.update({k: msg[k] for k in crewchat.EXTRA_FIELDS + ("files",) if msg.get(k) is not None})
+    return payload
+
+
+# --------------------------------------------------------------------------------------------
+# Sync: the Hub on one side, the store on the other
+# --------------------------------------------------------------------------------------------
+class CloudSync(crewchat.ProjectLink):
+    """Plugs into the Hub as hub.sync: publishes what happens here, applies what arrives.
+
+    Projects: the first project's CloudSync is the machine's link (the account, its devices and
+    keys). Every other project has a CloudSync of its own (chat = its name, lower case) in its own
+    space, under the same account key: projects with the same name on the machines are one chat,
+    and a project one machine lacks stays on the other."""
+
+    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None, file_max=CLOUD_FILE_MAX):
+        self._init_projects(hub, chat)
+        self.store = store
+        self.device = device
+        self.account = Account(store, device)
+        self.device_id = device.id
+        self.ttl = ttl_hours * 3600
+        self.file_max = max(1, min(int(file_max), crewchat.MAX_UPLOAD))  # bytes of a shared file that travel
+        self.log = log or (lambda text: sys.stderr.write("%s cloud %s\n" % (crewchat.now_iso(), text)))
+        self.space = space_id(self._root(), chat) if chat is not None else None
+        self.base = "spaces/%s/" % self.space if chat is not None else ""  # where its collections are
+        self.marked = False  # spaces/{space} written, so that a reset finds this project's documents
+        self.marks_sent = (None, 0)  # (synced_to, when) last written to the space's marks/
+        self.outbox = queue.Queue()
+        self.stop_event = threading.Event()
+        self.dirty = threading.Event()
+        self.held = []  # messages whose key has not arrived yet
+        self.state_sig = None
+        self.state_seen_at = 0
+        self.state_sent_at = 0
+        self.online = True
+        self.unsubscribe = []
+        self.marks_file = device.dir / ("sync.json" if chat is None else "sync-%s.json" % self.space)
+        self.marks = read_json(self.marks_file, {"published": 0, "synced_to": 0})
+        self.clock = time.time  # the lease's clock (the tests move it)
+        self.lease = {}  # meta/coordinator as last read
+        self.machine = self  # the machine's link, whose lease says who coordinates (a project's link: set by it)
+        self.catching_up = threading.Lock()  # one catch-up at a time, served or read
+
+    # The coordinator (roadmap Y1) --------------------------------------------------------------
+    def coordinator(self):
+        """Which machine coordinates now: the holder of a lease that has not run out (meta/coordinator)."""
+        doc = self.machine.lease or {}  # a project's link asks the machine's, which holds and follows the lease
+        live = float(doc.get("expires") or 0) > self.clock()
+        names = self._names()
+        return {"name": names.get(doc.get("device"), "") if live else "", "me": live and doc.get("device") == self.device.id,
+                "term": int(doc.get("term") or 0), "preferred": names.get(doc.get("preferred") or "", "")}
+
+    def _names(self):
+        """The approved machines' names, by id, from the account's trust list kept on this machine: no cloud read
+        (the page asks at every poll). Only an approved machine holds the lease or shares a file."""
+        return {i: e.get("name") or i for i, e in self.device.trust.get("devices", {}).items()}
+
+    def renew_lease(self, force=False):
+        """Hold the coordinator's lease, or take it: when this machine holds it, when it has run out, or when
+        this is the owner's preferred machine. A conditional write, so two machines never both take it; the
+        term goes up when it changes hands. Another machine's live lease is left alone."""
+        if not self.device.ready:
+            return self.lease
+        now = self.clock()
+        known = {} if force else (self.lease or {})  # force: the owner just chose this machine (set_preferred)
+        if known.get("device") not in (None, self.device.id) and float(known.get("expires") or 0) > now \
+                and known.get("preferred") != self.device.id:
+            return self.lease  # another machine's live lease, as last read or heard: no write, and no read, until it runs out
+
+        seen = {}
+
+        def update(doc):
+            doc = seen["doc"] = dict(doc or {})  # what the write found, or what it wrote
+            mine = doc.get("device") == self.device.id
+            if mine or float(doc.get("expires") or 0) <= now or doc.get("preferred") == self.device.id:
+                doc.update(device=self.device.id, term=int(doc.get("term") or 0) + (0 if mine else 1),
+                           expires=now + LEASE_SECS)
+                return doc
+            return None
+        try:
+            self.store.transact("meta/coordinator", update)
+            self.lease = seen.get("doc") or {}
+        except Exception as e:  # offline for now: the lease runs out, and someone online takes it
+            self.log("could not renew the coordinator's lease (%s)" % e)
+        return self.lease
+
+    def release_lease(self):
+        """Stopping: let the lease run out now, so another machine takes over at its next renewal."""
+        now = self.clock()
+
+        def update(doc):
+            return dict(doc, expires=now) if doc and doc.get("device") == self.device.id else None
+        try:
+            self.store.transact("meta/coordinator", update)
+        except Exception:
+            pass
+
+    def set_preferred(self, name):
+        """The owner's preferred coordinator (a device's name or id), or none: it takes the lease at its next
+        renewal whenever it is online."""
+        name = str(name or "").strip()
+        device = "" if name.lower() in ("", "none") else self.account.find(name)[0]
+        self.store.transact("meta/coordinator", lambda doc: dict(doc or {}, preferred=device))
+        self.lease = self.renew_lease(force=True) if device == self.device.id else (self.store.get("meta/coordinator") or {})
+        return self.coordinator()
+
+    def _leaser(self):
+        while not self.stop_event.is_set():
+            self.renew_lease()
+            if self.stop_event.wait(LEASE_RENEW):
+                return
+
+    def _all(self):
+        """This link and every project's."""
+        with self.projects_lock:
+            return [self] + list(self.projects.values())
+
+    # Wiring ----------------------------------------------------------------------------------
+    def start(self):
+        if self.chat is None:
+            self.account.refresh()
+        else:
+            adopted = self.hub.adopt_open_tasks(self.device.tag, self.device_id)
+            if not self.marks.get("announced"):  # before the hub is bound: the notice is for this machine
+                self.hub.announce_shared(self.chat, adopted)
+                self.marks["announced"] = True
+                self._save_marks()
+        with self.hub.lock:
+            self.hub.prefix = self.device.tag
+            self.hub.device = self.device.name
+            self.hub.sync = self
+        since = max(time.time() - self.ttl, float(self.marks.get("synced_to", 0)) - 120)
+        self.unsubscribe = [
+            self.store.listen(self.base + "messages", self._on_messages, since=("created", since)),
+            self.store.listen(self.base + "state", self._on_state),
+        ]
+        if self.chat is None:
+            self.unsubscribe += [self.store.listen("devices", self._on_devices),
+                                 self.store.listen("meta", self._on_meta)]
+        self.unsubscribe.append(self.store.listen(self.base + "catchups", self._on_catchups))
+        synced_to = float(self.marks.get("synced_to", 0))
+        if synced_to and time.time() - synced_to > self.ttl:  # away for longer than the cloud keeps messages
+            self.ask_catch_up(synced_to)
+        self._republish()
+        for target in (self._worker, self._ticker) + ((self._leaser,) if self.chat is None else ()):
+            threading.Thread(target=target, daemon=True).start()
+        self.dirty.set()
+        if self.chat is None and not self.device.ready:
+            self.log("waiting for this machine to be approved: on a trusted machine run "
+                     "`crewchat cloud approve %s` (fingerprint %s)" % (self.device.name, self.device.fp))
+        return self
+
+    def stop(self):
+        self.stop_event.set()
+        if self.chat is None:
+            self.release_lease()
+        for unsubscribe in self.unsubscribe:
+            try:
+                unsubscribe()
+            except Exception:
+                pass
+        if self.chat is None:
+            for project in self._all()[1:]:
+                project.stop()
+
+    def stopping(self):
+        return self.stop_event.is_set()
+
+    def link_status(self):
+        return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
+
+    def _project_link(self, hub, name):
+        link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name,
+                         file_max=self.file_max)
+        link.machine = self
+        return link
+
+    def _drop(self, device_id):
+        """Another machine is gone from this project (left it, removed, or no longer trusted)."""
+        self.shared_with.discard(device_id)
+        self.hub.drop_remote(device_id)
+
+    def _save_marks(self):
+        write_private(self.marks_file, json.dumps(self.marks))
+
+    # Hub -> cloud ----------------------------------------------------------------------------
+    def publish(self, msg):
+        """Called by the Hub (with its lock held) for every message written on this machine."""
+        self.outbox.put(dict(msg))
+
+    def state_changed(self):
+        self.dirty.set()
+
+    def _republish(self):
+        """Messages written here that never reached Firestore (offline, or not yet approved)."""
+        with self.hub.lock:
+            backlog = [dict(m) for m in self.hub.messages
+                       if m.get("origin") == self.device_id and m["seq"] > int(self.marks.get("published", 0))]
+        for msg in backlog:
+            self.outbox.put(msg)
+
+    def _seal(self, aad, payload):
+        kid = self.device.current
+        nonce, ct = seal(self.device.keys[kid], aad % kid, payload)
+        return {"dev": self.device_id, "key_id": kid, "nonce": nonce, "ct": ct}
+
+    def _root(self):
+        return getattr(self.store, "root", "users/memory/")
+
+    def _scope(self):
+        """What every sealed document of this project is bound to: the account's folder and the
+        project's space, so a document cannot be moved to another account or project."""
+        return self._root() + self.base
+
+    def _mark_space(self):
+        if self.chat is not None:
+            self.store.set("spaces/" + self.space, {"seen": SERVER_TIME}, merge=True)
+            self.marked = True
+
+    def _send_message(self, msg):
+        if not self.marked:
+            self._mark_space()
+        payload = wire(msg)
+        doc = self._seal("crewchat|%s|msg|%s|%%s|%s" % (self._scope(), msg["id"], self.device_id), payload)
+        doc["created"] = SERVER_TIME
+        self.store.set(self.base + "messages/" + msg["id"], doc)
+        for info in msg.get("files") or []:
+            self._send_file(info)
+        if msg["seq"] > int(self.marks.get("published", 0)):
+            self.marks["published"] = msg["seq"]
+            self._save_marks()
+
+    # Shared files (roadmap Y4) ----------------------------------------------------------------
+    def _file_aad(self, fid, part, by=None):
+        """What a file's piece is bound to: this project, the file, the piece, and the machine that shared it."""
+        return "crewchat|%s|file|%s|%d|%%s|%s" % (self._scope(), fid, part, by or self.device_id)
+
+    def _send_file(self, info):
+        """A file shared with a message written here, into the cloud beside it: encrypted, in FILE_PART pieces,
+        deleted with the messages. Only files up to CLOUD_FILE_MAX; a bigger one stays on this machine."""
+        fid = str(info.get("id") or "")
+        meta, path = self.hub.file(fid)
+        if meta is None or meta["size"] > self.file_max:
+            return
+        data = path.read_bytes()
+        parts = max(1, -(-len(data) // FILE_PART))
+        for n in range(parts):
+            doc = self._seal(self._file_aad(fid, n), {"data": b64(data[n * FILE_PART:(n + 1) * FILE_PART])})
+            doc.update(created=SERVER_TIME, parts=parts)
+            self.store.set(self.base + "files/%s-%d" % (fid, n), doc)
+
+    def fetch_file(self, origin, fid):
+        """The bytes of a file shared on another machine (Hub.open_file), from the cloud: what that machine
+        sealed with the message. A file too big to travel, or gone (delivered and deleted, or past the
+        retention), is on that machine only."""
+        name = self._names().get(origin) or "another machine"
+        first = self.store.get(self.base + "files/%s-0" % fid)
+        if not first or first.get("dev") != origin:
+            raise crewchat.HubError("that file is on %s only: open it there. With cloud sync, %s; and the cloud keeps "
+                                    "files %d hours" % (name, QUOTA_NOTE % crewchat.human_size(self.file_max),
+                                                        self.ttl // 3600))
+        pieces = []
+        try:
+            parts = int(first.get("parts") or 1)
+            if parts > -(-crewchat.MAX_UPLOAD // FILE_PART):
+                raise ValueError("too many parts")
+            for n in range(parts):
+                doc = first if n == 0 else self.store.get(self.base + "files/%s-%d" % (fid, n))
+                if not doc or doc.get("dev") != origin:
+                    raise ValueError("part %d is missing" % n)
+                pieces.append(unb64(self._open(self._file_aad(fid, n, origin), doc)["data"]))
+        except Exception as e:  # missing, tampered with, or sealed with a key this machine lacks
+            raise crewchat.HubError("cannot fetch that file from the cloud (%s); open it on %s" % (e, name))
+        return b"".join(pieces)
+
+    def _send_state(self):
+        rows = self.hub.local_state()
+        signature = json.dumps([{k: v for k, v in r.items() if k != "seen"} for r in rows], sort_keys=True)
+        now = time.time()
+        changed = signature != self.state_sig
+        seen_due = rows and self.shared and now - self.state_seen_at >= SEEN_EVERY  # read only by others
+        heartbeat_due = rows and now - self.state_sent_at >= HEARTBEAT
+        if not (changed or seen_due or heartbeat_due) or now - self.state_sent_at < STATE_DEBOUNCE:
+            return changed  # try again later if something is pending
+        doc = self._seal("crewchat|%s|state|%s|%%s" % (self._scope(), self.device_id),
+                         {"device": self.device.name, "agents": rows})
+        doc["updated"] = SERVER_TIME
+        self.store.set(self.base + "state/" + self.device_id, doc)
+        self.state_sig, self.state_sent_at, self.state_seen_at = signature, now, now
+        return False
+
+    def _worker(self):
+        backoff = 0
+        while not self.stop_event.is_set():
+            try:
+                msg = self.outbox.get(timeout=1)
+            except queue.Empty:
+                msg = None
+            try:
+                if msg is not None:
+                    if not self.device.ready:
+                        self.outbox.put(msg)
+                        time.sleep(2)
+                        continue
+                    self._send_message(msg)
+                if self.device.ready and self.dirty.is_set():
+                    self.dirty.clear()
+                    if self._send_state():
+                        self.dirty.set()
+                if not self.online:
+                    self.online = True
+                    self.log("connected again")
+                backoff = 0
+            except Exception as e:  # offline, or Firestore refused: keep the message and retry
+                if msg is not None:
+                    self.outbox.put(msg)
+                if self.online:
+                    self.online = False
+                    self.log("cannot send, will retry (%s)" % e)
+                backoff = min(60, max(2, backoff * 2))
+                self.stop_event.wait(backoff)
+
+    def _ticker(self):
+        last_housekeeping = 0
+        while True:  # housekeeping at once, so the others count this machine from the start
+            if time.time() - last_housekeeping >= HOUSEKEEPING:
+                last_housekeeping = time.time()
+                try:
+                    self.housekeeping()
+                except Exception as e:
+                    self.log("housekeeping skipped (%s)" % e)
+            if self.stop_event.wait(30):
+                return
+            self.dirty.set()
+
+    def housekeeping(self):
+        """Tell the others how far this machine has read, and delete what everyone has. The first
+        project keeps its marks in devices/; another in its space's marks/, where only the machines
+        that have the project write, so one that lacks it holds nothing back."""
+        marks = "devices" if self.chat is None else self.base + "marks"
+        now = time.time()
+        synced_to = float(self.marks.get("synced_to", 0))
+        if not self.marked:
+            self._mark_space()
+        # A project's marks are written when they move, or every few hours: `seen` only has to be
+        # younger than the retention for this machine to count.
+        if self.chat is None or self.marks_sent[0] != synced_to or now - self.marks_sent[1] > self.ttl / 6:
+            self.store.set(marks + "/" + self.device_id, {"seen": SERVER_TIME, "synced_to": synced_to}, merge=True)
+            self.marks_sent = (synced_to, now)
+        trusted = self.device.trust.get("devices", {})
+        docs = dict(self.store.list(marks))
+        reach = [float(docs[i].get("synced_to") or 0) for i in trusted
+                 if i in docs and now - float(docs[i].get("seen") or 0) < self.ttl]
+        everyone_has = min(reach) if reach else 0
+        for doc_id, doc in self.store.list(self.base + "messages", where=("dev", self.device_id)):
+            created = float(doc.get("created") or now)
+            if created <= everyone_has or now - created > self.ttl:
+                self.store.delete(self.base + "messages/" + doc_id)
+        for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
+            if now - float(doc.get("created") or now) > self.ttl:
+                self.store.delete(self.base + "tasks/" + doc_id)
+        # A file stays for the whole retention, even once every machine has its message: it is fetched only when
+        # someone opens it (Hub.open_file), which may be hours later.
+        for doc_id, doc in self.store.list(self.base + "files", where=("dev", self.device_id)):
+            if now - float(doc.get("created") or now) > self.ttl:
+                self.store.delete(self.base + "files/" + doc_id)
+        # Catch-ups: answer any waiting (the coordinator may have changed), read this machine's own, and drop
+        # parts nobody read within the TTL.
+        self.serve_catch_ups()
+        self.read_catch_up()
+        for doc_id, doc in self.store.list(self.base + "catchup_parts", where=("dev", self.device_id)):
+            if now - float(doc.get("created") or now) > self.ttl:
+                self.store.delete(self.base + "catchup_parts/" + doc_id)
+
+    # Catching up after more than the TTL (roadmap Y3) ------------------------------------------------
+    # The cloud keeps a message until every machine has it, but not longer than the TTL: a machine off for longer
+    # asks (catchups/{id}), and the coordinator, which has every message in its own log, answers with the ones
+    # written since, sealed, in parts that the machine reads and deletes. If every machine was off for longer
+    # than the TTL, those messages are gone: cloud_ttl_hours keeps them longer.
+    def ask_catch_up(self, since):
+        try:
+            start = since - crewchat.CATCHUP_MARGIN  # machines' clocks differ; what it has already is dropped by id
+            self.store.set(self.base + "catchups/" + self.device_id, {"since": since, "after": [start, "", 0], "state": "asked",
+                                                                       "parts": 0, "asked": SERVER_TIME})
+            self.log("away for longer than the cloud keeps messages: asking the coordinator for the ones missed")
+        except Exception as e:  # offline: the next start asks again
+            self.log("could not ask for the messages missed (%s)" % e)
+
+    def _part_aad(self, device_id, n, by):
+        return "crewchat|%s|catchup|%s|%d|%%s|%s" % (self._scope(), device_id, n, by)
+
+    def serve_catch_ups(self):
+        """The coordinator answers the machines that asked: the messages after the point each has read to (by any
+        machine but itself), from this machine's log, oldest first, in sealed parts. Returns how many it sent."""
+        if not (self.device.ready and self.machine.coordinator()["me"]) or not self.catching_up.acquire(blocking=False):
+            return 0
+        sent = 0
+        try:
+            for device_id, doc in self.store.list(self.base + "catchups"):
+                if device_id == self.device_id or doc.get("state") not in ("asked", "read") or \
+                        not self.device.trusted(device_id):
+                    continue
+                after = list(doc.get("after") or [float(doc.get("since") or 0) - crewchat.CATCHUP_MARGIN]) + ["", 0]
+                point = (float(after[0] or 0), str(after[1] or ""), int(after[2] or 0))
+                # The last CATCHUP_DAYS only, through Firestore (its free plan's quota); older messages stay on
+                # the machines that have them. Over Tailscale a machine gets everything.
+                since = max(float(doc.get("since") or 0), time.time() - CATCHUP_DAYS * 86400)
+                since = max(since, point[0])  # a later page starts where the last one stopped
+                missed = [m for m in self.hub.messages_since(since, skip=device_id)
+                          if crewchat.catchup_order(m) > point]
+                parts, part, size = [], [], 0
+                for msg in missed:
+                    payload = wire(msg, origin=True)
+                    n = len(json.dumps(payload))
+                    if part and size + n > CATCHUP_PART_BYTES:
+                        parts.append(part)
+                        part, size = [], 0
+                        if len(parts) == CATCHUP_PARTS:
+                            break
+                    part.append(payload)
+                    size += n
+                if part and len(parts) < CATCHUP_PARTS:
+                    parts.append(part)
+                for n, messages in enumerate(parts):
+                    sealed = self._seal(self._part_aad(device_id, n, self.device_id), {"messages": messages})
+                    sealed.update({"for": device_id, "created": SERVER_TIME})
+                    self.store.set(self.base + "catchup_parts/%s-%d" % (device_id, n), sealed)
+                served = sum(len(p) for p in parts)
+                last = parts[-1][-1] if parts else None
+                self.store.set(self.base + "catchups/" + device_id, {
+                    "state": "ready", "parts": len(parts), "more": served < len(missed), "by": self.device_id,
+                    "after": list(crewchat.catchup_order(last)) if last else after[:3]}, merge=True)
+                sent += served
+        except Exception as e:  # offline, or a part refused: the machine asks on, and this tries again
+            self.log("could not send the messages missed (%s)" % e)
+        finally:
+            self.catching_up.release()
+        return sent
+
+    def read_catch_up(self, doc=None):
+        """This machine's answer, once the coordinator has written it: read every part, oldest first, and delete
+        it; ask for more while there are more. Returns how many messages arrived."""
+        doc = doc if doc is not None else self.store.get(self.base + "catchups/" + self.device_id)
+        if not doc or doc.get("state") != "ready" or not self.catching_up.acquire(blocking=False):
+            return 0
+        got = 0
+        try:
+            for n in range(int(doc.get("parts") or 0)):
+                path = self.base + "catchup_parts/%s-%d" % (self.device_id, n)
+                part = self.store.get(path)
+                if part is None:
+                    continue
+                try:
+                    payload = self._open(self._part_aad(self.device_id, n, doc.get("by", "")), part)
+                except Exception:
+                    self.log("dropped part %d of the messages missed: it does not decrypt" % n)
+                    payload = {}
+                for msg in payload.get("messages") or []:
+                    if isinstance(msg, dict) and msg.get("id"):
+                        try:
+                            got += bool(self.hub.ingest(msg))
+                        except Exception as e:  # skip it, as a live message would be
+                            self.log("skipped message %s (%s: %s)" % (msg.get("id"), type(e).__name__, e))
+                self.store.delete(path)
+            if doc.get("more"):
+                self.store.set(self.base + "catchups/" + self.device_id, {"state": "read"}, merge=True)
+            else:
+                self.store.delete(self.base + "catchups/" + self.device_id)
+                self.marks["synced_to"] = max(float(self.marks.get("synced_to", 0)), float(doc.get("asked") or 0))
+                self._save_marks()
+            if got:
+                self.log("caught up on %d messages missed while away" % got)
+        except Exception as e:  # offline: the next look reads on
+            self.log("could not read the messages missed (%s)" % e)
+        finally:
+            self.catching_up.release()
+        return got
+
+    def _on_catchups(self, changes):
+        for kind, device_id, doc in changes:
+            if kind == "removed":
+                continue
+            if device_id == self.device_id:
+                work = lambda d=doc: self.read_catch_up(d)  # noqa: E731
+            elif doc.get("state") in ("asked", "read"):
+                work = self.serve_catch_ups
+            else:
+                continue
+            threading.Thread(target=work, daemon=True).start()  # never in the listener's own thread
+
+    # Tasks -------------------------------------------------------------------------------------
+    def claim_task(self, task_id, agent, key=None):
+        """Settle who takes a task, across machines: the first create of tasks/{key} wins (the key is
+        the task's id, or a new one each time it was given back)."""
+        if not self.device.ready:
+            raise crewchat.HubError("this machine is not approved for cloud sync yet")
+        task_id = key or task_id
+        aad = "crewchat|%s|task|%s|%%s" % (self._scope(), task_id)
+        try:
+            doc = self._seal(aad, {"agent": agent})
+            doc["created"] = SERVER_TIME
+            if self.store.create(self.base + "tasks/" + task_id, doc):
+                return agent
+            existing = self.store.get(self.base + "tasks/" + task_id)
+        except Exception as e:
+            raise crewchat.HubError("cannot take a task while this machine cannot reach the cloud (%s)" % e)
+        try:
+            return str(self._open(aad, existing)["agent"])
+        except Exception:
+            raise crewchat.HubError("task #%s was taken on a machine this one cannot read yet" % task_id)
+
+    def _open(self, aad, doc):
+        kid = doc.get("key_id", "")
+        if kid not in self.device.keys:
+            raise KeyError(kid)
+        return unseal(self.device.keys[kid], aad % kid, doc["nonce"], doc["ct"])
+
+    # Cloud -> hub ------------------------------------------------------------------------------
+    def _on_messages(self, changes):
+        for kind, doc_id, doc in changes:
+            if kind == "removed":
+                continue
+            created = float(doc.get("created") or 0)
+            if doc.get("dev") != self.device_id:
+                aad = "crewchat|%s|msg|%s|%%s|%s" % (self._scope(), doc_id, doc.get("dev"))
+                try:
+                    payload = self._open(aad, doc)
+                except KeyError:
+                    self.held.append((doc_id, doc))  # its key is still on its way
+                    continue
+                except Exception:
+                    self.log("dropped message %s: it does not decrypt (tampered, or from an untrusted device)" % doc_id)
+                    continue
+                if payload.get("id") != doc_id:
+                    self.log("dropped message %s: its content does not match its name" % doc_id)
+                    continue
+                payload["origin"] = doc.get("dev", "")
+                try:
+                    self.hub.ingest(payload)
+                except Exception as e:  # skip it, so one message cannot stop the rest of the batch
+                    self.log("skipped message %s (%s: %s)" % (doc_id, type(e).__name__, e))
+            if created > float(self.marks.get("synced_to", 0)):
+                self.marks["synced_to"] = created
+                self._save_marks()
+
+    def _retry_held(self):
+        held, self.held = self.held, []
+        if held:
+            self._on_messages([("added", i, d) for i, d in held])
+
+    def _on_state(self, changes):
+        for kind, device_id, doc in changes:
+            if device_id == self.device_id:
+                continue
+            if kind == "removed" or not self.device.trusted(device_id):
+                self._drop(device_id)
+                continue
+            try:
+                payload = self._open("crewchat|%s|state|%s|%%s" % (self._scope(), device_id), doc)
+            except Exception:
+                continue
+            if device_id not in self.shared_with:
+                self.shared_with.add(device_id)
+                self.dirty.set()  # a machine just joined this project: tell it who is here now
+            self.hub.set_remote(device_id, payload.get("device", ""), payload.get("agents", []),
+                                doc.get("updated") or time.time())
+
+    def _on_devices(self, changes):
+        for kind, device_id, doc in changes:
+            if device_id == self.device_id and kind != "removed":
+                if self.account.accept_keys(doc):
+                    self.account.accept_account(self.store.get("meta/account"))
+                    self._after_keys()
+            elif kind == "removed":
+                for sync in self._all():
+                    sync._drop(device_id)
+
+    def _on_meta(self, changes):
+        for kind, doc_id, doc in changes:
+            if doc_id == "trust" and self.account.accept_trust(doc):
+                # Keys may have arrived before the approval did, when they could not be checked yet.
+                self.account.refresh()
+                self._after_keys()
+                trusted = self.device.trust.get("devices", {})
+                for sync in self._all():
+                    for device_id in list(sync.hub.remote):
+                        if device_id not in trusted:
+                            sync._drop(device_id)
+                if self.device.id not in trusted and self.device.keys:
+                    self.log("this machine was removed from the account; cloud sync stops")
+                    self.stop()
+            elif doc_id == "account" and self.account.accept_account(doc):
+                self._after_keys()
+            elif doc_id == "coordinator":
+                self.lease = doc or {}
+
+    def _after_keys(self):
+        if self.device.ready:
+            self.log("approved: syncing with the other machines")
+            for sync in self._all():
+                sync._retry_held()
+                sync.dirty.set()
+
+
+# --------------------------------------------------------------------------------------------
+# Signing in with Google
+# --------------------------------------------------------------------------------------------
+def post(url, data, as_json=False):
+    body = json.dumps(data).encode() if as_json else urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "application/json" if as_json else "application/x-www-form-urlencoded"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode()[:300]
+        raise CloudError("sign-in failed at %s (HTTP %d): %s" % (url.split("?")[0], e.code, detail))
+    except (urllib.error.URLError, OSError) as e:
+        raise CloudError("cannot reach Google (%s)" % getattr(e, "reason", e))
+
+
+class Auth:
+    """The Firebase sign-in for this machine, renewed as needed."""
+
+    def __init__(self, root=None):
+        self.dir = cloud_dir(root)
+        self.config = read_json(self.dir / "firebase.json")
+        if not self.config:
+            raise CloudError("cloud sync is not set up here; run `crewchat cloud setup` (see docs/firebase-setup.md)")
+        self.project = self.config["projectId"]
+        self.data = read_json(self.dir / "auth.json") or {}
+        self.lock = threading.Lock()
+
+    @property
+    def signed_in(self):
+        return bool(self.data.get("refresh_token"))
+
+    @property
+    def uid(self):
+        return self.data.get("uid", "")
+
+    @property
+    def email(self):
+        return self.data.get("email", "")
+
+    def fresh(self):
+        return self.data.get("expires", 0) - time.time() > 300
+
+    def id_token(self):
+        with self.lock:
+            if not self.signed_in:
+                raise CloudError("not signed in; run `crewchat cloud login`")
+            if not self.fresh():
+                out = post("https://securetoken.googleapis.com/v1/token?key=" + self.config["apiKey"],
+                           {"grant_type": "refresh_token", "refresh_token": self.data["refresh_token"]})
+                self.data.update(id_token=out["id_token"], refresh_token=out["refresh_token"],
+                                 expires=time.time() + int(out["expires_in"]))
+                write_private(self.dir / "auth.json", json.dumps(self.data))
+            return self.data["id_token"]
+
+    def login(self, timeout=300):
+        """Google sign-in in the browser (OAuth for desktop apps, with PKCE), then Firebase."""
+        client = self.config.get("oauth") or {}
+        if not client.get("client_id"):
+            raise CloudError("the setup has no OAuth client; run `crewchat cloud setup` again with --oauth-client")
+        verifier = secrets.token_urlsafe(48)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        state = secrets.token_urlsafe(16)
+        got = {}
+
+        class Callback(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                if query.get("state", [""])[0] == state:
+                    got.update(code=query.get("code", [""])[0], error=query.get("error", [""])[0])
+                page = b"<h3>crewchat: you are signed in. You can close this tab.</h3>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+
+        server = HTTPServer(("127.0.0.1", 0), Callback)
+        redirect = "http://127.0.0.1:%d" % server.server_address[1]
+        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+            "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",
+            "scope": "openid email", "state": state, "code_challenge": challenge,
+            "code_challenge_method": "S256", "prompt": "select_account"})
+        print("Opening your browser to sign in with Google. If it does not open, visit:\n  %s" % url, flush=True)
+        webbrowser.open(url)
+        deadline = time.time() + timeout
+        server.timeout = 5
+        while "code" not in got and time.time() < deadline:
+            server.handle_request()
+        server.server_close()
+        if not got.get("code"):
+            raise CloudError("sign-in did not finish (%s)" % (got.get("error") or "timed out"))
+        google = post("https://oauth2.googleapis.com/token", {
+            "code": got["code"], "client_id": client["client_id"], "client_secret": client.get("client_secret", ""),
+            "redirect_uri": redirect, "grant_type": "authorization_code", "code_verifier": verifier})
+        firebase = post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=" + self.config["apiKey"], {
+            "postBody": "id_token=%s&providerId=google.com" % google["id_token"],
+            "requestUri": "http://localhost", "returnSecureToken": True}, as_json=True)
+        self.data = {"uid": firebase["localId"], "email": firebase.get("email", ""),
+                     "id_token": firebase["idToken"], "refresh_token": firebase["refreshToken"],
+                     "expires": time.time() + int(firebase["expiresIn"])}
+        write_private(self.dir / "auth.json", json.dumps(self.data))
+
+
+def load_firestore():
+    """Import Google's Firestore library, or raise CloudError saying why it cannot be loaded."""
+    try:
+        import asyncio  # noqa: F401  first: if it cannot load, Firestore's import hides why behind a NameError
+        import google.cloud.firestore  # noqa: F401
+    except Exception as e:  # a blocked DLL can also surface as a NameError from a half-loaded module
+        raise CloudError(firestore_import_error(e))
+
+
+def firestore_store(root=None):
+    load_firestore()
+    need_crypto()
+    auth = Auth(root)
+    if not auth.signed_in:
+        raise CloudError("not signed in; run `crewchat cloud login`")
+    return FirestoreStore(auth), auth
+
+
+def firestore_import_error(e):
+    if isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] == "google":
+        return "cloud sync needs Google's Firestore library, " + NOT_INSTALLED
+    if "Application Control" in str(e):
+        return ("Windows Smart App Control blocked a file of this Python (%s). It refuses the unsigned Python "
+                "that uv installs: install Python 3.12 from python.org (winget install -e --id Python.Python.3.12), "
+                "then run: uv tool install --reinstall --python-preference only-system --python 3.12 "
+                "\"crewchat[cloud]\"" % e)
+    return "cloud sync could not load Google's Firestore library (%s)" % e
+
+
+# --------------------------------------------------------------------------------------------
+# Called by crewchat.py
+# --------------------------------------------------------------------------------------------
+def configured(root=None):
+    folder = cloud_dir(root)
+    return (folder / "firebase.json").exists() and (folder / "auth.json").exists() and (folder / "device.json").exists()
+
+
+def start(hub, root=None, ttl_hours=None):
+    """Start syncing this server's hub. Returns the CloudSync, or raises CloudError."""
+    store, auth = firestore_store(root)
+    device = Device(root)
+    if not device.exists:
+        raise CloudError("this machine has no cloud identity; run `crewchat cloud login`")
+    config = crewchat.load_config(root)
+    ttl = ttl_hours or float(config.get("cloud_ttl_hours", TTL_HOURS))
+    try:
+        file_max = int(float(config.get("cloud_file_mb", CLOUD_FILE_MAX / 1048576)) * 1048576)
+    except (TypeError, ValueError):
+        file_max = CLOUD_FILE_MAX
+    sync = CloudSync(hub, store, device, ttl_hours=ttl, file_max=file_max)
+    sync.start()
+    sys.stderr.write("%s cloud sync on as %s (device %s, tag %s), account %s\n" % (
+        crewchat.now_iso(), auth.email, device.name, device.tag, "ready" if device.ready else "waiting for approval"))
+    return sync
+
+
+RULES = """rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Each Google account reads and writes only its own crewchat data.
+    function owner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    // Writes stay small, so one account cannot fill the project.
+    function small() {
+      return request.resource.data.keys().size() <= 16
+        && (!('ct' in request.resource.data) || request.resource.data.ct.size() <= 60000)
+        && (!('pub' in request.resource.data) || request.resource.data.pub.size() <= 2000);
+    }
+    match /users/{uid}/{document=**} {
+      allow read, delete: if owner(uid);
+      allow create, update: if owner(uid) && small();
+    }
+  }
+}
+"""
+
+
+def cmd_cloud(args):
+    try:
+        _cmd_cloud(args)
+    except CloudError as e:
+        crewchat.die(str(e))
+
+
+def _cmd_cloud(args):
+    root = crewchat.home()
+    folder = cloud_dir(root)
+    action = args.action
+    if action in ("setup", "login") and (root / "config.json").exists() and crewchat.load_config(root).get("peers"):
+        raise CloudError("this machine is linked over Tailscale (`crewchat peers status`); a machine syncs one "
+                         "way. Leave first with `crewchat peers leave`")
+    if action == "rules":
+        print(RULES, end="")
+        return
+    if action == "setup":
+        web = read_json(args.web_config) if args.web_config else {}
+        if args.web_config and not web:
+            raise CloudError("%s is not a readable JSON file" % args.web_config)
+        project = args.project_id or web.get("projectId")
+        api_key = args.api_key or web.get("apiKey")
+        oauth = {}
+        if args.oauth_client:
+            data = read_json(args.oauth_client)
+            if not data:
+                raise CloudError("%s is not a readable JSON file" % args.oauth_client)
+            data = data.get("installed") or data.get("web") or data
+            oauth = {"client_id": data.get("client_id", ""), "client_secret": data.get("client_secret", "")}
+        if args.client_id:
+            oauth = {"client_id": args.client_id, "client_secret": args.client_secret or ""}
+        if not (project and api_key and oauth.get("client_id")):
+            raise CloudError("need the Firebase project id, its web API key and a Desktop OAuth client: see "
+                             "docs/firebase-setup.md")
+        write_private(folder / "firebase.json", json.dumps(
+            {"projectId": project, "apiKey": api_key, "oauth": oauth}, indent=2))
+        print("Cloud sync is set up for Firebase project %s. Next: crewchat cloud login" % project)
+        return
+    if action == "login":
+        need_crypto()
+        auth = Auth(root)
+        if not auth.signed_in or args.again:
+            auth.login()
+        print("Signed in as %s." % auth.email)
+        store, auth = firestore_store(root)
+        device = Device(root)
+        if not device.exists:
+            names = {d.get("name") for _, d in store.list("devices")}
+            name = crewchat.place_label(args.device or crewchat.socket.gethostname())
+            base, number = name, 2
+            while name in names:
+                name, number = "%s-%d" % (base[:13], number), number + 1
+            device.create(name)
+        result = Account(store, device).register()
+        config = crewchat.load_config(root)
+        config["cloud"] = True
+        crewchat.save_config(config, root)
+        print("This machine is device \"%s\" (tag %s). Its fingerprint: %s" % (device.name, device.tag, device.fp))
+        if result == "founded":
+            print("It is the first device on this account, so it holds the account key.")
+        elif result == "ready":
+            print("It is approved and ready.")
+        else:
+            print()
+            print("Before it can read or send anything, approve it from a machine that is already set up:")
+            print("  crewchat cloud approve %s" % device.name)
+            print("That command shows a fingerprint: it must be %s." % device.fp)
+        print()
+        print("Restart the server so it starts syncing: crewchat service restart (or crewchat serve).")
+        return
+    store, auth = firestore_store(root)
+    device = Device(root)
+    account = Account(store, device)
+    if action == "status":
+        account.refresh()
+        print("Signed in as %s (Firebase project %s)." % (auth.email, auth.project))
+        if not device.exists:
+            print("This machine has no device identity yet: crewchat cloud login")
+            return
+        print("This machine: \"%s\", tag %s, fingerprint %s" % (device.name, device.tag, device.fp))
+        if device.ready:
+            print("Approved. Trusted devices: %d. Account key %s." % (len(device.trust["devices"]), device.current[:8]))
+            signer = device.trust.get("devices", {}).get(device.trust.get("signer"), {})
+            if signer and device.trust.get("signer") != device.id:
+                print("Last change to the trusted list was signed by \"%s\", fingerprint %s." % (
+                    signer.get("name"), signer.get("fp")))
+        else:
+            print("Waiting for approval: on a trusted machine run `crewchat cloud approve %s`." % device.name)
+        return
+    if action == "devices":
+        account.refresh()
+        for device_id, doc, trusted in sorted(account.devices(), key=lambda x: x[1].get("tag", "")):
+            mark = " (this machine)" if device_id == device.id else ""
+            state = "trusted" if trusted else "WAITING FOR APPROVAL"
+            seen = crewchat.now_iso(doc["seen"]) if doc.get("seen") else "never"
+            print("%-3s %-18s %-22s fingerprint %s; last seen %s%s" % (
+                doc.get("tag", "?"), doc.get("name", device_id), state, doc.get("fp", "?"), seen, mark))
+        return
+    if action == "approve":
+        account.refresh()
+        if not args.name:
+            raise CloudError("usage: crewchat cloud approve DEVICE")
+        target_id, doc = account.find(args.name)
+        if device.trusted(target_id):
+            print("%s is already trusted." % doc.get("name"))
+            return
+        fp = doc.get("fp", "")
+        expect = args.fingerprint
+        if expect is None:
+            if not sys.stdin.isatty():
+                raise CloudError("pass --fingerprint with what the new machine shows (from `crewchat cloud status` there)")
+            print("Device \"%s\" shows the fingerprint:\n  %s" % (doc.get("name"), fp))
+            answer = input("Does the new machine show exactly this? Type yes to approve: ").strip().lower()
+            if answer != "yes":
+                print("Not approved.")
+                return
+            expect = fp
+        name = account.approve(target_id, expect_fp=expect)
+        print("Approved %s. It receives the account key and starts syncing within a few seconds." % name)
+        return
+    if action == "remove":
+        account.refresh()
+        if not args.name:
+            raise CloudError("usage: crewchat cloud remove DEVICE")
+        name = account.remove(args.name)
+        if device.trust.get("devices"):
+            print("Removed %s and switched the others to a new account key it never sees." % name)
+        else:
+            print("Removed %s, the last machine on the account, and cleared the account's data from the cloud." % name)
+        return
+    if action == "logout":
+        if device.ready:
+            try:
+                account.remove(device.id)
+            except CloudError:
+                pass
+        for name in ("auth.json", "device.json", "device_key.pem", "keys.json", "trust.json", "sync.json"):
+            try:
+                (folder / name).unlink()
+            except OSError:
+                pass
+        config = crewchat.load_config(root)
+        config["cloud"] = False
+        crewchat.save_config(config, root)
+        print("Signed out and removed this machine's cloud identity. Restart the server.")
+        return
+    raise CloudError("unknown action %s" % action)
+
+
+def add_parser(sub):
+    p = sub.add_parser("cloud", help="sync with other machines on the same Google account (Firestore)",
+                       description="Cloud sync: each machine runs its own crewchat; machines signed in to "
+                       "the same Google account share one chat through your own Firebase project. "
+                       "Setup: docs/firebase-setup.md")
+    p.add_argument("action", choices=["setup", "login", "status", "devices", "approve", "remove", "logout", "rules"])
+    p.add_argument("name", nargs="?", help="device, for approve and remove")
+    p.add_argument("--web-config", help="setup: file with the Firebase web app config (projectId, apiKey)")
+    p.add_argument("--oauth-client", help="setup: the Desktop OAuth client JSON downloaded from Google Cloud")
+    p.add_argument("--project-id")
+    p.add_argument("--api-key")
+    p.add_argument("--client-id")
+    p.add_argument("--client-secret")
+    p.add_argument("--device", help="login: this machine's device name (default: its host name)")
+    p.add_argument("--again", action="store_true", help="login: sign in again even if signed in")
+    p.add_argument("--fingerprint", help="approve: the fingerprint the new machine shows")
+    p.set_defaults(fn=cmd_cloud)

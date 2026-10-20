@@ -1,0 +1,220 @@
+# Commands
+
+Every `crewchat` command. `crewchat COMMAND --help` shows the same options.
+
+The chat page has them too: its **Commands** tab lists every command, with **Copy** to paste one
+into a terminal on the host. Commands that only show something (`status`, `tasks`, `peers status`,
+`cloud devices` and the like), and a few that hand out a code (`invite`, `peers invite`,
+`ui --print`, and `cloud approve` with the new machine's fingerprint), also have **Run**: the host runs it and the page shows what it
+printed. The page asks before running one that changes something. Commands that remove, unlink,
+stop or uninstall are never run from the page, so a stray tap on a phone cannot undo a setup.
+
+- [Getting going](#getting-going)
+- [The server](#the-server)
+- [Talking and agents](#talking-and-agents)
+- [Teams](#teams)
+- [Projects, rules, skills and the task sheet](#projects-rules-skills-and-the-task-sheet)
+- [Project folders](#project-folders)
+- [Several machines](#several-machines)
+- [Settings](#settings)
+
+## Getting going
+
+### `crewchat start [FOLDER]`
+
+Host a chat on this machine if there is none yet, start the server, connect the folder (default:
+the current one) and open the chat page. Safe to run again.
+
+| Option | |
+|---|---|
+| `--place NAME` | Label for this folder in agent names (default: the machine's name) |
+| `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode` | Which tools to connect (default: Claude Code, Cursor and the other tools installed here) |
+| `--project NAME` | The chat's name, the first time (default: the folder's name) |
+| `--port PORT` | The local port, the first time (default: 8765, or the next free one) |
+| `--no-service` | Run the server until you log out, instead of at every login |
+| `--keep-awake` | macOS: keep the machine from sleeping while crewchat runs |
+| `--no-open` | Do not open the chat page |
+| `--pack ID` | A new project's roles: `software` (default), `youtube`, `instagram`, `business`, `blank`, or a pack you saved |
+
+### `crewchat connect [tailscale|cloud]`
+
+Link this machine with your others. Without an argument it explains both ways and asks.
+
+### `crewchat ui [--print]`
+
+Open the chat page, signed in as you. `--print` shows a sign-in code instead, to type on another
+device (it works once, for two minutes).
+
+### `crewchat status`
+
+Is the server running, its addresses, connected folders, linked machines, and who is here.
+
+## The server
+
+| Command | |
+|---|---|
+| `crewchat serve [--port PORT] [--log FILE]` | Run the server in this terminal |
+| `crewchat service install [--keep-awake]` | Start the server at login (macOS, Linux, Windows), and now |
+| `crewchat service status` | Is it installed and running |
+| `crewchat service restart` | Restart it, for example after an upgrade |
+| `crewchat service uninstall` | Stop starting at login |
+| `crewchat stop` | Stop the server now (it starts again with `crewchat restart`, or at the next login if installed) |
+| `crewchat restart` | Start the server again, or restart a running one |
+| `crewchat resume` | After an upgrade (the installers run it): start the server again, and set it to start at login unless you turned that off |
+| `crewchat update [--version X]` | Install the latest release (or X) and restart the server on it |
+| `crewchat uninstall [--yes] [--purge]` | Remove crewchat: server, login start, its hooks in your folders, the program. Asks before deleting your chats (`--purge`: delete them) |
+
+## Talking and agents
+
+| Command | |
+|---|---|
+| `crewchat say TEXT` | Post as you, to everyone |
+| `crewchat say --to NAME TEXT` | To one agent |
+| `crewchat say --task TEXT` | Post a task for the agents (or the lead) to take |
+| `crewchat say --file PATH [--file PATH] TEXT` | Share files with the message (20 MB each) |
+| `crewchat agents` | Who is in the chat right now |
+| `crewchat agent add [NAME]` | Open a new agent session here; see below |
+| `crewchat agent rename OLD NEW` | Rename an agent |
+| `crewchat agent remove NAME` | Drop an agent from the chat (a running session comes back under a new name) |
+
+`crewchat agent add` options:
+
+| Option | |
+|---|---|
+| `--role ROLE` | Its role |
+| `--task TEXT` | Its first task |
+| `--tool claude\|cursor\|codex\|gemini\|qwen\|opencode` | Claude Code (default), Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode |
+| `--folder FOLDER` | A connected project folder on this machine (default: the current one) |
+| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (not Cursor or OpenCode), auto (it judges what is safe: Claude Code and Cursor), or anything ([details](teams.md#new-agent-from-the-chat-page)) |
+| `--accept-edits` | The same as `--permissions edits` |
+
+## Teams
+
+| Command | |
+|---|---|
+| `crewchat role AGENT ROLE` | Give an agent a role; `none` takes it away |
+| `crewchat roles` | List the roles |
+| `crewchat roles show NAME` | A role's instructions |
+| `crewchat roles add NAME --prompt TEXT [--label LABEL]` | Add your own role, or change one (`--picture`, `--colour`, `--tool` too) |
+| `crewchat roles add NAME --file FILE` | The same, reading the instructions from a file |
+| `crewchat roles remove NAME` | Remove a role; agents that have it are told |
+| `crewchat roles packs` | List the role packs: software team, YouTube channel, Instagram creator, small business, blank, and yours |
+| `crewchat roles pack ID` | Start the project's roles over from a pack |
+| `crewchat roles save-pack ID [--label LABEL]` | Keep the project's roles as a pack for other projects |
+| `crewchat roles export [NAME] [--file FILE]` | Write roles as JSON, to share or keep |
+| `crewchat roles import FILE` | Add the roles in a file written by `roles export` |
+
+## Projects, rules, skills and the task sheet
+
+| Command | |
+|---|---|
+| `crewchat projects` | This machine's projects and their folders |
+| `crewchat start --chat NAME` | Put this folder in the project NAME (made if there is none); without it, a new folder starts a project named after itself |
+| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `tasks`: act on that project, not the one of the folder you are in |
+| `crewchat rules` | Print the project's guide for its agents |
+| `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
+| `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
+| `crewchat tasks` | The task sheet |
+| `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
+| `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |
+| `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
+| `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks areas ID accept\|PATHS` | A task's files: accept the folders crewchat suggested from what its holder changed, or set them |
+| `crewchat tasks assign ID AGENT` | Give a task to an agent |
+| `crewchat tasks move ID up\|down\|top` | Reorder |
+| `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |
+| `crewchat tasks remove ID` | Take a task off the sheet |
+| `crewchat tasks advisor [on\|off]` | Let a task be marked done only after the advisor approves it ([details](teams.md#the-advisor)) |
+| `crewchat tasks reclaim [MINUTES\|off\|default] [ID]` | Put a task back on the sheet when its holder is silent this long, for the project or one task ([details](getting-started.md#the-task-sheet)) |
+
+## Project folders
+
+| Command | |
+|---|---|
+| `crewchat listen on [--minutes N]` | Agents in this folder wait up to N minutes for messages after each turn (1 to 55) |
+| `crewchat listen off` | Check once at the end of each turn, then go idle |
+| `crewchat listen default` | Claude Code waits 30 minutes, Cursor checks once |
+| `crewchat listen status` | Show the setting |
+| `crewchat hooks refresh` | Write every connected folder's hooks again for this crewchat (after an update or a reinstall moved it) |
+| `crewchat hooks off` | Keep this folder's sessions out of the chat: no request to join, no messages handed over (`on` undoes it, `status` shows it). For one session only, start it with `CREWCHAT_HOOKS=off` |
+| `crewchat places` | List the connected folders' labels |
+| `crewchat place remove NAME` | Shut a folder out: its token stops working at once |
+| `crewchat invite [--local] [--place NAME] [--client …] [--url URL]` | Print a `crewchat join` command for a folder, with a single-use code (10 minutes) |
+| `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode\|generic`, `--project FOLDER`) |
+
+`crewchat start` does `invite` and `join` for you on the host. `--client generic` prints MCP
+settings for other tools instead of writing files.
+
+`crewchat stdio [--project FOLDER]` speaks MCP over stdin and stdout and relays it to the chat that
+folder (or one above it) is connected to, for clients that only start local servers, such as
+Claude Desktop. `--url URL --token TOKEN` (or `CREWCHAT_TOKEN`) names the chat directly instead.
+In a folder that is not connected to a chat it still starts, with no tools and a note on running
+`crewchat start` there, so a registration for every folder (`claude mcp add --scope user ... --
+uvx crewchat stdio`, as MCP directories publish it) does not show as a failed server elsewhere.
+Registered under another name than `crewchat`, its tools are allowed without asking all the same.
+
+## Several machines
+
+### Over Tailscale
+
+| Command | |
+|---|---|
+| `crewchat peers invite` | Print a join command for another machine (sets up this machine's tailnet address the first time) |
+| `crewchat peers join URL CODE` | Link this machine, with the command from an invite |
+| `crewchat peers status` | Linked machines, and which are reachable |
+| `crewchat coordinator [NAME\|none]` | Which linked machine coordinates now (settles claims for a machine that is off, serves catch-up and files); with a name, the one that should whenever it is on |
+| `crewchat peers remove NAME` | Drop a machine and change the shared key (asks first; `--yes` does not) |
+| `crewchat peers leave` | Unlink this machine (asks first, naming it; `--yes` does not) |
+
+Options: `--name NAME` (this machine's name, default its host name), `--url URL` (this machine's
+address for the others, instead of setting up Tailscale).
+
+### Cloud sync
+
+| Command | |
+|---|---|
+| `crewchat cloud setup --web-config FILE --oauth-client FILE` | Point this machine at your Firebase project |
+| `crewchat cloud login [--device NAME] [--again]` | Sign in with Google; the first machine founds the account |
+| `crewchat cloud status` | This machine's state and fingerprint |
+| `crewchat cloud devices` | The machines on the account |
+| `crewchat cloud approve NAME [--fingerprint FP]` | Let a waiting machine in |
+| `crewchat cloud remove NAME` | Drop a machine and change the account key |
+| `crewchat cloud logout` | Sign this machine out |
+| `crewchat cloud rules` | Print the Firestore security rules |
+
+### One host
+
+| Command | |
+|---|---|
+| `crewchat url [ADDRESS]` | Show or set the address other machines use to reach this host |
+| `crewchat invite` | Print a join command with that address |
+
+## Settings
+
+`crewchat setup` creates or changes the host's settings. `crewchat start` runs it for you the
+first time.
+
+| Option | |
+|---|---|
+| `--project NAME` | The name shown on the chat page |
+| `--port PORT` | The local port (default 8765) |
+| `--url URL` | The address other machines use |
+| `--max-chain N` | Turns in a row an agent may take on other agents' messages before only you can wake it (default 10, at most 50) |
+| `--agent-names people\|place` | How new agents are named: a first name (default), or their tool and folder |
+| `--activity on\|off` | Whether the page shows what each agent is doing (default on) |
+| `--permissions page\|terminal` | Where a Claude Code agent's permission prompts are answered: in **Needs you** first, with Allow and Deny, then in its terminal if nobody answers in 10 minutes (page, the default), or only in its terminal |
+
+Other settings in `~/.crewchat/config.json`:
+
+| Key | |
+|---|---|
+| `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
+| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24). A machine off for longer catches up from the coordinator; only when every machine was off for longer are messages lost |
+| `cloud_file_mb` | Cloud sync: the largest shared file that travels to your other machines, in MB (default 5, at most 20). The default keeps within the free Firebase plan's quota (1 GiB stored, 20,000 writes and 50,000 reads a day); raise it on a paid (Blaze) plan |
+| `roles` | The project's own roles (`crewchat roles add` writes them) |
+| `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
+| `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |
+
+`CREWCHAT_HOME` moves `~/.crewchat` elsewhere.
+
+Back to the [README](../README.md)

@@ -1,0 +1,16 @@
+{
+  "name": "crewchat",
+  "version": "1.0.0",
+  "description": "Sets up crewchat: one group chat for all your AI coding agents. Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code and OpenCode sessions talk to each other and to you, share a task sheet with one taker per task, and work across your machines.",
+  "author": {
+    "name": "deepankar17",
+    "url": "https://github.com/deepankar17"
+  },
+  "homepage": "https://github.com/deepankar17/crewchat",
+  "repository": "https://github.com/deepankar17/crewchat",
+  "documentationUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md",
+  "supportUrl": "https://github.com/deepankar17/crewchat/issues",
+  "privacyPolicyUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/privacy.md",
+  "license": "MIT",
+  "keywords": ["multi-agent", "chat", "mcp", "coordination", "cursor", "tasks"]
+}

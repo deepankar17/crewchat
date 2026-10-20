@@ -1,0 +1,138 @@
+name: new user
+
+# The install commands exactly as the README gives them, run on fresh machines against what is
+# published (raw.githubusercontent.com and the release), then a first `crewchat start`.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  schedule:
+    - cron: "17 6 * * 1"  # weekly: each run downloads the release from 5 machines, and GitHub counts them
+
+jobs:
+  # release-assets.yml attaches the release's package just after it is published: wait for it.
+  # Each job below waits for its own PyPI server, which may lag the one this runner reaches.
+  package:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - run: |
+          for i in $(seq 60); do
+            gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -q '\.whl$' && exit 0
+            sleep 10
+          done
+          echo "$TAG has no package after 10 minutes"; exit 1
+
+  windows:
+    needs: package
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh, cmd]  # where the user types the command
+    runs-on: windows-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      # Right after a release, the PyPI server this runner reaches may still serve the one before:
+      # wait until it lists this one, so the README's commands below get it the first time. The
+      # Accept header is uv's own, so the answer is the copy uv will be given.
+      - name: Wait for this runner's PyPI to list the release
+        if: github.event_name == 'release'
+        shell: powershell
+        run: |
+          $want = $env:TAG.TrimStart('v')
+          for ($i = 0; $i -lt 60; $i++) {
+            try {
+              $index = Invoke-WebRequest -UseBasicParsing https://pypi.org/simple/crewchat/ -Headers @{ Accept = 'application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01' }
+              if ($index.RawContent.Contains("""$want""")) { exit 0 }
+            } catch { "PyPI: $_" }
+            Start-Sleep -Seconds 10
+          }
+          "PyPI here does not list $want after 10 minutes"; exit 1
+      - name: The README's commands, typed in powershell
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          & "$env:USERPROFILE\.local\bin\uv.exe" tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
+      - name: The README's commands, typed in pwsh
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          & "$env:USERPROFILE\.local\bin\uv.exe" tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
+      - name: The README's commands, typed in cmd
+        if: matrix.shell == 'cmd'
+        shell: cmd
+        run: |
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+          "%USERPROFILE%\.local\bin\uv.exe" tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
+      # PyPI's CDN can still hand uv the index from before the release just after the wait above saw
+      # the new one (it happened to v0.11.0 and v0.11.1). That is the CDN, not the README: install
+      # again until uv gets the release, for up to five minutes.
+      - name: If uv was given the release before, install again
+        if: github.event_name == 'release'
+        shell: powershell
+        run: |
+          $want = "crewchat " + $env:TAG.TrimStart('v')
+          for ($i = 0; $i -lt 20; $i++) {
+            $v = & "$env:USERPROFILE\.local\bin\crewchat.exe" --version
+            if ($v -eq $want) { exit 0 }
+            "uv installed $v; trying again in 15 s"
+            Start-Sleep -Seconds 15
+            & "$env:USERPROFILE\.local\bin\uv.exe" tool install --reinstall --refresh --python 3.12 "crewchat[cloud]"
+          }
+          "uv never got $want"; exit 1
+      - name: A first chat
+        shell: powershell
+        run: |
+          $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+          $v = crewchat --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host $v
+          if ($env:TAG -and $v -ne "crewchat $($env:TAG.TrimStart('v'))") { "expected $env:TAG"; exit 1 }
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\notes-app" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\notes-app"
+          git init -q
+          crewchat start --no-service --no-open
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/health).Content
+          crewchat status
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  unix:
+    needs: package
+    if: ${{ !failure() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Wait for this runner's PyPI to list the release
+        if: github.event_name == 'release'
+        run: |
+          for i in $(seq 60); do
+            curl -sSf -H 'Accept: application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01' https://pypi.org/simple/crewchat/ |
+              grep -qF "\"${TAG#v}\"" && exit 0
+            sleep 10
+          done
+          echo "PyPI here does not list ${TAG#v} after 10 minutes"; exit 1
+      - name: The README's command
+        run: curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+      - name: A first chat
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          v=$(crewchat --version) && echo "$v"
+          if [ -n "$TAG" ] && [ "$v" != "crewchat ${TAG#v}" ]; then echo "expected $TAG"; exit 1; fi
+          mkdir "$RUNNER_TEMP/notes-app" && cd "$RUNNER_TEMP/notes-app" && git init -q
+          crewchat start --no-service --no-open
+          curl -sf http://127.0.0.1:8765/health
+          crewchat status

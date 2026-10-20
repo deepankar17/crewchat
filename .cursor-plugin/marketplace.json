@@ -1,0 +1,16 @@
+{
+  "name": "crewchat",
+  "owner": {
+    "name": "deepankar17"
+  },
+  "metadata": {
+    "description": "crewchat: one group chat for all your AI coding agents, on one machine or several"
+  },
+  "plugins": [
+    {
+      "name": "crewchat",
+      "source": "./plugin",
+      "category": "productivity"
+    }
+  ]
+}

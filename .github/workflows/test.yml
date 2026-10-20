@@ -1,0 +1,100 @@
+name: tests
+
+on:  # main only (owner, 19 Oct 2026): pushes to it and pull requests into it, never other branches
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install cryptography
+      # The code map's accurate readers (C9) on the newer Python of each system; 3.9 keeps the regular expressions.
+      - if: matrix.python != '3.9'
+        run: python -m pip install tree-sitter tree-sitter-java tree-sitter-kotlin tree-sitter-javascript tree-sitter-typescript
+      - run: python -m unittest discover -s tests -v
+
+  installers:
+    # The one-line installers, run as a user would, against this commit.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh
+        if: runner.os != 'Windows'
+        run: |
+          CREWCHAT_SOURCE="file://$PWD" sh install.sh
+          export PATH="$HOME/.local/bin:$PATH" CREWCHAT_HOME="$RUNNER_TEMP/crewchat-home"
+          mkdir "$RUNNER_TEMP/project" && cd "$RUNNER_TEMP/project" && git init -q
+          crewchat start --no-service --no-open
+          crewchat status
+          curl -sf "http://127.0.0.1:8765/manifest.webmanifest" > /dev/null
+          crewchat cloud status || true
+          "$(uv tool dir 2>/dev/null || echo "$HOME/.local/share/uv/tools")/crewchat/bin/python" -c "import google.cloud.firestore, cryptography"
+          up() { curl -sf -m 3 http://127.0.0.1:8765/health > /dev/null; }
+          crewchat stop
+          if up; then echo "stop did not stop it"; exit 1; fi
+          crewchat restart
+          up || { echo "restart did not start it"; exit 1; }
+          # An upgrade over a running server restarts it on the new code.
+          starts() { grep -c ' for .* on http' "$CREWCHAT_HOME/hub.log"; }
+          before=$(starts)
+          CREWCHAT_SOURCE="file://$GITHUB_WORKSPACE" sh "$GITHUB_WORKSPACE/install.sh"
+          up || { echo "an upgrade left the server stopped"; exit 1; }
+          [ "$(starts)" -gt "$before" ] || { echo "an upgrade did not restart the server"; exit 1; }
+          crewchat uninstall --yes
+          if up; then echo "uninstall left the server running"; exit 1; fi
+          hash -r  # bash remembers where it last ran crewchat; ask afresh
+          if [ -e "$HOME/.local/bin/crewchat" ] || command -v crewchat; then echo "the program is still installed"; exit 1; fi
+          if [ -e .mcp.json ]; then echo "uninstall left .mcp.json"; exit 1; fi
+          [ -e "$CREWCHAT_HOME/config.json" ] || { echo "uninstall deleted the chats without --purge"; exit 1; }
+      - name: install.ps1 (Windows PowerShell 5.1)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $env:CREWCHAT_SOURCE = ([System.Uri](Get-Location).Path).AbsoluteUri
+          .\install.ps1
+          if (-not $?) { exit 1 }
+          $env:Path = "$env:USERPROFILE\.local\bin;$env:Path"
+          $env:CREWCHAT_HOME = "$env:RUNNER_TEMP\crewchat-home"
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\project" | Out-Null
+          Set-Location "$env:RUNNER_TEMP\project"
+          git init -q
+          crewchat start --no-service --no-open
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          crewchat status
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          (Invoke-WebRequest -UseBasicParsing http://127.0.0.1:8765/manifest.webmanifest).StatusCode
+          $tools = (uv tool dir).Trim()
+          & "$tools\crewchat\Scripts\python.exe" -c "import google.cloud.firestore, cryptography"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          function Up { try { (Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 http://127.0.0.1:8765/health).StatusCode -eq 200 } catch { $false } }
+          crewchat stop
+          if ($LASTEXITCODE -ne 0 -or (Up)) { "stop did not stop it"; exit 1 }
+          crewchat restart
+          if ($LASTEXITCODE -ne 0 -or -not (Up)) { "restart did not start it"; exit 1 }
+          # An upgrade over a running server that does not start at log on: it must come back up.
+          & "$env:GITHUB_WORKSPACE\install.ps1"
+          if (-not $?) { exit 1 }
+          for ($i = 0; $i -lt 20 -and -not (Up); $i++) { Start-Sleep 1 }
+          if (-not (Up)) { "an upgrade left the server stopped"; exit 1 }
+          crewchat uninstall --yes
+          if ($LASTEXITCODE -ne 0 -or (Up)) { "uninstall left the server running"; exit 1 }
+          if (Test-Path .mcp.json) { "uninstall left .mcp.json"; exit 1 }
+          if (-not (Test-Path "$env:CREWCHAT_HOME\config.json")) { "uninstall deleted the chats without --purge"; exit 1 }
+          for ($i = 0; $i -lt 30 -and (Test-Path "$env:USERPROFILE\.local\bin\crewchat.exe"); $i++) { Start-Sleep 1 }
+          if (Test-Path "$env:USERPROFILE\.local\bin\crewchat.exe") { "the program is still installed"; exit 1 }

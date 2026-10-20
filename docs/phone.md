@@ -1,0 +1,65 @@
+# Your phone
+
+The chat page works on a phone, and installs like an app: its own icon on the home screen,
+opening full-screen. You read what your agents say, answer them, post tasks, give roles and add
+agents from it.
+
+The phone talks to one of your computers running crewchat, so it needs a private route to it.
+The easiest is Tailscale.
+
+<p>
+<img src="images/phone-sign-in.png" width="260" alt="The sign-in page on a phone: type the code from crewchat ui --print, then Sign in. A note explains Add to Home Screen.">
+&nbsp;
+<img src="images/demo-phone.gif" width="260" alt="On a phone, ☰ opens the crew: Needs you shows the lead's question on a blocked task. Tapped, it opens with a box to answer; the answer is sent, the task carries on, and the lead replies in the chat.">
+&nbsp;
+<img src="images/phone.png" width="260" alt="The chat on a phone: the project picker at the top, the project's name and how many agents, machines and open tasks it has, the conversation, and the message box at the bottom. ☰ opens the list of agents.">
+</p>
+
+![Your phone. 1: You open the chat on your phone: it goes over your tailnet, encrypted. 2: tailscale serve hands it to crewchat on the computer. 3: Your agent gets the message. 4: Its answer comes back to your phone, live. 5: Nothing is open to the internet: only your own devices get in. Add it to your home screen, and answer your agents from anywhere.](images/diagram-phone.gif)
+
+## Set it up
+
+1. **On the computer:** make the chat reachable on your tailnet. If you linked machines over
+   Tailscale, `crewchat peers invite` has already done this. Otherwise:
+
+   ```bash
+   tailscale serve --bg 8765
+   crewchat url https://computer.your-tailnet.ts.net
+   ```
+
+   `crewchat url` on its own shows the address.
+2. **On the phone:** install the Tailscale app and sign in to the same Tailscale account.
+3. Open the computer's address in Safari (iPhone) or Chrome (Android).
+4. **On the computer,** run:
+
+   ```bash
+   crewchat ui --print
+   ```
+
+   and type the code it shows on the phone. A code works once, for two minutes.
+5. Install it:
+   - **iPhone:** Share → **Add to Home Screen**.
+   - **Android:** menu → **Install app** (or **Add to Home screen**).
+
+## Things to know
+
+- **On an iPhone, the installed app keeps its own sign-in,** separate from Safari's. The first
+  time you open it, sign in once more with a new code from `crewchat ui --print`.
+- **Share a photo or screenshot** from the phone with **+** → **Attach a file**.
+- **Search folds to a magnifier** at the top, so the project's name keeps its room: tap it to search.
+- **Typing does not zoom the page:** the message box and the other fields use 16px text, the size
+  under which a phone zooms in when you tap a field.
+- **Sign-ins last 30 days.**
+- **Notifications reach the phone with the app closed.** Turn them on with the bell in the
+  installed app (on an iPhone, in the app from the home screen, not in Safari). The computer must
+  be on and connected to the internet to send them.
+- **If the computer is off or asleep,** the app says the chat cannot be reached instead of showing
+  a browser error. On a Mac that sleeps, `crewchat service install --keep-awake` keeps it awake
+  while crewchat runs.
+- **The chat itself is not kept on the phone.** Messages, tasks and settings always come fresh from the
+  computer. Only the page's own code is kept, and checked with the computer on every load.
+- **Adding an agent from the phone** opens it on the computer you are connected to.
+- **With cloud sync,** any of your machines can serve the page: each has the whole chat. A hosted
+  page that needs no machine switched on is planned.
+
+Back to the [README](../README.md)
