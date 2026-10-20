@@ -77,6 +77,11 @@ class Session:
         return line.split(" (you)")[0]
 
 
+def crewchat_sqlite():
+    import sqlite3
+    return sqlite3
+
+
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -562,7 +567,31 @@ class Advisor(Base):
         self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
 
 
+class UsageAcrossRenames(unittest.TestCase):
+    def test_token_usage_follows_tasks_renamed_when_the_chat_is_first_shared(self):
+        # Review: adopt_open_tasks renamed the sheet's tasks but left usage.json under the old numbers.
+        root = Path(tempfile.mkdtemp(prefix="usage-rename-", dir=TMP))
+        crewchat.save_config({"project": "usage-rename", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        old = hub.add_row(crewchat.OWNER, "counted")["id"]  # (the message itself is renamed in place)
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        with hub.lock:
+            hub.sheet[old]["usage"] = counts
+            hub._save_usage()
+        new = hub.adopt_open_tasks("A", "device-1")[old]
+        again = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(again.sheet[new].get("usage"), counts)
+        hub.events.close()
+        again.events.close()
+
+
 class ReconnectOnThePage(unittest.TestCase):
+    def test_asleep_means_idle_or_not_heard_from_for_its_listening_time(self):
+        page = crewchat.CHAT_PAGE
+        asleep = page[page.index("function asleep(a)"):page.index("function asleep(a)") + 300]
+        self.assertTrue('a.activity === "idle"' in asleep)  # never '' alone: unknown after a restart
+        self.assertTrue("a.seen" in asleep)
+
     def test_an_open_but_asleep_session_offers_reconnect(self):
         page = crewchat.CHAT_PAGE
         controls = page[page.index("function sessionControls"):page.index("function sessionControls") + 4000]
@@ -675,6 +704,35 @@ class EditPaths(unittest.TestCase):
         self.assertNotIn("SCAN activity", plan)
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
+
+    def test_a_failed_commit_loses_no_row(self):
+        # Review: rows a read had written without committing were rolled back with a failed commit and never queued again.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        with store.lock:
+            store.add_edit("teo", "app/b.kt", ts=2)
+            store._read()  # written, not committed
+            db = store._conn()
+            store.db = mock.Mock(wraps=db)
+            store.db.commit = mock.Mock(side_effect=crewchat_sqlite().OperationalError("database is locked"))
+            with self.assertRaises(crewchat_sqlite().OperationalError):
+                store._write_pending()
+            store.db = db
+        store.close()
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo"])
+
+    def test_a_row_that_cannot_be_written_does_not_block_the_others(self):
+        # Review: one bad row was put back at the front every time, and every later row waited behind it.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        store._add("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)", (2, None, "bad", ""))  # NOT NULL
+        store.add_edit("teo", "app/b.kt", ts=3)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])
+        self.assertEqual(store.pending, [])
+        store.close()
 
     def test_a_read_does_not_wait_for_the_disk(self):
         # Review: edits() is read under the hub's lock (a task's suggested areas); writing what waits must not commit
@@ -2918,6 +2976,7 @@ class Launching(Base):
         session.call("hub_link", key="link-" + name)
         task = self.say("all", "kept across the reconnect", "task")
         session.call("hub_task", action="take", id=task)
+        self.hub.activity[name] = ("listening", time.time() - 3600)  # past its listening time: idle, asleep
         steps, running = [], [True]
 
         def stop(pid):
@@ -2943,6 +3002,18 @@ class Launching(Base):
                                   steps.append(command)):
             crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
         self.assertEqual(len(steps), 1)
+
+    def test_reconnect_is_refused_while_the_agent_works_or_listens(self):
+        # Review: after a restart the page offered Reconnect for every running agent, a busy one too.
+        name = self.closed_session()
+        for state in ("working", "listening"):
+            self.hub.activity[name] = (state, time.time())
+            with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
+                    mock.patch.object(crewchat, "stop_process", lambda pid: self.fail("stopped a busy agent")):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+            self.assertIn("is %s" % state, json.loads(caught.exception.read())["error"])
+        self.hub.activity.pop(name, None)
 
     def test_switch_model_checks_it_can_reopen_before_it_stops(self):
         name = self.closed_session()

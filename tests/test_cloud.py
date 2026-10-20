@@ -263,6 +263,17 @@ class Sync(unittest.TestCase):
         self.assertEqual(cloud.CloudSync(self.a.hub, self.a.link, self.a.device, file_max=10 ** 9).file_max,
                          crewchat.MAX_UPLOAD)  # never past crewchat's own limit for a shared file
 
+    def test_the_preferred_machine_takes_the_lease_at_once(self):
+        # Review: renewing skipped its write on the cached lease (another's, live), so choosing this machine as the
+        # preferred coordinator waited for a later renewal instead of taking over at once.
+        now = [time.time()]
+        for m in (self.a, self.b):
+            m.sync.clock = lambda: now[0]
+        self.b.sync.renew_lease()
+        self.a.sync.lease = {"device": self.b.device.id, "expires": now[0] + cloud.LEASE_SECS, "term": 1}  # as heard
+        self.assertEqual(self.a.sync.set_preferred("mac")["name"], "mac")
+        self.assertTrue(self.a.sync.coordinator()["me"])
+
     def test_the_lease_costs_few_writes_and_no_reads_while_another_holds_it(self):
         # On the free plan's 20,000 writes and 50,000 reads a day: renewing every 30 s was 2,880 writes a day by
         # the holder, and as many reads by every other machine.

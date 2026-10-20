@@ -1718,6 +1718,7 @@ class EventStore:
         # what waits first, so they see every row added before them.
         self.pending = []  # [(sql, row)] not written yet
         self.uncommitted = False  # rows a read wrote without committing: the writer commits them
+        self.unsaved = []  # those rows, queued again if their commit fails
         self.wake = threading.Condition(threading.Lock())
         self.writer = None
 
@@ -1744,6 +1745,7 @@ class EventStore:
     def _write_pending(self, commit=True):
         """Write the rows that wait, in one transaction. Caller holds self.lock. Without commit (a read, which may run
         under the hub's lock): the rows are seen by this connection at once, and the writer commits them soon."""
+        import sqlite3
         with self.wake:
             rows, self.pending = self.pending, []
         if not rows and not (commit and self.uncommitted):
@@ -1751,19 +1753,25 @@ class EventStore:
         db = self._conn()
         try:
             for sql, row in rows:
-                db.execute(sql, row)
+                try:
+                    db.execute(sql, row)
+                except (sqlite3.IntegrityError, sqlite3.InterfaceError, sqlite3.ProgrammingError) as e:
+                    # A row that can never be written: dropped, said in the log, and the others go on.
+                    sys.stderr.write("%s dropped a row %s could not take: %s\n" % (now_iso(), self.path.name, e))
+                    continue
+                self.unsaved.append((sql, row))
             if commit:
                 db.commit()
-                self.uncommitted = False
+                self.unsaved, self.uncommitted = [], False
             elif rows:
                 with self.wake:
                     self.uncommitted = True
                     self.wake.notify()
         except Exception:
-            db.rollback()
-            self.uncommitted = False
+            db.rollback()  # everything since the last commit: queued again, in its order
+            back, self.unsaved, self.uncommitted = self.unsaved, [], False
             with self.wake:
-                self.pending[:0] = rows
+                self.pending[:0] = back
             raise
 
     def flush(self):
@@ -1793,12 +1801,8 @@ class EventStore:
 
     def rename(self, name, new):
         """An agent renamed: its edits and states are the new name's."""
-        with self.lock:
-            self._write_pending()
-            db = self._conn()
-            for table in ("edits", "activity"):
-                db.execute("UPDATE %s SET agent = ? WHERE agent = ?" % table, (new, name))
-            db.commit()
+        for table in ("edits", "activity"):  # after the rows already queued, by the writer: never under the hub's lock
+            self._add("UPDATE %s SET agent = ? WHERE agent = ?" % table, (new, name))
 
     def add_edit(self, agent, path, task="", ts=None):
         self._add("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)",
@@ -3351,6 +3355,8 @@ class Hub:
                 self.sheet[new]["origin"] = origin
             self.renamed.update(rename)
             self._save()  # first: a crash before the log is rewritten is put right on load (_apply_renames)
+            if any(self.sheet[new].get("usage") for new in rename.values() if new in self.sheet):
+                self._save_usage()  # the tasks' token counts go with their new numbers
             self._rewrite_log(rename, {m["id"]: m for m in moved})
             self._changed()
             return rename
@@ -4541,10 +4547,19 @@ class Hub:
         """The owner wakes an agent whose session is open but asleep (past its listening time, it only reads the chat at
         its user's next prompt): its session is stopped and its own conversation reopened, listening again. Its tasks
         stay its own. Everything reopening needs is checked first, so a failure never leaves it stopped."""
-        session, folder, command = self._reopen_plan(name)
+        with self.lock:
+            doing = self._activity(name, time.time())
+        if doing in ("working", "listening"):
+            raise HubError("%s is %s: Reconnect is for an agent whose window sleeps" % (name, doing))
+        self._restart_session(name, None, "reconnected")
+
+    def _restart_session(self, name, model, done):
+        """Stop an agent's session if it runs and reopen its conversation (on model): everything reopening needs is
+        checked first, so a failure never leaves it stopped. Its tasks stay its own."""
+        session, folder, command = self._reopen_plan(name, model)
         if process_running(session):
             end_session(name, session)
-        self._open_again(name, None, session, folder, command, "reconnected")
+        self._open_again(name, model, session, folder, command, done)
 
     def startable(self, name):
         """Can the owner start a new session for this local agent (Start again)? Its tool can be
@@ -4632,10 +4647,7 @@ class Hub:
         with self.lock:
             tool = self._session_of(name, "switch").get("tool", "claude")
         check_model(tool, model)
-        session, folder, command = self._reopen_plan(name, model)
-        if process_running(session):
-            end_session(name, session)
-        self._open_again(name, model, session, folder, command)
+        self._restart_session(name, model, "reopened")
         with self.lock:
             if name in self.agents:
                 self.agents[name]["model"] = model  # a later Reopen keeps it
@@ -13016,8 +13028,9 @@ function sessionLine(a) {
 }
 
 // Running, but neither working nor listening: it reads the chat only at its user's next prompt.
+// Unknown ('', after the server restarted) counts only when nothing was heard from it for its listening time (30 min).
 function asleep(a) {
-  return !["working", "listening"].includes(a.activity);
+  return a.activity === "idle" || (!a.activity && state.now - (a.seen || 0) > 30 * 60);
 }
 function sessionControls(a, acts, agentOp) {
   const s = a.session;

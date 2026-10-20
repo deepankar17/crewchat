@@ -489,11 +489,7 @@ class PeerSync(crewchat.ProjectLink):
                 data = answer.read()
                 return data if raw else json.loads(data.decode("utf-8"))
         except urllib.error.HTTPError as e:
-            try:
-                reason = json.loads(e.read().decode("utf-8")).get("error") or "HTTP %d" % e.code
-            except ValueError:
-                reason = "HTTP %d" % e.code
-            raise PeerError(reason, e.code)
+            raise PeerError(crewchat.http_error_reason(e), e.code)
         except (urllib.error.URLError, OSError, ValueError) as e:
             raise PeerError(str(getattr(e, "reason", e)))
 

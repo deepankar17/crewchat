@@ -851,14 +851,14 @@ class CloudSync(crewchat.ProjectLink):
         (the page asks at every poll). Only an approved machine holds the lease or shares a file."""
         return {i: e.get("name") or i for i, e in self.device.trust.get("devices", {}).items()}
 
-    def renew_lease(self):
+    def renew_lease(self, force=False):
         """Hold the coordinator's lease, or take it: when this machine holds it, when it has run out, or when
         this is the owner's preferred machine. A conditional write, so two machines never both take it; the
         term goes up when it changes hands. Another machine's live lease is left alone."""
         if not self.device.ready:
             return self.lease
         now = self.clock()
-        known = self.lease or {}
+        known = {} if force else (self.lease or {})  # force: the owner just chose this machine (set_preferred)
         if known.get("device") not in (None, self.device.id) and float(known.get("expires") or 0) > now \
                 and known.get("preferred") != self.device.id:
             return self.lease  # another machine's live lease, as last read or heard: no write, and no read, until it runs out
@@ -897,7 +897,7 @@ class CloudSync(crewchat.ProjectLink):
         name = str(name or "").strip()
         device = "" if name.lower() in ("", "none") else self.account.find(name)[0]
         self.store.transact("meta/coordinator", lambda doc: dict(doc or {}, preferred=device))
-        self.lease = self.renew_lease() if device == self.device.id else (self.store.get("meta/coordinator") or {})
+        self.lease = self.renew_lease(force=True) if device == self.device.id else (self.store.get("meta/coordinator") or {})
         return self.coordinator()
 
     def _leaser(self):
