@@ -93,7 +93,8 @@ MAX_CHAIN = 10  # hook-driven turns in a row before only the owner can wake an a
 MAX_LISTEN = 55 * 60
 # A program the server (or a hook) runs for its output, on Windows: CREATE_NO_WINDOW. The server runs with no console
 # of its own, so without it Windows opens a console window for each one (git, PowerShell, tailscale), and closes it.
-HIDDEN = {"creationflags": 0x08000000} if os.name == "nt" else {}
+CREATE_NO_WINDOW = 0x08000000
+HIDDEN = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 SAVE_DELAY = 1.0  # seconds state.json may lag behind read positions, status lines and presence (Hub._save_soon)
 USAGE_FILE = "usage.json"  # the agents' token counts by day, and each task's (X4): out of state.json, which is
 # rewritten on nearly every call, and written only when they change
@@ -1716,6 +1717,7 @@ class EventStore:
         # commit that waits for the disk (synchronous FULL) must not hold every agent's call up. Reads write
         # what waits first, so they see every row added before them.
         self.pending = []  # [(sql, row)] not written yet
+        self.uncommitted = False  # rows a read wrote without committing: the writer commits them
         self.wake = threading.Condition(threading.Lock())
         self.writer = None
 
@@ -1730,7 +1732,7 @@ class EventStore:
     def _write_loop(self):
         while True:
             with self.wake:
-                while not self.pending:
+                while not self.pending and not self.uncommitted:
                     self.wake.wait()
             try:
                 with self.lock:
@@ -1739,22 +1741,35 @@ class EventStore:
                 sys.stderr.write("%s could not write %s: %s\n" % (now_iso(), self.path.name, e))
                 time.sleep(5)
 
-    def _write_pending(self):
-        """Write the rows that wait, in one transaction. Caller holds self.lock."""
+    def _write_pending(self, commit=True):
+        """Write the rows that wait, in one transaction. Caller holds self.lock. Without commit (a read, which may run
+        under the hub's lock): the rows are seen by this connection at once, and the writer commits them soon."""
         with self.wake:
             rows, self.pending = self.pending, []
-        if not rows:
+        if not rows and not (commit and self.uncommitted):
             return
         db = self._conn()
         try:
             for sql, row in rows:
                 db.execute(sql, row)
-            db.commit()
+            if commit:
+                db.commit()
+                self.uncommitted = False
+            elif rows:
+                with self.wake:
+                    self.uncommitted = True
+                    self.wake.notify()
         except Exception:
             db.rollback()
+            self.uncommitted = False
             with self.wake:
                 self.pending[:0] = rows
             raise
+
+    def flush(self):
+        """Write and commit every row added so far (the server stopping)."""
+        with self.lock:
+            self._write_pending()
 
     def _conn(self):
         if self.db is None:
@@ -1805,8 +1820,9 @@ class EventStore:
                   (time.time() if ts is None else ts, agent, state))
 
     def _read(self):
-        """The connection, for a read under self.lock, with every row added so far written."""
-        self._write_pending()
+        """The connection, for a read under self.lock, with every row added so far in it (not yet committed: no wait
+        for the disk here)."""
+        self._write_pending(commit=False)
         return self._conn()
 
     def timelines(self, since, until=None, grace=LISTEN_GRACE):
@@ -2014,6 +2030,7 @@ class Hub:
         self._asked = {}  # agent -> when its hook was last asked to report its session (memory only)
         self._dirty = False  # state.json is behind memory, by what _save_soon let wait
         self._usage_dirty = False  # usage.json is behind memory, by what _save_usage_soon let wait
+        self._flush_due = False  # a flush() is on its way (_flush_later)
         self.usage = {}  # day (UTC) -> agent -> {model: counts}: tokens the agents' turns used (X4)
         self.analytics = Analytics(roster.root / "messages.jsonl")  # running totals for /api/analytics (X1)
         self.events = EventStore(roster.root / EVENTS_FILE)  # what cannot be rebuilt from the log: edits (C0)
@@ -2140,19 +2157,21 @@ class Hub:
 
     def _save_usage_soon(self):
         """Write usage.json within SAVE_DELAY, as _save_soon does state.json. Caller holds the lock."""
-        if not self._usage_dirty:
-            self._usage_dirty = True
-            timer = threading.Timer(SAVE_DELAY, self.flush)
-            timer.daemon = True
-            timer.start()
+        self._usage_dirty = True
+        self._flush_later()
 
     def _save_soon(self):
         """Write state.json within SAVE_DELAY, for what changes on nearly every call and may be lost for that
         long in a crash: read positions, status lines, sessions and presence. Each save rewrites the whole
         file, so under load these coalesce into one. Claims, links and the task sheet use _save. Caller
         holds the lock."""
-        if not self._dirty:
-            self._dirty = True
+        self._dirty = True
+        self._flush_later()
+
+    def _flush_later(self):
+        """flush() within SAVE_DELAY, once for whatever waits by then. Caller holds the lock."""
+        if not self._flush_due:
+            self._flush_due = True
             timer = threading.Timer(SAVE_DELAY, self.flush)
             timer.daemon = True
             timer.start()
@@ -2161,12 +2180,12 @@ class Hub:
         """Write what _save_soon let wait (its timer, and the server stopping), and the events the store's writer
         has not written yet."""
         with self.lock:
+            self._flush_due = False
             if self._dirty:
                 self._save()
             if self._usage_dirty:
                 self._save_usage()
-        with self.events.lock:
-            self.events._write_pending()
+        self.events.flush()
 
     def _changed(self):
         self.version += 1
@@ -3874,7 +3893,7 @@ class Hub:
         next one starts (every message of the origin after the page comes after that place)."""
         log = self.home / "messages.jsonl"
         with self.lock:
-            start = self._relay_marks.pop((origin, after), None)
+            start = self._relay_marks.get((origin, after))  # kept: a page asked again reads from there too
         if start is None:  # back from the end until CATCHUP_SLACK in a row are before the point
             start, past = 0, 0
             try:
@@ -5529,7 +5548,7 @@ def run_crewchat(argv, root=None):
     env = dict(os.environ, NO_COLOR="1", CREWCHAT_NO_UPDATE_CHECK="1", CREWCHAT_FROM_SERVER="1")
     if root is not None:
         env["CREWCHAT_HOME"] = str(root)
-    flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW: no console flashing up on Windows
+    flags = CREATE_NO_WINDOW if os.name == "nt" else 0  # no console flashing up on Windows
     if not RUN_SLOTS.acquire(blocking=False):
         raise HubError("two commands are still running; wait for one to finish")
     try:
@@ -6787,6 +6806,14 @@ def owner_token():
 CURRENT_CHAT = None  # the project owner commands act on: --chat, or the one of the folder they run in
 
 
+def http_error_reason(e):
+    """What a crewchat server said in an HTTP error answer ({"error": ...}), or "HTTP <code>"."""
+    try:
+        return json.loads(e.read().decode("utf-8")).get("error") or "HTTP %d" % e.code
+    except (ValueError, AttributeError):
+        return "the server answered HTTP %d" % e.code
+
+
 def owner_call(path, body, chat=None, offline=None):
     """POST to the chat server here as the owner. With offline, a server that isn't running calls
     offline() for the answer instead of stopping."""
@@ -6794,10 +6821,7 @@ def owner_call(path, body, chat=None, offline=None):
     try:
         return post_json(local_url() + path, owner_token(), body, headers={"X-Crewchat-Chat": chat} if chat else None)
     except urllib.error.HTTPError as e:
-        try:
-            die(json.loads(e.read().decode("utf-8")).get("error", "HTTP %d" % e.code))
-        except ValueError:
-            die("the server answered HTTP %d" % e.code)
+        die(http_error_reason(e))
     except (urllib.error.URLError, OSError) as e:
         if offline:
             return offline()
@@ -6914,7 +6938,7 @@ def start_background():
             python = str(Path(python).with_name("pythonw.exe"))
         # DETACHED_PROCESS | CREATE_NO_WINDOW, and CREATE_BREAKAWAY_FROM_JOB: tools that run commands
         # in a job (Claude Code, CI runners) end the job's processes when the command ends.
-        flags["creationflags"] = 0x00000008 | 0x08000000 | 0x01000000
+        flags["creationflags"] = 0x00000008 | CREATE_NO_WINDOW | 0x01000000
     else:
         flags["start_new_session"] = True
     command = [python, script, "serve", "--log", str(log)]
@@ -10683,7 +10707,7 @@ def cmd_uninstall(args):
         # Windows cannot remove a program while it runs: remove it once this process has ended.
         subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
                           "Wait-Process -Id %d -ErrorAction SilentlyContinue; & '%s' tool uninstall crewchat"
-                          % (os.getpid(), uv)], creationflags=0x08000000)  # CREATE_NO_WINDOW
+                          % (os.getpid(), uv)], creationflags=CREATE_NO_WINDOW)
         print("Done. The crewchat program is removed in a moment, once this window's command ends.")
         return
     out = run([uv, "tool", "uninstall", "crewchat"])

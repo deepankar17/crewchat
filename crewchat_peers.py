@@ -225,8 +225,8 @@ class Mesh:
     def _next_n(self):
         """The number of a change to the decisions here, counted up on this machine: a pull asks for those after
         the last it got (decisions_after), not for all of them each time. Caller holds the lock."""
-        n = self.data["decided_n"] = int(self.data.get("decided_n") or 0) + 1
-        return n
+        self.data["decided_n"] = int(self.data.get("decided_n") or 0) + 1
+        return self.data["decided_n"]
 
     def decisions(self):
         with self.lock:
@@ -990,13 +990,10 @@ def ready_to_link():
     try:
         crewchat.post_json(crewchat.local_url() + "/api/admin", crewchat.owner_token(), {"op": "peers-ready"})
     except urllib.error.HTTPError as e:
-        try:
-            reason = json.loads(e.read().decode("utf-8")).get("error", "")
-        except ValueError:
-            reason = ""
+        reason = crewchat.http_error_reason(e)
         # A server from before this check does not know the question: it links as before.
         if reason not in ("unknown operation", "this server is not linked to other machines"):
-            raise PeerError(reason or "the server here answered HTTP %d" % e.code)
+            raise PeerError(reason)
     except (urllib.error.URLError, OSError) as e:
         raise PeerError("cannot reach the server here (%s); the code still works" % getattr(e, "reason", e))
 

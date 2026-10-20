@@ -66,7 +66,8 @@ MAP_VERSION = "2"  # what the tables hold; a map of another version is built aga
 # What git runs by itself must not run anything a repository's own config names: an agent allowed only to edit files
 # could write a command there. core.fsmonitor is the one that commands reading the index (ls-files) run.
 GIT_SAFE = ["-c", "core.fsmonitor=false"]
-HIDDEN = {"creationflags": 0x08000000} if os.name == "nt" else {}  # Windows: no console window flashing up for git
+# Windows: no console window flashing up for git. crewchat.HIDDEN's twin: this module does not import crewchat.
+HIDDEN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 
 def git(folder, *args):

@@ -676,6 +676,28 @@ class EditPaths(unittest.TestCase):
         store.close()
         self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
 
+    def test_a_read_does_not_wait_for_the_disk(self):
+        # Review: edits() is read under the hub's lock (a task's suggested areas); writing what waits must not commit
+        # (synchronous FULL, a wait for the disk) there. The rows are seen at once; the writer commits them.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        db, committed = store._conn(), []
+        real = db.commit
+        store.db = mock.Mock(wraps=db)
+        store.db.commit = lambda: committed.append(threading.current_thread().name) or real()
+        with store.lock:
+            store.add_edit("teo", "app/b.kt", ts=2)
+        self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])
+        self.assertNotIn(threading.current_thread().name, committed)
+        for _ in range(200):
+            if committed:
+                break
+            time.sleep(0.01)
+        self.assertEqual(committed, ["events-writer"])
+        store.close()
+        self.assertEqual(len(crewchat.EventStore(store.path).edits()), 2)
+
     def test_event_rows_are_written_off_the_callers_thread(self):
         # add_edit and add_activity run under the hub's lock: a commit waiting on the disk (synchronous FULL) must
         # not hold it. Here the store's connection is busy (a slow disk): adding a row still returns at once.
