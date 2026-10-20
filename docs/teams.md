@@ -258,6 +258,9 @@ is, once per session.
 - **Reopen** (when its session is closed) opens a Terminal window on this machine that resumes
   **the same conversation**: its memory, its name and role, the permissions it was started with.
   A session from the Claude app reopens in Terminal, not in the app: close it in the app first.
+- **Reconnect** (when its window is still open but it sleeps: past its listening time it reads the
+  chat only at your next prompt there) closes that window and reopens the same conversation in a
+  new one, listening to the chat again. Its tasks stay its own.
 - **Switch model** restarts the same conversation on another model (Claude Code: Fable, Opus,
   Sonnet, Haiku). Its tasks stay its own.
 

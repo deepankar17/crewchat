@@ -4518,6 +4518,15 @@ class Hub:
             raise HubError("%s is still running: stop it first" % name)
         self._open_again(name, None, session, folder, command)
 
+    def reconnect_agent(self, name):
+        """The owner wakes an agent whose session is open but asleep (past its listening time, it only reads the chat at
+        its user's next prompt): its session is stopped and its own conversation reopened, listening again. Its tasks
+        stay its own. Everything reopening needs is checked first, so a failure never leaves it stopped."""
+        session, folder, command = self._reopen_plan(name)
+        if process_running(session):
+            end_session(name, session)
+        self._open_again(name, None, session, folder, command, "reconnected")
+
     def startable(self, name):
         """Can the owner start a new session for this local agent (Start again)? Its tool can be
         started from the page, it has no conversation to reopen, it is not waiting for messages, and
@@ -4581,7 +4590,7 @@ class Hub:
             self._save()
         return key
 
-    def _open_again(self, name, model, session, folder, command):
+    def _open_again(self, name, model, session, folder, command, done="reopened"):
         with self.lock:
             key = self._link_key(name)
         # OpenCode does not send a prompt given with the session it continues: crewchat's plugin does,
@@ -4591,8 +4600,8 @@ class Hub:
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
                 self.agents[name]["session"]["reopening"] = time.time()  # until its hooks report the new process
-            self._event("Owner reopened %s%s%s" % (
-                name, " on %s" % model if model else "",
+            self._event("Owner %s %s%s%s" % (
+                done, name, " on %s" % model if model else "",
                 " in a Terminal window (it was in the Claude app)" if session.get("app") == "claude-app" else ""))
             self._save()
             self._changed()
@@ -6268,6 +6277,8 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.stop_agent(name)
         elif op == "reopen":
             self.hub.reopen_agent(name)
+        elif op == "reconnect":
+            self.hub.reconnect_agent(name)
         elif op == "start":
             self.hub.start_again(name)
         elif op == "model":
@@ -6275,7 +6286,7 @@ class Handler(BaseHTTPRequestHandler):
         elif op == "profile":
             self.hub.set_profile(name, data.get("picture"), data.get("colour"))
         else:
-            raise HubError("op is rename, remove, listen, stop, reopen, start, model or profile")
+            raise HubError("op is rename, remove, listen, stop, reopen, reconnect, start, model or profile")
         return {"ok": True}
 
     def _role(self, data):
@@ -12980,6 +12991,10 @@ function sessionLine(a) {
   return "Session closed " + ago(s.since, state.now);
 }
 
+// Running, but neither working nor listening: it reads the chat only at its user's next prompt.
+function asleep(a) {
+  return !["working", "listening"].includes(a.activity);
+}
 function sessionControls(a, acts, agentOp) {
   const s = a.session;
   if (a.remote) return;
@@ -12992,6 +13007,15 @@ function sessionControls(a, acts, agentOp) {
           agentOp({ op: "start", agent: a.agent }, "Not started", b);
       });
     return;
+  }
+  if (s.running && s.reopen && asleep(a)) {
+    // Its window is open but it sleeps (past its listening time it reads the chat only at its user's next prompt).
+    actButton(acts, "Reconnect", "Wake " + a.agent + ": its session restarts with the same conversation", (b) => {
+      if (confirm("Reconnect " + a.agent + "? Its open window is closed and its conversation reopens in a new Terminal "
+                  + "window on this machine, with its memory, name and tasks, listening to the chat again. Anything typed "
+                  + "there and not sent is lost."))
+        agentOp({ op: "reconnect", agent: a.agent }, "Not reconnected", b);
+    });
   }
   if (s.running) {
     actButton(acts, "Stop", "Stop " + a.agent + "'s session", (b) => {

@@ -562,6 +562,15 @@ class Advisor(Base):
         self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
 
 
+class ReconnectOnThePage(unittest.TestCase):
+    def test_an_open_but_asleep_session_offers_reconnect(self):
+        page = crewchat.CHAT_PAGE
+        controls = page[page.index("function sessionControls"):page.index("function sessionControls") + 4000]
+        self.assertTrue('"Reconnect"' in controls)
+        self.assertTrue('op: "reconnect"' in controls)
+        self.assertTrue("asleep(a)" in controls)
+
+
 class NoConsoleWindows(unittest.TestCase):
     def test_programs_run_for_their_output_open_no_window(self):
         # On Windows the server has no console: a program it runs without CREATE_NO_WINDOW gets a console window of
@@ -2879,6 +2888,40 @@ class Launching(Base):
         self.assertEqual(self.hub.taken.get(task), name)  # still its task
         self.assertIn("Owner reopened %s on sonnet" % name, self.hub_history())
 
+    def test_reconnect_wakes_a_session_that_is_open_but_asleep(self):
+        # The owner's 1.0 test: an agent's window stayed open past its listening time, so the page saw it running and
+        # offered only Stop; Reopen came after Stop. Reconnect is both at once, and the agent keeps its tasks.
+        name = self.closed_session()
+        session = Session(self.base, self.token)
+        session.call("hub_link", key="link-" + name)
+        task = self.say("all", "kept across the reconnect", "task")
+        session.call("hub_task", action="take", id=task)
+        steps, running = [], [True]
+
+        def stop(pid):
+            steps.append("stop")
+            running[0] = False
+            return True
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
+                mock.patch.object(crewchat, "stop_process", stop), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                                  steps.append(command)):
+            out = crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(steps[0], "stop")
+        self.assertEqual(steps[1][-2:], ["--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])  # the same conversation
+        self.assertEqual(self.hub.taken.get(task), name)  # still its task
+        self.assertIn("Owner reconnected %s" % name, self.hub_history())
+        # A session already closed is just reopened.
+        self.hub.agents[name]["session"].pop("reopening", None)
+        steps.clear()
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
+                mock.patch.object(crewchat, "stop_process", stop), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                                  steps.append(command)):
+            crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertEqual(len(steps), 1)
+
     def test_switch_model_checks_it_can_reopen_before_it_stops(self):
         name = self.closed_session()
         self.hub.agents[name]["session"]["folder"] = "/no/longer/connected"
@@ -3057,7 +3100,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen, start, model or profile", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, reconnect, start, model or profile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()

@@ -145,6 +145,9 @@ four more agent tools, linked machines that never wait on one that is off, and a
 
 ### Fixes
 
+- **Reconnect** wakes an agent whose window is still open but asleep (past its listening time): before, the card
+  offered only Stop, and Reopen came after it.
+
 - A burst of messages bigger than memory (2,000) no longer loses its first ones on the way to a linked machine.
 - A message whose text held a Unicode line separator (U+2028) is no longer lost when the server restarts.
 - From an end-to-end test of every page: taking a task off the sheet asks first, and its card says "Off the sheet";
