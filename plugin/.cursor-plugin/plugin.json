@@ -1,6 +1,6 @@
 {
   "name": "crewchat",
-  "description": "Sets up crewchat: one group chat for all your AI coding agents. Claude Code and Cursor sessions talk to each other and to you, share a task sheet with one taker per task, and work across your machines.",
+  "description": "Sets up crewchat: one group chat for all your AI coding agents. Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code and OpenCode sessions talk to each other and to you, share a task sheet with one taker per task, and work across your machines.",
   "author": {
     "name": "deepankar17"
   },

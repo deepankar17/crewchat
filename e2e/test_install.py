@@ -22,8 +22,8 @@ def uv_dir(*args):
 @unittest.skipUnless(UV, "needs uv")
 class Install(unittest.TestCase):
     def setUp(self):
-        self.home = H.TMP / ("install-home-%d" % id(self))
-        self.home.mkdir()
+        # A folder of its own: named by id(self), a later test could get an earlier one's id, and its folder.
+        self.home = H.Path(H.tempfile.mkdtemp(prefix="install-home-", dir=H.TMP))
         # uv alone, not the folder it is in: that may hold the owner's own crewchat, which the
         # installer would then take for the one it updates.
         (self.home / "uv-only").mkdir()
@@ -59,7 +59,7 @@ class Install(unittest.TestCase):
                                        capture_output=True, text=True).stdout.strip(), version)
         # Cloud sync's libraries came with it.
         py = next((self.home / "uv-tools" / "crewchat" / "bin").glob("python3*"))
-        subprocess.run([str(py), "-c", "import cryptography, crewchat_cloud, crewchat_peers"], check=True)
+        subprocess.run([str(py), "-c", "import cryptography, crewchat_cloud, crewchat_map, crewchat_peers"], check=True)
         # Run a chat with the installed command, as a person would.
         os.environ["CREWCHAT_BIN"] = str(self.exe)
         try:
@@ -89,7 +89,7 @@ class Install(unittest.TestCase):
             a.link()
             m.owner.role(a.name, "developer")
             tid = m.owner.task("all", "made before the upgrade")
-            a.call("hub_take", id=tid)
+            a.call("hub_take", id=tid)  # the old version's own tool
             a.stop_hook()
             m.kill(hard=False)  # the installer on Windows stops it; here the owner restarts after
             self.install(H.ROOT)
@@ -104,7 +104,7 @@ class Install(unittest.TestCase):
             # The same session, still running from before, carries on with its old hook commands.
             m.owner.send(a.name, "after the upgrade")
             self.assertIn("after the upgrade", a.stop_hook())
-            a.call("hub_update", id=tid, status="in_progress", note="still mine")
+            a.call("hub_task", action="update", id=tid, status="in_progress", note="still mine")
             m.owner.wait_for("still mine", kind="update")
             m.stop()
         finally:

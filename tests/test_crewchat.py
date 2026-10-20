@@ -1,12 +1,15 @@
 """End-to-end tests: a real server on a free port, a throwaway home folder, real HTTP."""
 import argparse
+import ast
 import base64
 import contextlib
+import gzip
 import http.cookiejar
 import io
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -74,6 +77,11 @@ class Session:
         return line.split(" (you)")[0]
 
 
+def crewchat_sqlite():
+    import sqlite3
+    return sqlite3
+
+
 class Base(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -94,6 +102,9 @@ class Base(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # What waits to be saved (Hub._save_soon) is written now, as a stopping server does: a timer left
+        # behind would write this class's state into the next class's home.
+        crewchat.flush_all(cls.server.RequestHandlerClass.projects)
         cls.server.shutdown()
         cls.server.server_close()
 
@@ -143,15 +154,13 @@ class Protocol(Base):
     def test_initialize_starts_a_session_and_explains_the_chat(self):
         session = Session(self.base, self.token)
         self.assertTrue(session.sid)
-        self.assertEqual(session.hello["capabilities"], {"tools": {}})
+        self.assertEqual(session.hello["capabilities"], {"tools": {"listChanged": True}})  # a lead's list grows
         self.assertIn("crewchat for Demo", session.hello["instructions"])
         self.assertIn("hub_link", session.hello["instructions"])
         tools = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
-        self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_take", "hub_agents",
+        self.assertEqual([t["name"] for t in tools], ["hub_send", "hub_inbox", "hub_task", "hub_agents",
                                                       "hub_status", "hub_history", "hub_rename", "hub_profile", "hub_file",
-                                                      "hub_role",
-                                                      "hub_tasks", "hub_task_add", "hub_assign", "hub_update",
-                                                      "hub_ask", "hub_answer", "hub_link"])
+                                                      "hub_role", "hub_ask", "hub_answer", "hub_link"])
 
     def test_json_rpc_edges(self):
         session = Session(self.base, self.token)
@@ -273,7 +282,7 @@ class Identity(Base):
         finally:
             cli("setup", "--agent-names", "people")
         self.assertEqual(crewchat.load_config()["agent_names"], "people")
-        self.assertEqual(self.hub.poll(-1, -1, 0)["names"], crewchat.AGENT_NAMES)
+        self.assertEqual(self.hub.boot()["names"], crewchat.AGENT_NAMES)
 
     def test_sessions_sharing_one_folder_get_their_own_names(self):
         self.place_names()
@@ -320,6 +329,32 @@ class Identity(Base):
         for bad in ("backend", "BACKEND", "Owner", "all", "has space", "9lives", ""):
             self.assertTrue(other.call("hub_rename", name=bad)["isError"], bad)
         session.call("hub_rename", name=old)
+
+    def test_a_renamed_agent_keeps_its_tokens_and_its_day(self):
+        # hub_rename is what agents are told to do: the tokens it used, and its edits and states, go with it.
+        session, old = self.agent()
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        with self.hub.lock:
+            self.hub.usage.setdefault(day, {})[old] = {"claude-sonnet": [1000, 200, 0, 0, 0]}
+        self.hub.events.add_edit(old, "app/renamed.py")
+        try:
+            session.call("hub_rename", name="tokens-kept")
+            self.assertNotIn(old, self.hub.usage[day])
+            self.assertEqual(self.hub._usage_row("tokens-kept")["today"], 1200)
+            self.assertEqual({e["agent"] for e in self.hub.events.edits() if e["path"] == "app/renamed.py"}, {"tokens-kept"})
+        finally:
+            session.call("hub_rename", name=old)
+            self.hub.usage[day].pop(old, None)
+
+    def test_an_edit_the_event_store_cannot_take_still_reaches_the_code_map(self):
+        # A locked events.sqlite (a checkpoint, a virus scanner) or a full disk: the hook must not fail, or the
+        # agent's hook takes edit tracking as off and stops sending them.
+        import sqlite3
+        with mock.patch.object(self.hub.events, "add_edit", side_effect=sqlite3.OperationalError("database is locked")), \
+                mock.patch("sys.stderr"):
+            with self.hub.lock:
+                self.hub._edited("maya", "app/locked.py")
+        self.assertIn("app/locked.py", self.hub._map_edited)
 
     def test_client_kinds_and_place_labels(self):
         self.assertEqual(crewchat.client_kind({"name": "claude-code"}), "claude")
@@ -497,39 +532,612 @@ class Advisor(Base):
         dev, dev_name = self.agent()
         adv, adv_name = self.agent()
         task = self.say(dev_name, "Ship the cache", "task")
-        dev.call("hub_take", id=task)
+        dev.call("hub_task", action="take", id=task)
         set_check = lambda value: crewchat.post_json(self.base + "/api/task", self.owner,  # noqa: E731
                                                      {"op": "advisor", "value": value})["advisor"]
         self.assertEqual(set_check(""), "off")
         self.assertEqual(set_check("on"), "on")
         try:
-            self.assertIn("The chat has no advisor yet", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("The chat has no advisor yet", dev.text("hub_task", action="update", id=task, status="done"))
             self.role(adv_name, "advisor")
-            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("advisor check before done", dev.text("hub_task", action="update", id=task, status="done"))
             bystander, _ = self.agent()
             self.assertIn("only the agent holding task", bystander.text("hub_ask", question="Done?", task=task))
             question, _ = self.hub.ask(dev_name, "Done? Tests pass.", task=task, wait=0)
             adv.text("hub_answer", id=question["id"], text="Add a test for expiry.", verdict="changes")
-            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("advisor check before done", dev.text("hub_task", action="update", id=task, status="done"))
             question, _ = self.hub.ask(dev_name, "Added the expiry test.", task=task, wait=0)
             # A late answer to an older check does not count: only the newest check does.
             old, _ = question, None
             question, _ = self.hub.ask(dev_name, "Final round.", task=task, wait=0)
             adv.text("hub_answer", id=old["id"], text="Good.", verdict="approve")
-            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("advisor check before done", dev.text("hub_task", action="update", id=task, status="done"))
             adv.text("hub_answer", id=question["id"], text="Good.", verdict="approve")
-            self.assertIn("advisor: approved", dev.text("hub_tasks", view="all"))
+            self.assertIn("advisor: approved", dev.text("hub_task", action="view", show="all"))
             # Work started again: the approval was on other work, so it no longer counts.
-            dev.text("hub_update", id=task, status="in_progress", note="one more fix")
-            self.assertIn("advisor check before done", dev.text("hub_update", id=task, status="done"))
+            dev.text("hub_task", action="update", id=task, status="in_progress", note="one more fix")
+            self.assertIn("advisor check before done", dev.text("hub_task", action="update", id=task, status="done"))
             question, _ = self.hub.ask(dev_name, "Fixed.", task=task, wait=0)
             adv.text("hub_answer", id=question["id"], text="Good.", verdict="approve")
-            self.assertIn("marked done", dev.text("hub_update", id=task, status="done"))
+            self.assertIn("marked done", dev.text("hub_task", action="update", id=task, status="done"))
             self.assertIn("[QUESTION before done, task #%s]" % task, dev.text("hub_history"))
         finally:
             self.assertEqual(set_check("off"), "off")
             self.role(adv_name, "none")
         self.assertIn("Tasks can be marked done without the advisor's check", dev.text("hub_history"))
+
+
+class UsageAcrossRenames(unittest.TestCase):
+    def test_token_usage_follows_tasks_renamed_when_the_chat_is_first_shared(self):
+        # Review: adopt_open_tasks renamed the sheet's tasks but left usage.json under the old numbers.
+        root = Path(tempfile.mkdtemp(prefix="usage-rename-", dir=TMP))
+        crewchat.save_config({"project": "usage-rename", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        old = hub.add_row(crewchat.OWNER, "counted")["id"]  # (the message itself is renamed in place)
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        with hub.lock:
+            hub.sheet[old]["usage"] = counts
+            hub._save_usage()
+        new = hub.adopt_open_tasks("A", "device-1")[old]
+        again = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(again.sheet[new].get("usage"), counts)
+        hub.events.close()
+        again.events.close()
+
+
+class UsageAfterACrashMidRename(unittest.TestCase):
+    def test_counts_saved_under_the_old_numbers_are_found_under_the_new(self):
+        # Review: a crash between state.json (new numbers) and usage.json (old) dropped the tasks' token counts.
+        root = Path(tempfile.mkdtemp(prefix="usage-crash-", dir=TMP))
+        crewchat.save_config({"project": "usage-crash", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        old = hub.add_row(crewchat.OWNER, "counted")["id"]
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        with hub.lock:
+            hub.sheet[old]["usage"] = counts
+            hub._save_usage()
+        with mock.patch.object(hub, "_save_usage"):  # the crash: usage.json not written again
+            new = hub.adopt_open_tasks("A", "device-1")[old]
+        self.assertEqual(crewchat.Hub(crewchat.Roster(root)).sheet[new].get("usage"), counts)
+        hub.events.close()
+
+
+class FlushKeepsGoing(unittest.TestCase):
+    def test_one_failed_save_does_not_skip_the_others(self):
+        root = Path(tempfile.mkdtemp(prefix="flush-", dir=TMP))
+        crewchat.save_config({"project": "flush", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        hub.events.add_edit("maya", "a.py", ts=1)
+        with hub.lock:
+            hub._dirty = True
+        real = crewchat.write_json
+
+        def failing(path, *a, **kw):
+            if str(path).endswith("state.json"):
+                raise OSError(28, "No space left on device")
+            return real(path, *a, **kw)
+        with mock.patch.object(crewchat, "write_json", failing), contextlib.redirect_stderr(io.StringIO()):
+            hub.flush()
+        self.assertTrue(hub._dirty)  # still to write: the next flush tries again
+        self.assertEqual(len(crewchat.EventStore(root / crewchat.EVENTS_FILE).edits()), 1)  # the events were written
+        hub.flush()
+        self.assertFalse(hub._dirty)
+        hub.events.close()
+
+
+class ReconnectOnThePage(unittest.TestCase):
+    def test_asleep_means_idle_or_not_heard_from_for_its_listening_time(self):
+        page = crewchat.CHAT_PAGE
+        asleep = page[page.index("function asleep(a)"):page.index("function asleep(a)") + 300]
+        self.assertTrue('a.activity === "idle"' in asleep)  # never '' alone: unknown after a restart
+        self.assertTrue("a.seen" in asleep)
+
+    def test_an_open_but_asleep_session_offers_reconnect(self):
+        page = crewchat.CHAT_PAGE
+        controls = page[page.index("function sessionControls"):page.index("function sessionControls") + 4000]
+        self.assertTrue('"Reconnect"' in controls)
+        self.assertTrue('op: "reconnect"' in controls)
+        self.assertTrue("asleep(a)" in controls)
+
+
+class NoConsoleWindows(unittest.TestCase):
+    def test_programs_run_for_their_output_open_no_window(self):
+        # On Windows the server has no console: a program it runs without CREATE_NO_WINDOW gets a console window of
+        # its own, which flashes up and closes (the agents' process check every few seconds, git for the code map).
+        import crewchat_map
+        flag = {"creationflags": 0x08000000}
+        done = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        folder = Path(tempfile.mkdtemp(prefix="hidden-", dir=TMP))
+        with mock.patch.object(crewchat, "HIDDEN", flag), mock.patch.object(crewchat_map, "HIDDEN", flag), \
+                mock.patch.object(subprocess, "run", return_value=done) as ran:
+            crewchat.process_table([os.getpid()])
+            crewchat.run(["tailscale", "status", "--json"])
+            crewchat.tracked_by_git(folder, "a.py")
+            crewchat.git_exclude(folder, ["x"])
+            crewchat.tool_help("some-tool")
+            crewchat.status_of(["some-tool", "--version"])
+            crewchat_map.git(folder, "rev-parse", "HEAD")
+        self.assertGreaterEqual(ran.call_count, 7)
+        for call in ran.call_args_list:
+            self.assertEqual(call.kwargs.get("creationflags"), 0x08000000, call.args[0][:3])
+
+
+class PollAfter(unittest.TestCase):
+    def test_the_messages_after_a_number_are_found_by_halving(self):
+        hub = crewchat.Hub.__new__(crewchat.Hub)
+        for seqs in ([], [1], [1, 2, 3], [2, 5, 9, 10, 40], list(range(1, 2001)), [3, 7] + list(range(100, 160))):
+            hub.messages = [{"seq": n} for n in seqs]
+            for after in [-1, 0] + seqs + [n + 1 for n in seqs] + [10 ** 6]:
+                self.assertEqual(hub.messages[hub._after(after):], [m for m in hub.messages if m["seq"] > after],
+                                 (seqs[:5], after))
+
+
+class EditPaths(unittest.TestCase):
+    def test_only_paths_inside_the_project_are_sent_and_kept(self):
+        root = Path(tempfile.mkdtemp(prefix="edits-", dir=TMP))
+        (root / "src").mkdir()
+        call = lambda tool, **args: {"tool_name": tool, "tool_input": args}  # noqa: E731
+        self.assertEqual(crewchat.edited_path("claude", call("Edit", file_path=str(root / "src" / "a.py")), root), "src/a.py")
+        self.assertEqual(crewchat.edited_path("claude", call("Write", file_path="src/new.py"), root), "src/new.py")
+        self.assertEqual(crewchat.edited_path("claude", call("NotebookEdit", notebook_path=str(root / "n.ipynb")), root), "n.ipynb")
+        self.assertEqual(crewchat.edited_path("gemini", call("replace", file_path=str(root / "b.py")), root), "b.py")
+        self.assertEqual(crewchat.edited_path("cursor", {"file_path": str(root / "c.ts")}, root), "c.ts")
+        for outside in ("/etc/hosts", str(root / ".." / "elsewhere.py"), "../up.py", str(root)):
+            self.assertEqual(crewchat.edited_path("claude", call("Edit", file_path=outside), root), "", outside)
+        self.assertEqual(crewchat.edited_path("claude", call("Read", file_path=str(root / "a.py")), root), "")
+        self.assertEqual(crewchat.edited_path("claude", call("Bash", command="rm -rf /"), root), "")
+        self.assertEqual(crewchat.clean_edit_path("src\\win\\path.cs"), "src/win/path.cs")
+        self.assertEqual(crewchat.clean_edit_path("./a//b.py"), "a/b.py")
+        for bad in ("/abs.py", "C:/x.py", "a/../../b.py", "a\nb", "", "x" * 400, None, 3):
+            self.assertEqual(crewchat.clean_edit_path(bad), "", bad)
+
+    def test_timelines_from_recorded_states(self):
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="timeline-", dir=TMP)) / "events.sqlite")
+        for ts, agent, state in ((50, "maya", "idle"), (100, "maya", "working"), (160, "maya", "listening"),
+                                 (400, "maya", "working"), (500, "maya", "listening"),
+                                 (120, "teo", "working"), (130, "teo", "working")):
+            store.add_activity(agent, state, ts)
+        lines = store.timelines(since=90, until=1000, grace=15)
+        self.assertEqual(lines["maya"], [[90, 100, "idle"],  # the state at 90: the last one before it
+                                         [100, 160, "working"], [160, 400, "listening"], [400, 500, "working"],
+                                         [500, 515, "listening"], [515, 1000, "idle"]])  # stopped asking: idle
+        self.assertEqual(lines["teo"], [[120, 1000, "working"]])  # one state again is one piece
+        self.assertEqual(store.timelines(since=2000, until=3000)["maya"], [[2000, 2015, "listening"],
+                                                                          [2015, 3000, "idle"]])
+
+    def test_two_builds_at_once_count_each_message_once(self):
+        # The server builds every project's totals at start; the page may ask for them before that is done.
+        log = Path(tempfile.mkdtemp(prefix="analytics-", dir=TMP)) / "messages.jsonl"
+        log.write_text("".join(json.dumps({"id": "A%d" % n, "seq": n, "ts": 1000 + n, "from": "maya", "to": "all",
+                                           "text": "hi"}) + "\n" for n in range(1, 41)))
+        analytics = crewchat.Analytics(log)
+        analytics.cutoff = 40
+        real = crewchat.log_message
+        with mock.patch.object(crewchat, "log_message", lambda raw: (time.sleep(0.002), real(raw))[1]):
+            builds = [threading.Thread(target=analytics.build) for _ in range(2)]
+            for build in builds:
+                build.start()
+            for build in builds:
+                build.join()
+        self.assertEqual(analytics.total, 40)
+
+    def test_the_event_store(self):
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", "12", ts=100)
+        store.add_edit("teo", "app/a.kt", "", ts=200)
+        store.add_edit("maya", "app/b.kt", "12", ts=300)
+        self.assertEqual([e["path"] for e in store.edits(since=150)], ["app/a.kt", "app/b.kt"])
+        self.assertEqual([e["ts"] for e in store.edits(task="12")], [100, 300])
+        self.assertEqual(store.files(), [  # top: who edited it most (on a tie, last)
+            {"path": "app/a.kt", "edits": 2, "agents": ["maya", "teo"], "top": "teo", "last": 200},
+            {"path": "app/b.kt", "edits": 1, "agents": ["maya"], "top": "maya", "last": 300}])
+        # Written on the hook path, under the hub's lock: one sync per row (WAL, still durable), and a task's
+        # edits found by index rather than by reading them all.
+        db = store._conn()
+        self.assertEqual((db.execute("PRAGMA journal_mode").fetchone()[0], db.execute("PRAGMA synchronous").fetchone()[0]),
+                         ("wal", 2))  # 2: FULL, as the records cannot be rebuilt
+        plan = db.execute("EXPLAIN QUERY PLAN SELECT ts FROM edits WHERE ts >= 0 AND task = '12'").fetchall()
+        self.assertIn("edits_task", " ".join(str(row) for row in plan))
+        # The analytics view's "state before the window", every 15 s: found through the index, never a scan of a
+        # year of activity.
+        plan = " ".join(str(row[3]) for row in db.execute("EXPLAIN QUERY PLAN " + crewchat.BEFORE_STATES, (5,)))
+        self.assertNotIn("SCAN activity", plan)
+        store.close()
+        self.assertEqual(len(crewchat.EventStore(store.path).edits()), 3)  # kept on disk
+
+    def test_a_failed_commit_loses_no_row(self):
+        # Review: rows a read had written without committing were rolled back with a failed commit and never queued again.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        with store.lock:
+            store.add_edit("teo", "app/b.kt", ts=2)
+            store._read()  # written, not committed
+            db = store._conn()
+            store.db = mock.Mock(wraps=db)
+            store.db.commit = mock.Mock(side_effect=crewchat_sqlite().OperationalError("database is locked"))
+            with self.assertRaises(crewchat_sqlite().OperationalError):
+                store._write_pending()
+            store.db = db
+        store.close()
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo"])
+
+    def test_a_failed_write_mid_batch_keeps_the_rest_of_the_batch(self):
+        # Review: an error on one row (a full disk) lost it and every row after it in the batch.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        db = store._conn()
+        calls = [0]
+
+        class Flaky:
+            def __getattr__(self, name):
+                return getattr(db, name)
+
+            def execute(self, sql, row=()):
+                if sql.startswith("INSERT"):
+                    calls[0] += 1
+                    if calls[0] == 2:
+                        raise crewchat_sqlite().OperationalError("database or disk is full")
+                return db.execute(sql, row)
+        with store.lock:
+            for i, agent in enumerate(("teo", "ana", "lu")):
+                store.add_edit(agent, "app/x.kt", ts=2 + i)
+            store.db = Flaky()
+            with self.assertRaises(crewchat_sqlite().OperationalError):
+                store._write_pending()
+            store.db = db
+        store.close()
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo", "ana", "lu"])
+
+    def test_a_row_that_cannot_be_written_does_not_block_the_others(self):
+        # Review: one bad row was put back at the front every time, and every later row waited behind it.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        store._add("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)", (2, None, "bad", ""))  # NOT NULL
+        store.add_edit("teo", "app/b.kt", ts=3)
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])
+        self.assertEqual(store.pending, [])
+        store.close()
+
+    def test_a_read_does_not_wait_for_the_disk(self):
+        # Review: edits() is read under the hub's lock (a task's suggested areas); writing what waits must not commit
+        # (synchronous FULL, a wait for the disk) there. The rows are seen at once; the writer commits them.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        store.edits()
+        db, committed = store._conn(), []
+        real = db.commit
+        store.db = mock.Mock(wraps=db)
+        store.db.commit = lambda: committed.append(threading.current_thread().name) or real()
+        with store.lock:
+            store.add_edit("teo", "app/b.kt", ts=2)
+        self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])
+        self.assertNotIn(threading.current_thread().name, committed)
+        for _ in range(200):
+            if committed:
+                break
+            time.sleep(0.01)
+        self.assertEqual(committed, ["events-writer"])
+        store.close()
+        self.assertEqual(len(crewchat.EventStore(store.path).edits()), 2)
+
+    def test_event_rows_are_written_off_the_callers_thread(self):
+        # add_edit and add_activity run under the hub's lock: a commit waiting on the disk (synchronous FULL) must
+        # not hold it. Here the store's connection is busy (a slow disk): adding a row still returns at once.
+        store = crewchat.EventStore(Path(tempfile.mkdtemp(prefix="events-", dir=TMP)) / "events.sqlite")
+        store.add_edit("maya", "app/a.kt", ts=1)
+        self.assertEqual(len(store.edits()), 1)
+        done = threading.Event()
+        with store.lock:
+            threading.Thread(target=lambda: (store.add_edit("teo", "app/b.kt", ts=2),
+                                             store.add_activity("teo", "working", ts=2), done.set()), daemon=True).start()
+            self.assertTrue(done.wait(2), "adding a row waited for the store's connection")
+        self.assertEqual([e["agent"] for e in store.edits()], ["maya", "teo"])  # a read sees every row added before it
+        store.add_edit("lu", "app/d.kt", ts=2.5)
+        for _ in range(200):  # and the writer writes them on its own
+            if not store.pending:
+                break
+            time.sleep(0.01)
+        self.assertEqual(store.pending, [])
+        store.add_edit("ana", "app/c.kt", ts=3)
+        store.close()  # what waits is written before the store closes: the rows cannot be rebuilt
+        self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo", "lu", "ana"])
+
+
+class Faces(unittest.TestCase):
+    """A new agent's face, made of parts (a skin, hair, a hat, glasses, clothes, ...) at random, and drawn as SVG."""
+
+    def test_every_part_draws_a_well_formed_picture(self):
+        import xml.etree.ElementTree as ET
+        codes = []
+        for i, (_, n) in enumerate(crewchat.MIX_PARTS):  # each option of each part, the others at their first
+            for option in range(n):
+                parts = [0] * len(crewchat.MIX_PARTS)
+                parts[i] = option
+                codes.append(".".join(map(str, parts)))
+        codes += [crewchat.new_mix()[4:] for _ in range(300)]
+        for code in codes:
+            svg = crewchat.mix_svg(code)
+            root = ET.fromstring(svg)
+            self.assertEqual((root.tag, root.get("viewBox")), ("{http://www.w3.org/2000/svg}svg", "0 0 128 128"), code)
+            self.assertNotIn(b"<script", svg)
+
+    def test_a_code_is_one_number_per_part_in_its_range(self):
+        last = ".".join(str(n - 1) for _, n in crewchat.MIX_PARTS)
+        self.assertIsNotNone(crewchat.mix_parts(last))
+        too_far = ".".join(str(n) for _, n in crewchat.MIX_PARTS)
+        for bad in ("", "1.2.3", too_far, last + ".0", "a" + last[1:], "0" + last, "<svg>", "-" + last):
+            self.assertIsNone(crewchat.mix_parts(bad), bad)
+            self.assertIsNone(crewchat.mix_svg(bad), bad)
+        self.assertEqual(crewchat.clean_picture("mix:" + last), "mix:" + last)
+        self.assertEqual(crewchat.clean_picture("mix:" + too_far), "")  # another machine's odd one: initials
+        self.assertIsNotNone(crewchat.mix_parts(last.rsplit(".", 1)[0]))  # a code from before looks (eleven parts)
+        self.assertIsNone(crewchat.mix_parts(last.rsplit(".", 2)[0]))  # but not ten
+
+    def test_a_face_suits_its_name(self):
+        for name, want in crewchat.NAME_LOOKS.items():
+            for _ in range(5):
+                parts = crewchat.mix_parts(crewchat.new_mix(0, name=name)[4:])
+                self.assertIn(parts[4], crewchat.MIX_HAIR_FOR[want], name)  # hair that goes with the name
+                self.assertTrue(crewchat.mix_fits(parts, name))
+                if name not in crewchat.INDIAN_NAMES:
+                    self.assertIn(parts[11], crewchat.MIX_LOOK_FOR[want], name)  # lashes for "f"; a beard maybe for "m"
+        self.assertIn("Maya", crewchat.NAME_LOOKS)
+        self.assertNotIn("Noor", crewchat.NAME_LOOKS)  # a name for anyone: any face
+        self.assertTrue(set(crewchat.NAME_LOOKS) <= set(crewchat.AGENT_NAMES))
+        maya = crewchat.mix_parts(crewchat.new_mix(0, name="Maya")[4:])
+        self.assertFalse(crewchat.mix_fits(maya, "Teo"))
+        self.assertTrue(crewchat.mix_fits(maya, "Noor") and crewchat.mix_fits(maya, "Someone"))
+
+    def test_an_indian_name_gets_an_indian_face(self):
+        self.assertTrue(crewchat.INDIAN_NAMES <= set(crewchat.AGENT_NAMES))
+        self.assertEqual(len(set(crewchat.AGENT_NAMES)), len(crewchat.AGENT_NAMES))
+        bindis = 0
+        for name in crewchat.INDIAN_NAMES:
+            for _ in range(8):
+                parts = crewchat.mix_parts(crewchat.new_mix(0, name=name)[4:])
+                self.assertIn(parts[1], crewchat.MIX_INDIAN["skin"], name)  # a warm brown skin
+                self.assertIn(parts[5], crewchat.MIX_INDIAN["haircolour"], name)  # black or dark brown hair
+                if crewchat.NAME_LOOKS.get(name) == "f":
+                    self.assertIn(parts[11], (1, 3), name)  # lashes, and half the time a bindi
+                    bindis += parts[11] == 3
+                else:
+                    self.assertNotEqual(parts[11], 3, name)
+        self.assertGreater(bindis, 0)
+        self.assertIn(b"#c8283c", crewchat.mix_svg("0.0.0.0.0.0.0.0.0.0.0.3"))  # the bindi drawn
+        for _ in range(200):  # never on a face whose name does not call for it
+            self.assertNotEqual(crewchat.mix_parts(crewchat.new_mix(0, name="Noor")[4:])[11], 3)
+        light = [0] * 12
+        light[11] = 1
+        self.assertFalse(crewchat.mix_fits(light, "Priya"))  # the lightest skin tone is not one an Indian name gets
+
+    def test_a_new_face_works_at_the_machines_device_and_is_nobody_elses(self):
+        for device in range(3):
+            self.assertEqual(crewchat.mix_parts(crewchat.new_mix(device)[4:])[10], device)  # the device part
+        taken = {crewchat.new_mix(0) for _ in range(50)}
+        self.assertNotIn(crewchat.new_mix(0, taken), taken)
+        self.assertIn(crewchat.device_kind(), (0, 1, 2))
+        try:
+            crewchat.device_kind.cache_clear()
+            with mock.patch.dict(os.environ, {"CLAUDE_CODE_REMOTE": "true"}):
+                self.assertEqual(crewchat.device_kind(), 2)  # a cloud session sits on a cloud
+        finally:
+            crewchat.device_kind.cache_clear()
+
+
+class FacesOnThePage(Base):
+    """The server draws a face from its code, for the page; the dice on the page give an agent a new one."""
+
+    def test_the_server_draws_a_face_and_refuses_a_bad_code(self):
+        code = crewchat.new_mix()[4:]
+        with urllib.request.urlopen(self.base + "/pictures/mix/%s.svg" % code) as r:
+            self.assertEqual(r.headers["Content-Type"], "image/svg+xml")
+            self.assertEqual(r.headers["Content-Security-Policy"], "default-src 'none'")
+            self.assertEqual(r.read(), crewchat.mix_svg(code))
+        for bad in ("9.9.9", "..%2Fart"):
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                urllib.request.urlopen(self.base + "/pictures/mix/%s.svg" % bad)
+            self.assertEqual(e.exception.code, 404)
+
+    def test_a_renamed_agent_gets_a_face_that_suits_its_new_name(self):
+        name = self.hub.agent_for(self.hub.open_session("macbook", "claude"))
+        self.hub.rename(name, "Maya")
+        self.hub.set_profile("Maya", "mix:new")
+        face = self.hub.agents["Maya"]["picture"]
+        self.assertTrue(crewchat.mix_fits(crewchat.mix_parts(face[4:]), "Maya"))
+        self.hub.rename("Maya", "Teo")
+        after = self.hub.agents["Teo"]["picture"]
+        self.assertNotEqual(after, face)
+        self.assertTrue(crewchat.mix_fits(crewchat.mix_parts(after[4:]), "Teo"))
+        self.assertEqual(crewchat.mix_parts(after[4:])[10], crewchat.mix_parts(face[4:])[10])  # at the same device
+        self.hub.rename("Teo", "Noor")
+        self.assertEqual(self.hub.agents["Noor"]["picture"], after)  # it suits a name for anyone: kept
+        self.hub.set_profile("Noor", "art:owl")
+        self.hub.rename("Noor", "Maya")
+        self.assertEqual(self.hub.agents["Maya"]["picture"], "art:owl")  # a picture chosen stays
+        self.hub.remove("Maya")
+
+    def test_the_dice_give_an_agent_a_new_face(self):
+        name = self.hub.agent_for(self.hub.open_session("macbook", "claude"))
+        before = self.hub.agents[name]["picture"]
+        self.hub.set_profile(name, "mix:new")
+        after = self.hub.agents[name]["picture"]
+        self.assertTrue(after.startswith("mix:") and crewchat.mix_parts(after[4:]) and after != before)
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_profile(name, "mix:1.2")
+
+
+class AnalyticsTotals(unittest.TestCase):
+    """/api/analytics' numbers, worked out from the whole message log (roadmap X1)."""
+
+    def hub(self, lines=()):
+        root = Path(tempfile.mkdtemp(prefix="analytics-", dir=TMP))
+        crewchat.save_config({"project": "numbers"}, root)
+        (root / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in lines))
+        return crewchat.Hub(crewchat.Roster(root))
+
+    def test_a_day_of_work_in_numbers(self):
+        t0 = time.time() - 3600
+        msg = lambda seq, sender, to, kind="msg", **kw: dict({"id": str(seq), "seq": seq, "ts": t0 + seq * 60,  # noqa: E731
+                                                            "from": sender, "to": to, "kind": kind, "text": "x"}, **kw)
+        lines = [msg(1, "Owner", "all", "task"), msg(2, "Maya", "all", "take", task="1"),
+                 msg(3, "Maya", "Owner", "update", task="1", status="in_progress"),
+                 msg(4, "Maya", "Owner", "update", task="1", status="blocked"),
+                 msg(6, "Maya", "Owner", "update", task="1", status="in_progress"),
+                 msg(7, "Maya", "Owner", "update", task="1", status="review"),
+                 msg(8, "Maya", "Owner", "update", task="1", status="done"),
+                 msg(9, "Owner", "all", "task"), msg(10, "Teo", "all", "take", task="9"),
+                 msg(11, "Teo", "Owner", "update", task="9", status="review"),
+                 msg(12, "Teo", "Owner", "update", task="9", status="in_progress"),
+                 msg(13, "Teo", "Owner", "update", task="9", status="review"),
+                 msg(14, "crewchat", "all", "update", task="9", status="todo", reclaimed="Teo"),
+                 msg(15, "Wren", "Teo", "answer", answers="9", verdict="approve"),
+                 msg(16, "Teo", "Maya", files=[{"id": "a" * 16}, {"id": "b" * 16}]),
+                 msg(17, "crewchat", "all", "event")]
+        hub = self.hub(lines)
+        report = hub.analytics.report(hub)
+        self.assertEqual(report["messages"], 15)  # the event (who joined) is not a message
+        tasks = report["tasks"]
+        self.assertEqual((tasks["posted"], tasks["taken"], tasks["done"]), (2, 2, 1))
+        self.assertEqual(tasks["time_to_take"], 60)
+        self.assertEqual(tasks["cycle_time"], 7 * 60)
+        self.assertEqual(tasks["time_blocked"], 2 * 60)  # blocked at 4, going again at 6
+        self.assertEqual(tasks["review_pass_rate"], 0.5)  # #1 passed its first review, #9 did not
+        self.assertEqual((report["reclaims"], report["files"], report["verdicts"]), (1, 2, {"approve": 1}))
+        self.assertIn(["Maya", "Owner", 5], report["pairs"])
+        self.assertEqual(report["agents"]["Teo"]["messages"], 5)  # the take, three updates, the files
+        self.assertNotIn("crewchat", report["agents"])
+        self.assertEqual(sum(h["messages"] for h in report["hours"]), 15)
+        # New messages count as they come, once.
+        with hub.lock:
+            hub._append("Maya", "all", "and one more", "msg")
+        self.assertEqual(hub.analytics.report(hub)["messages"], 16)
+
+    def test_a_task_still_in_review_has_not_failed_it(self):
+        t0 = time.time() - 3600
+        msg = lambda seq, sender, kind, **kw: dict({"id": str(seq), "seq": seq, "ts": t0 + seq * 60, "from": sender,  # noqa: E731
+                                                    "to": "all", "kind": kind, "text": "x"}, **kw)
+        hub = self.hub([msg(1, "Owner", "task"), msg(2, "Maya", "take", task="1"),
+                        msg(3, "Maya", "update", task="1", status="review")])
+        self.assertIsNone(hub.analytics.report(hub)["tasks"]["review_pass_rate"])  # no review has ended yet: no rate
+        with hub.lock:
+            hub._append("Maya", "all", "x", "update", task="1", status="done")
+        self.assertEqual(hub.analytics.report(hub)["tasks"]["review_pass_rate"], 1.0)
+
+    def test_the_whole_log_counts_not_only_what_is_in_memory(self):
+        n = crewchat.KEEP_MESSAGES + 500
+        hub = self.hub([{"id": str(i), "seq": i, "ts": 1.0 + i, "from": "Maya", "to": "all", "kind": "msg", "text": "x"}
+                        for i in range(1, n + 1)])
+        with hub.lock:
+            hub._append("Teo", "all", "after the start", "msg")  # before the build: still counted once
+        self.assertEqual(len(hub.messages), crewchat.KEEP_MESSAGES)
+        report = hub.analytics.report(hub)
+        self.assertEqual(report["messages"], n + 1)
+        self.assertEqual(hub.analytics.report(hub)["messages"], n + 1)  # built once
+
+
+class TokenPrices(unittest.TestCase):
+    def test_prices_and_transcripts(self):
+        self.assertEqual(crewchat.model_price("claude-opus-5-5"), crewchat.PRICES["claude-opus-5-5"])
+        self.assertEqual(crewchat.model_price("claude-opus-5-5[1m]"), crewchat.PRICES["claude-opus-5-5"])
+        self.assertEqual(crewchat.model_price("claude-haiku-4-5-20251001"), crewchat.PRICES["claude-haiku-4-5"])
+        self.assertEqual(crewchat.model_price("claude-opus-5"), crewchat.PRICES["claude-opus-5"])  # not 5-5's
+        self.assertIsNone(crewchat.model_price("gpt-9"))
+        self.assertEqual(crewchat.usage_cost({"gpt-9": [1, 1, 1, 1, 1]}), (0.0, ["gpt-9"]))
+        path = Path(tempfile.mkdtemp(prefix="transcript-", dir=TMP)) / "t.jsonl"
+        line = lambda mid, n: json.dumps({"type": "assistant", "message": {"id": mid, "model": "m",  # noqa: E731
+                                                                         "usage": {"input_tokens": n, "output_tokens": n}}})
+        path.write_text(line("a", 1) + "\n" + line("a", 1) + "\n" + line("b", 2) + "\n" + line("c", 3)[:20])  # c: half written
+        found, offset, last = crewchat.transcript_usage(path)
+        self.assertEqual((found, last), ({"m": [3, 3, 0, 0, 0]}, "b"))
+        with open(path, "a") as f:
+            f.write(line("c", 3)[20:] + "\n" + json.dumps({"type": "assistant", "message": {"id": "s", "model": "<synthetic>",
+                                                                                          "usage": {"input_tokens": 0}}}) + "\n")
+        self.assertEqual(crewchat.transcript_usage(path, offset, last)[0], {"m": [3, 3, 0, 0, 0]})  # c, finished; nothing for 0s
+        path.write_text(line("z", 5) + "\n")  # a shorter, new transcript: read from its start
+        self.assertEqual(crewchat.transcript_usage(path, offset, last)[0], {"m": [5, 5, 0, 0, 0]})
+
+
+class TrimmedTools(Base):
+    """What every agent loads is short (roadmap P2): one hub_task for the task sheet, and inbox and history
+    answers that fit a cap without losing a message."""
+
+    def test_the_tool_definitions_are_short_and_task_tools_are_one(self):
+        self.assertLess(len(json.dumps(crewchat.TOOLS)), 7000)
+        names = [t["name"] for t in crewchat.TOOLS]
+        self.assertIn("hub_task", names)
+        self.assertFalse(set(names) & set(crewchat.OLD_TASK_TOOLS))
+        guide = crewchat.RULES
+        for action in crewchat.TASK_ACTIONS:  # how to use them is in the guide every folder gets
+            self.assertIn("`%s`" % action, guide)
+
+    def test_an_old_task_tool_says_to_restart_the_session(self):
+        session, _ = self.agent()
+        for old, action in crewchat.OLD_TASK_TOOLS.items():
+            out = session.call(old, id="1")
+            self.assertTrue(out["isError"], old)
+            text = out["content"][0]["text"]
+            self.assertIn("now hub_task with action %s" % action, text)
+            self.assertIn("restart it", text)
+
+    def test_hub_task_takes_one_action_at_a_time(self):
+        session, name = self.agent()
+        self.assertIn("action is view, add, take, assign, areas, update", session.text("hub_task", action="peek"))
+        self.assertIn("action is", session.text("hub_task"))
+        added = session.text("hub_task", action="add", title="Write the release notes", areas="docs/")
+        tid = re.search(r"#(\w+)", added).group(1)
+        self.assertIn("Write the release notes", session.text("hub_task", action="view", show="all"))
+        self.assertIn("is yours", session.text("hub_task", action="take", id=tid))
+        self.assertIn("marked in progress", session.text("hub_task", action="update", id=tid, status="in_progress", note="on it"))
+        self.assertIn("not both", session.text("hub_task", action="assign", to=name, id=tid, title="x"))
+
+    def test_a_long_inbox_comes_in_parts_and_loses_nothing(self):
+        sender, _ = self.agent()
+        reader, reader_name = self.agent()
+        reader.text("hub_inbox")  # what was there before
+        texts = ["Message %02d: %s" % (i, "word " * 80) for i in range(50)]  # about 20,000 characters in all
+        for t in texts:
+            sender.call("hub_send", to=reader_name, text=t)
+        self.assertIn("more unread", reader.text("hub_inbox", peek=True))
+        first = reader.text("hub_inbox", peek=True)
+        self.assertEqual(reader.text("hub_inbox", peek=True), first)  # peek marks nothing read
+        seen, parts = [], 0
+        while True:
+            out = reader.text("hub_inbox")
+            if out == "No new messages.":
+                break
+            parts += 1
+            body = out.split("\n\n", 1)[1].split("\n\n")[0]
+            self.assertLessEqual(len(body), crewchat.MAX_TOOL_OUTPUT)
+            seen += re.findall(r"Message \d\d: ", out)
+        self.assertGreater(parts, 2)
+        self.assertEqual(seen, ["Message %02d: " % i for i in range(50)])  # every one, once, in order
+        big = "x" * crewchat.MAX_TEXT
+        sender.call("hub_send", to=reader_name, text=big)
+        self.assertIn(big, reader.text("hub_inbox"))  # one message bigger than the cap: whole, never cut
+        history = reader.text("hub_history", limit=50)
+        self.assertIn("older left out", history)
+        self.assertIn(big, history)  # the newest that fit
+
+    def test_messages_show_a_short_time(self):
+        now = time.time()
+        self.assertEqual(crewchat.short_time(now), time.strftime("%H:%M", time.gmtime(now)))
+        self.assertEqual(crewchat.short_time(now - 3 * 86400), time.strftime("%m-%d %H:%M", time.gmtime(now - 3 * 86400)))
+        msg = {"id": "7", "ts": now, "kind": "msg", "from": "Maya", "to": "all", "text": "hi"}
+        self.assertTrue(crewchat.fmt(msg, "Teo", True).startswith("[#7 %s]" % crewchat.short_time(now)))
+        self.assertIn("UTC", crewchat.fmt(msg, "Teo"))  # hooks keep the full time
+
+    def test_the_old_task_tools_leave_the_allow_lists(self):
+        settings = {"permissions": {"allow": ["mcp__crewchat__hub_take", "mcp__crewchat__hub_send", "Bash(ls)"]}}
+        self.assertTrue(crewchat.allow_rule(settings, crewchat.CLAUDE_ALLOW))
+        allow = settings["permissions"]["allow"]
+        self.assertNotIn("mcp__crewchat__hub_take", allow)
+        self.assertIn("mcp__crewchat__hub_task", allow)
+        self.assertIn("Bash(ls)", allow)  # the user's own stay
+        self.assertFalse(crewchat.allow_rule(settings, crewchat.CLAUDE_ALLOW))  # up to date
 
 
 class Tasks(Base):
@@ -540,7 +1148,7 @@ class Tasks(Base):
         task = self.say("all", "Add a dark icon", "task")
         self.assertIn("Owner -> all: [TASK, open] Add a dark icon", self.crew[0][0].text("hub_inbox"))
         results = {}
-        threads = [threading.Thread(target=lambda s=s, n=n: results.update({n: s.call("hub_take", id=task)}))
+        threads = [threading.Thread(target=lambda s=s, n=n: results.update({n: s.call("hub_task", action="take", id=task)}))
                    for s, n in self.crew]
         [t.start() for t in threads]
         [t.join() for t in threads]
@@ -556,18 +1164,18 @@ class Tasks(Base):
     def test_a_task_for_one_agent_is_only_that_agents(self):
         (a, a_name), (b, _) = self.crew[:2]
         task = self.say(a_name, "Only for you", "task")
-        self.assertIn("was given to " + a_name, b.text("hub_take", id=task))
-        self.assertFalse(a.call("hub_take", id=task)["isError"])
+        self.assertIn("was given to " + a_name, b.text("hub_task", action="take", id=task))
+        self.assertFalse(a.call("hub_task", action="take", id=task)["isError"])
 
     def test_a_task_number_can_be_written_with_a_hash(self):
         (a, a_name) = self.crew[0]
         task = self.say("all", "hash me", "task")
-        self.assertIn("Task #%s is yours" % task, a.text("hub_take", id="#%s" % task))
+        self.assertIn("Task #%s is yours" % task, a.text("hub_task", action="take", id="#%s" % task))
 
     def test_only_tasks_can_be_taken(self):
         message = self.say("all", "just a note")
-        self.assertTrue(self.crew[0][0].call("hub_take", id=message)["isError"])
-        self.assertTrue(self.crew[0][0].call("hub_take", id=999999)["isError"])
+        self.assertTrue(self.crew[0][0].call("hub_task", action="take", id=message)["isError"])
+        self.assertTrue(self.crew[0][0].call("hub_task", action="take", id=999999)["isError"])
 
     def test_agents_cannot_post_as_owner(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
@@ -581,6 +1189,367 @@ class Tasks(Base):
         self.assertIn("Posted message #", cli("say", "plain note"))
         with self.assertRaises(SystemExit):
             cli("say", "--to", "nobody-here", "hello")
+
+
+class TaskAreas(Base):
+    """Roadmap C2: a task's areas suggested from the files its holder edited (C0), accepted by the owner or the
+    lead, and an overlap check that sees imports (C1)."""
+
+    def setUp(self):
+        self.crew = [self.agent() for _ in range(2)]
+        maps = mock.patch.object(self.hub, "_maps", None)  # the code map: none unless a test makes one
+        maps.start()
+        self.addCleanup(maps.stop)
+
+    def task(self, title, areas=""):
+        return crewchat.post_json(self.base + "/api/task", self.owner, {"op": "add", "title": title, "areas": areas})["id"]
+
+    def sheet(self, mid):
+        return self.hub.sheet[mid]
+
+    def suggestions(self, mid):
+        return [m for m in self.hub.messages if m.get("task") == mid and m.get("suggested")]
+
+    def test_the_folders_it_edited_are_suggested_when_it_goes_to_review(self):
+        (a, a_name), _ = self.crew
+        mid = self.task("Fix the login", "login/")
+        a.call("hub_task", action="take", id=mid)
+        for path in ("login/form.kt", "session/store.kt", "session/keys/token.kt", "docs/login.md", "README.md"):
+            self.hub.events.add_edit(a_name, path, mid)
+        self.hub.events.add_edit(a_name, "unrelated/file.kt", "")  # not while it held the task
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        self.assertEqual(self.sheet(mid)["suggested"], ["README.md", "docs/", "session/"])  # login/ it has already
+        [notice] = self.suggestions(mid)
+        self.assertEqual((notice["from"], notice["to"]), (crewchat.SERVER_NAME, crewchat.OWNER))  # no lead: the owner
+        self.assertIn("outside its areas: README.md, docs/, session/", notice["text"])
+        self.assertIn("crewchat tasks areas %s accept" % mid, notice["text"])
+        self.assertIn("suggested files README.md, docs/, session/", cli("tasks"))
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "done"})
+        self.assertEqual(len(self.suggestions(mid)), 1)  # done, with nothing new since: not suggested again
+        out = crewchat.post_json(self.base + "/api/task", self.owner, {"op": "areas", "task": mid, "accept": True})
+        self.assertEqual(out["areas"], ["login/", "README.md", "docs/", "session/"])
+        self.assertNotIn("suggested", self.sheet(mid))
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/task", self.owner, {"op": "areas", "task": mid, "accept": True})
+
+    def test_the_lead_accepts_them_with_hub_task(self):
+        (a, a_name), (lead, lead_name) = self.crew
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": lead_name, "role": "lead"})
+        self.addCleanup(crewchat.post_json, self.base + "/api/role", self.owner, {"agent": lead_name, "role": "none"})
+        mid = self.task("Add search")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.events.add_edit(a_name, "web/search/box.tsx", mid)
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        inbox = lead.text("hub_inbox")
+        self.assertIn("but has no areas: web/search/", inbox)
+        self.assertIn("hub_task action=areas id=%s accept=true" % mid, inbox)
+        self.assertIn("only the lead or the owner", a.text("hub_task", action="areas", id=mid, accept=True))
+        self.assertIn("Task #%s's files: web/search/." % mid, lead.text("hub_task", action="areas", id=mid, accept=True))
+        self.assertIn("Task #%s's files: web/, api/." % mid, lead.text("hub_task", action="areas", id=mid, areas="web/,api/"))
+        self.assertIn("files web/, api/", lead.text("hub_task", action="view", show="all"))
+        self.assertIn("Task #%s's files: web/." % mid, cli("tasks", "areas", mid, "web/"))
+
+    def test_an_edit_goes_to_the_task_its_holder_works_on_now(self):
+        (a, a_name), _ = self.crew
+        first, second, third = self.task("Holding one"), self.task("Holding two"), self.task("Holding three")
+        for mid in (first, second):
+            a.call("hub_task", action="take", id=mid)
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), second)  # taken last
+        a.text("hub_task", action="update", id=first, status="in_progress", note="on it")
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), first)  # reported on last
+        a.call("hub_task", action="take", id=third)
+        with self.hub.lock:
+            self.assertEqual(self.hub._usage_task(a_name), third)
+
+    def test_nothing_is_suggested_without_edit_tracking(self):
+        (a, a_name), _ = self.crew
+        mid = self.task("Quiet one", "quiet/")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.events.add_edit(a_name, "elsewhere/x.py", mid)
+        with mock.patch.object(crewchat.Hub, "edits_on", lambda hub: False):
+            a.text("hub_task", action="update", id=mid, status="review", note="ready")
+        self.assertEqual(self.suggestions(mid), [])
+        a.text("hub_task", action="update", id=mid, status="in_progress", note="again")
+        a.text("hub_task", action="update", id=mid, status="review", note="ready")  # tracking on: suggested now
+        self.assertEqual(self.sheet(mid)["suggested"], ["elsewhere/"])
+
+    def test_a_changed_interface_is_told_to_the_tasks_that_import_it(self):
+        # Roadmap C3, done when: renaming a parameter of a function another agent's area imports sends exactly
+        # one notice; a change to a body alone sends none.
+        code = Path(tempfile.mkdtemp(prefix="iface-", dir=TMP)).resolve()
+        files = {"paylib/parse.py": "def read(path):\n    return path\n", "paylib/__init__.py": "",
+                 "payapp/main.py": "from paylib.parse import read\nread('x')\n", "paydocs/notes.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        import crewchat_map
+        self.hub._maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="iface-maps-", dir=TMP)))
+        self.addCleanup(self.hub._maps.close)
+        self.hub.update_map()
+        (a, a_name), (b, b_name) = self.crew
+        c, c_name = self.agent()
+        # A works on scripts and changes the parser on the way; B's task is on the app, which imports it.
+        mine, theirs, docs = self.task("The scripts", "payscripts/"), self.task("The app", "payapp/"), \
+            self.task("Notes", "paydocs/")
+        for agent, mid in ((a, mine), (b, theirs), (c, docs)):
+            self.assertNotIn("Error", agent.text("hub_task", action="take", id=mid))
+        for agent in (a, b, c):
+            agent.text("hub_inbox")
+
+        def edit(text):
+            (code / "paylib/parse.py").write_text(text)
+            later = time.time() + 30 + len(self.hub.messages)
+            os.utime(code / "paylib/parse.py", (later, later))
+            with self.hub.lock:
+                self.hub._edited(a_name, "paylib/parse.py")
+            self.hub.update_map()
+
+        start = time.time()
+        edit("def read(source):\n    return source\n")
+        edit("def read(source):\n    return source.strip()\n")  # still at it: one notice, when it settles
+        self.assertEqual(self.hub.interface_notices(self.hub._maps, now=start + 10), [])  # not settled yet
+        [notice] = self.hub.interface_notices(self.hub._maps, now=start + crewchat.NOTICE_SETTLE + 5)
+        self.assertEqual((notice["to"], notice["task"], notice["changed"]), (b_name, theirs, "paylib/parse.py"))
+        inbox = b.text("hub_inbox")
+        self.assertIn("%s changed paylib/parse.py, which your task #%s uses: read(path) is now read(source)" % (
+            a_name, theirs), inbox)
+        self.assertNotIn("paylib/parse.py", a.text("hub_inbox") + c.text("hub_inbox"))  # not its editor, nor others
+        edit("def read(source):\n    return source.lower()\n")  # a body only
+        self.assertEqual(self.hub.interface_notices(self.hub._maps, now=start + 10000), [])
+
+    def test_taking_or_giving_a_task_warns_of_the_code_others_work_on(self):
+        # Roadmap C4: a note naming the other task and its holder, firm on certain links, a hint on guesses;
+        # never in the way.
+        code = Path(tempfile.mkdtemp(prefix="blast-", dir=TMP)).resolve()
+        # The guess: a service injected by a name two files define (a guess with either readers, C9's too).
+        files = {"blastlib/parse.py": "def read():\n    pass\n", "blastlib/__init__.py": "",
+                 "blastapp/main.py": "from blastlib.parse import read\n",
+                 "blastng/cart.component.ts": "@Component({ selector: 'app-cart', template: `<p></p>` })\n"
+                                              "export class CartComponent { constructor(private prices: PriceService) {} }\n",
+                 "blastng/a/price.service.ts": "@Injectable()\nexport class PriceService {}\n",
+                 "blastng/b/price.service.ts": "@Injectable()\nexport class PriceService {}\n", "blastdocs/notes.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="blast-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        self.hub._maps = maps
+        (a, a_name), (b, b_name) = self.crew
+        pricing, cart = self.task("Pricing rules", "blastng/a/"), self.task("The cart", "blastng/cart.component.ts")
+        lib, app, docs = self.task("The parser", "blastlib/"), self.task("The app", "blastapp/"), self.task("Notes", "blastdocs/")
+        a.call("hub_task", action="take", id=pricing)
+        out = b.text("hub_task", action="take", id=cart)  # a guess only (a name defined twice): taken, with a hint
+        self.assertIn("Task #%s is yours" % cart, out)
+        self.assertIn("Heads up: #%s (%s) may touch code this task uses (a guess from names)" % (pricing, a_name), out)
+        a.call("hub_task", action="take", id=lib)
+        # The owner gives the app to b: certain, so a firm note, in the message b gets; nothing stopped.
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "assign", "task": app, "agent": b_name})
+        self.assertEqual(self.hub.taken[app], b_name)
+        inbox = b.text("hub_inbox")
+        self.assertIn("Heads up: #%s (%s) works on code that this task's files import or are imported by" % (lib, a_name), inbox)
+        self.assertIn("agree any change to what they share with %s first" % a_name, inbox)
+        self.assertNotIn("Heads up", a.text("hub_task", action="take", id=docs))  # nothing it shares: nothing said
+        self.hub._maps = None
+        self.assertEqual(self.hub.blast_radius(b_name, cart), "")  # no map: no note
+
+    def test_joining_agents_get_a_brief_of_the_code(self):
+        # Roadmap C6: a skill (and a Cursor rule) made from the code map and the sheet, stamped with the commit;
+        # AGENTS.md only points to it (owner, 18 Oct: not every turn's cost).
+        code = Path(tempfile.mkdtemp(prefix="brief-", dir=TMP)).resolve()
+        for rel, text in {"brieflib/core.py": "class Engine:\n    def run(self):\n        pass\n", "brieflib/__init__.py": "",
+                          "briefapp/main.py": "from brieflib.core import Engine\n", "AGENTS.md": "# Our notes\n"}.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        import crewchat_map
+        self.hub._maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="brief-maps-", dir=TMP)))
+        self.addCleanup(self.hub._maps.close)
+        (a, a_name), _ = self.crew
+        mid = self.task("Speed up the engine", "brieflib/")
+        a.call("hub_task", action="take", id=mid)
+        self.hub.update_map()
+        brief = (code / crewchat.BRIEF_SKILL).read_text()
+        self.assertTrue(brief.startswith("---\nname: crewchat-brief\n"))
+        self.assertIn("at commit `none`", brief)  # not a git folder: stamped as such
+        self.assertIn("- `brieflib/core.py`: used by 1; defines Engine", brief)
+        self.assertIn("- `briefapp/main.py`", brief)  # where it starts
+        self.assertIn("- #%s Speed up the engine: %s, in progress; files brieflib/" % (mid, a_name), brief)
+        self.assertIn("alwaysApply: false", (code / crewchat.BRIEF_RULE).read_text())
+        self.assertIn("read %s when you join" % crewchat.BRIEF_SKILL, (code / "AGENTS.md").read_text())
+        self.assertNotIn("used by 1", (code / "AGENTS.md").read_text())  # a pointer, not the brief
+        with mock.patch.object(crewchat_map.CodeMap, "overview") as overview:
+            self.assertEqual(self.hub.update_map(), {})
+        self.assertFalse(overview.called)  # no edit, no commit, the same sheet: not even made again
+        (code / "NOTES.md").write_text("not code\n")
+        self.hub._map_edited.add("NOTES.md")
+        with mock.patch.object(crewchat_map.CodeMap, "overview") as overview:
+            self.assertEqual(list(self.hub.update_map().values()), [[]])  # an edit the map does not read
+        self.assertFalse(overview.called)
+        self.assertEqual(self.hub.write_briefs(self.hub._maps), [])  # nothing new: nothing written
+        a.text("hub_task", action="update", id=mid, status="done", note="faster")
+        self.assertEqual(self.hub.write_briefs(self.hub._maps), [str(code)])  # the sheet moved: written again
+        self.assertNotIn("#%s Speed up the engine" % mid, (code / crewchat.BRIEF_SKILL).read_text())
+        crewchat.remove_guides(code)
+        self.assertFalse((code / crewchat.BRIEF_SKILL).exists() or (code / crewchat.BRIEF_RULE).exists())
+
+    def test_suggested_areas_travel_as_a_message_field(self):
+        mid = self.task("From another machine")
+        self.assertTrue(self.hub.ingest({"id": "far-%s" % mid, "ts": time.time(), "from": crewchat.SERVER_NAME,
+                                         "to": crewchat.OWNER, "text": "suggested", "kind": "msg", "task": mid,
+                                         "suggested": "api/,docs/"}))
+        self.assertEqual(self.sheet(mid)["suggested"], ["api/", "docs/"])
+
+    def test_tasks_whose_code_imports_the_others_do_not_run_at_once(self):
+        # Done when: two tasks that share no prefix, one importing the other's code, overlap; without the map
+        # (C0 alone) only prefixes count.
+        code = Path(tempfile.mkdtemp(prefix="areas-", dir=TMP)).resolve()
+        for rel, text in {"shopapp/main.py": "from shoplib.parse import read\n", "shoplib/__init__.py": "",
+                          "shoplib/parse.py": "def read():\n    pass\n", "shoptools/run.py": "import json\n"}.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        (a, a_name), (b, b_name) = self.crew
+        first, second, third = self.task("Change the parser", "shoplib/"), self.task("Change the app", "shopapp/"), \
+            self.task("Change the tools", "shoptools/")
+        a.call("hub_task", action="take", id=first)
+        free = lambda: [r["id"] for r in self.hub.sheet_rows(b_name, "next")]  # noqa: E731
+        self.assertIn(second, free())  # no map: shopapp/ and shoplib/ share no prefix
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="areas-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        self.hub._maps = maps
+        self.assertNotIn(second, free())
+        self.assertIn(third, free())
+        self.assertIn("import, or are imported by, those of #%s, which %s is working on" % (first, a_name),
+                      b.text("hub_task", action="take", id=second))
+        a.text("hub_task", action="update", id=first, status="done", note="done")
+        self.assertIn(second, free())  # the parser is done: the app task may start
+
+
+class LeadTools(Base):
+    """Owner, 18 Oct: the lead and the advisor get hub_code (C5 history, C7 split); every other agent's tools stay
+    as short as they are. A session whose role changes is told its tool list changed (MCP list_changed)."""
+
+    def test_a_new_lead_on_an_older_protocol_is_told_to_start_again_for_hub_code(self):
+        for streams, told in ((False, True), (True, False)):
+            sid = self.hub.open_session("macbook", "claude")
+            name = self.hub.agent_for(sid)
+            with self.hub.lock:
+                self.hub.sessions[sid]["streams"] = streams  # what its initialize said (list_changed from 2025-03-26)
+            msg = self.hub.set_role(crewchat.OWNER, name, "lead")
+            self.assertEqual("start a new session to have it" in msg["text"], told, streams)
+            self.hub.set_role(crewchat.OWNER, name, "")
+            self.hub.remove(name)
+
+    def role(self, name, role):
+        crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": role})
+
+    def tools(self, session):
+        return [t["name"] for t in crewchat.rpc(session.mcp, self.token, "tools/list", {}, session=session.sid)["result"]["tools"]]
+
+    def call_stream(self, session, tool, **arguments):
+        """A tool call, every message of the answer: notifications first, the result last."""
+        body = {"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": tool, "arguments": arguments}}
+        return crewchat.post_json(session.mcp, self.token, body, headers={"Mcp-Session-Id": session.sid}, stream=True)
+
+    def test_only_the_lead_and_the_advisor_have_hub_code(self):
+        self.assertLessEqual(len(json.dumps(crewchat.TOOLS)), 7000)  # everyone's, as P2 left it
+        self.assertLessEqual(len(json.dumps(crewchat.TOOLS + crewchat.LEAD_TOOLS)), 7700)
+        self.assertTrue(Session(self.base, self.token).hello["capabilities"]["tools"]["listChanged"])
+        session, name = self.agent()
+        self.assertNotIn("hub_code", self.tools(session))
+        self.assertIn("is for the lead and the advisor", session.text("hub_code", action="history", path="app/x.py"))
+        self.assertEqual([m.get("method") for m in self.call_stream(session, "hub_agents")], [None])  # nothing new
+        self.role(name, "lead")
+        told = self.call_stream(session, "hub_agents")  # its next answer says its tools changed
+        self.assertEqual(told[0], {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        self.assertIn("result", told[-1])
+        self.assertIn("hub_code", self.tools(session))
+        self.assertEqual(len(self.call_stream(session, "hub_agents")), 1)  # told once
+        self.assertIn("hub_code split", session.text("hub_role"))  # the lead's instructions say how
+        self.role(name, "none")
+        self.assertEqual(self.call_stream(session, "hub_agents")[0].get("method"), "notifications/tools/list_changed")
+        self.assertNotIn("hub_code", self.tools(session))
+        # A client on the 2024-11-05 protocol, which knew no answers as event streams, is not told: plain JSON.
+        old = Session(self.base, self.token)
+        old_name = old.me
+        with self.hub.lock:
+            self.hub.sessions[old.sid]["streams"] = False
+        self.tools(old)
+        self.role(old_name, "advisor")
+        self.assertEqual([m.get("method") for m in self.call_stream(old, "hub_agents")], [None])
+        self.assertIn("hub_code", self.tools(old))  # it gets the tool when it asks again (a new session)
+        self.role(old_name, "none")
+
+    def test_a_files_history_says_who_for_which_task_and_what_was_said(self):
+        # Roadmap C5.
+        (lead, lead_name), (dev, dev_name) = self.agent(), self.agent()
+        self.role(lead_name, "advisor")
+        task = self.say("all", "Fix the sync of history/engine.py", "task")
+        dev.call("hub_task", action="take", id=task)
+        with self.hub.lock:
+            for _ in range(3):
+                self.hub.events.add_edit(dev_name, "history/engine.py", task)
+            self.hub.events.add_edit(lead_name, "history/engine.py", "")
+            self.hub.events.add_edit(dev_name, "history/other.py", task)
+        dev.call("hub_task", action="update", id=task, status="review", note="engine.py retries now")
+        dev.call("hub_send", to="all", text="heads up: engine.py changed its retry loop")
+        out = lead.text("hub_code", action="history", path="history/engine.py")
+        self.assertIn("history/engine.py: edited 4 times, by %s (3), %s (1)." % (dev_name, lead_name), out)
+        self.assertIn("Tasks: #%s Fix the sync of history/engine.py (review, %s)." % (task, dev_name), out)
+        self.assertIn("[REVIEW] engine.py retries now", out)
+        self.assertIn("heads up: engine.py changed its retry loop", out)  # named in a message
+        self.assertIn("edited 5 times", lead.text("hub_code", action="history", path="history/"))  # a folder
+        self.assertIn("no edits recorded", lead.text("hub_code", action="history", path="nowhere/x.py"))
+        self.hub.chat_index.close()
+        (self.hub.home / crewchat.HISTORY_FILE).unlink()  # derived: deleted, it is built again
+        self.assertIn("[REVIEW] engine.py retries now", lead.text("hub_code", action="history", path="history/engine.py"))
+
+    def test_a_task_split_into_groups_that_hang_together(self):
+        # Roadmap C7: groups by imports, then folders.
+        code = Path(tempfile.mkdtemp(prefix="split-", dir=TMP)).resolve()
+        files = {"splitapp/sync/engine.py": "from splitapp.sync import queue\n", "splitapp/sync/queue.py": "",
+                 "splitapp/sync/__init__.py": "", "splitapp/ui/view.py": "from splitapp.ui import theme\n",
+                 "splitapp/ui/theme.py": "", "splitapp/ui/__init__.py": "", "splitapp/__init__.py": ""}
+        for rel, text in files.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="split-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        saved, self.hub._maps = self.hub._maps, maps
+        self.addCleanup(setattr, self.hub, "_maps", saved)
+        lead, lead_name = self.agent()
+        self.role(lead_name, "lead")
+        self.addCleanup(self.role, lead_name, "none")
+        task = crewchat.post_json(self.base + "/api/task", self.owner, {"op": "add", "title": "The app", "areas": "splitapp/"})["id"]
+        out = lead.text("hub_code", action="split", id=task, count=2)
+        self.assertIn("Files of task #%s (splitapp/) in 2 groups" % task, out)
+        self.assertRegex(out, r"(?m)^1\. splitapp/(sync|ui)/ \(\d files\): ")
+        self.assertRegex(out, r"(?m)^2\. splitapp/(sync|ui)/ ")
+        self.assertIn("is not on the task sheet", lead.text("hub_code", action="split", id="999999"))
+
+    def test_the_stdio_relay_passes_the_notice_on(self):
+        session, name = self.agent()
+        relay = crewchat.StdioRelay(self.base + "/mcp", self.token)
+        relay.session = session.sid
+        out = io.BytesIO()
+        with mock.patch.object(sys, "stdout", mock.Mock(buffer=out)):
+            relay.send({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            self.role(name, "advisor")
+            relay.send({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "hub_agents", "arguments": {}}})
+        lines = [json.loads(l) for l in out.getvalue().decode().splitlines()]
+        self.assertEqual([l.get("id", l.get("method")) for l in lines], [1, "notifications/tools/list_changed", 2])
 
 
 class Teams(Base):
@@ -610,10 +1579,10 @@ class Teams(Base):
         status, _, _ = self.raw("/api/role", json.dumps({"agent": dev_name, "role": "qa"}).encode(),
                                 {"Content-Type": "application/json", "Origin": self.base}, opener)
         self.assertEqual((status, self.row(dev_name)["role"]), (200, "qa"))
-        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
-        qa = next(r for r in poll["roles"] if r["name"] == "qa")
+        boot = json.loads(self.raw("/api/boot", opener=opener)[1])
+        qa = next(r for r in boot["roles"] if r["name"] == "qa")
         self.assertEqual((qa["title"], qa["picture"], qa["source"]), ("QA", "art:scientist", "pack"))
-        self.assertNotIn("description", qa)  # instructions come from /api/roles, not every poll
+        self.assertNotIn("description", qa)  # instructions come from /api/roles
 
     def test_there_is_one_lead(self):
         (one, n1), (two, n2) = self.agent(), self.agent()
@@ -631,16 +1600,16 @@ class Teams(Base):
         for s in (lead, dev, qa):
             s.text("hub_inbox")
         job = self.say("all", "Add a dark theme", "task")
-        self.assertIn("leave open tasks to the lead", lead.hello["instructions"])
-        self.assertIn("only the lead assigns", dev.call("hub_assign", to=qa_name, text="x")["content"][0]["text"])
-        lead.call("hub_take", id=job)
-        out = lead.text("hub_assign", to=dev_name, text="Build the theme switch", task=job)
+        self.assertIn("With a [lead] in the chat, leave it to the lead", lead.hello["instructions"])
+        self.assertIn("only the lead assigns", dev.call("hub_task", action="assign", to=qa_name, title="x")["content"][0]["text"])
+        lead.call("hub_task", action="take", id=job)
+        out = lead.text("hub_task", action="assign", to=dev_name, title="Build the theme switch", parent=job)
         piece = re.search(r"task #(\w+)", out).group(1)
         self.assertEqual(self.hub.taken[piece], dev_name)
         got = dev.text("hub_inbox")
         self.assertIn("[TASK, assigned to you, part of #%s] Build the theme switch" % job, got)
         # Progress goes to the lead, and shows on the task.
-        self.assertIn(lead_name, dev.text("hub_update", id=piece, status="review",
+        self.assertIn(lead_name, dev.text("hub_task", action="update", id=piece, status="review",
                                                                 note="Ready: toggle in Settings"))
         self.assertEqual(self.hub.progress[piece]["status"], "review")
         self.assertIn("[UPDATE on #%s: ready for review] Ready: toggle in Settings" % piece, lead.text("hub_inbox"))
@@ -651,21 +1620,21 @@ class Teams(Base):
         self.assertIn("ready to test", qa_in)
         qa.call("hub_send", to=dev_name, text="Bug: the switch resets on restart")
         self.assertIn("resets on restart", dev.text("hub_inbox"))
-        self.assertIn("status must be one of", qa.call("hub_update", id=piece, status="sideways")["content"][0]["text"])
+        self.assertIn("status must be one of", qa.call("hub_task", action="update", id=piece, status="sideways")["content"][0]["text"])
         # Done: the lead is told the developer is free, to hand it the next piece.
-        dev.call("hub_update", id=piece, status="done", note="Merged")
+        dev.call("hub_task", action="update", id=piece, status="done", note="Merged")
         done = lead.text("hub_inbox")
         self.assertIn("[UPDATE on #%s: done] Merged" % piece, done)
-        self.assertIn("%s is free. Check the work, then give it its next task with hub_assign" % dev_name, done)
-        self.assertIn("give that agent its next task with hub_assign right away", crewchat.ROLES["lead"][1])
+        self.assertIn("%s is free. Check the work, then give it its next task with hub_task assign" % dev_name, done)
+        self.assertIn("give that agent its next task with hub_task assign right away", crewchat.ROLES["lead"][1])
         for name in (lead_name, dev_name, qa_name):
             self.role(name, "none")
 
     def test_without_a_lead_updates_go_to_whoever_posted_the_task(self):
         dev, dev_name = self.agent()
         job = self.say(dev_name, "Fix the login test", "task")
-        dev.call("hub_take", id=job)
-        self.assertIn("the owner has been told", dev.text("hub_update", id=job, status="in_progress"))
+        dev.call("hub_task", action="take", id=job)
+        self.assertIn("the owner has been told", dev.text("hub_task", action="update", id=job, status="in_progress"))
         update = self.hub.history(1)[0]
         self.assertEqual((update["to"], update["kind"], update["text"]), ("Owner", "update", "in progress"))
 
@@ -673,13 +1642,13 @@ class Teams(Base):
         (lead, lead_name), (dev, dev_name) = self.agent(), self.agent()
         self.role(lead_name, "lead")
         job = self.say(dev_name, "Work on T229", "task")
-        taken = dev.text("hub_take", id=job)
-        self.assertIn("Before any other work, send hub_update id=%s status=in_progress" % job, taken)
-        self.assertIn("the owner has been told", dev.text("hub_update", id=job, status="in_progress",
+        taken = dev.text("hub_task", action="take", id=job)
+        self.assertIn("Before any other work, send hub_task action=update id=%s status=in_progress" % job, taken)
+        self.assertIn("the owner has been told", dev.text("hub_task", action="update", id=job, status="in_progress",
                                                           note="Starting: reading the backup code"))
         update = self.hub.history(1)[0]
         self.assertEqual((update["to"], update["text"]), ("Owner", "Starting: reading the backup code"))
-        self.assertIn("first send hub_update on it\n  with in_progress", dev.hello["instructions"])
+        self.assertIn("first hub_task update it to\n  in_progress", dev.hello["instructions"])
         self.role(lead_name, "none")
 
     def test_an_agent_takes_a_role_when_told_to_and_custom_roles(self):
@@ -741,7 +1710,7 @@ class RolePacks(unittest.TestCase):
                 self.assertTrue(role["picture"].startswith("art:"), (pid, name))  # the 3D pictures
         lead = self.packs["youtube"]["roles"]["lead"]
         self.assertEqual(lead["label"], "Producer")
-        self.assertIn("hub_assign", lead["description"])
+        self.assertIn("hub_task assign", lead["description"])
         self.assertIn("Never publish, post", self.packs["business"]["roles"]["support"]["description"])
         self.assertEqual([r["label"] for r in self.packs["instagram"]["roles"].values()][:5],
                          ["Content planner", "Caption writer", "Visual designer", "Community manager", "Analytics"])
@@ -877,6 +1846,29 @@ class Roles(Base):
     def poll(self):
         return self.hub.poll(-1, -1, 0)
 
+    def test_the_poll_carries_a_tag_and_api_boot_the_rest(self):
+        # What changes only with the server or the roles comes from /api/boot (roadmap P4); the poll says
+        # when to fetch it again.
+        self.assertEqual(self.raw("/api/boot")[0], 401)
+        opener, _ = self.owner_browser()
+        boot = json.loads(self.raw("/api/boot", opener=opener)[1])
+        moved = {"roles", "statuses", "tools", "presets", "art", "pictures", "models", "advisors", "names", "images",
+                 "max_upload", "releases"}
+        self.assertEqual(set(boot), moved | {"tag"})
+        poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
+        self.assertFalse(set(poll) & moved)
+        self.assertEqual(poll["boot"], boot["tag"])
+        self.assertEqual(self.poll()["boot"], boot["tag"])  # the same while nothing changes
+        self.op(op="create", name="tagger", label="Tagger", description="You tag things.")
+        try:
+            changed = self.hub.boot()
+            self.assertNotEqual(changed["tag"], boot["tag"])  # a role edited: the page fetches again
+            self.assertEqual(self.poll()["boot"], changed["tag"])
+            self.assertIn("tagger", [r["name"] for r in changed["roles"]])
+        finally:
+            self.op(op="delete", name="tagger")
+        self.assertEqual(self.hub.boot()["tag"], boot["tag"])
+
     def test_only_the_owner_changes_roles(self):
         self.assertEqual(self.op(token=self.token, op="list")["status"], 403)
         listing = self.op(op="list")
@@ -888,7 +1880,7 @@ class Roles(Base):
         role = self.op(op="create", name="designer", label="Designer", description="You design screens.",
                        picture="preset:palette", tool="cursor")["role"]
         self.assertEqual(role["name"], "designer")
-        page = {r["name"]: r for r in self.poll()["roles"]}
+        page = {r["name"]: r for r in self.hub.boot()["roles"]}
         self.assertEqual((page["designer"]["title"], page["designer"]["tool"]), ("Designer", "cursor"))
         session, name = self.agent()
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": name, "role": "designer"})
@@ -902,7 +1894,7 @@ class Roles(Base):
         self.assertEqual(self.op(op="delete", name="docs"), {"deleted": "docs"})
         self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")
         self.assertIn("You no longer have a role", session.text("hub_inbox"))
-        self.assertNotIn("docs", [r["name"] for r in self.poll()["roles"]])
+        self.assertNotIn("docs", [r["name"] for r in self.hub.boot()["roles"]])
         self.assertIn("no role called docs", self.op(op="edit", name="docs", label="x")["error"])
 
     def test_a_pack_sets_the_crew_and_takes_away_roles_it_does_not_have(self):
@@ -912,11 +1904,11 @@ class Roles(Base):
         self.assertEqual(self.poll()["crew"], "software")
         listing = self.op(op="pack", pack="youtube")
         self.assertEqual(listing["pack"], "youtube")
-        poll = self.poll()
+        poll, boot = self.poll(), self.hub.boot()
         self.assertEqual((poll["pack"], poll["crew"]), ("youtube", "general"))
         self.assertEqual(next(r for r in self.hub.rows() if r["agent"] == name)["role"], "")  # no qa in youtube
         self.assertIn("You no longer have a role", session.text("hub_inbox"))
-        self.assertEqual(next(r for r in poll["roles"] if r["name"] == "lead")["title"], "Producer")
+        self.assertEqual(next(r for r in boot["roles"] if r["name"] == "lead")["title"], "Producer")
         self.op(op="pack", pack="software")
         self.assertEqual(self.poll()["crew"], "software")
 
@@ -1087,12 +2079,12 @@ class NeedsYou(Base):
         self.add("Ship it", depends=client)
         review = self.add("Write the changelog")
         back = self.add("Clean the logs")
-        a.text("hub_take", id=api)
-        a.text("hub_update", id=api, status="blocked", note="Which auth: tokens or cookies?")
-        b.text("hub_take", id=review)
-        b.text("hub_update", id=review, status="review", note="Ready for a look")
-        b.text("hub_take", id=back)
-        b.text("hub_update", id=back, status="todo", note="No time, sorry")
+        a.text("hub_task", action="take", id=api)
+        a.text("hub_task", action="update", id=api, status="blocked", note="Which auth: tokens or cookies?")
+        b.text("hub_task", action="take", id=review)
+        b.text("hub_task", action="update", id=review, status="review", note="Ready for a look")
+        b.text("hub_task", action="take", id=back)
+        b.text("hub_task", action="update", id=back, status="todo", note="No time, sorry")
         a.text("hub_send", to="Owner", text="A question for you")
         needs = self.hub.needs_you()
         kinds = [(n["kind"], n.get("task") or n.get("text")) for n in needs]
@@ -1102,7 +2094,7 @@ class NeedsYou(Base):
         self.assertEqual((blocked["agent"], blocked["text"], blocked["blocking"]), (a_name, "Which auth: tokens or cookies?", 2))
         self.assertEqual(needs[3]["text"], "No time, sorry")
         # Once handled, an item leaves the list.
-        a.text("hub_update", id=api, status="in_progress", note="Going with tokens")
+        a.text("hub_task", action="update", id=api, status="in_progress", note="Going with tokens")
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": review, "status": "done"})
         msg = needs[2]
         self.assertEqual(crewchat.post_json(self.base + "/api/read", self.owner, {"seq": msg["seq"]})["read"], msg["seq"])
@@ -1111,27 +2103,27 @@ class NeedsYou(Base):
         self.assertNotIn("review", left)
         self.assertNotIn("message", left)
         self.assertIn("given_back", left)
-        b.text("hub_take", id=back)
+        b.text("hub_task", action="take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
 
     def test_an_answered_question_waits_on_the_agent_not_the_owner(self):
         a, a_name = self.agent()
         mid = self.add("Pick the icons")
-        a.text("hub_take", id=mid)
-        a.text("hub_update", id=mid, status="blocked", note="Outline or filled?")
+        a.text("hub_task", action="take", id=mid)
+        a.text("hub_task", action="update", id=mid, status="blocked", note="Outline or filled?")
         self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
         self.hub.send(crewchat.OWNER, a_name, "Re #%s: Outline" % mid)  # as the answer box in Needs you sends it
         self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])  # the agent's turn now
         self.hub.send(crewchat.OWNER, a_name, "Re #%s1: about another task" % mid)
-        a.text("hub_update", id=mid, status="blocked", note="Which size?")  # asks again: it needs the owner again
+        a.text("hub_task", action="update", id=mid, status="blocked", note="Which size?")  # asks again: it needs the owner again
         self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
         b, b_name = self.agent()
         self.hub.send(crewchat.OWNER, b_name, "Re #%s: Small" % mid)  # to another agent: not an answer to this one
         self.hub.send(crewchat.OWNER, "all", "Re #%s: Small" % mid)
         self.assertIn(mid, [n.get("task") for n in self.hub.needs_you()])
         review = self.add("Polish the icons")
-        a.text("hub_take", id=review)
-        a.text("hub_update", id=review, status="review", note="Have a look")
+        a.text("hub_task", action="take", id=review)
+        a.text("hub_task", action="update", id=review, status="review", note="Have a look")
         self.hub.send(crewchat.OWNER, a_name, "Re #%s: thanks" % review)
         self.assertIn(review, [n.get("task") for n in self.hub.needs_you()])  # a review waits for Mark done
         for t in (mid, review):
@@ -1141,11 +2133,11 @@ class NeedsYou(Base):
         a, a_name = self.agent()
         b, b_name = self.agent()
         mid = self.add("Migrate the database")
-        a.text("hub_take", id=mid)
-        b.text("hub_update", id=mid, status="blocked", note="OK to drop the old tables?")  # not b's task
+        a.text("hub_task", action="take", id=mid)
+        b.text("hub_task", action="update", id=mid, status="blocked", note="OK to drop the old tables?")  # not b's task
         item = next(n for n in self.hub.needs_you() if n.get("task") == mid)
         self.assertEqual((item["agent"], item["holder"], item["text"]), (b_name, a_name, "OK to drop the old tables?"))
-        a.text("hub_update", id=mid, status="in_progress", note="carrying on")
+        a.text("hub_task", action="update", id=mid, status="in_progress", note="carrying on")
 
     def test_what_the_owner_blocked_is_not_listed_back(self):
         mid = self.add("Wait for the designer")
@@ -1153,16 +2145,22 @@ class NeedsYou(Base):
         self.assertNotIn(mid, [n.get("task") for n in self.hub.needs_you()])
         crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
 
+    def test_the_page_hears_which_tasks_were_taken_off_the_sheet(self):
+        mid = self.add("Write the release notes")
+        self.assertNotIn(mid, self.hub.poll(-1, -1, 0)["removed"])
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "remove", "task": mid})
+        self.assertIn(mid, self.hub.poll(-1, -1, 0)["removed"])  # its card in the chat says so, not "Open"
+
     def test_a_long_chain_of_tasks_is_counted_without_recursion(self):
         first = prev = self.add("Step 0")
         for i in range(1, 1200):
             prev = self.add("Step %d" % i, depends=prev)
         a, _ = self.agent()
-        a.text("hub_take", id=first)
-        a.text("hub_update", id=first, status="blocked", note="stuck")
+        a.text("hub_task", action="take", id=first)
+        a.text("hub_task", action="update", id=first, status="blocked", note="stuck")
         item = next(n for n in self.hub.needs_you() if n.get("task") == first)
         self.assertEqual(item["blocking"], 1199)
-        a.text("hub_update", id=first, status="done", note="unstuck")
+        a.text("hub_task", action="update", id=first, status="done", note="unstuck")
 
     def test_the_poll_and_the_tabs_say_so(self):
         a, _ = self.agent()
@@ -1542,10 +2540,10 @@ class Launching(Base):
         session.text("hub_link", key=self.launched[-1][2])
         return session.me
 
-    def test_a_new_agent_gets_a_random_3d_picture_unless_initials_are_asked_for(self):
+    def test_a_new_agent_gets_a_face_of_its_own_unless_initials_are_asked_for(self):
         pictures = [self.hub.agents[self.linked()]["picture"] for _ in range(4)]
-        self.assertTrue(all(p.startswith("art:") and p[4:] in crewchat.ART_PICTURES for p in pictures), pictures)
-        self.assertEqual(len(set(pictures)), 4)  # one nobody here has, while any is free
+        self.assertTrue(all(p.startswith("mix:") and crewchat.mix_parts(p[4:]) for p in pictures), pictures)
+        self.assertEqual(len(set(pictures)), 4)  # one nobody here wears
         self.assertEqual(self.hub.agents[self.linked(picture="initials")]["picture"], "")
         self.assertEqual(self.hub.agents[self.linked(picture="art:owl")]["picture"], "art:owl")
 
@@ -2021,7 +3019,7 @@ class Launching(Base):
         session = Session(self.base, self.token)  # it holds a task, which a model switch must not free
         session.call("hub_link", key="link-" + name)
         task = self.say("all", "kept across the switch", "task")
-        session.call("hub_take", id=task)
+        session.call("hub_task", action="take", id=task)
         steps, running = [], [True]
         def stop(pid):
             steps.append("stop")
@@ -2037,6 +3035,64 @@ class Launching(Base):
         self.assertEqual(steps[1][-4:], ["--model", "sonnet", "--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])
         self.assertEqual(self.hub.taken.get(task), name)  # still its task
         self.assertIn("Owner reopened %s on sonnet" % name, self.hub_history())
+
+    def test_reconnect_wakes_a_session_that_is_open_but_asleep(self):
+        # The owner's 1.0 test: an agent's window stayed open past its listening time, so the page saw it running and
+        # offered only Stop; Reopen came after Stop. Reconnect is both at once, and the agent keeps its tasks.
+        name = self.closed_session()
+        session = Session(self.base, self.token)
+        session.call("hub_link", key="link-" + name)
+        task = self.say("all", "kept across the reconnect", "task")
+        session.call("hub_task", action="take", id=task)
+        self.hub.activity[name] = ("listening", time.time() - 3600)  # past its listening time: idle, asleep
+        steps, running = [], [True]
+
+        def stop(pid):
+            steps.append("stop")
+            running[0] = False
+            return True
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: running[0]), \
+                mock.patch.object(crewchat, "stop_process", stop), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                                  steps.append(command)):
+            out = crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(steps[0], "stop")
+        self.assertEqual(steps[1][-2:], ["--resume=sess-0003-abc", crewchat.REOPEN_PROMPT])  # the same conversation
+        self.assertEqual(self.hub.taken.get(task), name)  # still its task
+        self.assertIn("Owner reconnected %s" % name, self.hub_history())
+        # A session already closed is just reopened.
+        self.hub.agents[name]["session"].pop("reopening", None)
+        steps.clear()
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: False), \
+                mock.patch.object(crewchat, "stop_process", stop), \
+                mock.patch.object(crewchat, "open_terminal", lambda folder, command, key, title="", root=None, env=None:
+                                  steps.append(command)):
+            crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertEqual(len(steps), 1)
+
+    def test_reconnect_is_refused_for_an_agent_heard_from_lately_whose_state_is_unknown(self):
+        # Review: after a restart its state is unknown (''): the server must keep the page's rule, not stop it mid-turn.
+        name = self.closed_session()
+        self.hub.activity.pop(name, None)
+        self.hub.agents[name]["seen"] = time.time() - 60
+        with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
+                mock.patch.object(crewchat, "stop_process", lambda pid: self.fail("stopped an agent heard from lately")):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+        self.assertIn("heard from", json.loads(caught.exception.read())["error"])
+
+    def test_reconnect_is_refused_while_the_agent_works_or_listens(self):
+        # Review: after a restart the page offered Reconnect for every running agent, a busy one too.
+        name = self.closed_session()
+        for state in ("working", "listening"):
+            self.hub.activity[name] = (state, time.time())
+            with mock.patch.object(crewchat, "process_running", lambda session, table=None: True), \
+                    mock.patch.object(crewchat, "stop_process", lambda pid: self.fail("stopped a busy agent")):
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "reconnect", "agent": name})
+            self.assertIn("is %s" % state, json.loads(caught.exception.read())["error"])
+        self.hub.activity.pop(name, None)
 
     def test_switch_model_checks_it_can_reopen_before_it_stops(self):
         name = self.closed_session()
@@ -2210,13 +3266,13 @@ class AgentCards(Base):
         self.assertIn("reserved", self.op(op="rename", agent="page-named", new="Owner")["error"])
         self.assertIn("listening is on, off or default", self.op(op="listen", agent="page-named", mode="loud")["error"])
         task = self.say("all", "held by the one we remove", "task")
-        session.call("hub_take", id=task)
+        session.call("hub_task", action="take", id=task)
         self.assertEqual(self.op(op="remove", agent="page-named"), {"ok": True})
         self.assertNotIn("page-named", self.names())
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen, start, model or profile", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, reconnect, start, model or profile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()
@@ -2253,7 +3309,7 @@ class AgentCards(Base):
     def test_stop_ends_the_agents_process_and_frees_its_tasks(self):
         session, name = self.agent()
         task = self.say("all", "held when stopped", "task")
-        session.call("hub_take", id=task)
+        session.call("hub_task", action="take", id=task)
         proc = self.stand_in(name)
         self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["session"]["running"])
         self.assertEqual(self.op(op="stop", agent=name), {"ok": True})
@@ -2321,7 +3377,7 @@ class Profiles(Base):
 
     def test_owner_sets_a_preset_and_a_colour(self):
         _, name = self.agent()
-        self.assertTrue(self.row(name)["picture"].startswith("art:"))  # a random 3D picture to begin with
+        self.assertTrue(self.row(name)["picture"].startswith("mix:"))  # a face of its own to begin with
         self.assertEqual(self.row(name)["colour"], "")
         self.assertEqual(self.row(name)["os"], crewchat.os_name())
         self.assertEqual(self.op(op="profile", agent=name, picture="preset:rocket", colour="#FF8800"), {"ok": True})
@@ -2345,7 +3401,7 @@ class Profiles(Base):
         self.assertIn("picture art:fox", session.text("hub_profile", picture="fox"))
         self.assertEqual(crewchat.clean_picture("art:../x"), "")
         self.assertEqual(set(crewchat.ART_DATA), set(crewchat.ART_PICTURES))
-        self.assertEqual(self.hub.poll(-1, -1, 0)["art"]["bot"], "Robot")
+        self.assertEqual(self.hub.boot()["art"]["bot"], "Robot")
         self.assertIn("picture preset:robot", session.text("hub_profile", picture="robot"))  # the emoji, still
 
     def test_uploaded_picture_limits(self):
@@ -2447,6 +3503,80 @@ class ChatPage(Base):
         self.assertIn("SameSite=Strict", headers["Set-Cookie"])
         self.assertEqual(self.raw("/login?code=" + code, headers={"X-Forwarded-For": "7.7.7.2"})[0], 401)
 
+    def test_analytics_are_the_owners_only(self):
+        self.assertEqual(self.raw("/api/analytics", b"{}", {"Content-Type": "application/json"})[0], 401)
+        self.assertEqual(self.raw("/api/analytics", b"{}", {"Content-Type": "application/json",
+                                                           "Authorization": "Bearer " + self.token})[0], 403)
+        report = crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 3})
+        for key in ("messages", "hours", "days", "pairs", "tasks", "agents", "usage", "verdicts"):
+            self.assertIn(key, report)
+        status, body, _ = self.raw("/api/analytics", b'{"days": "x"}', {"Content-Type": "application/json",
+                                                                       "Authorization": "Bearer " + self.owner})
+        self.assertEqual((status, json.loads(body)["error"]), (400, "days is a number"))
+
+    def test_the_page_is_compressed_and_a_reload_is_a_304(self):
+        opener, _ = self.owner_browser()
+        status, body, headers = self.raw("/", headers={"Accept-Encoding": "gzip, deflate, br"}, opener=opener)
+        self.assertEqual((status, headers["Content-Encoding"]), (200, "gzip"))
+        self.assertEqual(gzip.decompress(body), crewchat.PAGE_BYTES)
+        self.assertLess(len(body), len(crewchat.PAGE_BYTES) / 3)
+        self.assertEqual(headers["Vary"], "Accept-Encoding")
+        etag = headers["ETag"]
+        for k in ("Content-Security-Policy", "X-Frame-Options", "X-Content-Type-Options", "Referrer-Policy"):
+            self.assertEqual(headers[k], crewchat.PAGE_HEADERS[k], k)  # the page's protections, unchanged
+        # A reload: the browser asks with the ETag it kept, and gets nothing but headers.
+        for asked in (etag, "W/" + etag, '"other", ' + etag):
+            status, body, headers = self.raw("/", headers={"If-None-Match": asked, "Accept-Encoding": "gzip"}, opener=opener)
+            self.assertEqual((status, body), (304, b""), asked)
+            self.assertEqual(headers["ETag"], etag)
+            self.assertEqual(headers["Content-Security-Policy"], crewchat.PAGE_HEADERS["Content-Security-Policy"])
+            self.assertLess(len(str(headers)), 1024)  # the whole answer: under 1 KB
+        status, body, _ = self.raw("/", headers={"If-None-Match": '"an older page"'}, opener=opener)
+        self.assertEqual((status, body), (200, crewchat.PAGE_BYTES))  # changed: the whole page, uncompressed here
+        for refused in ("identity", "gzip;q=0", "br"):
+            self.assertNotIn("Content-Encoding", self.raw("/", headers={"Accept-Encoding": refused}, opener=opener)[2], refused)
+        # Signed out, a kept page's ETag gets the sign-in page, never a 304.
+        status, _, headers = self.raw("/", headers={"If-None-Match": etag})
+        self.assertEqual((status, headers["Location"]), (303, "/login"))
+        self.assertEqual(json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1]) and
+                         self.raw("/api/boot", opener=opener)[2]["Cache-Control"], "no-store")  # the chat's data never kept
+
+    def test_the_analytics_view_is_its_own_script_fetched_when_opened(self):
+        # Roadmap X2: the view's code is not in the page every phone loads; the page fetches it when it opens.
+        self.assertIn('id="view-analytics"', crewchat.CHAT_PAGE)
+        self.assertNotIn("window.crewAnalytics = {", crewchat.CHAT_PAGE)
+        self.assertIn("window.crewAnalytics = {", crewchat.ANALYTICS_JS)
+        self.assertEqual(self.raw("/analytics.js")[0], 401)  # signed out
+        self.assertEqual(self.raw("/analytics.js", headers={"Authorization": "Bearer " + self.token})[0], 401)  # an agent
+        opener, _ = self.owner_browser()
+        status, body, headers = self.raw("/analytics.js", headers={"Accept-Encoding": "gzip"}, opener=opener)
+        self.assertEqual((status, headers["Content-Type"], headers["Content-Encoding"]),
+                         (200, "text/javascript; charset=utf-8", "gzip"))
+        self.assertEqual(gzip.decompress(body), crewchat.ANALYTICS_BYTES)
+        self.assertEqual(headers["Content-Security-Policy"], crewchat.PAGE_HEADERS["Content-Security-Policy"])
+        status, body, _ = self.raw("/analytics.js", headers={"If-None-Match": headers["ETag"]}, opener=opener)
+        self.assertEqual((status, body), (304, b""))  # opened again: the browser's copy
+
+    def test_the_analytics_report_has_the_days_messages_and_the_files_edited(self):
+        session, name = self.agent()
+        task = self.say("all", "Polish the analytics", "task")
+        session.call("hub_task", action="take", id=task)
+        with self.hub.lock:
+            for path in ("app/a.kt", "app/a.kt", "app/b.kt"):
+                self.hub.events.add_edit(name, path, task)
+            self.hub.events.add_edit("someone-else", "app/b.kt", task)
+            self.hub.events.add_edit("someone-else", "app/b.kt", task)
+        report = crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 1})
+        rows = [r for r in report["stream"] if r[4] == task]
+        self.assertEqual([r[3] for r in rows[:2]], ["task", "take"])  # [ts, from, to, kind, task, status]
+        self.assertEqual(rows[0][1:3], ["Owner", "all"])
+        self.assertFalse(any(r[3] in ("event", "plan") for r in report["stream"]))
+        files = {f["path"]: f for f in report["edits"]}
+        self.assertEqual((files["app/a.kt"]["edits"], files["app/a.kt"]["top"]), (2, name))
+        self.assertEqual(files["app/b.kt"]["top"], "someone-else")  # who edited it most
+        with mock.patch.object(crewchat.Hub, "edits_on", lambda hub: False):
+            self.assertEqual(crewchat.post_json(self.base + "/api/analytics", self.owner, {"days": 1})["edits"], [])
+
     def test_chat_page_and_api(self):
         session, name = self.agent("cursor")
         opener, _ = self.owner_browser()
@@ -2454,7 +3584,7 @@ class ChatPage(Base):
         self.assertEqual(status, 200)
         self.assertIn(b"<title>crewchat</title>", body)
         self.assertIn(b'id="panel"', body)  # the page from 0.14
-        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(headers["Cache-Control"], "private, no-cache")  # kept, and asked about each time
         self.assertEqual(self.raw("/classic", opener=opener)[0], 404)  # the page before 0.14 is gone
         send = lambda obj, extra=None: self.raw(  # noqa: E731
             "/api/send", json.dumps(obj).encode(), dict({"Content-Type": "application/json"}, **(extra or {})), opener)
@@ -2570,7 +3700,7 @@ class WebPush(Base):
         store = self.store()
         key = store.public_key()
         self.assertEqual(len(base64.urlsafe_b64decode(key + "=")), 65)
-        if os.name != "nt":  # Windows has no POSIX mode bits: every file reads back as 0o666
+        if os.name != "nt":  # Windows has no such modes: the file is in the user's own profile
             self.assertEqual(oct(os.stat(store.path).st_mode & 0o777), "0o600")
         store.set_mode(self.ENDPOINT, "demo", "all")
         store.set_mode(self.ENDPOINT, "other", "mentions")
@@ -2616,8 +3746,8 @@ class WebPush(Base):
         self.hub.page_seen = 0
         store.set_mode(self.ENDPOINT, self.projects().primary.id, "mentions")
         tid = self.say("all", "Ship it", "task")
-        session.call("hub_take", id=tid)
-        session.call("hub_update", id=tid, status="blocked", note="Which branch?")
+        session.call("hub_task", action="take", id=tid)
+        session.call("hub_task", action="update", id=tid, status="blocked", note="Which branch?")
         crewchat.push_round(self.projects(), store, seen, send)
         self.assertEqual(sent, [self.ENDPOINT])  # messages only: a blocked task is not pushed
 
@@ -2669,9 +3799,16 @@ class CommandsTab(Base):
             def link_status(self):
                 return {"via": "cloud", "me": "mac", "online": True, "approved": True}
 
+        class Coordinated(Link):
+            def coordinator(self):
+                return {"name": "laptop", "me": False, "term": 3, "preferred": ""}
+
         hub = lambda sync: type("Hub", (), {"sync": sync})()  # noqa: E731
-        self.assertEqual(crewchat.link_info(hub(Link()), shared=False),
-                         {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False})
+        self.assertEqual(crewchat.link_info(hub(Link()), shared=False),  # a link that cannot say who coordinates
+                         {"via": "cloud", "me": "mac", "online": True, "approved": True, "shared": False,
+                          "coordinator": None})
+        self.assertEqual(crewchat.link_info(hub(Coordinated()))["coordinator"],
+                         {"name": "laptop", "me": False, "term": 3, "preferred": ""})
         self.assertEqual(crewchat.link_info(hub(None)), {"via": "none"})
 
     def test_every_runnable_command_parses(self):
@@ -2783,12 +3920,14 @@ class Joining(Base):
         self.assertEqual(allow[0], "Bash(ls:*)")  # the user's own rule stays
         self.assertIn("mcp__crewchat__hub_inbox", allow)  # crewchat's tools do not ask...
         self.assertIn("mcp__crewchat__hub_send", allow)  # ...sending too: a file comes only from its own folder (#33)
+        self.assertIn("mcp__crewchat__hub_code", allow)  # the lead's own tool too: it only reads
         self.assertNotIn("mcp__crewchat", allow)
         cursor_permissions = json.loads((folder / ".cursor" / "cli.json").read_text())["permissions"]
         cursor_allow = cursor_permissions["allow"]
         self.assertEqual(cursor_permissions["deny"], [])  # Cursor's agent refuses a cli.json without one
-        self.assertIn("Mcp(crewchat:hub_update)", cursor_allow)
+        self.assertIn("Mcp(crewchat:hub_task)", cursor_allow)
         self.assertIn("Mcp(crewchat:hub_send)", cursor_allow)
+        self.assertIn("Mcp(crewchat:hub_code)", cursor_allow)
         self.assertIn("crewchat", settings["enabledMcpjsonServers"])
         stop = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
         self.assertEqual(stop[0], "echo mine")
@@ -3022,7 +4161,7 @@ class OtherNames(Base):
         self.assertTrue(crewchat.local_folder(mine))
 
     def test_the_chat_tools_are_not_shown_as_activity_by_any_name(self):
-        for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_update)"):
+        for name in ("mcp__crewchat-mcp__hub_send", "mcp__chat__hub_inbox", "hub_send", "Mcp(crew:hub_task)"):
             self.assertEqual(crewchat.tool_summary("claude", {"tool_name": name}), "", name)
 
 
@@ -3267,6 +4406,352 @@ class Hooks(Base):
         agent(op="listen", agent=name, mode="default")
         self.assertEqual(self.hub.agents[name]["listen"], "")
 
+    def light_hook(self, client, payload, env_extra=None, project=None):
+        """The tool-call hook as the client runs it now: Python and the light hook script, nothing of crewchat."""
+        command = crewchat.hook_command(client, "tool")
+        self.assertNotIn("crewchat.py", command)
+        env = dict(os.environ, CREWCHAT_PROJECT=str(project or self.folder), TMPDIR=self.state, TEMP=self.state, TMP=self.state,
+                   **(env_extra or {}))
+        env.pop("CLAUDE_PROJECT_DIR", None)
+        out = subprocess.run(shlex.split(command), input=json.dumps(payload), capture_output=True, text=True,
+                             env=env, timeout=60, cwd=str(TMP))
+        self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
+
+    def test_the_light_hook_script_after_each_tool_call(self):
+        text = crewchat.hook_script()
+        self.assertEqual(text, crewchat.hook_script())  # the same crewchat writes the same file
+        tree = ast.parse(text)
+        imported = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        imported |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertEqual(imported, {"hashlib", "json", "os", "re", "shlex", "socket", "sys", "tempfile", "time",
+                                    "pathlib", "urllib.request"})  # standard library only, crewchat not loaded
+        path = crewchat.home() / crewchat.HOOK_SCRIPT_FILE
+        self.assertIn(path.as_posix(), crewchat.hook_command("claude", "tool"))
+        self.assertEqual(path.read_text(), text)
+        self.assertIn(" hook claude stop", crewchat.hook_command("claude", "stop"))  # the other events: crewchat itself
+        self.assertTrue(crewchat.is_our_hook(crewchat.hook_command("cursor", "tool")))
+        # It does what `crewchat hook claude tool` does: a sign of life, and what the call was.
+        session, name = self.linked("light-turn")
+        self.hub.agents[name]["seen"] = 0
+        self.light_hook("claude", {"session_id": "light-turn", "tool_name": "Bash",
+                                   "tool_input": {"command": "FOO=1 npm test -- --watch"}})
+        self.assertGreater(self.hub.agents[name]["seen"], time.time() - 30)
+        self.assertEqual(self.hub.agents[name]["doing"], "Running npm test")
+        self.hub.agents[name]["seen"] = 0
+        self.light_hook("claude", {"session_id": "light-turn", "tool_name": "Bash", "tool_input": {"command": "npm test"}})
+        self.assertEqual(self.hub.agents[name]["seen"], 0)  # within the minute, nothing new: no call to the server
+        self.light_hook("claude", {"session_id": "never-linked", "tool_name": "Read"})  # quiet
+        self.assertFalse((Path(self.state) / "crewchat-hooks" / ("claude-" + crewchat.sha("never-linked")[:16])).exists())
+        self.light_hook("claude", "not an object")  # a payload it cannot read: quiet too
+        # A Cursor agent started from the page links with its start key at its first tool call.
+        key = self.hub.new_start()
+        cursor = Session(self.base, self.token, "cursor")
+        cursor.call("hub_link", key=key)
+        self.hub.agents[cursor.me]["seen"] = 0
+        self.light_hook("cursor", {"conversation_id": "light-first", "command": "ls"}, env_extra={"CREWCHAT_LINK_KEY": key})
+        self.assertGreater(self.hub.agents[cursor.me]["seen"], time.time() - 30)
+
+    def test_parallel_hooks_never_read_the_state_half_written(self):
+        # Parallel tool calls run their hooks at once: one reading while another writes must get it whole.
+        state_file = Path(self.state) / "crewchat-hooks" / "claude-parallel"
+        state = {"key": "k" * 12, "pad": "x" * 400000}
+        crewchat.save_hook_state(state_file, state)
+        bad, done = [], threading.Event()
+
+        def read():
+            while not done.is_set():
+                try:
+                    json.loads(state_file.read_text())
+                except ValueError:
+                    bad.append(1)
+                except OSError:
+                    pass
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            for n in range(150):
+                crewchat.save_hook_state(state_file, dict(state, n=n))
+        finally:
+            done.set()
+            reader.join()
+        self.assertEqual(bad, [])
+        self.assertIn("save_hook_state", crewchat.hook_script())  # the light hook script writes it the same way
+
+    def test_an_edit_just_after_a_turn_boundary_is_still_sent(self):
+        # The prompt and stop hooks rewrite the state file: they must keep what the tool hook learned there
+        # (that edits are kept), or the edits of the next minute go unsent.
+        session, name = self.linked("edits-boundary")
+        edit = lambda path: self.light_hook("claude", {  # noqa: E731
+            "session_id": "edits-boundary", "tool_name": "Edit", "tool_input": {"file_path": path}})
+        edit(str(self.folder / "app" / "First.kt"))  # learns that edits are kept here
+        self.hook("claude", "prompt", {"session_id": "edits-boundary"})  # the user's next prompt
+        before = len(self.hub.events.edits())
+        edit(str(self.folder / "app" / "Second.kt"))  # within the minute
+        self.assertEqual([r["path"] for r in self.hub.events.edits()[before:]], ["app/Second.kt"])
+
+    def test_edited_files_are_kept_for_a_software_team_paths_only(self):
+        # Roadmap C0: the path of each file an agent edits, inside its project, while edit tracking is on.
+        session, name = self.linked("edits-turn")
+        inside = str(self.folder / "app" / "Login.kt")
+        edit = lambda path, sid="edits-turn", tool="Edit": self.light_hook("claude", {  # noqa: E731
+            "session_id": sid, "tool_name": tool, "tool_input": {"file_path": path, "old_string": "secret code"}})
+        before = len(self.hub.events.edits())
+        edit(inside)  # the first call learns that edits are kept here (a software team: auto is on)
+        state = json.loads((Path(self.state) / "crewchat-hooks" / ("claude-" + crewchat.sha("edits-turn")[:16])).read_text())
+        self.assertTrue(state["edits"])
+        edit(str(self.folder / "app" / "Main.kt"))
+        edit("/etc/passwd")  # outside the project: never sent
+        edit(str(self.folder / "notes.md"), tool="Read")  # not an edit
+        rows = self.hub.events.edits()[before:]
+        self.assertEqual([r["path"] for r in rows], ["app/Main.kt"])
+        self.assertEqual(rows[0]["agent"], name)
+        self.assertNotIn("secret code", (self.hub.home / crewchat.EVENTS_FILE).read_bytes().decode("latin-1"))
+        # A YouTube team: auto is off, the hook hears it at its next call, and the server keeps nothing anyway.
+        crewchat.post_json(self.base + "/api/roles", self.owner, {"op": "pack", "pack": "youtube"})
+        try:
+            self.hub.agents[name].pop("doing", None)
+            edit(str(self.folder / "app" / "Again.kt"))
+            self.assertEqual(len(self.hub.events.edits()), before + 1)
+            self.assertFalse(self.hub.edits_on())
+            out = crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "on"})  # the owner turns it on
+            self.assertEqual((out["setting"], out["on"]), ("on", True))
+            self.assertIn("app/Main.kt", [f["path"] for f in out["files"]])
+            self.assertIn("Edit tracking: on", cli("edits"))
+        finally:
+            crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "auto"})
+            crewchat.post_json(self.base + "/api/roles", self.owner, {"op": "pack", "pack": "software"})
+        self.assertTrue(self.hub.edits_on())
+        config = crewchat.load_config()
+        config["activity"] = "off"  # what agents do kept off the page: edits too, whatever the setting
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            self.assertFalse(self.hub.edits_on())
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+    def test_edits_keep_the_code_map_up_to_date(self):
+        # Roadmap C1: the map of the project's code, built while edit tracking is on, read again after an edit.
+        code = Path(tempfile.mkdtemp(prefix="mapped-", dir=TMP)).resolve()  # a folder connected to the project
+        shutil.copy(self.folder / ".mcp.json", code / ".mcp.json")
+        (code / "shop.py").write_text("def pay():\n    pass\n")
+        (code / "cart.py").write_text("import json\n")
+        folders = mock.patch.object(crewchat.Hub, "project_folders", lambda hub, place=None: [code])
+        folders.start()
+        self.addCleanup(folders.stop)
+        status = crewchat.post_json(self.base + "/api/map", self.owner, {})
+        self.assertTrue(status["on"])
+        self.assertEqual(status["maps"][0]["files"], 2)
+        session, name = self.linked("map-turn")
+        (code / "cart.py").write_text("from shop import pay\npay()\n")
+        crewchat.MAP_WAKE.clear()
+        self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Edit",
+                                   "tool_input": {"file_path": str(code / "cart.py")}}, project=code)  # learns edits are kept
+        self.light_hook("claude", {"session_id": "map-turn", "tool_name": "Write",
+                                   "tool_input": {"file_path": str(code / "cart.py")}}, project=code)
+        self.assertTrue(crewchat.MAP_WAKE.is_set())  # the map thread wakes
+        self.assertEqual(self.hub.update_map(), {str(code): ["cart.py"]})
+        out = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "imports", "path": "cart.py"})
+        self.assertEqual([(f["path"], f["kind"]) for f in out["files"]], [("shop.py", "calls"), ("shop.py", "imports")])
+        self.assertIn("commit", out)
+        out = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "importers", "path": str(code / "shop.py")})
+        self.assertEqual({f["path"] for f in out["files"]}, {"cart.py"})
+        self.assertIn("shop.py", cli("map", "cart.py"))
+        self.assertIn("pay", cli("map", "shop.py", "--defs"))
+        self.assertIn("2 files", cli("map"))
+        graph = crewchat.post_json(self.base + "/api/map", self.owner, {"op": "graph"})  # for the analytics view (C8)
+        self.assertEqual((sorted(graph["files"]), graph["links"]), (["cart.py", "shop.py"], [[0, 1, 2]]))
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/map", self.token, {})  # the owner's, not an agent's
+        crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "off"})  # no edit tracking: no map
+        try:
+            self.assertEqual(crewchat.post_json(self.base + "/api/map", self.owner, {})["on"], False)
+            self.assertEqual(self.hub.update_map(), {})
+            self.assertIn("edit tracking", cli("map"))
+        finally:
+            crewchat.post_json(self.base + "/api/edits", self.owner, {"op": "auto"})
+
+    def test_an_agents_day_is_recorded_for_its_timeline(self):
+        # Roadmap X1: working while a turn runs, idle when it ends without listening.
+        session, name = self.linked("timeline-turn")
+        self.hook("claude", "prompt", {"session_id": "timeline-turn"})
+        self.hook("claude", "stop", {"session_id": "timeline-turn"}, listen="0")
+        states = [s for ts, s in [(r[0], r[2]) for r in self.hub.events._conn().execute(
+            "SELECT ts, agent, state FROM activity WHERE agent = ? ORDER BY ts", (name,))]]
+        self.assertEqual(states[-2:], ["working", "idle"])
+        line = self.hub.analytics.report(self.hub, 1)["timelines"][name]
+        self.assertEqual([piece[2] for piece in line][-2:], ["working", "idle"])
+        config = crewchat.load_config()
+        config["activity"] = "off"  # kept off the page: nothing recorded either
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            before = len(states)
+            self.hook("claude", "prompt", {"session_id": "timeline-turn"})
+            count = self.hub.events._conn().execute("SELECT COUNT(*) FROM activity WHERE agent = ?", (name,)).fetchone()[0]
+            self.assertEqual(count, before)
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+
+    def test_the_light_hook_reaches_another_machines_chat_through_urllib(self):
+        sent = {}
+
+        class Answer(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def urlopen(req, timeout):
+            sent.update(url=req.full_url, auth=req.get_header("Authorization"), body=json.loads(req.data))
+            return Answer(b"{}")
+        with mock.patch.object(urllib.request, "urlopen", urlopen):
+            crewchat.hook_post("https://computer.tailnet.ts.net/api/hook", "tok", {"event": "tool"})
+        self.assertEqual(sent, {"url": "https://computer.tailnet.ts.net/api/hook", "auth": "Bearer tok",
+                                "body": {"event": "tool"}})
+        with mock.patch.object(urllib.request, "urlopen", side_effect=AssertionError("not for this machine's server")):
+            crewchat.hook_post(self.base + "/api/hook", self.token, {"key": "x" * 12, "event": "tool"})  # a plain socket
+
+    def test_tool_hooks_run_crewchat_when_the_script_cannot_be_written(self):
+        with mock.patch.object(crewchat, "write_hook_script", return_value=None):
+            self.assertTrue(crewchat.hook_command("claude", "tool").endswith(" hook claude tool"))
+        folder = Path(tempfile.mkdtemp(prefix="old-tool-hook-", dir=TMP))
+        (folder / ".claude").mkdir()
+        (folder / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"hooks": [{"type": "command", "command": "python3 crewchat.py hook claude tool"}]}]}}))
+        crewchat.update_hooks(folder)  # an older crewchat's tool hook gives way to the light script's
+        tool = [h["command"] for g in json.loads((folder / ".claude" / "settings.local.json").read_text())["hooks"]
+                ["PostToolUse"] for h in g["hooks"]]
+        self.assertEqual(len(tool), 1)
+        self.assertIn(crewchat.HOOK_SCRIPT_FILE, tool[0])
+
+    @staticmethod
+    def transcript(path, turns, secret="the secret plan"):
+        """A Claude Code transcript: each assistant message on several lines (one per content block) with the
+        same usage, as Claude Code writes them, between user lines that hold text."""
+        with open(path, "a", encoding="utf-8") as f:
+            for mid, model, usage in turns:
+                f.write(json.dumps({"type": "user", "message": {"role": "user", "content": secret + " (usage: none)"}}) + "\n")
+                for block in ("thinking", "text", "tool_use"):
+                    f.write(json.dumps({"type": "assistant", "requestId": "req_" + mid, "message": {
+                        "id": mid, "model": model, "role": "assistant", "usage": usage,
+                        "content": [{"type": block, "text": secret}]}}) + "\n")
+
+    def test_token_usage_comes_from_the_transcript_counts_only(self):
+        session, name = self.linked("usage-turns")
+        path = Path(self.state) / "usage-transcript.jsonl"
+        u = lambda i, o, cr=0, cw=0, hour=0: {"input_tokens": i, "output_tokens": o, "cache_read_input_tokens": cr,  # noqa: E731
+                                            "cache_creation_input_tokens": cw, "service_tier": "standard",
+                                            "cache_creation": {"ephemeral_5m_input_tokens": cw - hour, "ephemeral_1h_input_tokens": hour}}
+        self.transcript(path, [("msg_1", "claude-opus-5-5", u(10, 200, 30000, 5000)),
+                               ("msg_2", "claude-opus-5-5", u(3, 50, 35000, 400, 100))])
+        tid = self.say("all", "count my tokens", "task")
+        session.call("hub_task", action="take", id=tid)
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        # The transcript's own numbers, each message once: 13 in, 250 out, 65,000 read, 5,400 written (100 of them
+        # for an hour).
+        self.assertEqual(self.hub.usage[day][name], {"claude-opus-5-5": [13, 250, 65000, 5300, 100]})
+        self.assertEqual(self.hub.sheet[str(tid)]["usage"], {"claude-opus-5-5": [13, 250, 65000, 5300, 100]})
+        # The next turn sends only what the transcript gained since.
+        self.transcript(path, [("msg_3", "claude-haiku-5-5", u(1, 2))])
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        self.assertEqual(self.hub.usage[day][name]["claude-haiku-5-5"], [1, 2, 0, 0, 0])
+        self.assertEqual(self.hub.usage[day][name]["claude-opus-5-5"], [13, 250, 65000, 5300, 100])  # not again
+        self.hook("claude", "stop", {"session_id": "usage-turns", "transcript_path": str(path)})
+        self.assertEqual(self.hub.usage[day][name]["claude-haiku-5-5"], [1, 2, 0, 0, 0])  # nothing new: nothing added
+        self.hub.flush()
+        saved = (self.hub.home / "state.json").read_text()
+        self.assertNotIn("secret plan", saved)  # no conversation text reaches the server
+        # Kept in usage.json, written when the counts change, not in state.json, rewritten on nearly every call.
+        self.assertNotIn("claude-opus-5-5", saved)
+        kept = json.loads((self.hub.home / "usage.json").read_text())
+        self.assertEqual(kept["days"][day][name]["claude-opus-5-5"], [13, 250, 65000, 5300, 100])
+        self.assertEqual(kept["tasks"][str(tid)], self.hub.sheet[str(tid)]["usage"])
+        self.assertNotIn("secret plan", json.dumps(kept))
+        self.assertNotIn("secret plan", json.dumps(self.hub.usage_report()))
+        report = crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "view"})
+        row = report["agents"][name]
+        self.assertEqual(row["all"], 13 + 250 + 65000 + 5300 + 100 + 3)
+        cost = (13 * 4 + 250 * 20 + 65000 * 0.20 + 5300 * 4 * 1.25 + 100 * 4 * 2 + 1 * 0.1 + 2 * 0.5) / 1e6
+        self.assertAlmostEqual(row["cost_all"], cost)
+        self.assertEqual(report["tasks"][0]["id"], str(tid))
+        self.assertEqual(report["prices"], crewchat.PRICES_DATE)
+        page_row = next(r for r in self.hub.rows() if r["agent"] == name)["usage"]
+        self.assertEqual((page_row["today"], page_row["all"]), (row["all"], row["all"]))
+
+    def test_machine_settings_of_another_project_are_read_when_they_change(self):
+        # machine_config is asked on every tool hook: for a project kept outside the machine's folder it read
+        # config.json from disk each time.
+        root, machine = (Path(tempfile.mkdtemp(prefix="machine-cfg-", dir=TMP)) for _ in range(2))
+        crewchat.save_config({"project": "other", "port": 9}, root)
+        crewchat.save_config({"project": "machine", "port": 9, "activity": "on"}, machine)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        hub.machine_root = machine
+        real, reads = crewchat.load_config, []
+        with mock.patch.object(crewchat, "load_config", side_effect=lambda r=None: reads.append(r) or real(r)):
+            for _ in range(5):
+                self.assertEqual(hub.machine_config()["activity"], "on")
+            self.assertEqual(len(reads), 1)
+            crewchat.save_config({"project": "machine", "port": 9, "activity": "off", "x": "longer"}, machine)
+            self.assertEqual(hub.machine_config()["activity"], "off")  # a change is seen at once
+            self.assertEqual(len(reads), 2)
+        hub.events.close()
+
+    def test_token_usage_moves_out_of_an_older_state_json(self):
+        root = Path(tempfile.mkdtemp(prefix="usage-move-", dir=TMP))
+        crewchat.save_config({"project": "usage-move", "port": 9}, root)
+        counts = {"claude-opus-5-5": [1, 2, 3, 4, 0]}
+        crewchat.write_json(root / "state.json", {"agents": {}, "usage": {"2026-01-02": {"maya": counts}},
+                                                  "sheet": {"7": {"title": "t", "order": 1, "depends": [], "areas": [],
+                                                                  "to": "all", "usage": counts}}})
+        hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(hub.usage, {"2026-01-02": {"maya": counts}})
+        self.assertEqual(hub.sheet["7"]["usage"], counts)
+        self.assertEqual(json.loads((root / "usage.json").read_text()),
+                         {"days": {"2026-01-02": {"maya": counts}}, "tasks": {"7": counts}})  # moved at once
+        with hub.lock:
+            hub._save()
+        state = json.loads((root / "state.json").read_text())
+        self.assertNotIn("usage", state)
+        self.assertNotIn("usage", state["sheet"]["7"])
+        again = crewchat.Hub(crewchat.Roster(root))  # read back from usage.json
+        self.assertEqual((again.usage, again.sheet["7"]["usage"]), (hub.usage, counts))
+        hub.events.close()
+        again.events.close()
+
+    def test_token_usage_is_off_when_the_owner_says_so(self):
+        session, name = self.linked("usage-off")
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        place = self.hub.agents[name]["place"]
+        crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "off"})
+        try:
+            self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"kept": False})
+            self.assertIn("not kept", cli("usage"))
+        finally:
+            crewchat.post_json(self.base + "/api/usage", self.owner, {"op": "on"})
+        config = crewchat.load_config()
+        config["activity"] = "off"  # what agents do kept off the page: their tokens too
+        crewchat.save_config(config)
+        self.hub.roster.refresh(force=True)
+        try:
+            self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"kept": False})
+        finally:
+            config.pop("activity")
+            crewchat.save_config(config)
+            self.hub.roster.refresh(force=True)
+        self.assertEqual(self.hub.record_usage(place, key, {"claude-opus-5-5": [1, 1, 1, 1, 0]})["kept"], True)
+        self.assertEqual(self.hub.record_usage(place, "unknownkey99", {"claude-opus-5-5": [1, 1, 1, 1, 0]}), {"link": True})
+        for bad in ({"m": [1, 2]}, {"m": [-1, 0, 0, 0, 0]}, {"m": ["1", 0, 0, 0, 0]}, ["m"]):
+            with self.assertRaises(crewchat.HubError, msg=bad):
+                self.hub.record_usage(place, key, bad)
+        self.assertIn(name, cli("usage"))
+
     def test_a_launched_cursor_agent_is_alive_before_its_first_turn_ends(self):
         key = self.hub.new_start()
         session = Session(self.base, self.token, "cursor")
@@ -3330,7 +4815,7 @@ class Hooks(Base):
         self.assertGreater(asks[0]["timeout"], crewchat.PERMISSION_WAIT)  # the hook outlives its wait
         tool = [h["command"] for g in claude["PostToolUse"] for h in g["hooks"]]
         self.assertEqual((len(tool), tool[0]), (2, "echo mine"))
-        self.assertTrue(tool[1].endswith(" hook claude tool"))
+        self.assertTrue(tool[1].endswith("/%s claude tool" % crewchat.HOOK_SCRIPT_FILE))  # the light hook script
         cursor = json.loads((folder / ".cursor" / "hooks.json").read_text())["hooks"]
         self.assertEqual(sorted(cursor), ["afterFileEdit", "afterMCPExecution", "afterShellExecution", "stop"])
         self.assertEqual(crewchat.update_hooks(folder), [])  # up to date: nothing written
@@ -3491,7 +4976,7 @@ class Hooks(Base):
         self.say(name, "hello")
         reason = json.loads(self.hook("claude", "stop", {"session_id": "W"}))["reason"]
         self.assertIn("answer anything Owner wrote with hub_send", reason)
-        self.assertIn("answer in the chat", session.hello["instructions"])
+        self.assertIn("answer the owner in the chat", session.hello["instructions"])
         self.assertLess(len(reason), 1200)
 
     def test_every_tool_says_what_it_changes_and_what_its_parameters_mean(self):
@@ -3504,7 +4989,7 @@ class Hooks(Base):
             for name, spec in tool["inputSchema"]["properties"].items():
                 self.assertTrue(spec.get("description"), "%s.%s" % (tool["name"], name))
         reads = {t["name"] for t in crewchat.TOOLS if t["annotations"]["readOnlyHint"]}
-        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file", "hub_tasks"})
+        self.assertEqual(reads, {"hub_agents", "hub_history", "hub_file"})
         session = Session(self.base, self.token)
         listed = crewchat.rpc(self.mcp, self.token, "tools/list", session=session.sid)["result"]["tools"]
         self.assertEqual(listed[0]["annotations"], crewchat.TOOLS[0]["annotations"])
@@ -3715,14 +5200,239 @@ class Plugin(unittest.TestCase):
         self.assertIn("<!-- mcp-name: %s -->" % entry["name"], (ROOT / "README.md").read_text(encoding="utf-8"))
 
 
+class LogLoading(unittest.TestCase):
+    """Startup reads messages.jsonl from its end (roadmap P3): only the messages it keeps."""
+
+    @staticmethod
+    def old_load(path):
+        """The loader before P3, as the reference: every line, then the last KEEP_MESSAGES."""
+        out = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(msg, dict) or "id" not in msg:
+                continue
+            if "seq" not in msg:
+                msg["seq"] = int(msg["id"])
+            msg["id"] = str(msg["id"])
+            msg.setdefault("kind", "msg")
+            out.append(msg)
+        return out[-crewchat.KEEP_MESSAGES:]
+
+    def project(self, lines, raw=b""):
+        root = Path(tempfile.mkdtemp(prefix="log-", dir=TMP))
+        crewchat.save_config({"project": "logs"}, root)
+        (root / "messages.jsonl").write_bytes(raw + b"".join(
+            (l if isinstance(l, bytes) else json.dumps(l).encode()) + b"\n" for l in lines))
+        return root
+
+    def test_the_same_messages_and_next_number_as_before(self):
+        msg = lambda seq, **kw: dict({"id": str(seq), "seq": seq, "ts": 1.0, "from": "Maya", "to": "all", "text": "m%d" % seq}, **kw)  # noqa: E731
+        n = crewchat.KEEP_MESSAGES
+        fixtures = {
+            "empty": [],
+            "a few": [msg(1), msg(2, kind="task"), msg(3)],
+            "damaged lines": [msg(1), b"not json", b"[1, 2]", b'{"no": "id"}', msg(2), b"", msg(3)],
+            "written by 0.2": [{"id": 1, "from": "a", "to": "all", "text": "x", "ts": 1}, {"id": 2, "from": "a", "to": "all", "text": "y", "ts": 2}],
+            "more than are kept": [msg(i) for i in range(1, n + 300)],
+            "damage among many": [msg(i) if i % 7 else b"{broken" for i in range(1, n + 50)],
+            "half a last line": [msg(1), msg(2)] + [b'{"id": "3", "seq": 3, "te'],
+        }
+        for name, lines in fixtures.items():
+            root = self.project(lines)
+            hub = crewchat.Hub(crewchat.Roster(root))
+            expected = self.old_load(root / "messages.jsonl")
+            self.assertEqual(hub.messages, expected, name)
+            self.assertEqual(hub.next_seq, expected[-1]["seq"] + 1 if expected else 1, name)
+            self.assertEqual({i: m["seq"] for i, m in hub.by_id.items()}, {m["id"]: m["seq"] for m in expected}, name)
+        # The last line half written by a crash, with no newline after it: skipped, as before.
+        root = self.project([msg(1)], raw=b"")
+        with open(root / "messages.jsonl", "ab") as f:
+            f.write(b'{"id": "2", "seq"')
+        self.assertEqual([m["seq"] for m in crewchat.Hub(crewchat.Roster(root)).messages], [1])
+
+    def test_lines_end_at_newlines_only(self):
+        # Windows writes \r\n; a message's text may hold U+2028, which splitlines() took for a line end.
+        text = "one\u2028two\u2029three\x85four"
+        root = self.project([], raw=b'{"id": "1", "seq": 1, "text": "a"}\r\n' + json.dumps(
+            {"id": "2", "seq": 2, "text": text}, ensure_ascii=False).encode() + b"\r\n")
+        hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual([m["text"] for m in hub.messages], ["a", text])
+
+    def test_only_the_end_of_a_long_log_is_read(self):
+        n = crewchat.KEEP_MESSAGES
+        lines = [json.dumps({"id": str(i), "seq": i, "text": "x" * 100}).encode() for i in range(1, 3 * n)]
+        root = self.project(lines, raw=b"\xff\xfe not UTF-8, never read\n" * 1000)  # the old loader stopped here
+        size = (root / "messages.jsonl").stat().st_size
+        read = []
+        real_open = open
+
+        def counting_open(path, mode="r", *a, **kw):
+            f = real_open(path, mode, *a, **kw)
+            if str(path).endswith("messages.jsonl"):
+                plain = f.read
+                f = mock.Mock(wraps=f)
+                f.read = lambda *ra: (lambda data: read.append(len(data)) or data)(plain(*ra))
+                f.__enter__ = lambda *x: f
+                f.__exit__ = lambda *x: False
+            return f
+        with mock.patch.object(crewchat, "open", counting_open, create=True):
+            hub = crewchat.Hub(crewchat.Roster(root))
+        self.assertEqual(len(hub.messages), n)
+        self.assertEqual(hub.messages[-1]["seq"], 3 * n - 1)
+        self.assertLess(sum(read), size * 0.4 + 65536)  # about a third of the file: the messages it keeps
+
+    def test_read_back_across_blocks(self):
+        path = Path(tempfile.mkdtemp(prefix="back-", dir=TMP)) / "f"
+        for data in (b"", b"a", b"a\n", b"a\nbb\nccc", b"\n\n", b"x" * 50 + b"\n" + b"y" * 3 + b"\n"):
+            path.write_bytes(data)
+            for block in (1, 2, 3, 7, 1 << 16):
+                self.assertEqual(list(crewchat.read_back(path, block)), data.split(b"\n")[::-1], (data, block))
+
+
+class StateWrites(Base):
+    """state.json is rewritten at most once a SAVE_DELAY for read positions, status lines and presence, at
+    once for claims, links and the task sheet (roadmap P5)."""
+
+    def writes(self):
+        count = [0]
+        real = crewchat.write_json
+
+        def counting(path, *a, **kw):
+            if Path(path).name == "state.json":
+                count[0] += 1
+            return real(path, *a, **kw)
+        patch = mock.patch.object(crewchat, "write_json", counting)
+        patch.start()
+        self.addCleanup(patch.stop)
+        return count
+
+    def on_disk(self):
+        return json.loads((self.hub.home / "state.json").read_text(encoding="utf-8"))
+
+    def test_presence_and_read_positions_wait_and_come_together(self):
+        sender, _ = self.agent()
+        reader, name = self.agent()
+        self.hub.flush()
+        count = self.writes()
+        for i in range(20):
+            sender.call("hub_send", to=name, text="m%d" % i)
+            reader.call("hub_inbox")
+            reader.call("hub_status", text="reading %d" % i)
+        self.assertNotEqual(self.on_disk()["agents"][name]["status"], "reading 19")  # not yet
+        time.sleep(crewchat.SAVE_DELAY + 0.5)
+        self.assertLessEqual(count[0], 3)  # a handful, not one per call
+        disk = self.on_disk()["agents"][name]
+        self.assertEqual(disk["status"], "reading 19")  # within SAVE_DELAY
+        self.assertEqual(disk["cursor"], self.hub.agents[name]["cursor"])
+
+    def test_claims_links_and_the_sheet_are_written_at_once(self):
+        session, name = self.agent()
+        self.hub.flush()
+        session.call("hub_link", key="key-at-once-01")
+        self.assertEqual(self.on_disk()["links"]["key-at-once-01"], name)
+        tid = self.say("all", "claim me", "task")
+        session.call("hub_task", action="take", id=tid)
+        disk = self.on_disk()
+        self.assertEqual(disk["taken"][str(tid)], name)  # no flush, no wait: on disk already
+        session.call("hub_task", action="update", id=tid, status="blocked", note="need a key")
+        self.assertEqual(self.on_disk()["progress"][str(tid)]["status"], "blocked")
+
+    def test_windows_tries_again_when_the_file_is_held(self):
+        path = Path(tempfile.mkdtemp(prefix="held-", dir=TMP)) / "state.json"
+        real, calls = os.replace, []
+
+        def held_twice(src, dst):
+            calls.append(dst)
+            if len(calls) <= 2:
+                raise PermissionError(32, "The process cannot access the file because it is being used by another process")
+            return real(src, dst)
+        with mock.patch.object(crewchat.os, "replace", held_twice), mock.patch.object(crewchat.sys, "platform", "win32"), \
+                mock.patch.object(crewchat.time, "sleep"):
+            crewchat.write_json(path, {"ok": 1})
+        self.assertEqual((len(calls), json.loads(path.read_text())), (3, {"ok": 1}))
+        with mock.patch.object(crewchat.os, "replace", side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):  # elsewhere a refusal is not a moment's: it is an error
+                crewchat.write_json(path, {"ok": 2})
+
+    def test_an_immediate_write_takes_what_was_waiting_with_it(self):
+        session, name = self.agent()
+        session.call("hub_status", text="waiting to be saved")
+        self.assertTrue(self.hub._dirty)
+        tid = self.say("all", "and a claim", "task")
+        session.call("hub_task", action="take", id=tid)
+        self.assertFalse(self.hub._dirty)
+        self.assertEqual(self.on_disk()["agents"][name]["status"], "waiting to be saved")
+
+
+class MessageIndex(unittest.TestCase):
+    """Hub.by_id finds a message by its id without a scan (roadmap P6), and always matches the messages."""
+
+    def hub(self, lines=()):
+        root = Path(tempfile.mkdtemp(prefix="index-", dir=TMP))
+        crewchat.save_config({"project": "index"}, root)
+        (root / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in lines))
+        return crewchat.Hub(crewchat.Roster(root))
+
+    def assertIndexed(self, hub):
+        self.assertEqual(hub.by_id, {m["id"]: m for m in hub.messages})
+        self.assertTrue(all(hub.by_id[m["id"]] is m for m in hub.messages))  # the same objects, not copies
+        self.assertTrue(all(hub.seq_of(m["id"]) == m["seq"] for m in hub.messages))
+
+    def test_loaded_sent_trimmed_and_ingested(self):
+        hub = self.hub([{"id": str(i), "seq": i, "ts": 1, "from": "Owner", "to": "all", "text": "x"} for i in range(1, 6)])
+        self.assertIndexed(hub)
+        with hub.lock:
+            for i in range(crewchat.KEEP_MESSAGES + 10):
+                hub._append(crewchat.OWNER, "all", "m%d" % i, "msg")
+        self.assertEqual(len(hub.messages), crewchat.KEEP_MESSAGES)
+        self.assertIndexed(hub)
+        self.assertNotIn("1", hub.by_id)  # trimmed out of memory: out of the index too
+        self.assertTrue(hub.ingest({"id": "B7", "from": "Teo", "to": "all", "text": "from another machine", "ts": 2}))
+        self.assertFalse(hub.ingest({"id": "B7", "from": "Teo", "to": "all", "text": "again", "ts": 2}))
+        self.assertEqual(hub.by_id["B7"]["text"], "from another machine")
+        self.assertIndexed(hub)
+
+    def test_renamed_tasks_are_found_by_their_new_ids(self):
+        hub = self.hub()
+        with hub.lock:
+            hub._append(crewchat.OWNER, "all", "warm up", "msg")
+        old = hub.add_row(crewchat.OWNER, "Ship the release", "", "", "")["id"]
+        before = (hub.home / "messages.jsonl").read_bytes()
+        renamed = hub.adopt_open_tasks("A", "device-a")  # linking machines: open tasks get the device's tag
+        self.assertEqual(renamed, {old: "A" + old})
+        self.assertIndexed(hub)
+        self.assertNotIn(old, hub.by_id)
+        self.assertEqual(hub._task("A" + old)["text"], "Ship the release")
+        # A log a crash left with the old number (state saved, log not yet rewritten): put right in memory,
+        # and in the index, on load.
+        (hub.home / "messages.jsonl").write_bytes(before)
+        again = crewchat.Hub(hub.roster)
+        self.assertNotIn(old, again.by_id)
+        self.assertIndexed(again)
+        self.assertEqual(again.by_id["A" + old]["text"], "Ship the release")
+
+    def test_questions_and_answers_are_found_by_id(self):
+        hub = self.hub()
+        with hub.lock:
+            ask = hub._append("Maya", "Wren", "Is this safe?", "ask")
+            hub._append(crewchat.OWNER, "all", "unrelated", "msg")
+            self.assertIs(hub.by_id[ask["id"]], ask)
+        with self.assertRaises(crewchat.HubError):
+            hub.answer("Wren", "999", "no such question")
+
+
 class Persistence(Base):
     def test_everything_survives_a_restart(self):
         session, name = self.agent()
         session.call("hub_link", key="key-persist-001")
         session.call("hub_status", text="busy")
         task = self.say("all", "persist me", "task")
-        session.call("hub_take", id=task)
+        session.call("hub_task", action="take", id=task)
         session.call("hub_inbox")
+        self.hub.flush()  # a server that is stopped writes what waits (its read position) first
         again = crewchat.Hub(crewchat.Roster())  # what a restarted server loads
         self.assertEqual(again.agent_for(session.sid, create=False), name)
         self.assertEqual(again.links["key-persist-001"], name)
@@ -4033,7 +5743,8 @@ class Lifecycle(Base):
         opener, _ = self.owner_browser()
         poll = lambda: json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])  # noqa: E731
         self.hub.set_update("99.0.0")
-        self.assertEqual((poll()["update"], poll()["releases"]), ("99.0.0", crewchat.RELEASES))
+        self.assertEqual(poll()["update"], "99.0.0")
+        self.assertEqual(json.loads(self.raw("/api/boot", opener=opener)[1])["releases"], crewchat.RELEASES)
         self.hub.set_update("")
         self.assertEqual(poll()["update"], "")
         page = self.raw("/", opener=opener)[1].decode()
@@ -4094,6 +5805,29 @@ class Lifecycle(Base):
             self.assertIn("<string>%s</string>\n    <string>serve</string>" % launched, crewchat.launchd_plist(False))
         # A checkout runs its script with this Python, as before.
         self.assertTrue(crewchat.hook_command("claude", "stop").endswith(crewchat.self_command()[1] + " hook claude stop"))
+
+    def test_the_tool_hook_runs_the_console_python_whoever_writes_it(self):
+        # Windows: the server runs windowless (pythonw.exe), `crewchat start` in a console (python.exe). Both must
+        # write the same hook, or they rewrite each other's settings at every start.
+        folder = Path(tempfile.mkdtemp(prefix="pythons-", dir=TMP))
+        for name in ("python.exe", "pythonw.exe"):
+            (folder / name).write_text("")
+        commands = set()
+        for python in ("python.exe", "pythonw.exe"):
+            with mock.patch.object(sys, "executable", str(folder / python)):
+                commands.add(crewchat.hook_command("claude", "tool"))
+        self.assertEqual(len(commands), 1, commands)
+        self.assertIn("/python.exe", commands.pop())
+
+    def test_hooks_under_a_home_with_a_space_are_still_ours(self):
+        # C:/Users/John Smith: the light hook script's path is quoted, and crewchat must still know its hook (or each
+        # refresh adds another, and uninstalling leaves one behind), in a settings file as in its JSON.
+        for script in ("C:/Users/John Smith/.crewchat/crewchat-hook.py", "/Users/js/.crewchat/crewchat-hook.py"):
+            with mock.patch.object(crewchat, "hook_program", lambda event: ["C:/Python 3/python.exe", script]):
+                command = crewchat.hook_command("claude", "tool")
+            self.assertTrue(crewchat.is_our_hook(command), command)
+            self.assertTrue(crewchat.is_our_hook(json.dumps({"PostToolUse": [{"command": command}]})), command)
+        self.assertFalse(crewchat.is_our_hook('python "/x/my-crewchat-hook.pyc" claude tool'))
 
     def test_a_hook_gives_up_on_a_server_stopped_while_it_listened(self):
         answers = iter([{"text": ""}])
@@ -4287,21 +6021,21 @@ class Lifecycle(Base):
         login = add("Build the login screen", areas="app/login/")
         tests = add("Write login tests", depends=login, areas="app/login/tests/")
         sign = add("Sign the build", where="nowhere-machine")
-        found = a.text("hub_task_add", title="Fix the crash on rotate", areas="app/main/")
+        found = a.text("hub_task", action="add", title="Fix the crash on rotate", areas="app/main/")
         crash = re.search(r"#(\w+)", found).group(1)
-        nxt = a.text("hub_tasks")
+        nxt = a.text("hub_task", action="view")
         self.assertIn("#%s [todo] Build the login screen" % login, nxt)
         self.assertNotIn("Write login tests", nxt)  # waits for the login screen
         self.assertNotIn("Sign the build", nxt)  # needs another machine
-        self.assertIn("cannot be taken yet: it waits for #%s" % login, a.text("hub_take", id=tests))
-        self.assertIn("is yours", a.text("hub_take", id=login))
+        self.assertIn("cannot be taken yet: it waits for #%s" % login, a.text("hub_task", action="take", id=tests))
+        self.assertIn("is yours", a.text("hub_task", action="take", id=login))
         # Another task over the same files cannot start while the first is in hand.
         overlap = add("Restyle the login screen", areas="app/login/style/")
-        self.assertIn("overlap #%s" % login, b.text("hub_take", id=overlap))
-        a.text("hub_update", id=login, status="done", note="built")
-        self.assertIn("Write login tests", b.text("hub_tasks"))
-        b.text("hub_take", id=tests)
-        b.text("hub_update", id=tests, status="todo", note="no time")  # given back
+        self.assertIn("overlap #%s" % login, b.text("hub_task", action="take", id=overlap))
+        a.text("hub_task", action="update", id=login, status="done", note="built")
+        self.assertIn("Write login tests", b.text("hub_task", action="view"))
+        b.text("hub_task", action="take", id=tests)
+        b.text("hub_task", action="update", id=tests, status="todo", note="no time")  # given back
         sheet = {r["id"]: r for r in hub.sheet_rows()}
         self.assertEqual((sheet[login]["status"], sheet[tests]["status"], sheet[tests]["holder"]), ("done", "todo", ""))
         self.assertEqual(sheet[sign]["status"], "todo")
@@ -4342,11 +6076,14 @@ class Lifecycle(Base):
         with hub.lock:
             kept = list(hub.messages)
             hub.messages = [m for m in hub.messages if m["id"] != login]
+            hub._index()  # as trimming leaves it
+            self.assertIsNone(hub.by_id.get(login))
         try:
             self.assertEqual({r["id"]: r for r in hub.sheet_rows()}[login]["status"], "done")
         finally:
             with hub.lock:
                 hub.messages = kept
+                hub._index()
         # Agents cannot use the owner's sheet controls.
         with self.assertRaises(urllib.error.HTTPError) as e:
             crewchat.post_json(self.base + "/api/task", self.token, {"op": "remove", "task": crash})
@@ -4372,13 +6109,13 @@ class Lifecycle(Base):
         tid = self.say("all", "changes hands", "task")
         self.assertEqual(self.hub.claim_key(tid), tid)
         a, a_name = self.agent()
-        a.text("hub_take", id=tid)
-        a.text("hub_update", id=tid, status="todo", note="back")
+        a.text("hub_task", action="take", id=tid)
+        a.text("hub_task", action="update", id=tid, status="todo", note="back")
         self.assertEqual(self.hub.claim_key(tid), tid + "@1")
         # Only its holder gives a task back: anyone else's "todo" is refused, and the key stays.
         b, b_name = self.agent()
-        a.text("hub_take", id=tid)
-        self.assertIn("you do not hold task #%s" % tid, b.text("hub_update", id=tid, status="todo", note="not mine"))
+        a.text("hub_task", action="take", id=tid)
+        self.assertIn("you do not hold task #%s" % tid, b.text("hub_task", action="update", id=tid, status="todo", note="not mine"))
         self.assertEqual(self.hub.claim_key(tid), tid + "@1")
         self.assertEqual(self.hub.taken[tid], a_name)
 
@@ -4392,7 +6129,7 @@ class Lifecycle(Base):
         tid = self.say("all", "goes quiet", "task")
         a, a_name = self.agent()
         b, b_name = self.agent()
-        a.text("hub_take", id=tid)
+        a.text("hub_task", action="take", id=tid)
         self.assertIn("silent for 60 min", cli("tasks", "reclaim"))  # the default
         cli("tasks", "reclaim", "off")
         with self.later(600):
@@ -4417,18 +6154,18 @@ class Lifecycle(Base):
             self.assertIn("reclaimed from %s" % a_name, cli("tasks"))
             # Back from its silence, the agent is told; it may take the task again while it is free.
             self.assertIn("reclaimed from you while you were silent; it is back on the sheet",
-                          a.text("hub_update", id=tid, status="done", note="finished"))
-            taken = b.text("hub_take", id=tid)
+                          a.text("hub_task", action="update", id=tid, status="done", note="finished"))
+            taken = b.text("hub_task", action="take", id=tid)
             self.assertIn("no sign of life (no tool call, no hook) for 60 min", taken)  # told when it takes it
-            self.assertIn("for 60 min", b.text("hub_tasks", view="all"))
-            self.assertIn("%s holds it now" % b_name, a.text("hub_update", id=tid, status="in_progress", note="still on it"))
-            self.assertIn("already taken by " + b_name, a.text("hub_take", id=tid))
+            self.assertIn("for 60 min", b.text("hub_task", action="view", show="all"))
+            self.assertIn("%s holds it now" % b_name, a.text("hub_task", action="update", id=tid, status="in_progress", note="still on it"))
+            self.assertIn("already taken by " + b_name, a.text("hub_task", action="take", id=tid))
             row = next(r for r in hub.sheet_rows() if r["id"] == tid)
             self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("doing", b_name, a_name))
             # Once it has the task again, it reports on it as before.
-            b.text("hub_update", id=tid, status="todo", note="over to you")
-            self.assertIn("is yours", a.text("hub_take", id=tid))
-            self.assertIn("marked done", a.text("hub_update", id=tid, status="done", note="finished"))
+            b.text("hub_task", action="update", id=tid, status="todo", note="over to you")
+            self.assertIn("is yours", a.text("hub_task", action="take", id=tid))
+            self.assertIn("marked done", a.text("hub_task", action="update", id=tid, status="done", note="finished"))
             self.assertEqual(next(r for r in hub.sheet_rows() if r["id"] == tid)["reclaimed"], "")
             saved = json.loads((hub.home / "state.json").read_text(encoding="utf-8"))
             self.assertNotIn("reclaimed", saved["sheet"][tid])
@@ -4448,10 +6185,10 @@ class Lifecycle(Base):
         a, a_name = self.agent()
         b, b_name = self.agent()
         c, c_name = self.agent()
-        a.text("hub_take", id=long)
-        b.text("hub_take", id=quick)
-        c.text("hub_take", id=blocked)
-        c.text("hub_update", id=blocked, status="blocked", note="which colour?")
+        a.text("hub_task", action="take", id=long)
+        b.text("hub_task", action="take", id=quick)
+        c.text("hub_task", action="take", id=blocked)
+        c.text("hub_task", action="update", id=blocked, status="blocked", note="which colour?")
         self.assertIn("Task #%s: tasks stay with their holder" % long, cli("tasks", "reclaim", "off", long))
         cli("tasks", "reclaim", "30", quick)
         self.assertIn("never reclaimed", cli("tasks"))
@@ -4480,7 +6217,7 @@ class Lifecycle(Base):
                 hub.sheet[long]["origin"] = ""
             self.assertEqual(hub.taken.get(long), a_name)
             with self.later(45):  # taking it does not wait for the server's next check
-                self.assertIn("is yours", b.text("hub_take", id=long))
+                self.assertIn("is yours", b.text("hub_task", action="take", id=long))
             self.assertEqual(hub.sheet[long]["reclaimed"], a_name)
             # The project's setting is a message, so one set on another machine applies here too.
             hub.ingest({"id": "other-machine-1", "from": "Owner", "to": "all", "kind": "plan", "text": "", "reclaim": "45"})
@@ -4505,11 +6242,26 @@ class Lifecycle(Base):
         fine.hub.reclaim_silent.assert_called_once_with()  # one project's error does not stop the others
         self.assertIn("could not check for silent task holders: bad state", err.getvalue())
 
+    def test_areas_are_grouped_by_folder(self):
+        group = crewchat.group_areas
+        self.assertEqual(group(["app/a.kt", "app/b.kt", "README.md"]), ["README.md", "app/"])
+        self.assertEqual(group(["app/login/a.kt", "app/a.kt"]), ["app/"])  # a folder inside another counts with it
+        many = ["app/f%d/x.kt" % i for i in range(8)] + ["docs/a.md", "docs/b.md"]
+        self.assertEqual(group(many), ["app/", "docs/"])  # too many: raised to their parent
+        tops = ["t%d/x.py" % i for i in range(7)] + ["t3/y.py", "t3/z.py", "t5/y.py"]
+        self.assertEqual(group(tops), ["t0/", "t1/", "t2/", "t3/", "t5/"])  # still too many: the most edited
+        self.assertEqual(group([]), [])
+        self.assertTrue(crewchat.area_covered("app/login/", ["app/"]))
+        self.assertFalse(crewchat.area_covered("app/", ["app/login/"]))
+
     def test_areas_overlap_by_path_prefix(self):
         self.assertTrue(crewchat.areas_overlap(["app/login/"], ["app/login/tests/"]))
         self.assertTrue(crewchat.areas_overlap(["app"], ["app/"]))
         self.assertFalse(crewchat.areas_overlap(["app/login/"], ["app/logout/"]))
         self.assertFalse(crewchat.areas_overlap([], ["app/"]))
+        imports = lambda a, b: {a, b} == {"web/", "lib/"}  # noqa: E731  (the code map's, C1)
+        self.assertTrue(crewchat.areas_overlap(["web/"], ["lib/"], imports))
+        self.assertFalse(crewchat.areas_overlap(["web/"], ["docs/"], imports))
         self.assertEqual(crewchat.split_list("#A1, A2,-"), ["A1", "A2"])
 
     def test_update_refuses_a_copy_the_installer_did_not_put_there(self):

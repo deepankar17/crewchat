@@ -234,7 +234,13 @@ class Agent:
             return None
         if status != 200:
             raise AssertionError("MCP %s: HTTP %d %s" % (method, status, raw[:300]))
-        data = json.loads(raw)
+        if "text/event-stream" in answer_headers.get("Content-Type", ""):  # the answer, with notifications first
+            events = [json.loads("\n".join(l[5:].lstrip() for l in e.split("\n") if l.startswith("data:")))
+                      for e in raw.decode("utf-8").replace("\r\n", "\n").split("\n\n") if "data:" in e]
+            self.notices = getattr(self, "notices", []) + [e for e in events if "id" not in e]
+            data = events[-1]
+        else:
+            data = json.loads(raw)
         if "error" in data:
             raise AssertionError("MCP %s: %s" % (method, data["error"]))
         return data["result"]

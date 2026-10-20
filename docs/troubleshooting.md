@@ -14,6 +14,7 @@ release: `crewchat --version` shows yours, `crewchat update` gets the latest.
 - [Windows](#windows)
 - [Updating](#updating)
 - [Agents](#agents)
+- [Edit tracking, the code map and token counts](#edit-tracking-the-code-map-and-token-counts)
 - [The chat page and your phone](#the-chat-page-and-your-phone)
 - [Projects](#projects)
 - [Several machines](#several-machines)
@@ -95,9 +96,14 @@ code until it restarts. `crewchat update` restarts the usual one; restart any ot
 hand (`crewchat service restart`, or `crewchat stop` then `crewchat restart`). The server log's
 first line after a start names the version.
 
-**Linked machines behave differently.** Each machine runs its own copy: update every machine.
-Sharing projects by name needs 0.11 over Tailscale and 0.12 with cloud sync on every machine; a
-machine on an older version shares only its first project.
+**Linked machines behave differently.** Each machine runs its own copy: update every machine, so
+they all run the same version. Sharing projects by name needs 0.11 over Tailscale and 0.12 with
+cloud sync on every machine; a machine on an older version shares only its first project.
+
+**An agent calls `hub_take` (or `hub_tasks`, `hub_task_add`, `hub_assign`, `hub_update`) and is
+told the tool is gone.** `hub_task` replaced those five tools, with an `action` (`view`, `add`,
+`take`, `assign`, `areas`, `update`). A session that started before the update still has the old
+tool list: restart it.
 
 ## Agents
 
@@ -109,7 +115,7 @@ machine on an older version shares only its first project.
 
 **An agent does not answer messages from the chat.**
 
-![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer?. 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
+![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer? 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
 
 - Click it in the list: its panel says what it is doing. **Idle** means it has stopped waiting: it sees new messages the next time its
   user types. `crewchat listen on` makes agents in that folder wait longer.
@@ -131,6 +137,29 @@ server issues. Claude Code and Cursor do; for other tools this is expected.
 **Two agents keep talking to each other.** That stops after 10 turns in a row (`--max-chain`). To
 stop it sooner, tell them in the chat.
 
+**The lead (or the advisor) has no `hub_code`.** A session is told when its role brings it a new
+tool, but a tool on an MCP protocol older than 2025-03-26 cannot be told while it runs; its role
+message says so. Start a new session for that agent (**Reopen** keeps its conversation).
+
+## Edit tracking, the code map and token counts
+
+**`crewchat usage` shows nothing.** Token counts come from a Claude Code agent's stop hook, which
+reads them from the session's transcript. Cursor's hooks do not say how many tokens a turn used, so
+a Cursor agent has none. Counting is also off for a project after `crewchat usage off`
+(`crewchat usage on` turns it back on), and everywhere with `crewchat setup --activity off`.
+
+**`crewchat map` is empty, or the lead's `hub_code` says there is no code map yet.** The map is
+kept only while edit tracking is on: `crewchat edits` shows the setting. It is on by default for a
+software team only (`crewchat edits on` for another pack), and always off with
+`crewchat setup --activity off`. The map also needs `crewchat_map.py` next to `crewchat.py`: a
+`crewchat.py` copied alone to a machine has none. `hub_code` history says "no edits recorded" for a
+file nobody edited while tracking was on.
+
+**Interface-change notices come only for Python files.** Without the `map` extra, Java, Kotlin,
+JavaScript and TypeScript are read with regular expressions, which do not keep a function's
+parameters. Add the extra (`uv tool install "crewchat[cloud,map]"`), then `crewchat service
+restart`.
+
 ## The chat page and your phone
 
 **"That code is wrong or has expired."** A sign-in code works once, for two minutes. Run
@@ -140,6 +169,10 @@ stop it sooner, tell them in the chat.
 
 **The installed iPhone app asks me to sign in again.** It keeps its own sign-in, separate from
 Safari's. Sign in once inside it with a new code.
+
+**The glass is too see-through to read.** The page's bars, panels and menus are glass. Turn on
+**Reduce transparency** or **Increase contrast** in your system's accessibility settings, and the
+page makes them solid. A browser that cannot blur shows them solid too.
 
 **"The chat cannot be reached" on the phone.** The computer is off or asleep, or the phone is not
 connected to Tailscale. Open the Tailscale app on the phone and check it is connected.
@@ -195,7 +228,8 @@ removed and the shared key changed. Run `crewchat peers leave` on it, then
 `crewchat peers invite` on a linked machine and join again.
 
 **Taking a task fails with "cannot reach …".** Over Tailscale, the machine a task was posted on
-settles it, so it must be on. Try again when it is back.
+settles it, or the coordinator while that machine is off: this means neither could be reached. Try
+again when one is back.
 
 ## Cloud sync
 
@@ -214,23 +248,26 @@ behind by an older version is cleared by the next login on 0.11.1 or later.
 **A machine that was removed cannot join again.** Run `crewchat cloud logout` on it, then
 `crewchat cloud login`, and approve it again.
 
-**A shared file does not open on the other machine.** With cloud sync a file opens only on the
-machine it was shared on, for now; over Tailscale the other machine fetches it.
+**A shared file does not open on the other machine.** With cloud sync, files up to 5 MB
+(`cloud_file_mb`) open on every machine while the cloud keeps the message (24 hours,
+`cloud_ttl_hours`); a bigger or older one opens only on the machine it was shared on. Over Tailscale
+the other machine fetches it.
 
 **The machine cannot reach Firestore.** The local chat keeps working; messages wait and go out
 when the connection is back. The log says `cannot send, will retry`.
 
 ## Adding an agent from the chat page
 
-**No folders to choose from, or "No project folder on this machine is connected yet".** The menu
-lists this machine's folders in the project that is open on the page. Connect one: in a folder,
-`crewchat start --chat NAME` (or `crewchat start` in a new folder named like the project). With two
-setups on the machine, use the setup that serves the page (see
+**No folders to choose from, or "No folder on this machine is in this project yet".** The menu
+lists this machine's folders in the project that is open on the page. Connect one in New agent
+itself (**Or connect one**: type a path, or **Browse…**, then **Connect**), or in a terminal in the
+folder: `crewchat start --chat NAME` (or `crewchat start` in a new folder named like the project).
+With two setups on the machine, use the setup that serves the page (see
 [Two crewchat setups](#projects)). Folders connected before version 0.8 need `crewchat start` once
 more.
 
-**Cursor is missing from the agent menu.** The chat page starts Cursor's command-line agent, not
-the Cursor app. Install it (`curl https://cursor.com/install -fsS | bash`), then run
+**Cursor shows as "not installed" in the tool menu.** The chat page starts Cursor's command-line
+agent, not the Cursor app. Install it (`curl https://cursor.com/install -fsS | bash`), then run
 `crewchat start` once in a terminal where `cursor-agent` works.
 
 **"Claude Code is not installed here, or crewchat cannot find it."** The server may run with a

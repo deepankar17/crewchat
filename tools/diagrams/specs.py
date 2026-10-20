@@ -125,7 +125,7 @@ SPECS["start"] = {
         go("d1-a1", caption="The first time, it sets this machine up as the chat's host", icon="folder"),
         go("a1-d2", "d2-a2", caption="It starts the server, and has it start at every login", icon="server",
            ) | {"edges": [{"id": "a1-d2", "span": [.1, .45]}, {"id": "d2-a2", "span": [.5, .85]}]},
-        go("a2-d3", "d3-a3", caption="It connects the folder: MCP config and hooks for Claude Code and Cursor",
+        go("a2-d3", "d3-a3", caption="It connects the folder: MCP config and hooks for each agent tool installed",
            icon="plug") | {"edges": [{"id": "a2-d3", "span": [.1, .45]}, {"id": "d3-a3", "span": [.5, .85]}]},
         go("a3-end", caption="Then it opens the chat page, signed in as you", icon="chat"),
         go("run-d1", caption="Next time, every check passes: it only refreshes the hooks", icon="refresh", dur=3.4) | {
@@ -147,7 +147,7 @@ SPECS["link"] = {
     ],
     "steps": [
         msg("agent", "srv", "first chat tool call (MCP)", "The new session calls a chat tool for the first time"),
-        msg("srv", "agent", "you are claude-macbook", "crewchat gives it a name: claude-macbook", reply=True),
+        msg("srv", "agent", "you are Maya", "crewchat gives it a first name: Maya", reply=True),
         msg("hook", "srv", "messages for key K?", "Its hook asks for messages, with the session's key"),
         msg("srv", "hook", "link first", "crewchat doesn't know that key yet", reply=True),
         msg("hook", "agent", "call hub_link with key K", "The hook tells the agent to link", reply=True),
@@ -163,9 +163,9 @@ SPECS["bids"] = {
     "nodes": [
         card("you", "You", 60, 330, 190, 80, "user", "teal", "post a task"),
         card("srv", "crewchat", 360, 324, 240, 92, "crewchat", SERVER, "the chat"),
-        card("a1", "claude-macbook", 820, 140, 320, 84, "bot", AGENT, "wrote these tests"),
-        card("a2", "cursor-laptop", 820, 328, 320, 84, "bot", CURSOR, "busy with the UI"),
-        card("a3", "claude-desktop", 820, 516, 320, 84, "bot", AGENT, "new to this repo"),
+        card("a1", "Maya", 820, 140, 320, 84, "bot", AGENT, "wrote these tests"),
+        card("a2", "Teo", 820, 328, 320, 84, "bot", CURSOR, "busy with the UI"),
+        card("a3", "Wren", 820, 516, 320, 84, "bot", AGENT, "new to this repo"),
     ],
     "edges": [
         edge("you", "srv"), edge("srv", "a1", bend=710), edge("srv", "a2"), edge("srv", "a3", bend=710),
@@ -175,7 +175,7 @@ SPECS["bids"] = {
         go("srv-a1", "srv-a2", "srv-a3", caption="Every agent gets it", packet="task 9"),
         go(back("srv-a1", packet="yes: I wrote it"), back("srv-a2", packet="no: busy"),
            back("srv-a3", packet="no"), caption="Each bids once: yes or no, and why", dur=2.8),
-        go(back("srv-a1", packet="hub_take 9"), caption="The best placed calls hub_take: only the first caller gets it"),
+        go(back("srv-a1", packet="hub_task take 9"), caption="The best placed calls hub_task take: only the first caller gets it"),
         go("srv-a2", "srv-a3", caption="Everyone else is told it's taken", packet="taken"),
         go(back("srv-a1", span=[.1, .45], packet="found it"), back("you-srv", span=[.5, .85], packet="found it"),
            caption="It reports back to you as it works"),
@@ -223,7 +223,7 @@ SPECS["pieces"] = {
         card("mcp", "/mcp", 498, 186, 350, 76, "plug", SERVER, "the tools agents use"),
         card("api", "/api/hook", 498, 300, 350, 76, "hook", SERVER, "new messages for a hook"),
         card("pg", "/", 498, 414, 350, 76, "page", SERVER, "the chat page"),
-        card("st", "Plain files", 498, 528, 350, 76, "db", "slate", "messages.jsonl, state.json, files"),
+        card("st", "On this machine", 498, 528, 350, 76, "db", "slate", "messages.jsonl, state.json, SQLite"),
         card("you", "You", 970, 414, 260, 76, "user", "teal", "signed in"),
         card("other", "Your other machines", 970, 186, 260, 76, "mesh", "purple", "Tailscale or cloud sync"),
     ],
@@ -236,7 +236,8 @@ SPECS["pieces"] = {
         go("cc-mcp", "cu-mcp", caption="Agents use crewchat's tools over MCP, with the folder's own token", icon="plug"),
         go("hk-api", caption="Their hooks ask /api/hook for new messages", icon="hook"),
         go("you-pg", caption="You read and write on the chat page, once signed in", icon="chat"),
-        {"glow": ["st"], "caption": "Everything is kept in plain files, on this machine", "badgeAt": [840, 534]},
+        {"glow": ["st"], "caption": "Everything stays on this machine: the chat in messages.jsonl, edits and the code map in SQLite",
+         "badgeAt": [840, 534]},
         go("mcp-other", caption="Optionally, it syncs with crewchat on your other machines", icon="lock"),
     ],
 }
@@ -267,27 +268,29 @@ SPECS["hooks"] = {
 SPECS["take"] = {
     "type": "sequence",
     "title": "Two agents, one task",
-    "subtitle": "hub_take is first come, first served",
+    "subtitle": "hub_task take is first come, first served",
     "left": 230, "right": 1050,
     "participants": [
-        {"id": "a", "label": "claude-macbook", "icon": "bot", "color": AGENT},
+        {"id": "a", "label": "Maya", "icon": "bot", "color": AGENT},
         {"id": "srv", "label": "crewchat", "icon": "crewchat", "color": SERVER},
-        {"id": "b", "label": "cursor-laptop", "icon": "bot", "color": CURSOR},
+        {"id": "b", "label": "Teo", "icon": "bot", "color": CURSOR},
     ],
     "cardW": 200,
     "steps": [
         note(["a", "srv", "b"], "both bid yes on task 9", "Both agents bid yes on task 9"),
-        msg("a", "srv", "hub_take 9", "claude-macbook calls hub_take"),
-        msg("b", "srv", "hub_take 9", "A moment later, so does cursor-laptop"),
+        msg("a", "srv", "hub_task take 9", "Maya calls hub_task take"),
+        msg("b", "srv", "hub_task take 9", "A moment later, so does Teo"),
         msg("srv", "a", "task 9 is yours", "The first call wins, and everyone is told", reply=True),
-        msg("srv", "b", "already taken by claude-macbook", "The second gets a clear no, and moves on", reply=True),
+        msg("srv", "b", "already taken by Maya", "The second gets a clear no, and moves on", reply=True),
+        note(["a", "srv", "b"], "posted on a linked machine that is off?",
+             "A task from a linked machine that is off: the coordinator settles it instead"),
     ],
 }
 
 SPECS["files"] = {
     "type": "sequence",
     "title": "Sharing a screenshot",
-    "subtitle": "Files stay on your machines, and travel only when an agent asks",
+    "subtitle": "Over Tailscale a file travels when it is opened; cloud sync carries it with the message",
     "participants": [
         {"id": "you", "label": "You", "icon": "user", "color": "teal"},
         {"id": "m", "label": "crewchat", "sub": "on the macbook", "icon": "crewchat", "color": SERVER},
@@ -297,11 +300,13 @@ SPECS["files"] = {
     "cardW": 200,
     "steps": [
         msg("you", "m", "paste a screenshot, send", "You paste a screenshot and send it", icon="image"),
-        msg("m", "l", "the message, with the file's id", "Only the message and the file's id sync to the laptop"),
+        msg("m", "l", "the message, with the file's id", "Over Tailscale, only the message and the file's id sync to the laptop"),
         msg("agent", "l", "hub_file with the id", "The agent asks for the file"),
         msg("l", "m", "fetch the file, once", "The laptop fetches it from the macbook, once"),
         msg("m", "l", "the file", "The file comes over", reply=True, icon="image"),
         msg("l", "agent", "the image, to look at", "The agent sees the image itself", reply=True, icon="image"),
+        note(["m", "l"], "cloud sync: up to 5 MB, with the message",
+             "With cloud sync, a file up to 5 MB travels with its message, encrypted"),
     ],
 }
 
@@ -355,7 +360,7 @@ SPECS["tailnet"] = {
         go("b1-B", caption="And answers", packet="answer"),
         go(back("A-B"), "B-C", caption="The answer reaches every machine", icon="lock"),
     ],
-    "summary": "No server in the middle: a machine that's off only takes its own agents out",
+    "summary": "No server in the middle: a machine that's off only takes its own agents out, and catches up when back",
 }
 
 SPECS["peers"] = {
@@ -376,6 +381,8 @@ SPECS["peers"] = {
             reply=True, icon="key"),
         msg("l", "m", "anything new? (waits until there is)", "From then on, each asks the other for anything new"),
         msg("m", "l", "anything new? (waits until there is)", "and waits until there is: messages arrive at once"),
+        note(["m", "l"], "back after days: everything since, from the logs",
+             "A machine that was off gets everything it missed, however long it was away"),
     ],
 }
 
@@ -400,6 +407,8 @@ SPECS["cloud"] = {
         {"glow": ["m2"], "caption": "The laptop decrypts it: Google only ever stored ciphertext", "badgeAt": [1216, 474]},
         go(back("fs-m2", span=[.1, .45], packet="7d02 b6aa"), back("m1-fs", span=[.5, .85], packet="7d02 b6aa"),
            caption="Answers travel back the same way"),
+        {"glow": ["m2"], "caption": "Off for more than a day? The coordinator sends what it missed, the same way",
+         "badgeAt": [1216, 474]},
     ],
 }
 
@@ -459,10 +468,10 @@ SPECS["who-takes"] = {
         card("task", "You post a task", 24, 334, 170, 64, None, "teal", shape="pill"),
         card("q", "Is there a lead?", 236, 320, 220, 92, "question", "amber"),
         card("L", "The lead takes it", 520, 150, 250, 86, "crown", "purple", "and splits it up"),
-        card("A", "hub_assign", 830, 150, 210, 86, "task", "purple", "a piece to each agent"),
+        card("A", "hub_task assign", 830, 150, 210, 86, "task", "purple", "a piece to each agent"),
         card("R", "Reports to you", 1090, 157, 170, 72, None, "green", shape="pill"),
         card("B", "Every agent bids", 520, 500, 250, 86, "users", "amber", "once: yes or no"),
-        card("K", "hub_take", 830, 500, 210, 86, "check", "amber", "one takes it"),
+        card("K", "hub_task take", 830, 500, 210, 86, "check", "amber", "one takes it"),
         card("R2", "Reports to you", 1090, 507, 170, 72, None, "green", shape="pill"),
     ],
     "edges": [
@@ -472,7 +481,7 @@ SPECS["who-takes"] = {
     "steps": [
         go("task-q", caption="You post a task", packet="task 9"),
         go("q-L", caption="With a lead: the lead takes it, and splits it up", icon="crown"),
-        go("L-A", caption="It hands out each piece with hub_assign: no bidding", icon="task"),
+        go("L-A", caption="It hands out each piece with hub_task assign: no bidding", icon="task"),
         go("A-R", caption="Agents report progress to the lead, which reports to you", icon="chat"),
         go("q-B", caption="Without a lead: every agent bids once", icon="users"),
         go("B-K", "K-R2", caption="The best placed takes it, and reports back to you", icon="check") | {
@@ -493,20 +502,20 @@ SPECS["team"] = {
     "cardW": 190, "stepDur": 2.1,
     "steps": [
         msg("you", "lead", "task 9: add a dark theme", "You post a task, and the lead gets it", packet="task 9"),
-        msg("lead", "lead", "hub_take 9", "The lead takes it"),
-        msg("lead", "dev", "hub_assign 11, part of 9", "and assigns a piece to the developer"),
-        msg("dev", "lead", "hub_update 11: in progress", "The developer reports progress"),
+        msg("lead", "lead", "hub_task take 9", "The lead takes it"),
+        msg("lead", "dev", "hub_task assign 11, part of 9", "and assigns a piece to the developer"),
+        msg("dev", "lead", "hub_task update 11: in progress", "The developer reports progress"),
         msg("dev", "qa", "ready to test: Settings, Theme", "and tells QA it's ready to test"),
         msg("qa", "dev", "bug: it resets after a restart", "QA finds a bug, and tells the developer directly", icon="bug"),
         msg("dev", "qa", "fixed: ready again", "The developer fixes it"),
-        msg("qa", "lead", "hub_update 11: done", "QA marks it done"),
+        msg("qa", "lead", "hub_task update 11: done", "QA marks it done"),
         msg("lead", "you", "dark theme done, one question", "The lead reports back to you"),
     ],
 }
 
 SPECS["task-states"] = {
     "title": "A task's progress",
-    "subtitle": "hub_update moves it along; the lead and you see every change",
+    "subtitle": "hub_task update moves it along; the lead and you see every change",
     "nodes": [
         card("as", "assigned", 30, 230, 200, 88, "task", "blue"),
         card("ip", "in progress", 330, 230, 220, 88, "zap", "green"),
@@ -533,7 +542,7 @@ SPECS["task-states"] = {
 
 SPECS["add-agent"] = {
     "type": "sequence",
-    "title": "Add an agent from the chat",
+    "title": "New agent, from the chat",
     "subtitle": "A new session opens in a terminal window, already linked and briefed",
     "participants": [
         {"id": "you", "label": "You", "icon": "user", "color": "teal"},
@@ -543,7 +552,7 @@ SPECS["add-agent"] = {
     ],
     "cardW": 190,
     "steps": [
-        msg("you", "page", "Add an agent: name, role, task", "You click Add an agent, and fill in a name, role and task"),
+        msg("you", "page", "New agent: name, role, task", "You click New agent, and fill in a name, role and task"),
         msg("page", "srv", "launch", "The page asks crewchat to launch it"),
         msg("srv", "term", "open Claude Code, one-time key", "A terminal window opens Claude Code in the folder", icon="terminal"),
         msg("term", "srv", "hub_link with the key", "The new session links itself, with the one-time key"),

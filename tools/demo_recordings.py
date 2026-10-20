@@ -418,13 +418,15 @@ def scene_add_agent(r):
     chat.quiet()
     started = {}
     old_options, old_launch, old_folders = crewchat.launch_options, crewchat.launch_agent, crewchat.launch_folders
+    old_ready = crewchat.tool_readiness
+    crewchat.tool_readiness = lambda tool, *more, **named: [crewchat.ready_item("ok", "Signed in")]  # not this machine's own
     folder = [{"path": "/Users/you/code/notes-app", "name": "notes-app", "place": "macbook"}]
     crewchat.launch_folders = lambda config, root=None, chat="": folder
     crewchat.launch_options = lambda config, root=None, chat="": {"tools": [
         {"id": t, "label": label, "models": crewchat.tool_models(t),
          "permissions": [[k, v[0]] for k, v in crewchat.LAUNCH_PERMISSIONS[t].items()]}
         for t, (label, _) in crewchat.LAUNCH_TOOLS.items()], "folders": folder}
-    crewchat.launch_agent = lambda tool, folder, key, permissions="ask", root=None, model="": started.update(key=key)
+    crewchat.launch_agent = lambda tool, folder, key, *more, **named: started.update(key=key)
     try:
         r.size(1280, 720)
         r.open(chat.sign_in())
@@ -454,6 +456,7 @@ def scene_add_agent(r):
         frames = r.stop(2.4)
     finally:
         crewchat.launch_options, crewchat.launch_agent, crewchat.launch_folders = old_options, old_launch, old_folders
+        crewchat.tool_readiness = old_ready
         chat.stop()
     return frames
 

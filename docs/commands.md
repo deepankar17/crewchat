@@ -13,6 +13,7 @@ stop or uninstall are never run from the page, so a stray tap on a phone cannot 
 - [The server](#the-server)
 - [Talking and agents](#talking-and-agents)
 - [Teams](#teams)
+- [Projects, rules, skills and the task sheet](#projects-rules-skills-and-the-task-sheet)
 - [Project folders](#project-folders)
 - [Several machines](#several-machines)
 - [Settings](#settings)
@@ -27,7 +28,7 @@ the current one) and open the chat page. Safe to run again.
 | Option | |
 |---|---|
 | `--place NAME` | Label for this folder in agent names (default: the machine's name) |
-| `--client all\|claude\|cursor` | Which tools to connect (default: both) |
+| `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode` | Which tools to connect (default: Claude Code, Cursor and the other tools installed here) |
 | `--project NAME` | The chat's name, the first time (default: the folder's name) |
 | `--port PORT` | The local port, the first time (default: 8765, or the next free one) |
 | `--no-service` | Run the server until you log out, instead of at every login |
@@ -82,9 +83,9 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 |---|---|
 | `--role ROLE` | Its role |
 | `--task TEXT` | Its first task |
-| `--tool claude\|cursor` | Claude Code (default) or Cursor's agent |
+| `--tool claude\|cursor\|codex\|gemini\|qwen\|opencode` | Claude Code (default), Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode |
 | `--folder FOLDER` | A connected project folder on this machine (default: the current one) |
-| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (Claude Code), auto (it judges what is safe), or anything ([details](teams.md#add-an-agent-from-the-chat-page)) |
+| `--permissions ask\|edits\|auto\|all` | What it may do without asking: ask (default), also edit files (not Cursor or OpenCode), auto (it judges what is safe: Claude Code and Cursor), or anything ([details](teams.md#new-agent-from-the-chat-page)) |
 | `--accept-edits` | The same as `--permissions edits` |
 
 ## Teams
@@ -114,7 +115,11 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
 | `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
 | `crewchat tasks` | The task sheet |
+| `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
+| `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |
+| `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
 | `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks areas ID accept\|PATHS` | A task's files: accept the folders crewchat suggested from what its holder changed, or set them |
 | `crewchat tasks assign ID AGENT` | Give a task to an agent |
 | `crewchat tasks move ID up\|down\|top` | Reorder |
 | `crewchat tasks done\|todo\|blocked ID [NOTE]` | Settle a task (`todo` puts it back on the sheet) |
@@ -130,11 +135,12 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat listen off` | Check once at the end of each turn, then go idle |
 | `crewchat listen default` | Claude Code waits 30 minutes, Cursor checks once |
 | `crewchat listen status` | Show the setting |
+| `crewchat hooks refresh` | Write every connected folder's hooks again for this crewchat (after an update or a reinstall moved it) |
 | `crewchat hooks off` | Keep this folder's sessions out of the chat: no request to join, no messages handed over (`on` undoes it, `status` shows it). For one session only, start it with `CREWCHAT_HOOKS=off` |
 | `crewchat places` | List the connected folders' labels |
 | `crewchat place remove NAME` | Shut a folder out: its token stops working at once |
 | `crewchat invite [--local] [--place NAME] [--client …] [--url URL]` | Print a `crewchat join` command for a folder, with a single-use code (10 minutes) |
-| `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|generic`, `--project FOLDER`) |
+| `crewchat join --url URL --code CODE` | Connect this folder to a chat (`--place`, `--client all\|claude\|cursor\|codex\|gemini\|qwen\|opencode\|generic`, `--project FOLDER`) |
 
 `crewchat start` does `invite` and `join` for you on the host. `--client generic` prints MCP
 settings for other tools instead of writing files.
@@ -156,6 +162,7 @@ Registered under another name than `crewchat`, its tools are allowed without ask
 | `crewchat peers invite` | Print a join command for another machine (sets up this machine's tailnet address the first time) |
 | `crewchat peers join URL CODE` | Link this machine, with the command from an invite |
 | `crewchat peers status` | Linked machines, and which are reachable |
+| `crewchat coordinator [NAME\|none]` | Which linked machine coordinates now (settles claims for a machine that is off, serves catch-up and files); with a name, the one that should whenever it is on |
 | `crewchat peers remove NAME` | Drop a machine and change the shared key (asks first; `--yes` does not) |
 | `crewchat peers leave` | Unlink this machine (asks first, naming it; `--yes` does not) |
 
@@ -202,7 +209,8 @@ Other settings in `~/.crewchat/config.json`:
 | Key | |
 |---|---|
 | `forget_hours` | Hours of silence before an agent drops off the roster (default 24) |
-| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24) |
+| `cloud_ttl_hours` | Cloud sync: hours a message stays in Firestore at most (default 24). A machine off for longer catches up from the coordinator; only when every machine was off for longer are messages lost |
+| `cloud_file_mb` | Cloud sync: the largest shared file that travels to your other machines, in MB (default 5, at most 20). The default keeps within the free Firebase plan's quota (1 GiB stored, 20,000 writes and 50,000 reads a day); raise it on a paid (Blaze) plan |
 | `roles` | The project's own roles (`crewchat roles add` writes them) |
 | `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
 | `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |

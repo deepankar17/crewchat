@@ -8,6 +8,8 @@ Needs Google Chrome. Everything runs in a throwaway folder; nothing touches ~/.c
 arguments it makes every scene; name scenes to make only those (see SCENES at the bottom).
 """
 import base64
+import functools
+import http.server
 import json
 import os
 import shutil
@@ -58,12 +60,15 @@ class Chat:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def agent(self, place="macbook", client="claude", status="", activity="working", name=None):
-        """A new agent; name gives it that first name instead of one the hub picks at random (by a
-        rename, whose line in the chat quiet() drops with the join lines)."""
-        auto = self.hub.agent_for(self.hub.open_session(place, client))
-        if name and name != auto:
-            self.hub.rename(auto, name)
-        name = name or auto
+        """A new agent; name gives it that first name instead of one the hub picks at random (it joins
+        with it, so the chat says so and no rename takes a message number)."""
+        pick = self.hub._agent_name
+        if name:
+            self.hub._agent_name = lambda *where: name
+        try:
+            name = self.hub.agent_for(self.hub.open_session(place, client))
+        finally:
+            self.hub._agent_name = pick
         if status:
             self.hub.set_status(name, status)
         self.doing(name, activity)
@@ -93,7 +98,7 @@ class Chat:
         """Drop the join and role lines, and mark everything read, for a tidy picture."""
         with self.hub.lock:
             self.hub.messages[:] = [m for m in self.hub.messages if m["kind"] not in ("event", "role")]
-            self.hub.ids = {m["id"]: m["seq"] for m in self.hub.messages}
+            self.hub._index()  # ids and by_id, for the messages left
             self.read_all()
 
     def read_all(self):
@@ -205,10 +210,16 @@ def terminal(browser, name, title, runs):
 
 
 def run(args, home, cwd, ports=()):
-    """Run a crewchat command for real; its output, with throwaway paths and ports made readable."""
+    """Run a crewchat command for real; its output, with throwaway paths and ports made readable. It gets a
+    throwaway home folder too, so this machine's own agent settings (~/.claude.json, ~/.cursor) stay out of it."""
+    user = home.parent / (home.name + "-user")
+    user.mkdir(exist_ok=True)
+    env = dict(os.environ, CREWCHAT_HOME=str(home), HOME=str(user))
+    env.pop("CLAUDE_CONFIG_DIR", None)
     out = subprocess.run([sys.executable, str(ROOT / "crewchat.py")] + args, cwd=str(cwd), capture_output=True,
-                         text=True, env=dict(os.environ, CREWCHAT_HOME=str(home)))
+                         text=True, env=env)
     text = (out.stdout + out.stderr).replace(str(cwd), "~/code/notes-app").replace(str(home), "~/.crewchat")
+    text = text.replace(str(user), "~")
     for port in ports:
         text = text.replace("127.0.0.1:%s" % port, "127.0.0.1:8765")
     return text
@@ -235,10 +246,10 @@ def scene_empty_chat(b):
 
 def team_chat():
     chat = Chat()
-    lead = chat.agent(status="Coordinating the dark theme", activity="listening")
-    dev = chat.agent(status="Persisting the theme choice", activity="listening")
-    cur = chat.agent("laptop", "cursor", status="Dark colour scheme")
-    qa = chat.agent(status="Testing the colours")
+    lead = chat.agent(status="Coordinating the dark theme", activity="listening", name="Maya")
+    dev = chat.agent(status="Persisting the theme choice", activity="listening", name="Teo")
+    cur = chat.agent("laptop", "cursor", status="Dark colour scheme", name="Noor")
+    qa = chat.agent(status="Testing the colours", name="Kira")
     for name, role in ((lead, "lead"), (dev, "developer"), (cur, "developer"), (qa, "qa")):
         chat.hub.set_role(O, name, role)
     chat.quiet()
@@ -283,6 +294,8 @@ def scene_team(b):
     chat.hub.take(lead_name, blocked)
     chat.hub.update(lead_name, blocked, "blocked", "Should the default follow the system setting, or always be light?")
     time.sleep(1.5)
+    # The agent's settings close again, and the rail goes back to its top: Needs you, then the crew.
+    b.js("closeAgent(); for (let e = $('agents'); e; e = e.parentElement) e.scrollTop = 0")
     b.js("openPanel('task', %s)" % json.dumps(blocked))
     time.sleep(0.6)
     b.shoot("needs-you")
@@ -295,9 +308,9 @@ def scene_team(b):
 
 def scene_agents_joined(b):
     chat = Chat()
-    a = chat.agent(status="Fixing the login test")
-    c = chat.agent("macbook", "cursor", status="Reviewing the settings screen", activity="listening")
-    w = chat.agent("windows", "claude", status="", activity="idle")
+    a = chat.agent(status="Fixing the login test", name="Kai")
+    c = chat.agent("macbook", "cursor", status="Reviewing the settings screen", activity="listening", name="Ines")
+    w = chat.agent("windows", "claude", status="", activity="idle", name="Wren")
     chat.say(a, "all", "Heads up: I'm about to change LoginViewModel.kt and its test.")
     chat.say(c, a, "Fine by me. I'm only in SettingsScreen.kt.")
     chat.say(w, "all", "I'm on the Windows laptop if anything needs checking there.")
@@ -311,14 +324,14 @@ def scene_agents_joined(b):
 
 def scene_task(b):
     chat = Chat()
-    a = chat.agent(status="Free")
-    c = chat.agent("macbook", "cursor", status="Dark theme")
-    w = chat.agent("windows", "claude", status="Free")
+    a = chat.agent(status="Free", name="Luca")
+    c = chat.agent("macbook", "cursor", status="Dark theme", name="Selin")
+    w = chat.agent("windows", "claude", status="Free", name="Odin")
     chat.quiet()
     task = chat.say(O, "all", "Find out why the login test is flaky.", "task")
     chat.say(a, "all", "BID #%s: yes. I wrote that test and I'm free." % task["id"])
     chat.say(c, "all", "BID #%s: no. I'm in the middle of the dark theme." % task["id"])
-    chat.say(w, "all", "BID #%s: yes, but claude-macbook knows that code better." % task["id"])
+    chat.say(w, "all", "BID #%s: yes, but %s knows that code better." % (task["id"], a))
     chat.hub.take(a, task["id"])
     chat.hub.set_status(a, "Flaky login test")
     chat.say(a, O, "Found it: the test waited 100 ms for the token refresh, which takes up to 300 ms on CI. "
@@ -332,7 +345,7 @@ def scene_task(b):
 
 def scene_add_agent(b):
     chat = Chat()
-    chat.agent(status="Coordinating the dark theme", activity="listening")
+    chat.agent(status="Coordinating the dark theme", activity="listening", name="Maya")
     chat.hub.set_role(O, list(chat.hub.agents)[0], "lead")
     chat.quiet()
     old = crewchat.launch_options
@@ -372,8 +385,8 @@ justify-content:space-between;padding:16px 18px;border-top:1px solid #333} .on{c
 def scene_files(b):
     shot = app_screenshot(b)
     chat = Chat()
-    qa = chat.agent(status="Testing the theme switch")
-    dev = chat.agent(status="Persisting the theme choice")
+    qa = chat.agent(status="Testing the theme switch", name="Gia")
+    dev = chat.agent(status="Persisting the theme choice", name="Hana")
     chat.hub.set_role(O, qa, "qa")
     chat.hub.set_role(O, dev, "developer")
     chat.quiet()
@@ -441,10 +454,119 @@ def scene_terminals(b):
         subprocess.run(["pkill", "-f", "serve --log %s" % (h / "hub.log")])
 
 
+def scene_analytics(b):
+    """The analytics view on its sample data, as the public demo shows it (site/build.py builds it, and it is served
+    here as crewchat.dev serves it): light and dark pictures, and a short GIF of the crew talking."""
+    sys.path.insert(0, str(ROOT / "site"))
+    import build
+    site = build.build(TMP / "site")
+    quiet = type("Quiet", (http.server.SimpleHTTPRequestHandler,), {"log_message": lambda *a: None})
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), functools.partial(quiet, directory=str(site)))
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = "http://127.0.0.1:%d/demo/" % server.server_address[1]
+    try:
+        for dark, name in ((False, "analytics-light"), (True, "analytics-dark")):
+            b.size(1280, 900, scale=1, dark=dark)
+            b.open(url, wait=4)
+            b.shoot(name)
+        # The GIF: the crew, as messages fly between them, for about six seconds.
+        b.size(1100, 760, scale=1)
+        b.open(url, wait=4)
+        x, y, w, h = b.js("(() => { const r = document.querySelector('.ax-hero').getBoundingClientRect();"
+                          " return [r.x, r.y, r.width, r.height]; })()")
+        frames = TMP / "frames"
+        frames.mkdir(exist_ok=True)
+        started, count = time.time(), 0
+        while time.time() - started < 6:
+            shot = b.call("Page.captureScreenshot", format="png",
+                          clip={"x": x, "y": y, "width": w, "height": h, "scale": 1})
+            (frames / ("%03d.png" % count)).write_bytes(base64.b64decode(shot["data"]))
+            count += 1
+            time.sleep(0.04)
+        rate = count / (time.time() - started)  # as fast as the frames came, so it plays at the speed it ran
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-framerate", "%.2f" % rate, "-i", str(frames / "%03d.png"),
+                        "-vf", "scale=760:-1:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];"
+                        "[b][p]paletteuse=dither=bayer:bayer_scale=4", "-loop", "0", str(OUT / "analytics-demo.gif")],
+                       check=True)
+        print("  docs/images/analytics-demo.gif (%d frames)" % count)
+    finally:
+        server.shutdown()
+
+
+def scene_code(b):
+    """Code-aware teamwork: crewchat telling an agent that code its task uses changed (C3), as it arrives in the chat."""
+    chat = Chat()
+    lead = chat.agent(status="Coordinating the payments work", activity="listening", name="Maya")
+    dev = chat.agent(status="Refunds screen", name="Teo")
+    qa = chat.agent("laptop", "cursor", status="Testing refunds", name="Priya")
+    for name, role in ((lead, "lead"), (dev, "developer"), (qa, "qa")):
+        chat.hub.set_role(O, name, role)
+    chat.quiet()
+    task = chat.say(O, "all", "Add refunds to the payments screen, with tests.", "task")
+    chat.hub.take(lead, task["id"])
+    mine = chat.hub.assign(lead, dev, "Show refunds on the payments screen (app/payments/).", task["id"])
+    chat.hub.update(dev, mine["id"], "in_progress", "Reading the payment rows with paylib.parse.read.")
+    chat.say(lead, "all", "I'm changing paylib/parse.py so it can read a whole statement, not only a file path.")
+    with chat.hub.lock:
+        chat.hub._append(crewchat.SERVER_NAME, dev, "%s changed paylib/parse.py, which your task #%s uses: read(path) is now "
+                         "read(source, encoding). Check the code that calls it." % (lead, mine["id"]), "msg", task=mine["id"],
+                         changed="paylib/parse.py")
+        chat.hub._changed()
+    chat.say(dev, lead, "Thanks: updated my two calls to read(source, encoding). Tests pass.")
+    chat.read_all()
+    b.size(1100, 680)
+    b.open(chat.sign_in())
+    b.shoot("code-notice")
+    chat.stop()
+
+
+def scene_faces(b):
+    """A sheet of generated faces with their names: what new agents look like."""
+    names = [("Maya", 0), ("Teo", 1), ("Priya", 2), ("Arjun", 0), ("Noor", 1), ("Kira", 2), ("Kabir", 0), ("Zoe", 1),
+             ("Omar", 2), ("Meera", 0), ("Wren", 1), ("Hugo", 2), ("Diya", 0), ("Levi", 1), ("Yuki", 2), ("Rohan", 0)]
+    tiles = []
+    for name, device in names:
+        svg = crewchat.mix_svg(crewchat.new_mix(device, name=name)[4:]).decode()
+        tiles.append('<figure><img src="data:image/svg+xml;base64,%s" alt=""><figcaption>%s</figcaption></figure>'
+                     % (base64.b64encode(svg.encode()).decode(), name))
+    page = TMP / "faces.html"
+    page.write_text("""<!doctype html><meta charset="utf-8"><style>
+body { margin: 0; background: radial-gradient(60%% 55%% at 0%% 0%%, #c7d7ff, transparent 62%%),
+  radial-gradient(55%% 50%% at 100%% 0%%, #e7d6ff, transparent 60%%), radial-gradient(60%% 55%% at 85%% 100%%, #ffe1cc, transparent 62%%), #eef3ff;
+  font: 600 15px ui-rounded, "SF Pro Rounded", system-ui, sans-serif; color: #0b1f55; }
+#sheet { display: grid; grid-template-columns: repeat(8, 110px); gap: 18px 14px; padding: 26px 30px; width: max-content; }
+figure { margin: 0; text-align: center; } img { width: 96px; height: 96px; border-radius: 50%%; display: block; margin: 0 auto 8px;
+  box-shadow: 0 6px 18px rgba(11, 31, 85, .14), inset 0 0 0 1px rgba(255, 255, 255, .6); }
+</style><div id="sheet">%s</div>""" % "".join(tiles), encoding="utf-8")
+    b.size(1100, 420)
+    b.open(page.as_uri(), wait=0.8)
+    b.shoot("faces", "#sheet")
+    b.js("document.getElementById('sheet').style.gridTemplateColumns = 'repeat(4, 110px)'")  # square, for the site
+    b.size(600, 700)
+    time.sleep(0.4)
+    b.shoot("faces-square", "#sheet")
+
+
+def scene_permission(b):
+    """Needs you with a Claude Code agent's permission prompt (its PermissionRequest hook): Allow or Deny from the page."""
+    chat = team_chat()
+    dev = list(chat.hub.agents)[1]
+    with chat.hub.lock:  # as Hub.ask_permission puts one while the agent's hook waits
+        chat.hub.permissions["a1b2c3"] = {"id": "a1b2c3", "agent": dev, "tool": "Bash", "ts": time.time(), "answer": "",
+                                          "text": "./gradlew connectedAndroidTest --tests '*ThemeSettingsTest*'"}
+        chat.hub._changed()
+    time.sleep(1)
+    b.size(1200, 760)
+    b.open(chat.sign_in())
+    b.shoot("permission")
+    chat.stop()
+
+
 SCENES = {
     "sign-in": scene_sign_in, "empty-chat": scene_empty_chat, "team": scene_team,
     "agents-joined": scene_agents_joined, "task": scene_task, "add-agent": scene_add_agent,
-    "files": scene_files, "phone": scene_phone, "terminals": scene_terminals,
+    "files": scene_files, "phone": scene_phone, "terminals": scene_terminals, "analytics": scene_analytics,
+    "code": scene_code, "faces": scene_faces, "permission": scene_permission,
 }
 
 

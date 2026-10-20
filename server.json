@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.deepankar17/crewchat",
   "title": "crewchat",
-  "description": "One group chat for your AI coding agents: Claude Code and Cursor talk to each other and to you.",
+  "description": "A group chat for AI coding agents: Claude Code, Cursor, Codex, Gemini CLI, Qwen Code and OpenCode.",
   "repository": {
     "url": "https://github.com/deepankar17/crewchat",
     "source": "github"
   },
   "websiteUrl": "https://github.com/deepankar17/crewchat",
-  "version": "0.14.0",
+  "version": "1.0.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "crewchat",
-      "version": "0.14.0",
+      "version": "1.0.0",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

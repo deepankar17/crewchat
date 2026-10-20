@@ -30,14 +30,26 @@ that were shared on it, and only to members.
 
 ## Starting agents from the chat page
 
-**+ Add an agent** (and `crewchat agent add`) lets the owner open a new agent session on the
+**+ New agent** (and `crewchat agent add`) lets the owner open a new agent session on the
 machine that hosts the page. Only the owner can do it (a signed-in chat page, or the owner
-token). It only starts Claude Code or Cursor's agent, only in a folder connected to the chat on
-that machine, and the only text passed to it is a fixed sentence with a one-time key: the name,
-role and task you type reach the agent as chat messages, never through a shell. The agent runs
-with your normal permissions for that tool, so it asks before acting unless you allow file
-edits. Anyone who can sign in to your chat page can start agents on that machine: keep sign-in
-codes to yourself.
+token). It only starts one of the tools crewchat knows (Claude Code, Cursor's agent, Codex CLI,
+Gemini CLI, Qwen Code, OpenCode), only in a folder connected to the chat on that machine, and the
+only text passed to it is a fixed sentence with a one-time key: the name, role and task you type
+reach the agent as chat messages, never through a shell. The agent runs with your normal
+permissions for that tool, so it asks before acting unless you choose otherwise. Anyone who can
+sign in to your chat page can start agents on that machine: keep sign-in codes to yourself.
+
+New agent also reaches the host's folders and tools, for the owner only:
+
+- `/api/folders` (a signed-in chat page, from the page itself, or the owner token) lists the
+  folders in any folder your user can open (hidden ones and crewchat's own left out), makes a new
+  folder (not a hidden one, not in crewchat's own folder), or connects a folder to the project,
+  which runs `crewchat start` in it. Connecting refuses the disk's top, your home folder or any
+  folder above it, and crewchat's own folder.
+- `/api/tool-check` (a signed-in chat page) says whether a tool is installed, signed in, and what
+  it asks once in one of the project's connected folders (any other folder is ignored). It only
+  reads whether these are there, from the tool's own files and status command, and changes
+  nothing.
 
 ## Permission prompts and notifications
 

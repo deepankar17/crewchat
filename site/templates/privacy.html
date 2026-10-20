@@ -12,7 +12,7 @@
       <li><b>GitHub, for the update check.</b> About every 6 hours the server asks GitHub for the number of the
         latest crewchat release. Nothing about you, your machine or your chat is sent.
         <code>CREWCHAT_NO_UPDATE_CHECK=1</code> turns it off.</li>
-      <li><b>Your own Firebase project, if you turn on cloud sync.</b> Messages, tasks and agent lists are
+      <li><b>Your own Firebase project, if you turn on cloud sync.</b> Messages, tasks, agent lists and shared files (up to 5 MB) are
         encrypted on your machine before they are sent, with a key only your machines hold; Firestore stores the
         ciphertext under your Google account. You sign in with Google to your own project.
         <a href="{{docs}}/cloud-sync-design.md">How cloud sync works</a>.</li>
@@ -23,6 +23,27 @@
         you and no chat page is open, the server sends that service an <b>empty</b> push, signed with a key kept
         on your machine; the page then fetches what is new from your own server. Nothing from the chat goes
         through the push service.</li>
+    </ul>
+    <h2>What crewchat reads on your machine and keeps there</h2>
+    <ul>
+      <li><b>Which files agents edit,</b> in a project whose team edits code (on by default for a software team,
+        off for others; <code>crewchat edits on|off|auto</code>). The hook sends the path of each file an agent
+        edits inside the project folder, never what it wrote and never a path outside the project, and it is
+        kept on this machine. Other machines only ever see what is worked out from it.</li>
+      <li><b>A map of the project's code,</b> while edits are kept: the server reads the source files of the
+        project's folders (Python, Java, Kotlin, JavaScript and TypeScript, Angular templates) and keeps their
+        paths, the names of the classes and functions in them (with their parameters: for Python, and for Java,
+        Kotlin, JavaScript and TypeScript with the <code>map</code> extra) and which file imports which, on this
+        machine.
+        Never the code itself; it never leaves the machine (<code>crewchat map</code>).</li>
+      <li><b>When each agent was working, waiting for messages or idle,</b> for the timelines on the analytics
+        page: only those states and when they changed, kept on this machine. Not kept while
+        <code>crewchat setup --activity off</code> keeps what agents do off the page.</li>
+      <li><b>Token counts.</b> At the end of each turn of a Claude Code agent, its hook reads how many tokens the
+        turn used from the session's own transcript: the model and the numbers, never the conversation. They are
+        added to the agent and the task it works on, and shown to you as totals with a cost estimate.
+        <code>crewchat usage off</code> stops it for a project; <code>crewchat setup --activity off</code> stops it
+        everywhere.</li>
     </ul>
     <p>Installing crewchat downloads it from PyPI or GitHub (and uv from Astral, if missing); those sites see the
       download as they see any other. The Claude Code and Cursor plugin is a setup guide only: it contains no

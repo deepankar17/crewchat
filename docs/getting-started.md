@@ -7,10 +7,14 @@ minutes: install, start, open your agents, talk to them, share files, and tune h
 - [2. Start a chat](#2-start-a-chat)
 - [3. Open your agents](#3-open-your-agents)
 - [4. Talk to them](#4-talk-to-them)
+- [Needs you](#needs-you)
 - [5. Share screenshots and files](#5-share-screenshots-and-files)
 - [Who is who](#who-is-who)
 - [Listening for messages](#listening-for-messages)
-- [More folders](#more-folders)
+- [Projects](#projects)
+- [The task sheet](#the-task-sheet)
+- [Analytics](#analytics)
+- [What agents learn: rules and skills](#what-agents-learn-rules-and-skills)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 
 ## 1. Install
@@ -96,7 +100,7 @@ crewchat start
 
 What it does, and why it is safe to run again:
 
-![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for Claude Code and Cursor. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
+![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for each agent tool installed. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
 
 - `--no-service` runs the server only until you log out, instead of at every login.
 - **On a Mac that sleeps,** agents on other machines lose the chat while it sleeps.
@@ -104,7 +108,7 @@ What it does, and why it is safe to run again:
 
 The chat page opens, empty for now:
 
-<img src="images/empty-chat.png" width="760" alt="The chat page with no agents and no messages yet. On the left: the project name, an Add an agent button, and a hint to run crewchat start in the project folder.">
+<img src="images/empty-chat.png" width="760" alt="The chat page with no agents yet. On the left: a hint to use New agent or run crewchat start in the project folder, and + New agent. In the middle: Your crew's chat starts here, with New agent, Post a task and Roles.">
 
 To open it later on this machine: `crewchat ui`. On another device, open the chat's address and
 sign in with a code from `crewchat ui --print` ([Your phone](phone.md) shows how to reach it):
@@ -117,12 +121,12 @@ Open Claude Code or Cursor in the connected folder. Each session joins the chat 
 first time it uses a chat tool; there is nothing to set up per agent. Sessions that were already
 open before you ran `crewchat start` need a restart.
 
-<img src="images/agents-joined.png" width="760" alt="Three agents have joined: claude-macbook, cursor-macbook and claude-windows. In the chat, claude-macbook warns it is about to change LoginViewModel.kt, and cursor-macbook replies it is only in SettingsScreen.kt.">
+<img src="images/agents-joined.png" width="760" alt="Three agents have joined: Kai (Claude Code on the macbook), Ines (Cursor on the macbook) and Wren (Claude Code on Windows). In the chat, Kai warns it is about to change LoginViewModel.kt, and Ines replies it is only in SettingsScreen.kt.">
 
 The first time, the agent's hook asks it to make one short tool call, `hub_link`. That ties the
 session to its chat name, and tells it who else is here:
 
-![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a name: claude-macbook. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
+![How a new session joins. 1: The new session calls a chat tool for the first time. 2: crewchat gives it a first name: Maya. 3: Its hook asks for messages, with the session's key. 4: crewchat doesn't know that key yet. 5: The hook tells the agent to link. 6: The agent calls hub_link with the key. 7: Linked: from now on, its hook gets its messages.](images/diagram-link.gif)
 
 ### Other agent tools
 
@@ -163,27 +167,35 @@ It stays on the machine the agent runs on. `crewchat setup --activity off` keeps
 
 Click an agent to open its settings on the left, under the list of agents: what it is doing
 (**working**, **waiting for messages**, so it answers at once, or **idle**, so it sees messages when
-its user next types), its task and last message, its role and listening setting, and **Message**,
-**Stop** or **Reopen**, and **Remove**. Click its picture to change it. Its name is a field: click
-it, type, Enter. ✕ or Esc closes it. The side panel on the right is for the project: its rules,
-skills and machines, its roles (**⋯**), its tasks, and **Commands**.
+its user next types), its task and last message, the tokens it used today and in all with what they
+would cost at API prices (an estimate; Claude Code agents only, `crewchat usage` for the whole crew),
+its role and listening setting, and **Message**, **Stop** or **Reopen**, and **Remove**. Click its
+picture to change it. Its name is a field: click it, type, Enter. ✕ or Esc closes it. The side
+panel on the right is for the project: its rules, skills and machines, its roles (**⋯**), its
+tasks, and **Commands**.
 
 An agent whose last conversation crewchat did not record (one that joined before crewchat kept
 track of sessions) has **Start again** instead of **Reopen**: a new session opens in a Terminal
 window in its folder and checks in as the same agent, with its name, role, picture and tasks.
 
-**New agent** works in a project made on the page, too: under **Or connect one**, type a folder's
-path (`~/code/my-app`), or **Browse…** the folders on the host and make a **New folder** there, and
-**Connect** runs `crewchat start` in it for you (a folder that is not there yet: **Create it and connect**).
+**+ New agent**, under the list of agents, starts a new agent session for you: its name, role and
+picture, its folder, its tool and model, and a first task
+([New agent, from the chat page](teams.md#new-agent-from-the-chat-page)). For a project made on the
+page, **Or connect one** takes a folder's path, or **Browse…** the host's folders, and **Connect**
+runs `crewchat start` in it. When you pick a tool, New agent says what it still needs on this
+machine (installed, signed in, the folder trusted), with the command to run (**Copy**) and **Check
+again**; crewchat only reads these, and never changes them.
 
-When you pick its tool, New agent says what that tool still needs on this machine: whether it is
-installed, signed in (or set up with an API key or a model provider of its own), and what it asks
-once in that folder: whether you trust it, and, for Codex and Gemini CLI, crewchat's hooks. A step
-you must take first comes with the command to run in a terminal (**Copy**); **Check again** when it
-is done. crewchat only reads whether these are there (it asks each tool's own status command where
-there is one) and never changes them.
+<img src="images/agent-panel.png" width="760" alt="The chat page with an agent's settings open in the list on the left, under the crew: its picture, name, role, tool and machine; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Remove.">
 
-<img src="images/agent-panel.png" width="760" alt="The chat page with an agent open in the side panel: its picture, name, role and tool; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Stop, Rename, Change picture, Remove.">
+**The look.** The page uses Liquid Glass, after Apple's macOS 26 and iOS 26: the tabs, the list of
+agents, the message box, the side panel, menus and dialogs are see-through glass over a colourful
+backdrop, while messages and task cards stay solid to read. With **Reduce transparency** or
+**Increase contrast** on in your system's accessibility settings (or in a browser that cannot blur),
+every surface is solid. Each new agent gets a face of its own that suits its first name, and nobody
+in the chat wears the same one ([Pictures and colours](teams.md#pictures-and-colours)):
+
+<img src="images/faces.png" width="760" alt="Sixteen faces crewchat made for new agents, each with its name: Maya, Teo, Priya, Arjun, Noor, Kira, Kabir, Zoe, Omar, Meera, Wren, Hugo, Diya, Levi, Yuki and Rohan, with hats, headphones, glasses and hair of their own.">
 
 ## 4. Talk to them
 
@@ -198,7 +210,7 @@ From a terminal on the host:
 ```bash
 crewchat say "Stop and commit what you have"
 crewchat say --task "Find out why the login test is flaky"
-crewchat say --to claude-macbook "Rebase before you push"
+crewchat say --to Maya "Rebase before you push"
 crewchat agents                         # who is here
 crewchat status                         # is the server running, and who is connected
 ```
@@ -215,7 +227,7 @@ from other agents are requests and information; only yours are instructions.
 **Post as task**, in the box's **+** menu, turns a message into a task that one agent takes. Without a lead, the agents
 settle it among themselves:
 
-![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
+![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_task take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
 
 <img src="images/demo-task.gif" width="760" alt="Post as task is chosen in the message box's + menu, and a task typed and sent; Maya, Teo and Wren bid one after another and Maya takes it. On the task board it moves to Doing, then to Review; Needs you shows it, and Mark done in its panel moves it to Done.">
 
@@ -239,7 +251,7 @@ a task opens in the side panel with the agent's question and a box to answer it,
 for a review. An item leaves the list once it is handled: the agent carries on, the task is done
 or taken, the message is read.
 
-<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up two tasks. The task is open in the side panel with the question and a box to answer it.">
+<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up one other task, above a task ready for review. The blocked task is open in the side panel with the question and a box to answer it.">
 
 ### Permission prompts
 
@@ -292,7 +304,7 @@ Write to an agent in any case: `@maya` reaches Maya.
 - **The label** of a folder (its place) defaults to the machine's name. Choose your own with
   `crewchat start --place NAME`.
 - **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or click its name in its
-  panel on the chat page and type a new one, or from the host: `crewchat agent rename claude-macbook backend`.
+  panel on the chat page and type a new one, or from the host: `crewchat agent rename Maya backend`.
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
   `~/.crewchat/config.json`). **Remove** in its panel, or `crewchat agent remove NAME`, drops one at once and puts
@@ -350,8 +362,8 @@ crewchat projects                              # this machine's projects and the
 
 The chat page has a tab for each project at the top (a menu on a phone), marking the ones with
 messages you have not seen; **+** makes a new project, with the [role pack](teams.md#role-packs)
-its crew starts from. Agent names belong to their project: `claude-macbook` in `website` and
-`claude-macbook` in `notes-app` are two agents that never see each other. Commands act on the
+its crew starts from. Agent names belong to their project: `Maya` in `website` and
+`Maya` in `notes-app` are two agents that never see each other. Commands act on the
 project of the folder you run them in; `--chat NAME` picks another (`crewchat say --chat website
 "..."`). Your first project stays where it was, so a machine set up before projects keeps its chat,
 agents and links as they are. Linked over Tailscale, machines share projects by name: start `t2` on
@@ -385,18 +397,24 @@ crewchat tasks                                         # the sheet
 crewchat tasks add "Build the login screen" --areas app/login/
 crewchat tasks add "Write its tests" --depends A12 --areas app/login/tests/
 crewchat tasks add "Sign the iOS build" --where macbook  # only for that machine's agents
-crewchat tasks assign A12 claude-macbook
+crewchat tasks assign A12 Maya
 crewchat tasks move A14 top
 crewchat tasks done A12                                # or todo (back on the sheet), blocked, remove
 ```
 
 A message you post as a task also goes on the sheet.
 
+**A task's files.** `--areas` says which files a task changes, as path prefixes, and two tasks over
+the same files never run at once. With edit tracking on (a software team's default), crewchat also
+maps which file imports which, holds back tasks over code that depends on each other, suggests the
+files a task really changed, and tells agents when code their task uses changes: see
+[Agents that know the code](code-map.md).
+
 **When an agent goes silent.** A crashed session would keep its task until someone gave it back,
 so crewchat reclaims it: a task whose holder has shown no sign of life for 60 minutes (no tool
 call, no hook; a hook waiting for messages counts as alive) goes back on the sheet,
-the way giving it back does, with a line in the chat: "Task #A12 reclaimed from claude-macbook
-(silent for 61 min)". The sheet keeps "reclaimed from claude-macbook" on the row, and if that agent
+the way giving it back does, with a line in the chat: "Task #A12 reclaimed from Maya
+(silent for 61 min)". The sheet keeps "reclaimed from Maya" on the row, and if that agent
 comes back and reports on the task, it is told who holds it now. Blocked tasks and tasks ready for
 review are never reclaimed: they wait for a person. Every tool call an agent makes counts (its
 hooks tell the server, at most once a minute), but one command that runs longer than the reclaim
@@ -412,6 +430,33 @@ crewchat tasks reclaim off         # turn it off; with no value, shows the setti
 The setting reaches every linked machine. The machine a task was posted on reclaims it, so while that
 machine is off, its tasks stay with their holders. Run the same crewchat version on every linked
 machine: an older one does not know reclaims and keeps showing the old holder.
+
+## Analytics
+
+**Analytics**, next to Tasks and Commands, shows the crew at a glance, live:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="images/analytics-dark.png">
+  <img src="images/analytics-light.png" width="760" alt="The analytics view on its sample data: the day's numbers at the top, then the crew round 'You' with the paths between them wider where they talk more, and a slider to replay the day; below, the task river and the machines.">
+</picture>
+
+- **The crew:** your agents round you, with their pictures, roles and machines. Each message flies from its
+  sender to whoever it is for, and a path grows wider the more two of them talk. Click an agent for its card.
+- **Numbers:** tasks done today, messages today, agents active now, the median time to take a task, the
+  review pass rate and today's tokens.
+- **Tasks**, flowing from posted to done, with how long they take; **the day, agent by agent** (working,
+  waiting for messages, idle); **machines** and their agents; **tokens and cost** per agent and per task,
+  and the cost per day; a **code heat map** of the files agents edit, coloured by who edits each most; and
+  **the code, by who holds it**: the project's files in their folders, each coloured by the agent whose task
+  covers it, with the imports between them (folders only past 500 files: click one to open it;
+  [the code map](code-map.md)).
+- **Replay the day**, or drag the slider, to watch it all again. **Present** shows it full screen, one
+  panel after another, for a demo or a screen on the wall (Esc ends it).
+
+It is worked out on your machine from the chat, and follows the page's light or dark mode. With reduced
+motion set on your device, messages light up their path instead of flying. **Sample data** shows a made-up
+crew and a day of its work instead, the same as the [live demo](https://crewchat.dev/demo/): never mixed with
+your chat, and off again when you leave the view.
 
 ## What agents learn: rules and skills
 
@@ -429,6 +474,9 @@ carries two things you set per project:
   PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out everywhere. A
   skill of your own by the same name is never touched.
 
+With edit tracking on, each folder also gets **the code at a glance** for agents that join, a skill
+and a Cursor rule made from the code map ([details](code-map.md#the-code-at-a-glance-for-agents-that-join)).
+
 ## Upgrade and uninstall
 
 **Upgrade:** `crewchat update` installs the latest release and starts the server again on it.
@@ -439,11 +487,24 @@ about you or your chat (`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).
 **Stop:** `crewchat stop` stops the server; agents keep working but cannot reach the chat until
 `crewchat restart`, or your next login if it starts at login.
 
-**Uninstall:** `crewchat uninstall` stops crewchat, stops it starting at login, takes it out of
-every project folder you connected (only its own entries in `.mcp.json`,
-`.claude/settings.local.json`, `.cursor/mcp.json` and `.cursor/hooks.json`; yours stay), and
-removes the program. It asks before deleting your chats, shared files and settings in
-`~/.crewchat`; `--purge` deletes them without asking.
+**Uninstall:** `crewchat uninstall` stops crewchat, stops it starting at login, leaves the machines
+it is linked to over Tailscale, and takes it out of every project folder you connected. It removes only its
+own entries from each file; yours stay:
 
-Next: [Teams and roles](teams.md) · [Several machines](multiple-machines.md) ·
-[Your phone](phone.md)
+| For | What it takes crewchat out of |
+|---|---|
+| Claude Code | `.mcp.json`, `.claude/settings.local.json` |
+| Cursor | `.cursor/mcp.json`, `.cursor/hooks.json`, `.cursor/cli.json` |
+| Codex CLI | its block in `~/.codex/config.toml`, and the folder's `.mcp.json` |
+| Gemini CLI | `.gemini/settings.json` |
+| Qwen Code | `.qwen/settings.json` |
+| OpenCode | `opencode.json`, and its plugin `.opencode/plugins/crewchat.js` |
+| The guide and skills | `.claude/skills/crewchat/` and `.claude/skills/crewchat-brief/`, the shared skills it installed in `.claude/skills/`, `.cursor/rules/crewchat.mdc` and `.cursor/rules/crewchat-brief.mdc`, and its section of `AGENTS.md` |
+| Settings you made | `.crewchat-listen` (`crewchat listen`) and `.crewchat-hooks` (`crewchat hooks off`) |
+
+It also deletes the hook script, `crewchat-hook.py`, from `~/.crewchat`, then removes the program.
+It asks before deleting your chats, shared files and settings in `~/.crewchat`; `--purge` deletes
+them without asking.
+
+Next: [Teams and roles](teams.md) · [Agents that know the code](code-map.md) ·
+[Several machines](multiple-machines.md) · [Your phone](phone.md)

@@ -1,0 +1,1327 @@
+"""crewchat's code map (roadmap C1): the files, definitions and imports of a project's code, so the chat can
+tell which tasks and agents touch code that depends on each other. Standard library only; the server loads it
+only for projects that keep edit events (C0), the way it loads cloud sync.
+
+One SQLite file per repository and branch, in the project's crewchat folder: maps/<key>.sqlite. It is derived
+data (docs/storage.md): delete it and the server builds it again from the code.
+
+  nodes(id, kind, path, name, line, lang)   a file, or a definition in one (class, function, component...)
+  edges(src, dst, kind, certain)            imports, calls, uses (a template using a component), injects
+  refs(path, kind, target, certain)         what each file points at, kept to link again when files change
+  files(path, mtime, size)                  what was read, to read again only what changed
+  signatures(path, name, signature)         each Python function's parameters, for interface-change notices (C3)
+  meta(key, value)                          the repository, branch and commit the map was built from
+
+Python is read with the ast module. Java, Kotlin, React (JS, JSX, TS, TSX) and Angular are read with regular
+expressions. A link that resolves to a file of the repository is certain; a guess (a bare name in the same
+package, a class name defined in more than one file) is stored with certain = 0 and only ever used as a hint.
+"""
+import ast
+import bisect
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+MAX_FILES = 20000  # read at most this many source files of one repository
+MAX_FILE_BYTES = 1024 * 1024  # bigger source files are skipped (generated, minified)
+MAX_GUESSES = 3  # a name defined in more files than this is not linked at all
+CERTAIN, GUESS = 2, 1  # how two areas are linked (CodeMap.link)
+MAX_GRAPH_FILES = 3000  # files C8's view is sent at most
+SKIP_DIRS = {".git", "node_modules", "build", "dist", "out", "target", ".gradle", ".idea", "__pycache__", ".venv",
+             "venv", ".tox", ".mypy_cache", ".pytest_cache", "coverage", ".next", ".angular", "Pods", "obj",
+             "generated", ".dart_tool", "vendor", "site-packages"}
+LANGS = {".py": "python", ".java": "java", ".kt": "kotlin", ".kts": "kotlin", ".js": "react", ".jsx": "react",
+         ".mjs": "react", ".cjs": "react", ".ts": "react", ".tsx": "react", ".html": "html"}
+JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+PY_ROOTS = ("", "src/", "lib/")  # where a Python import may start, besides the importing file's own folder
+JVM_ROOTS = ("src/main/java/", "src/main/kotlin/", "src/test/java/", "src/test/kotlin/", "src/")
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS nodes (id INTEGER PRIMARY KEY, kind TEXT NOT NULL, path TEXT NOT NULL, name TEXT NOT NULL,
+                                  line INTEGER NOT NULL DEFAULT 0, lang TEXT NOT NULL DEFAULT '');
+CREATE INDEX IF NOT EXISTS nodes_path ON nodes (path);
+CREATE TABLE IF NOT EXISTS edges (src INTEGER NOT NULL, dst INTEGER NOT NULL, kind TEXT NOT NULL,
+                                  certain INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS edges_src ON edges (src);
+CREATE INDEX IF NOT EXISTS edges_dst ON edges (dst);
+CREATE TABLE IF NOT EXISTS refs (path TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL,
+                                 certain INTEGER NOT NULL DEFAULT 1);
+CREATE INDEX IF NOT EXISTS refs_path ON refs (path);
+CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, mtime REAL NOT NULL, size INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS signatures (path TEXT NOT NULL, name TEXT NOT NULL, signature TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS signatures_path ON signatures (path);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+MAP_VERSION = "2"  # what the tables hold; a map of another version is built again
+
+
+# --------------------------------------------------------------------------------------------
+# Which repository and branch a folder is
+# --------------------------------------------------------------------------------------------
+# What git runs by itself must not run anything a repository's own config names: an agent allowed only to edit files
+# could write a command there. core.fsmonitor is the one that commands reading the index (ls-files) run.
+GIT_SAFE = ["-c", "core.fsmonitor=false"]
+# Windows: no console window flashing up for git. crewchat.HIDDEN's twin: this module does not import crewchat.
+HIDDEN = {"creationflags": 0x08000000} if os.name == "nt" else {}
+
+
+def git(folder, *args):
+    try:
+        out = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder)] + list(args), capture_output=True, text=True,
+                             timeout=20, stdin=subprocess.DEVNULL, **HIDDEN)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return out.stdout.strip() if out.returncode == 0 else ""
+
+
+def clean_remote(url):
+    """A remote's address as one name for the repository: git@github.com:a/b.git and https://github.com/a/b
+    are the same repository."""
+    url = re.sub(r"^[a-z][a-z0-9+.-]*://", "", url.strip(), flags=re.I)
+    url = re.sub(r"^[^@/]+@", "", url)
+    if re.match(r"^[^/:]+:[^/\d]", url):  # scp style host:owner/repo (not host:port/...)
+        url = url.replace(":", "/", 1)
+    return re.sub(r"(\.git)?/*$", "", url).lower()
+
+
+def head_of(folder):
+    """(branch, commit) a folder has checked out, from one git call; ("", "") outside a repository."""
+    out = git(folder, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").splitlines()
+    return (out[1], out[0]) if len(out) == 2 else ("", "")
+
+
+def repo_of(folder):
+    """(repository, branch, commit, top folder) of a folder. The repository is named by its origin remote (else
+    by its top folder), so every checkout of one repository and branch on this machine shares one map."""
+    folder = Path(folder).resolve()
+    top = git(folder, "rev-parse", "--show-toplevel")
+    if not top:
+        return str(folder), "", "", folder
+    remote = git(folder, "config", "--get", "remote.origin.url")
+    branch, commit = head_of(folder)
+    return (clean_remote(remote) if remote else str(Path(top).resolve())), branch, commit, Path(top).resolve()
+
+
+def map_key(repo, branch):
+    return hashlib.sha256(("%s\0%s" % (repo, branch)).encode("utf-8")).hexdigest()[:16]
+
+
+def source_files(top):
+    """The repository's source files, relative with forward slashes: git's list (tracked files, and new ones it
+    does not ignore), else a walk; never inside SKIP_DIRS; at most MAX_FILES."""
+    listed = git(top, "ls-files", "-co", "--exclude-standard", "-z")
+    paths = [p for p in listed.split("\0") if p] if listed else []
+    if not listed:
+        for root, dirs, files in os.walk(top):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+            paths += [os.path.relpath(os.path.join(root, f), top) for f in sorted(files)]
+            if len(paths) > MAX_FILES * 10:  # a folder of everything (a home folder): enough
+                break
+    out = []
+    for rel in paths:
+        rel = rel.replace("\\", "/")
+        if wanted(rel):
+            out.append(rel)
+            if len(out) >= MAX_FILES:
+                break
+    return out
+
+
+def wanted(rel):
+    """Is this path (relative, forward slashes) a source file the map reads?"""
+    return os.path.splitext(rel)[1].lower() in LANGS and not SKIP_DIRS.intersection(rel.split("/")[:-1])
+
+
+def line_of(text, index):
+    return text.count("\n", 0, index) + 1
+
+
+# --------------------------------------------------------------------------------------------
+# Readers: each returns (definitions, references)
+#   definitions  [(kind, name, line)]        an Angular component's name is "Name|selector"
+#   references   [(kind, target, certain)]   target is a list for _resolve: ["py", module, name], ["jvm", ...]
+# --------------------------------------------------------------------------------------------
+def read_python(rel, text):
+    """(definitions, references, signatures): signatures is None for a file that does not parse (someone is in
+    the middle of an edit), so what it had stays."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return [], [], None
+    defs, refs, sigs = [], [], {}
+    if rel.endswith("/__init__.py") or rel == "__init__.py":
+        package = rel[:-len("__init__.py")].rstrip("/").replace("/", ".")
+    else:
+        package = rel.rsplit("/", 1)[0].replace("/", ".") if "/" in rel else ""
+    names = {}  # a name this file imported -> (module, name or "") it came from
+    calls = []
+    for node in ast.walk(tree):  # once over the tree: imports, and the calls to look at once all imports are known
+        if isinstance(node, ast.Call):
+            calls.append(node.func)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                refs.append(("imports", ["py", alias.name, ""], 1))
+                names[alias.asname or alias.name.split(".")[0]] = (alias.name if alias.asname
+                                                                   else alias.name.split(".")[0], "")
+        elif isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                parts = [p for p in package.split(".") if p]
+                parts = parts[:max(0, len(parts) - node.level + 1)]
+                base = ".".join(parts + ([node.module] if node.module else []))
+            for alias in node.names:
+                refs.append(("imports", ["py", base, "" if alias.name == "*" else alias.name], 1))
+                if alias.name != "*":
+                    names[alias.asname or alias.name] = (base, alias.name)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            defs.append(("function", node.name, node.lineno))
+            sigs[node.name] = parameters(node)
+        elif isinstance(node, ast.ClassDef):
+            defs.append(("class", node.name, node.lineno))
+            sigs[node.name] = "class"
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    defs.append(("method", "%s.%s" % (node.name, item.name), item.lineno))
+                    sigs["%s.%s" % (node.name, item.name)] = parameters(item)
+    # Calls that can be resolved: f() for an f imported by name, m.f() for a module m imported.
+    called = set()
+    for func in calls:
+        if isinstance(func, ast.Name) and func.id in names and names[func.id][1]:
+            called.add(names[func.id])
+        elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id in names:
+            module, name = names[func.value.id]
+            called.add(((module + "." + name) if name else module, func.attr))
+    refs += [("calls", ["py", module, name], 1) for module, name in sorted(called)]
+    return defs, refs, sigs
+
+
+def parameters(fn):
+    """A function's parameters as written, (a, b=1, *, c), and its return annotation."""
+    returns = " -> %s" % ast.unparse(fn.returns) if fn.returns is not None else ""
+    return "(%s)%s" % (ast.unparse(fn.args), returns)
+
+
+def public(name):
+    """A name other code may use: none of its parts starts with _, except dunders such as __init__."""
+    return not any(part.startswith("_") and not (part.startswith("__") and part.endswith("__"))
+                   for part in name.split("."))
+
+
+def signature_changes(old, new, limit=5):
+    """What changed in a file's interface, as short lines: parameters changed, public names renamed or removed.
+    New names are not a change to anyone using the file; a body changed alone is none at all."""
+    def shown(name, sig):
+        return "class %s" % name if sig == "class" else name + sig
+    out = []
+    for name in sorted(old):
+        if public(name) and name in new and old[name] != new[name]:
+            out.append("%s is now %s" % (shown(name, old[name]), shown(name, new[name])))
+    added = [n for n in new if n not in old and public(n)]
+    for name in sorted(n for n in old if n not in new and public(n)):
+        scope = name.rpartition(".")[0]
+        twins = [a for a in added if new[a] == old[name] and a.rpartition(".")[0] == scope]
+        if len(twins) == 1:  # the same parameters under a new name, in the same class: renamed
+            out.append("%s was renamed %s" % (shown(name, old[name]), twins[0]))
+            added.remove(twins[0])
+        else:
+            out.append("%s was removed" % shown(name, old[name]))
+    if len(out) > limit:
+        out = out[:limit] + ["and %d more" % (len(out) - limit)]
+    return out
+
+
+JVM_PACKAGE = re.compile(r"^\s*package\s+([\w.]+)", re.M)
+JVM_IMPORT = re.compile(r"^\s*import\s+(static\s+)?([\w.]+?)(\.\*)?\s*(?:\bas\s+\w+)?\s*;?\s*$", re.M)
+JAVA_TYPE = re.compile(r"^[ \t]*(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|protected|private|abstract|final|static|"
+                       r"sealed|non-sealed|strictfp)\s+)*(class|interface|enum|record|@interface)\s+(\w+)", re.M)
+JAVA_METHOD = re.compile(r"^[ \t]+(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|protected|private|static|final|abstract|"
+                         r"synchronized|native|default)\s+)+(?:<[^>]+>\s+)?[\w<>\[\],.? ]+?\s+(\w+)\s*\(", re.M)
+KOTLIN_TYPE = re.compile(r"^[ \t]*(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|internal|private|protected|open|abstract|"
+                         r"sealed|data|enum|inner|annotation|value|inline|expect|actual|fun)\s+)*"
+                         r"(class|interface|object)\s+(\w+)", re.M)
+KOTLIN_FUN = re.compile(r"^[ \t]*(?:@[\w.]+(?:\([^)]*\))?\s+)*(?:(?:public|internal|private|protected|open|override|"
+                        r"suspend|inline|operator|infix|tailrec|external|abstract|actual|expect)\s+)*"
+                        r"fun\s+(?:<[^>]+>\s*)?(?:[\w.<>]+\.)?(\w+)\s*\(", re.M)
+CAPITAL_NAME = re.compile(r"\b([A-Z]\w+)\b")
+NOT_METHODS = {"if", "for", "while", "switch", "catch", "return", "new", "else", "throw", "synchronized"}
+
+
+def read_jvm(rel, text, lang):
+    defs, refs = [], []
+    package = JVM_PACKAGE.search(text)
+    defs.append(("package", package.group(1) if package else "", 0))
+    for m in JVM_IMPORT.finditer(text):
+        static, name, wildcard = m.group(1), m.group(2), m.group(3)
+        if static and not wildcard:  # import static a.b.C.member: the class a.b.C
+            name = name.rsplit(".", 1)[0]
+        refs.append(("imports", ["jvm", name, bool(wildcard and not static)], 1))
+    for m in (JAVA_TYPE if lang == "java" else KOTLIN_TYPE).finditer(text):
+        kind = m.group(1) if m.group(1) in ("interface", "object") else "class"
+        defs.append((kind, m.group(2), line_of(text, m.start())))
+    for m in (JAVA_METHOD if lang == "java" else KOTLIN_FUN).finditer(text):
+        if m.group(1) not in NOT_METHODS:
+            defs.append(("function", m.group(1), line_of(text, m.start())))
+    # Classes of the same package need no import: a capitalised name it mentions is a hint (certain = 0).
+    body = JVM_IMPORT.sub("", text)
+    refs.append(("uses", ["names", sorted(set(CAPITAL_NAME.findall(body)))], 0))
+    return defs, refs
+
+
+JS_IMPORT = re.compile(r"""(?:^|[;\s}])(?:import\s+(?:type\s+)?(?:[\w*{}\s,$]+?\s+from\s+)?|export\s+(?:type\s+)?"""
+                       r"""(?:\*(?:\s+as\s+\w+)?|\{[^}]*\})\s+from\s+)['"]([^'"\n]+)['"]""", re.M)
+JS_DYNAMIC = re.compile(r"""\b(?:require|import)\s*\(\s*['"]([^'"\n]+)['"]\s*\)""")
+JS_EXPORT = re.compile(r"""^\s*export\s+(?:default\s+)?(?:declare\s+)?(?:abstract\s+)?(?:async\s+)?"""
+                       r"""(function\*?|class|const|let|var|interface|type|enum)\s+(\w+)""", re.M)
+ANGULAR = re.compile(r"""@(Component|NgModule|Injectable|Directive|Pipe)\s*\(\s*(\{.*?\})?\s*\)\s*"""
+                     r"""(?:export\s+)?(?:default\s+)?(?:abstract\s+)?class\s+(\w+)""", re.S)
+SELECTOR = re.compile(r"""selector\s*:\s*['"]([^'"]+)['"]""")
+TEMPLATE_URL = re.compile(r"""templateUrl\s*:\s*['"]([^'"]+)['"]""")
+TEMPLATE = re.compile(r"""\btemplate\s*:\s*`([^`]*)`""", re.S)
+CONSTRUCTOR = re.compile(r"""\bconstructor\s*\(([^)]*)\)""", re.S)
+INJECTED = re.compile(r"""(?:private|public|protected|readonly)\s+(?:readonly\s+)?\w+\s*:\s*(\w+)""")
+INJECT_CALL = re.compile(r"""\binject\s*(?:<[^>]*>)?\(\s*(\w+)""")
+TAG = re.compile(r"""<([a-z][a-z0-9]*-[a-z0-9-]+)""")
+ANGULAR_KINDS = {"Component": "component", "NgModule": "module", "Injectable": "service", "Directive": "directive",
+                 "Pipe": "pipe"}
+
+
+def read_js(rel, text):
+    defs, refs = [], []
+    specs = [m.group(1) for m in JS_IMPORT.finditer(text)] + [m.group(1) for m in JS_DYNAMIC.finditer(text)]
+    refs += [("imports", ["js", spec], 1) for spec in dict.fromkeys(specs)]
+    for m in JS_EXPORT.finditer(text):
+        word, name = m.group(1), m.group(2)
+        kind = "component" if name[:1].isupper() and word in ("function", "function*", "class", "const") \
+            else "class" if word in ("class", "interface", "type", "enum") else "function"
+        defs.append((kind, name, line_of(text, m.start())))
+    angular = False
+    for m in ANGULAR.finditer(text):
+        angular = True
+        kind, body, name = ANGULAR_KINDS[m.group(1)], m.group(2) or "", m.group(3)
+        selector = SELECTOR.search(body)
+        defs = [d for d in defs if d[1] != name]  # the decorator says what it is better than its export does
+        defs.append((kind, name + ("|" + selector.group(1) if selector and kind in ("component", "directive")
+                                   else ""), line_of(text, m.start())))
+        template = TEMPLATE.search(body)
+        if template:
+            refs += [("uses", ["tag", tag], 1) for tag in sorted(set(TAG.findall(template.group(1))))]
+        url = TEMPLATE_URL.search(body)
+        if url:
+            refs.append(("uses", ["template", url.group(1)], 1))
+        rest = text[m.end():m.end() + 20000]
+        ctor = CONSTRUCTOR.search(rest)
+        injected = INJECTED.findall(ctor.group(1)) if ctor else []
+        for service in dict.fromkeys(injected + INJECT_CALL.findall(rest)):
+            refs.append(("injects", ["name", service], 1))
+    return defs, refs, angular
+
+
+def read_html(rel, text):
+    return [], [("uses", ["tag", tag], 1) for tag in sorted(set(TAG.findall(text)))]
+
+
+# --------------------------------------------------------------------------------------------
+# Accurate readers (roadmap C9): with `pip install "crewchat[map]"` (tree-sitter and its grammars), Java, Kotlin,
+# JavaScript and TypeScript are read with real parsers. Same tables; more of their links certain (a call is linked
+# to what it calls, a class of the same package to its file), and every function's parameters kept, so C3's notices
+# work for them too. Without the extra, the regular expressions above.
+# --------------------------------------------------------------------------------------------
+_PARSERS = None
+
+
+def parsers():
+    """{"java", "kotlin", "js", "ts", "tsx": tree_sitter.Parser}, or {} without the extra."""
+    global _PARSERS
+    if _PARSERS is None:
+        try:
+            import tree_sitter
+            import tree_sitter_java
+            import tree_sitter_javascript
+            import tree_sitter_kotlin
+            import tree_sitter_typescript
+
+            def make(capsule):
+                language = tree_sitter.Language(capsule)
+                try:
+                    return tree_sitter.Parser(language)
+                except TypeError:  # tree-sitter before 0.22
+                    parser = tree_sitter.Parser()
+                    parser.set_language(language)
+                    return parser
+            _PARSERS = {"java": make(tree_sitter_java.language()), "kotlin": make(tree_sitter_kotlin.language()),
+                        "js": make(tree_sitter_javascript.language()),
+                        "ts": make(tree_sitter_typescript.language_typescript()),
+                        "tsx": make(tree_sitter_typescript.language_tsx())}
+        except Exception:  # not installed, or a grammar this platform has no wheel for
+            _PARSERS = {}
+    return _PARSERS
+
+
+def parser_name():
+    return "tree-sitter" if parsers() else "regex"
+
+
+def _nodes(node):
+    """Every node under this one, depth first."""
+    stack = [node]
+    while stack:
+        node = stack.pop()
+        yield node
+        stack.extend(reversed(node.children))
+
+
+def _child(node, *types):
+    return next((c for c in node.children if c.type in types), None)
+
+
+def read_jvm_accurately(rel, src, lang):
+    """Java or Kotlin with tree-sitter: (definitions, references, signatures), as read_jvm gives the first two."""
+    text = lambda n: src[n.start_byte:n.end_byte].decode("utf-8", "replace")  # noqa: E731
+    root = parsers()[lang].parse(src).root_node
+    defs, refs, sigs = [], [], {}
+    package, imported, members, names = "", {}, {}, set()
+    for node in root.children:
+        if node.type in ("package_declaration", "package_header"):
+            name = _child(node, "scoped_identifier", "identifier", "qualified_identifier")
+            package = text(name) if name else ""
+        elif node.type in ("import_declaration", "import"):
+            name = _child(node, "scoped_identifier", "identifier", "qualified_identifier")
+            if name is None:
+                continue
+            full = text(name)
+            star = _child(node, "asterisk", "*") is not None
+            static = _child(node, "static") is not None
+            alias = node.children[-1] if node.children and node.children[-2:-1] and node.children[-2].type == "as" else None
+            if static and not star:  # import static a.b.C.member: the class, and the member it brings
+                cls, member = full.rsplit(".", 1)
+                refs.append(("imports", ["jvm", cls, False], 1))
+                members[member] = (cls, member)
+            elif star:
+                refs.append(("imports", ["jvm", full, not static], 1))
+            else:
+                refs.append(("imports", ["jvm", full, False], 1))
+                imported[text(alias) if alias is not None else full.rsplit(".", 1)[-1]] = full
+    defs.append(("package", package, 0))
+    kinds = {"class_declaration": "class", "interface_declaration": "interface", "enum_declaration": "class",
+             "record_declaration": "class", "annotation_type_declaration": "class", "object_declaration": "object"}
+
+    def private(node):
+        mods = _child(node, "modifiers")
+        return mods is not None and any(w in text(mods).split() for w in ("private", "internal"))
+
+    def walk(node, owner):
+        for child in node.children:
+            kind = kinds.get(child.type)
+            if child.type == "class_declaration" and _child(child, "interface") is not None:
+                kind = "interface"
+            if kind:
+                name = child.child_by_field_name("name") or _child(child, "identifier", "type_identifier")
+                if name is not None:
+                    defs.append((kind, text(name), child.start_point[0] + 1))
+                    if not private(child):
+                        sigs[(owner + "." if owner else "") + text(name)] = "class"
+                    walk(child, (owner + "." if owner else "") + text(name))
+                continue
+            if child.type in ("method_declaration", "constructor_declaration", "function_declaration"):
+                name = child.child_by_field_name("name") or _child(child, "identifier")
+                params = child.child_by_field_name("parameters") or _child(child, "function_value_parameters")
+                if name is not None:
+                    defs.append(("function", text(name), child.start_point[0] + 1))
+                    if not private(child) and params is not None:
+                        returns = child.child_by_field_name("type") if lang == "java" else _child(child, "user_type")
+                        written = (" -> " if lang == "java" else ": ") + text(returns) if returns is not None else ""
+                        sigs[(owner + "." if owner else "") + text(name)] = " ".join(text(params).split()) + written
+                walk(child, owner)
+                continue
+            walk(child, owner)
+    walk(root, "")
+    for node in _nodes(root):
+        if node.type == "method_invocation":  # Java: Cls.m() for an imported Cls, or m() imported static
+            obj, name = node.child_by_field_name("object"), node.child_by_field_name("name")
+            if name is None:
+                continue
+            if obj is not None and obj.type == "identifier" and text(obj) in imported:
+                refs.append(("calls", ["member", imported[text(obj)], text(name)], 1))
+            elif obj is None and text(name) in members:
+                refs.append(("calls", ["member"] + list(members[text(name)]), 1))
+        elif node.type == "call_expression" and lang == "kotlin":  # f() imported, or Obj.m() for an imported Obj
+            head = node.children[0] if node.children else None
+            if head is not None and head.type == "identifier" and text(head) in imported:
+                refs.append(("calls", ["jvm", imported[text(head)], False], 1))
+            elif head is not None and head.type == "navigation_expression" and head.children:
+                obj, last = head.children[0], head.children[-1]
+                if obj.type == "identifier" and text(obj) in imported and last.type == "identifier":
+                    refs.append(("calls", ["member", imported[text(obj)], text(last)], 1))
+        elif node.type in ("type_identifier", "user_type", "identifier") and node.parent is not None and \
+                node.parent.type not in ("import_declaration", "import", "scoped_identifier", "qualified_identifier",
+                                         "package_declaration", "package_header"):
+            word = text(node).split("<")[0].split(".")[-1]
+            if word[:1].isupper() and word.isidentifier():
+                names.add(word)
+    # Classes of its own package, named in its code: certain now that they are known to be types or calls.
+    refs.append(("uses", ["names", sorted(names)], 1))
+    return defs, refs, sigs
+
+
+def read_js_accurately(rel, src, flavour):
+    """JavaScript or TypeScript with tree-sitter: (definitions, references, signatures, angular)."""
+    text = lambda n: src[n.start_byte:n.end_byte].decode("utf-8", "replace")  # noqa: E731
+    root = parsers()[flavour].parse(src).root_node
+    defs, refs, sigs, names, spaces = [], [], {}, {}, {}
+
+    def spec_of(node):
+        string = node.child_by_field_name("source") or _child(node, "string")
+        frag = _child(string, "string_fragment") if string is not None else None
+        return text(frag) if frag is not None else ""
+    for node in _nodes(root):
+        if node.type == "import_statement":
+            spec = spec_of(node)
+            if not spec:
+                continue
+            refs.append(("imports", ["js", spec], 1))
+            clause = _child(node, "import_clause")
+            for part in (clause.children if clause is not None else []):
+                if part.type == "identifier":
+                    names[text(part)] = (spec, "default")
+                elif part.type == "namespace_import":
+                    alias = _child(part, "identifier")
+                    if alias is not None:
+                        spaces[text(alias)] = spec
+                elif part.type == "named_imports":
+                    for item in part.children:
+                        if item.type == "import_specifier":
+                            name, alias = item.child_by_field_name("name"), item.child_by_field_name("alias")
+                            if name is not None:
+                                names[text(alias if alias is not None else name)] = (spec, text(name))
+        elif node.type == "export_statement" and (node.child_by_field_name("source") or _child(node, "string")):
+            spec = spec_of(node)
+            if spec:
+                refs.append(("imports", ["js", spec], 1))
+        elif node.type == "call_expression":
+            fn, args = node.child_by_field_name("function"), node.child_by_field_name("arguments")
+            if fn is None:
+                continue
+            if fn.type in ("identifier", "import") and text(fn) in ("require", "import") and args is not None:
+                first = _child(args, "string")
+                frag = _child(first, "string_fragment") if first is not None else None
+                if frag is not None:
+                    refs.append(("imports", ["js", text(frag)], 1))
+            elif fn.type == "identifier" and text(fn) in names:
+                refs.append(("calls", ["jsname"] + list(names[text(fn)]), 1))
+            elif fn.type == "member_expression":
+                obj, prop = fn.child_by_field_name("object"), fn.child_by_field_name("property")
+                if obj is not None and prop is not None and obj.type == "identifier" and text(obj) in spaces:
+                    refs.append(("calls", ["jsname", spaces[text(obj)], text(prop)], 1))
+    for node in root.children:  # what it exports: functions, classes and constants, their parameters kept
+        if node.type != "export_statement":
+            continue
+        decl = node.child_by_field_name("declaration")
+        if decl is None:
+            continue
+        if decl.type in ("function_declaration", "generator_function_declaration", "class_declaration",
+                         "abstract_class_declaration", "interface_declaration", "type_alias_declaration",
+                         "enum_declaration"):
+            name = decl.child_by_field_name("name")
+            if name is None:
+                continue
+            word, line = text(name), decl.start_point[0] + 1
+            if "class" in decl.type:
+                defs.append(("component" if word[:1].isupper() else "class", word, line))
+                sigs[word] = "class"
+                body = decl.child_by_field_name("body")
+                for member in (body.children if body is not None else []):
+                    if member.type == "method_definition":
+                        mname, params = member.child_by_field_name("name"), member.child_by_field_name("parameters")
+                        if mname is not None and params is not None and not text(mname).startswith("#"):
+                            sigs[word + "." + text(mname)] = " ".join(text(params).split())
+            elif decl.type in ("interface_declaration", "type_alias_declaration", "enum_declaration"):
+                defs.append(("class", word, line))
+            else:
+                defs.append(("component" if word[:1].isupper() else "function", word, line))
+                params, returns = decl.child_by_field_name("parameters"), decl.child_by_field_name("return_type")
+                if params is not None:
+                    sigs[word] = " ".join(text(params).split()) + (" ".join(text(returns).split()) if returns else "")
+        elif decl.type in ("lexical_declaration", "variable_declaration"):
+            for item in decl.children:
+                if item.type != "variable_declarator":
+                    continue
+                name, value = item.child_by_field_name("name"), item.child_by_field_name("value")
+                if name is None or name.type != "identifier":
+                    continue
+                word = text(name)
+                callable_ = value is not None and value.type in ("arrow_function", "function_expression", "function")
+                defs.append(("component" if word[:1].isupper() and callable_ else "function", word, item.start_point[0] + 1))
+                params = value.child_by_field_name("parameters") if callable_ else None
+                if params is None and callable_:
+                    params = value.child_by_field_name("parameter")
+                if params is not None:
+                    sigs[word] = " ".join(text(params).split())
+    # Angular's decorators and templates: the regular expressions read those well; their findings join these.
+    text_all = src.decode("utf-8", "replace")
+    rx_defs, rx_refs, angular = read_js(rel, text_all)
+    if angular:
+        decorated = {d[1].split("|")[0] for d in rx_defs if d[0] in ("component", "module", "service", "directive", "pipe")}
+        defs = [d for d in defs if d[1] not in decorated] + [d for d in rx_defs if d[1].split("|")[0] in decorated]
+        refs += [r for r in rx_refs if r[0] in ("uses", "injects")]
+    return defs, refs, sigs, angular
+
+
+def norm(path):
+    """A relative path with forward slashes and no ./ or ..; a folder keeps its trailing /."""
+    text = str(path).replace("\\", "/")
+    out = os.path.normpath(text).replace("\\", "/") if text else ""
+    out = "" if out == "." else out
+    return out + "/" if text.endswith("/") and out and not out.endswith("/") else out
+
+
+def folder_of(path):
+    """A file's folder, as an area: "app/sync/", or "" at the top."""
+    return path.rsplit("/", 1)[0] + "/" if "/" in path else ""
+
+
+def like_prefix(folder):
+    """A LIKE pattern (escape \\) for every path under folder."""
+    folder = folder.rstrip("/")
+    escaped = folder.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "/%" if escaped else "%"
+
+
+# --------------------------------------------------------------------------------------------
+# The map of one repository and branch
+# --------------------------------------------------------------------------------------------
+class CodeMap:
+    def __init__(self, path, top, repo="", branch=""):
+        self.path, self.top, self.repo, self.branch = Path(path), Path(top), repo, branch
+        self.lock = threading.RLock()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(self.path), check_same_thread=False)
+        # Derived data, built again when lost (docs/storage.md): no waiting on the disk at each commit, which
+        # costs most of a one-file update on Windows.
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=OFF")
+        self.db.executescript(SCHEMA)
+        if self.meta("version") != MAP_VERSION or self.meta("parser", parser_name()) != parser_name():
+            # Made by another version, or with other readers (the map extra came or went): build it again.
+            for table in ("nodes", "edges", "refs", "files", "signatures", "meta"):
+                self.db.execute("DELETE FROM %s" % table)
+            self._set_meta("version", MAP_VERSION)
+            self._set_meta("parser", parser_name())
+            self.db.commit()
+        self.base_url, self.aliases = self._ts_paths()
+        self._linked = {}  # (a, b) -> linked(a, b), until the next update changes something
+        self._link_idx = None  # (sorted files that use others, {file: {each file and folder it uses: certain}}), lowercase
+        self.changes = []  # [(path, signatures before, after)] since pop_changes, for C3's notices
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+    def meta(self, key, default=""):
+        with self.lock:  # the connection is shared with the map thread, which may be updating it
+            row = self.db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+    def _set_meta(self, key, value):
+        self.db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, str(value)))
+
+    def _ts_paths(self):
+        """tsconfig's baseUrl and paths aliases, e.g. ("src", {"@app/*": ["src/app/*"]})."""
+        for name in ("tsconfig.json", "tsconfig.base.json", "jsconfig.json"):
+            try:
+                text = (self.top / name).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            text = re.sub(r'("(?:\\.|[^"\\])*")|//[^\n]*|/\*.*?\*/', lambda m: m.group(1) or "", text, flags=re.S)
+            text = re.sub(r",(\s*[}\]])", r"\1", text)
+            try:
+                options = json.loads(text).get("compilerOptions") or {}
+            except (ValueError, AttributeError):
+                continue
+            base = norm(str(options.get("baseUrl") or "").rstrip("/"))
+            paths = options.get("paths") if isinstance(options.get("paths"), dict) else {}
+            return base, {alias: [norm(base + "/" + t if base else t) for t in targets if isinstance(t, str)]
+                          for alias, targets in paths.items() if isinstance(targets, list)}
+        return "", {}
+
+    # Building ----------------------------------------------------------------------------
+    def update(self, commit="", paths=None):
+        """Read the files that are new or changed since the last update, forget the ones gone, and link again
+        what that touches. With paths (files agents edited), only those are looked at: no git, so an edit is
+        read at once. Returns the paths read, or None when a path is neither here nor known (it is another
+        folder's): then the caller looks at everything."""
+        started = time.time()
+        with self.lock:
+            if paths is None:
+                files = source_files(self.top)
+                known = {p: (m, s) for p, m, s in self.db.execute("SELECT path, mtime, size FROM files")}
+            else:
+                files = sorted({norm(p) for p in paths if wanted(norm(p))})
+                known = {}
+                for rel in files:
+                    row = self.db.execute("SELECT mtime, size FROM files WHERE path = ?", (rel,)).fetchone()
+                    if row:
+                        known[rel] = tuple(row)
+                    elif not (self.top / rel).is_file():
+                        return None
+            changed = []
+            for rel in files:
+                try:
+                    st = (self.top / rel).stat()
+                except OSError:
+                    continue
+                if st.st_size > MAX_FILE_BYTES:
+                    continue
+                if known.pop(rel, None) != (float(st.st_mtime), st.st_size):
+                    changed.append((rel, st))
+            gone = list(known)
+            if changed or gone or not self.meta("built"):
+                self._apply([rel for rel, _ in changed], gone, dict(changed))
+                self._linked = {}
+                self._link_idx = self._link_index()
+            self._set_meta("commit", commit)
+            self._set_meta("repo", self.repo)
+            self._set_meta("branch", self.branch)
+            self._set_meta("built", time.time())
+            self._set_meta("took", round(time.time() - started, 3))
+            self.db.commit()
+            return [rel for rel, _ in changed]
+
+    def _apply(self, changed, gone, stats):
+        before = {rel: self._definitions(rel) for rel in changed}
+        # The files whose links point into what changes link again after it: their edges point at node ids
+        # that are made anew.
+        touched = sorted(set(changed) | set(gone))
+        users = set()
+        for start in range(0, len(touched), 500):
+            chunk = touched[start:start + 500]
+            users |= {p for (p,) in self.db.execute(
+                "SELECT DISTINCT s.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                "WHERE d.path IN (%s)" % ",".join("?" * len(chunk)), chunk)}
+        for rel in gone:
+            old = self.signatures(rel)
+            if old:
+                self.changes.append((rel, old, {}))
+            self._forget(rel)
+        new = [rel for rel in changed if not self._exists(rel)]
+        for rel in changed:
+            self._read(rel, stats[rel])
+        # A file came or went, or what one defines changed: any reference anywhere may resolve differently now.
+        everything = bool(new or gone) or any(self._definitions(rel) != before[rel] for rel in changed)
+        self._link(None if everything else (set(changed) | users) - set(gone))
+
+    def _exists(self, rel):
+        return self.db.execute("SELECT 1 FROM files WHERE path = ?", (rel,)).fetchone() is not None
+
+    def _definitions(self, rel):
+        return sorted(self.db.execute("SELECT kind, name FROM nodes WHERE path = ?", (rel,)).fetchall())
+
+    def _forget(self, rel):
+        ids = [i for (i,) in self.db.execute("SELECT id FROM nodes WHERE path = ?", (rel,))]
+        for start in range(0, len(ids), 400):
+            chunk = ids[start:start + 400]
+            marks = ",".join("?" * len(chunk))
+            self.db.execute("DELETE FROM edges WHERE src IN (%s) OR dst IN (%s)" % (marks, marks), chunk + chunk)
+        for table in ("nodes", "refs", "files", "signatures"):
+            self.db.execute("DELETE FROM %s WHERE path = ?" % table, (rel,))
+
+    def signatures(self, rel):
+        """name -> parameters of each function, method and class of a Python file, as last read."""
+        return dict(self.db.execute("SELECT name, signature FROM signatures WHERE path = ?", (rel,)).fetchall())
+
+    def pop_changes(self):
+        """The signature changes found since the last call: [(path, before, after)]."""
+        with self.lock:
+            out, self.changes = self.changes, []
+        return out
+
+    def _read(self, rel, st):
+        known, old = self._exists(rel), self.signatures(rel)
+        self._forget(rel)
+        lang = LANGS[os.path.splitext(rel)[1].lower()]
+        try:
+            text = (self.top / rel).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return
+        sigs, accurate = {}, None
+        if parsers() and lang in ("java", "kotlin", "react"):
+            try:
+                if lang == "react":
+                    flavour = {".ts": "ts", ".tsx": "tsx"}.get(os.path.splitext(rel)[1].lower(), "js")
+                    defs, refs, sigs, angular = read_js_accurately(rel, text.encode("utf-8"), flavour)
+                    lang = "angular" if angular else lang
+                else:
+                    defs, refs, sigs = read_jvm_accurately(rel, text.encode("utf-8"), lang)
+                accurate = True
+            except Exception:  # whatever a grammar trips on: the regular expressions read it instead
+                sigs = {}
+        if accurate:
+            pass
+        elif lang == "python":
+            defs, refs, sigs = read_python(rel, text)
+            if sigs is None:  # does not parse now: keep what it had
+                sigs = old
+        elif lang in ("java", "kotlin"):
+            defs, refs = read_jvm(rel, text, lang)
+        elif lang == "html":
+            defs, refs = read_html(rel, text)
+        else:
+            defs, refs, angular = read_js(rel, text)
+            lang = "angular" if angular else lang
+        if known and sigs != old and (sigs or old):  # an interface changed (C3)
+            self.changes.append((rel, old, sigs))
+        self.db.execute("INSERT INTO nodes (kind, path, name, line, lang) VALUES ('file', ?, ?, 0, ?)", (rel, rel, lang))
+        self.db.executemany("INSERT INTO nodes (kind, path, name, line, lang) VALUES (?, ?, ?, ?, ?)",
+                            [(kind, rel, name, line, lang) for kind, name, line in defs])
+        self.db.executemany("INSERT INTO refs (path, kind, target, certain) VALUES (?, ?, ?, ?)",
+                            [(rel, kind, json.dumps(target), int(certain)) for kind, target, certain in refs])
+        self.db.executemany("INSERT INTO signatures (path, name, signature) VALUES (?, ?, ?)",
+                            [(rel, name, sig) for name, sig in sorted(sigs.items())])
+        self.db.execute("INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?, ?, ?)",
+                        (rel, float(st.st_mtime), st.st_size))
+
+    def _index(self):
+        """What the map defines, in memory, for resolving references."""
+        ix = {"files": {}, "path_of": {}, "defs": {}, "package_of": {}, "packages": {}, "types": {}, "names": {},
+              "selectors": {}, "jvm_paths": {}}
+        for i, kind, path, name, lang in self.db.execute("SELECT id, kind, path, name, lang FROM nodes ORDER BY id"):
+            if kind == "file":
+                ix["files"][path] = i
+                ix["path_of"][i] = path
+                continue
+            bare, _, selector = name.partition("|")
+            ix["defs"].setdefault(path, {}).setdefault(bare, i)
+            if kind == "package":
+                ix["package_of"][path] = bare
+                ix["packages"].setdefault(bare, []).append(path)
+            elif kind not in ("method", "function") or lang in ("react", "angular"):
+                ix["names"].setdefault(bare, []).append(path)
+            if selector:
+                ix["selectors"].setdefault(selector, []).append(path)
+        for path, package in ix["package_of"].items():
+            stem = os.path.splitext(path.rsplit("/", 1)[-1])[0]
+            for name in list(ix["defs"].get(path, {})) + [stem]:
+                if name and name[:1].isupper():
+                    ix["types"].setdefault((package + "." if package else "") + name, path)
+            for root in JVM_ROOTS:
+                at = path.find(root)
+                if at == 0 or at > 0 and path[at - 1] == "/":
+                    ix["jvm_paths"].setdefault(os.path.splitext(path[at + len(root):])[0].replace("/", "."), path)
+                    break
+        return ix
+
+    def _link(self, only=None):
+        """Turn references into edges: every file's (only=None), or only these files'."""
+        ix = self._index()
+        if only is None:
+            self.db.execute("DELETE FROM edges")
+            rows = self.db.execute("SELECT path, kind, target, certain FROM refs").fetchall()
+        else:
+            ids = [ix["files"][p] for p in only if p in ix["files"]]
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                self.db.execute("DELETE FROM edges WHERE src IN (%s)" % ",".join("?" * len(chunk)), chunk)
+            rows = []
+            for path in sorted(only):
+                rows += self.db.execute("SELECT path, kind, target, certain FROM refs WHERE path = ?", (path,)).fetchall()
+        best = {}  # (src, dst, kind) -> certain: one link per pair and kind, a certain one over a guess
+        for path, kind, target, certain in rows:
+            src = ix["files"].get(path)
+            if src is None:
+                continue
+            target = json.loads(target)
+            found = []
+            if target[0] == "template":  # the component uses what its template uses
+                html = norm(os.path.dirname(path) + "/" + target[1])
+                if html in ix["files"]:
+                    found.append((ix["files"][html], True, "template"))
+                    for (tag,) in self.db.execute("SELECT target FROM refs WHERE path = ?", (html,)).fetchall():
+                        found += [(dst, sure, kind) for dst, sure in self._resolve(path, json.loads(tag), ix)]
+            else:
+                found = [(dst, sure, kind) for dst, sure in self._resolve(path, target, ix)]
+            for dst, sure, how in found:
+                if dst != src:
+                    key = (src, dst, how)
+                    best[key] = max(best.get(key, 0), int(bool(certain) and sure))
+        self.db.executemany("INSERT INTO edges (src, dst, kind, certain) VALUES (?, ?, ?, ?)",
+                            [(s, d, k, c) for (s, d, k), c in best.items()])
+
+    def _resolve(self, path, target, ix):
+        """[(node id, certain)] that a reference of the file at path points at."""
+        files, kind = ix["files"], target[0]
+        if kind == "py":
+            module, name = target[1], target[2]
+            here = folder_of(path)
+            for root in dict.fromkeys(PY_ROOTS + (here,)):
+                base = (root + module.replace(".", "/")) if module else root.rstrip("/")
+                if not base:
+                    continue
+                if name and base + "/" + name + ".py" in files:  # from package import module
+                    return [(files[base + "/" + name + ".py"], True)]
+                for candidate in (base + ".py", base + "/__init__.py"):
+                    if candidate in files:
+                        defined = ix["defs"].get(candidate, {}).get(name) if name else None
+                        return [(defined or files[candidate], True)]
+            return []
+        if kind == "jvm":
+            name, wildcard = target[1], target[2]
+            if wildcard:
+                return [(files[p], True) for p in ix["packages"].get(name, []) if p != path and p in files]
+            parts = name.split(".")
+            for end in range(len(parts), 1, -1):  # a.b.C.Inner: the file that defines a.b.C
+                prefix = ".".join(parts[:end])
+                found = ix["types"].get(prefix) or ix["jvm_paths"].get(prefix)
+                if found:
+                    return [(files[found], True)]
+            parent, _, last = name.rpartition(".")  # import a.b.topLevelFunction (Kotlin)
+            hits = [p for p in ix["packages"].get(parent, []) if last in ix["defs"].get(p, {})]
+            return [(ix["defs"][p][last], True) for p in hits[:MAX_GUESSES]]
+        if kind == "names":  # capitalised names a JVM file mentions: classes of its own package (a guess unless a
+            package = ix["package_of"].get(path)  # parser said they are types: the reference's own certainty)
+            if package is None:
+                return []
+            out = []
+            for word in target[1]:
+                found = ix["types"].get((package + "." if package else "") + word)
+                if found and found != path:
+                    out.append((files[found], True))
+            return out
+        if kind == "member":  # a call to Cls.member, Cls imported: the member in the file that defines Cls (C9)
+            found = self._resolve(path, ["jvm", target[1], False], ix)
+            if not found:
+                return []
+            where = ix["path_of"].get(found[0][0])  # None for a definition (a Kotlin top-level function)
+            member = ix["defs"].get(where, {}).get(target[2]) if where else None
+            return [(member or found[0][0], True)]
+        if kind == "jsname":  # a call to a name imported from a file: that name's definition in it (C9)
+            found = self._js_target(path, target[1], files)
+            if not found:
+                return []
+            defined = ix["defs"].get(found, {}).get(target[2]) if target[2] != "default" else None
+            return [(defined or files[found], True)]
+        if kind == "js":
+            found = self._js_target(path, target[1], files)
+            return [(files[found], True)] if found else []
+        if kind == "tag":
+            hits = ix["selectors"].get(target[1], [])
+            return [(files[p], len(hits) == 1) for p in hits[:MAX_GUESSES]]
+        if kind == "name":
+            hits = [p for p in ix["names"].get(target[1], []) if p != path]
+            return [(files[p], len(hits) == 1) for p in hits] if len(hits) <= MAX_GUESSES else []
+        return []
+
+    def _js_target(self, path, spec, files):
+        bases = []
+        if spec.startswith("."):
+            bases.append(norm(os.path.dirname(path) + "/" + spec))
+        else:
+            for alias, targets in self.aliases.items():
+                if alias.endswith("*") and spec.startswith(alias[:-1]):
+                    rest = spec[len(alias) - 1:]
+                    bases += [norm(t[:-1] + rest) if t.endswith("*") else t for t in targets]
+                elif spec == alias:
+                    bases += targets
+            if self.base_url:
+                bases.append(norm(self.base_url + "/" + spec))
+        for base in bases:
+            for candidate in [base] + [base + e for e in JS_EXTS] + [base + "/index" + e for e in JS_EXTS]:
+                if candidate in files:
+                    return candidate
+        return ""
+
+    # Questions -----------------------------------------------------------------------------
+    def answer(self, value):
+        """Every answer says which commit the map was built from."""
+        return dict({"commit": self.meta("commit"), "repo": self.repo, "branch": self.branch}, **value)
+
+    def _links(self, path, out, certain_only):
+        here, there = ("src", "dst") if out else ("dst", "src")
+        rows = self.db.execute(
+            "SELECT o.path, e.kind, MAX(e.certain) FROM nodes f JOIN edges e ON e.%s = f.id JOIN nodes o ON o.id = e.%s "
+            "WHERE f.path = ?%s GROUP BY o.path, e.kind ORDER BY o.path, e.kind"
+            % (here, there, " AND e.certain = 1" if certain_only else ""), (path,)).fetchall()
+        return [{"path": p, "kind": k, "certain": bool(c)} for p, k, c in rows if p != path]
+
+    def imports(self, path, certain_only=False):
+        """The files this one uses: imports, calls into, uses a component of, injects."""
+        with self.lock:
+            return self.answer({"path": norm(path), "files": self._links(norm(path), True, certain_only)})
+
+    def importers(self, path, certain_only=False):
+        """The files that use this one."""
+        with self.lock:
+            return self.answer({"path": norm(path), "files": self._links(norm(path), False, certain_only)})
+
+    def linked(self, a, b, wait=True):
+        """Is there a certain link, either way, between a and b? Each is an area as tasks give them: a path
+        prefix, a file or every file under a folder. For C2's check of whether two tasks' areas overlap.
+        wait=False never waits for an update in progress: it answers from what it knew."""
+        return self.link(a, b, wait) == CERTAIN
+
+    def link(self, a, b, wait=True):
+        """How a and b are linked, either way: CERTAIN, GUESS (only links the readers guessed, C4's soft hint) or
+        0. Cached until the next update changes something."""
+        a, b = norm(a).rstrip("/"), norm(b).rstrip("/")
+        if not wait and (a, b) in self._linked:
+            return self._linked[(a, b)]
+        if not self.lock.acquire(blocking=wait):  # being updated: what it said before, else no link
+            return self._linked.get((a, b), 0)
+        try:
+            if (a, b) not in self._linked:
+                if self._link_idx is None:
+                    self._link_idx = self._link_index()
+                how = max(self._link_from(a.lower(), b.lower()), self._link_from(b.lower(), a.lower()))
+                self._linked[(a, b)] = self._linked[(b, a)] = how
+            return self._linked[(a, b)]
+        finally:
+            self.lock.release()
+
+    def _link_index(self):
+        """Every file's links, read once per update so link() asks no SQL (it runs for each pair of task areas, under
+        the hub's lock): ([files that use others], {file: {each file it uses, and each folder above it: certain}}).
+        Lowercase, as LIKE matches."""
+        out = {}
+        for src, dst, certain in self.db.execute(
+                "SELECT s.path, d.path, MAX(e.certain) FROM edges e JOIN nodes s ON s.id = e.src "
+                "JOIN nodes d ON d.id = e.dst GROUP BY s.path, d.path"):
+            uses = out.setdefault(src.lower(), {})
+            how = CERTAIN if certain else GUESS
+            parts = dst.lower().split("/")
+            for i in range(len(parts), -1, -1):
+                above = "/".join(parts[:i])
+                if uses.get(above, 0) < how:
+                    uses[above] = how
+        return sorted(out), out
+
+    def _link_from(self, a, b):
+        """The strongest link from a file at or under area a to one at or under area b (lowercase, no trailing /)."""
+        files, uses = self._link_idx
+        best = uses.get(a, {}).get(b, 0)
+        prefix = a + "/" if a else ""
+        i = bisect.bisect_left(files, prefix)
+        while best < CERTAIN and i < len(files) and files[i].startswith(prefix):
+            best = max(best, uses[files[i]].get(b, 0))
+            i += 1
+        return best
+
+    def graph(self, inside="", limit=MAX_GRAPH_FILES):
+        """The files under a folder of the repository (paths relative to it) and the certain links between them,
+        each pair once: {files: [path], links: [[i, j, count]], more: files left out}. For C8's view."""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            paths = [p for (p,) in self.db.execute(
+                "SELECT path FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\' ORDER BY path", (prefix,))]
+            shown = paths[:limit]
+            index = {p: i for i, p in enumerate(shown)}
+            pairs = {}
+            for a, b in self.db.execute(
+                    "SELECT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1"):
+                if a in index and b in index and a != b:
+                    key = (min(index[a], index[b]), max(index[a], index[b]))
+                    pairs[key] = pairs.get(key, 0) + 1
+        cut = len(inside)
+        return self.answer({"files": [p[cut:] for p in shown], "links": [[i, j, n] for (i, j), n in sorted(pairs.items())],
+                            "more": len(paths) - len(shown)})
+
+    def overview(self, inside="", parts=8, used=8, entries=6):
+        """What a joining agent should know first (roadmap C6), for the files under a folder of the repository
+        (paths relative to it): its main parts (folders, by size), the files most others use (certain links) with
+        what they define, and where it starts (files that use others but nothing uses, conventional names first)."""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            files = dict(self.db.execute("SELECT path, lang FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\'",
+                                         (prefix,)).fetchall())
+            users, uses = {}, {}
+            for a, b in self.db.execute(
+                    "SELECT DISTINCT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1 AND s.path != d.path"):
+                if a in files and b in files:
+                    users.setdefault(b, set()).add(a)
+                    uses.setdefault(a, set()).add(b)
+            defined, methods = {}, {}
+            for path, kind, name in self.db.execute(
+                    "SELECT path, kind, name FROM nodes WHERE kind IN ('class', 'interface', 'object', 'component', "
+                    "'module', 'service', 'function', 'method') AND path LIKE ? ESCAPE '\\' ORDER BY line", (prefix,)):
+                if kind == "method":  # Python's Class.method: how much a class does
+                    methods[(path, name.split(".")[0])] = methods.get((path, name.split(".")[0]), 0) + 1
+                else:
+                    defined.setdefault(path, []).append((kind, name.split("|")[0]))
+        cut = len(inside)
+        rel = lambda p: p[cut:]  # noqa: E731
+        groups = {}
+        for path, lang in files.items():
+            short = rel(path)
+            folder = short.split("/")[0] + "/" if "/" in short else "(top)"
+            groups.setdefault(folder, []).append((path, lang))
+        main = []
+        for folder, members in sorted(groups.items(), key=lambda kv: -len(kv[1]))[:parts]:
+            langs = {}
+            for _, lang in members:
+                langs[lang] = langs.get(lang, 0) + 1
+            top = sorted(members, key=lambda m: -len(users.get(m[0], ())))[:4]
+            main.append({"folder": folder, "files": len(members), "langs": sorted(langs, key=lambda l: -langs[l])[:2],
+                         "key": [rel(p).rsplit("/", 1)[-1] for p, _ in top]})
+        def names(path):  # its biggest classes first, else its functions in order
+            classes = sorted((n for k, n in defined.get(path, []) if k != "function"),
+                             key=lambda n: -methods.get((path, n), 0))
+            return (classes or [n for k, n in defined.get(path, [])])[:5]
+
+        def test(path):
+            return bool(re.search(r"(^|/)(tests?|spec|e2e|__tests__)/|(^|/)test_|[._-](test|spec)\.", path))
+        most = sorted((p for p in files if users.get(p)), key=lambda p: (-len(users[p]), p))[:used]
+        conventional = ("main.py", "__main__.py", "app.py", "manage.py", "index.ts", "index.js", "main.ts", "App.tsx",
+                        "App.jsx", "main.kt", "Main.kt", "Application.java", "Main.java", "MainActivity.kt", "server.py")
+        starts = sorted((p for p in files if uses.get(p) and not users.get(p)),
+                        key=lambda p: (test(rel(p)), p.rsplit("/", 1)[-1] not in conventional, -len(uses[p]), p))[:entries]
+        return self.answer({"files": len(files), "parts": main,
+                            "used": [{"path": rel(p), "by": len(users[p]), "defines": names(p)} for p in most],
+                            "starts": [{"path": rel(p), "uses": len(uses[p])} for p in starts]})
+
+    def groups(self, inside="", areas=(), most=6):
+        """Roadmap C7: the files under these areas (paths relative to a folder of the repository; all of them
+        with none), in groups that hang together, for a lead to give one to each agent. Files joined by certain
+        imports go together; a file alone joins its folder's group; past `most`, the smallest groups join the
+        one they link to most, else their folder's. One big file alone is split by its classes and functions
+        instead. [{files: [path], folder, inside: links within, out: {group: links}, parts: [names]}]"""
+        with self.lock:
+            prefix = like_prefix(inside) if inside else "%"
+            cut = len(inside)
+            wanted = [a.strip("/").lower() for a in areas if a.strip("/")]
+            files = [p for (p,) in self.db.execute(
+                "SELECT path FROM nodes WHERE kind = 'file' AND path LIKE ? ESCAPE '\\' ORDER BY path", (prefix,))
+                if not wanted or any(p[cut:].lower() == a or p[cut:].lower().startswith(a + "/") for a in wanted)]
+            index = {p: i for i, p in enumerate(files)}
+            links = {}
+            for a, b in self.db.execute(
+                    "SELECT s.path, d.path FROM edges e JOIN nodes s ON s.id = e.src JOIN nodes d ON d.id = e.dst "
+                    "WHERE e.certain = 1 AND s.path != d.path"):
+                if a in index and b in index:
+                    key = (min(index[a], index[b]), max(index[a], index[b]))
+                    links[key] = links.get(key, 0) + 1
+            defs = {}
+            if len(files) == 1:
+                defs = self.db.execute("SELECT kind, name, line FROM nodes WHERE path = ? AND kind IN ('class', "
+                                       "'interface', 'object', 'component', 'service', 'function') ORDER BY line",
+                                       (files[0],)).fetchall()
+        if not files:
+            return []
+        rel = [p[cut:] for p in files]
+        if len(files) == 1:  # one file: its classes and functions, in up to `most` runs of about the same size
+            size = max(1, -(-len(defs) // most))
+            runs = [defs[i:i + size] for i in range(0, len(defs), size)]
+            return [{"files": rel, "folder": folder_of(rel[0]), "inside": 0, "out": {},
+                     "parts": {"from": run[0][2], "to": run[-1][2], "count": len(run),
+                               "names": [n.split("|")[0] for _, n, _ in run[:6]]}} for run in runs] or \
+                [{"files": rel, "folder": folder_of(rel[0]), "inside": 0, "out": {}, "parts": {}}]
+        parent = list(range(len(files)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+        # A file most of the others use (a core module) is shared ground, not what holds a group together: its
+        # links do not join groups, or one core file would make the whole project one group.
+        used = {}
+        for (i, j) in links:
+            used[i], used[j] = used.get(i, 0) + 1, used.get(j, 0) + 1
+        core = {i for i, n in used.items() if n >= max(4, len(files) // 5)}
+        for (i, j) in links:
+            if i not in core and j not in core:
+                parent[find(i)] = find(j)
+        groups = {}
+        for i in range(len(files)):
+            groups.setdefault(find(i), []).append(i)
+        by_folder = {}
+        for root, members in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            by_folder.setdefault(folder_of(rel[members[0]]), root)
+        for root, members in list(groups.items()):  # a file alone joins its folder's group
+            if len(members) == 1 and root in groups:
+                home = by_folder.get(folder_of(rel[members[0]]))
+                if home is not None and home != root and home in groups:
+                    groups[home] += groups.pop(root)
+
+        group_of = join_small(groups, links, rel, most)
+        order = sorted(groups, key=lambda g: -len(groups[g]))
+        number = {g: n + 1 for n, g in enumerate(order)}
+        inside_links, outside = {g: 0 for g in order}, {g: {} for g in order}
+        for (i, j), n in links.items():  # one pass over the links: within a group, or from one to another
+            gi, gj = group_of[i], group_of[j]
+            if gi == gj:
+                inside_links[gi] += n
+            else:
+                for g, other in ((gi, gj), (gj, gi)):
+                    outside[g][number[other]] = outside[g].get(number[other], 0) + n
+        out = []
+        for g in order:
+            folders = {}
+            for i in groups[g]:
+                folders[folder_of(rel[i])] = folders.get(folder_of(rel[i]), 0) + 1
+            out.append({"files": sorted(rel[i] for i in groups[g]), "folder": max(folders, key=folders.get),
+                        "inside": inside_links[g], "out": outside[g], "parts": {}})
+        return out
+
+    def definitions(self, path):
+        with self.lock:
+            rows = self.db.execute("SELECT kind, name, line FROM nodes WHERE path = ? AND kind NOT IN ('file', "
+                                   "'package') ORDER BY line, name", (norm(path),)).fetchall()
+            return self.answer({"path": norm(path), "definitions": [{"kind": k, "name": n.split("|")[0], "line": l}
+                                                                    for k, n, l in rows]})
+
+    def status(self):
+        with self.lock:
+            langs = dict(self.db.execute("SELECT lang, COUNT(*) FROM nodes WHERE kind = 'file' GROUP BY lang"))
+            edges = self.db.execute("SELECT COUNT(*), COALESCE(SUM(certain), 0) FROM edges").fetchone()
+            return self.answer({"files": sum(langs.values()), "langs": langs, "links": edges[0], "certain": edges[1],
+                                "parser": self.meta("parser", parser_name()),
+                                "built": float(self.meta("built") or 0), "took": float(self.meta("took") or 0),
+                                "folder": str(self.top)})
+
+
+# --------------------------------------------------------------------------------------------
+# A project's maps
+# --------------------------------------------------------------------------------------------
+def join_small(groups, links, rel, most):
+    """CodeMap.groups' last step, in place: while there are more than `most` groups ({root: [file]}), the smallest
+    joins the one it links to most (links: {(file, file): count}), else its folder's, else the next. Returns
+    {file: its group}. Each join counts only the smallest group's own links: a big project's split stays quick."""
+    group_of = {i: g for g, members in groups.items() for i in members}
+    touching = {}
+    for (i, j), n in links.items():
+        touching.setdefault(i, []).append((j, n))
+        touching.setdefault(j, []).append((i, n))
+    while len(groups) > most:
+        small = min(groups, key=lambda g: (len(groups[g]), folder_of(rel[groups[g][0]])))
+        weight = {}
+        for i in groups[small]:
+            for j, n in touching.get(i, ()):
+                weight[group_of[j]] = weight.get(group_of[j], 0) + n
+        home = folder_of(rel[groups[small][0]])
+        target = max((g for g in groups if g != small), key=lambda g: (weight.get(g, 0), folder_of(rel[groups[g][0]])
+                                                                        == home, -len(groups[g])))
+        for i in groups[small]:
+            group_of[i] = target
+        groups[target] += groups.pop(small)
+    return group_of
+
+
+class Maps:
+    """The maps of a project's connected folders on this machine: one per repository and branch, shared by every
+    folder that is a checkout of it. check() brings them up to date; the server calls it when agents edit
+    files and now and then to see whether a folder's HEAD moved."""
+
+    def __init__(self, root):
+        self.dir = Path(root) / "maps"
+        self.maps = {}  # key -> CodeMap
+        self.seen = {}  # folder -> (the (branch, commit) its map was last brought up to date at, the map, where
+        # the folder is in its repository: "" or "app/")
+        self.tops = {}  # folder -> (its map, where the folder is in its repository), for linked()
+        self.lock = threading.Lock()
+
+    def for_folder(self, folder):
+        """(the folder's map, its commit)."""
+        repo, branch, commit, top = repo_of(folder)
+        key = map_key(repo, branch)
+        with self.lock:
+            cmap = self.maps.get(key)
+            if cmap is not None and not cmap.path.exists():  # deleted: built again
+                cmap.close()
+                cmap = None
+            if cmap is None:
+                cmap = self.maps[key] = CodeMap(self.dir / ("%s.sqlite" % key), top, repo, branch)
+        return cmap, commit
+
+    def check(self, folders, edited=False, paths=()):
+        """Bring up to date the map of each folder whose files were edited, whose HEAD moved (a commit, a pull,
+        another branch), or that has none yet. paths: the files edited, relative to the folders, read alone
+        when nothing else moved. Returns {folder: paths read, or why it could not}."""
+        done = {}
+        for folder in folders:
+            folder = str(folder)
+            head = head_of(folder)
+            seen = self.seen.get(folder)
+            try:
+                if seen and seen[0] == head and seen[1].path.exists():
+                    if not edited:
+                        continue
+                    if paths:
+                        read = seen[1].update(head[1], [seen[2] + p for p in paths])
+                        if read is not None:
+                            done[folder] = read
+                            continue
+                        if not any((Path(folder) / p).exists() for p in paths):
+                            continue  # another folder's edits: nothing of this one's changed
+                cmap, commit = self.for_folder(folder)
+                done[folder] = cmap.update(commit)
+                inside = git(folder, "rev-parse", "--show-prefix")  # where the folder is in its repository
+                self.seen[folder] = (head, cmap, inside)
+                with self.lock:
+                    self.tops[folder] = (cmap, inside)
+            except (OSError, sqlite3.Error) as e:
+                done[folder] = "could not map: %s" % e
+        return done
+
+    def find(self, folders, path=""):
+        """The map a path belongs to, and the path relative to that map's repository: (CodeMap, rel), or
+        (None, path) when no folder has one. An absolute path picks the folder it is in; a relative one is
+        taken as relative to the first folder's repository. A folder check() has seen runs no git: its map is the one
+        check() found (and finds again when the folder's HEAD moves)."""
+        for folder in folders:
+            seen = self.seen.get(str(folder))
+            if seen and seen[1].path.exists():
+                cmap = seen[1]
+            else:
+                try:
+                    cmap, _ = self.for_folder(folder)
+                except (OSError, sqlite3.Error):
+                    continue
+            if not path:
+                return cmap, ""
+            p = Path(path)
+            if not p.is_absolute():
+                return cmap, norm(path)
+            try:
+                return cmap, p.resolve().relative_to(cmap.top).as_posix()
+            except ValueError:
+                continue
+        return None, path
+
+    def linked(self, a, b):
+        """Is there a certain link between two areas (paths relative to a project folder) in any folder's map?
+        Only maps already built are asked, and no git is run: cheap enough for every look at the task sheet."""
+        return self.link(a, b) == CERTAIN
+
+    def link(self, a, b):
+        """The strongest link between two areas in any folder's map: CERTAIN, GUESS or 0 (as linked, no git)."""
+        with self.lock:
+            tops = list(self.tops.values())
+        best = 0
+        for cmap, inside in tops:
+            try:
+                best = max(best, cmap.link(inside + a, inside + b, wait=False))
+            except sqlite3.Error:  # a map being built again (its file was deleted)
+                continue
+            if best == CERTAIN:
+                break
+        return best
+
+    def insides(self, cmap):
+        """Where the project's folders that use this map are in its repository: "" or "app/" each."""
+        with self.lock:
+            return sorted({inside for m, inside in self.tops.values() if m is cmap})
+
+    def all(self):
+        with self.lock:
+            return list(self.maps.values())
+
+    def close(self):
+        with self.lock:
+            for cmap in self.maps.values():
+                cmap.close()
+            self.maps = {}

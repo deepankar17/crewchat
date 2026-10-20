@@ -5,7 +5,7 @@ crewchat is a group chat over MCP for several AI coding agents and their owner. 
 
 ## Hard rules
 
-- `crewchat.py` and `crewchat_peers.py` use the Python standard library only (3.9+), and
+- `crewchat.py`, `crewchat_peers.py` and `crewchat_map.py` use the Python standard library only (3.9+), and
   `crewchat.py` must keep working when copied alone to another machine. A new dependency goes in an
   optional extra, imported lazily, the way `crewchat_cloud.py` is.
 - The server listens on 127.0.0.1 only. No telemetry. Code and data stay on the owner's machines.

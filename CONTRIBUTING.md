@@ -5,9 +5,10 @@ its core.
 
 ## Ground rules
 
-- **No dependencies in the core.** `crewchat.py` and `crewchat_peers.py` use the standard library
-  only, and `crewchat.py` must keep working when copied on its own to another machine. Cloud sync
-  (`crewchat_cloud.py`) is the one optional part with libraries.
+- **No dependencies in the core.** `crewchat.py`, `crewchat_peers.py` and `crewchat_map.py` use the standard library
+  only, and `crewchat.py` must keep working when copied on its own to another machine. Libraries
+  go in an optional extra, imported only when used: `cloud` for cloud sync (`crewchat_cloud.py`),
+  and `map` for the code map's accurate readers (tree-sitter and its grammars, in `crewchat_map.py`).
 - **The server binds to 127.0.0.1.** Changes that make it listen elsewhere will not be merged;
   remote access goes through a private network.
 - **Storage follows [docs/storage.md](docs/storage.md).** `messages.jsonl` is the source of truth;
@@ -19,13 +20,18 @@ its core.
 
 | File | |
 |---|---|
-| `crewchat.py` | The server, the MCP tools, the chat page, hooks, and every command |
+| `crewchat.py` | The server, the MCP tools, the chat page (and its analytics view, `ANALYTICS_JS`), hooks, and every command. It also writes the light hook script, `~/.crewchat/crewchat-hook.py`, from its own code (`hook_script`): edit the functions it copies, never the written file |
 | `crewchat_peers.py` | Linking machines over Tailscale |
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
-| `install.sh`, `install.ps1` | The installers: macOS and Linux's one line; on Windows the README uses uv and PyPI, and `install.ps1` serves older notes |
-| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines) |
+| `crewchat_map.py` | The code map: files, definitions and imports of the project's code (standard library) |
+| `install.sh`, `install.ps1` | The one-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows (PowerShell) |
+| `tests/` | `test_crewchat.py` (one machine), `test_peers.py`, `test_cloud.py` (several machines), `test_map.py` (the code map), `test_docs_images.py` (the docs' pictures and diagram alt text), `test_site.py` (the website's build), `test_workflows.py` (GitHub Actions run only for main) |
 | `e2e/` | End-to-end tests: real servers, agents' hooks, the chat page, linked machines, the installer |
-| `tools/docs_screenshots.py` | Makes the pictures in `docs/images` |
+| `tools/docs_screenshots.py` | Makes the screenshots and terminal pictures in `docs/images` |
+| `tools/demo_recordings.py` | Records the animated demos in `docs/images` (and MP4 clips for videos) |
+| `tools/shorts/` | Makes a release's short videos (vertical and landscape, narrated with Kokoro, captioned) from `episodes.json` |
+| `tools/diagrams/` | The animated diagrams: `specs.py` says what each shows, `diagrams.py` makes the GIFs |
+| `site/`, `hosting/` | The website: `site/build.py` builds `site/templates` and `site/assets` into `hosting/public` (not in git); `site/media.py` makes its videos from the GIFs; its live demo is the analytics view, cut from `ANALYTICS_JS` in `crewchat.py`. `hosting/README.md` says how it is deployed |
 
 ## Running the tests
 
@@ -33,7 +39,9 @@ its core.
 python3 -m unittest discover -s tests -v
 ```
 
-The cloud-sync tests need `pip install cryptography`; they are skipped without it.
+The cloud-sync tests need `pip install cryptography`; they are skipped without it. The code map's
+accurate readers are tested with `pip install tree-sitter tree-sitter-java tree-sitter-kotlin
+tree-sitter-javascript tree-sitter-typescript`, and the regular-expression readers without them.
 
 Before a release, run the end-to-end tests too. They start real servers in a throwaway folder
 with the `crewchat` command, and drive them as agents and the owner would:
@@ -48,6 +56,19 @@ instead of this checkout, `CREWCHAT_LOAD=80` sends more messages in the load tes
 `CREWCHAT_E2E_KEEP=1` keeps the throwaway folder for a look afterwards. Cloud sync needs a real
 Firebase project, so it is covered by `tests/test_cloud.py` with a stand-in store; Windows is not
 covered here.
+
+## Measuring speed
+
+A speed change comes with numbers from before and after it, from the benchmark: a real server with
+5 agents and 5,000 messages, its hook calls, the chat page's poll and server startup, as medians.
+
+```bash
+python3 e2e/bench.py --json before.json      # on the code before the change
+python3 e2e/bench.py --compare before.json   # after it: exit 1 if a median got over 20% worse
+```
+
+Compare on the same machine and Python. `CREWCHAT_BIN=/path/to/crewchat` measures an installed copy,
+whose hooks import a cached `.pyc` instead of compiling `crewchat.py` on every call.
 
 ## Trying a change by hand
 

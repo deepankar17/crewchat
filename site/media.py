@@ -12,9 +12,11 @@ IMAGES = ROOT / "docs" / "images"
 OUT = ROOT / "site" / "assets" / "media"
 
 # The GIFs the site shows (docs/images/<name>.gif).
-CLIPS = ["demo-start", "demo-talk", "demo-task", "demo-roles", "demo-files", "demo-phone", "diagram-architecture"]
+CLIPS = ["demo-start", "demo-talk", "demo-task", "demo-roles", "demo-files", "demo-phone", "diagram-architecture",
+         "analytics-demo"]
 # Screenshots, and the width each is scaled down to.
-STILLS = {"screenshot-light": 1600, "screenshot-dark": 1600, "task-board": 1400}
+STILLS = {"screenshot-light": 1600, "screenshot-dark": 1600, "task-board": 1400, "code-notice": 1400,
+          "faces-square": 900, "permission": 1400}
 
 
 def ffmpeg(*args):

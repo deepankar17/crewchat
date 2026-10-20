@@ -9,8 +9,9 @@ readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Deepankar" }]
-keywords = ["mcp", "agents", "claude-code", "cursor", "multi-agent", "chat"]
+keywords = ["mcp", "agents", "claude-code", "cursor", "codex", "gemini-cli", "qwen-code", "opencode", "multi-agent", "chat"]
 classifiers = [
+  "Development Status :: 5 - Production/Stable",
   "Programming Language :: Python :: 3",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -20,6 +21,8 @@ dynamic = ["version"]
 
 [project.optional-dependencies]
 cloud = ["cryptography>=41", "google-cloud-firestore>=2.16"]
+# Accurate readers for the code map (roadmap C9): Java, Kotlin, JavaScript and TypeScript parsed exactly.
+map = ["tree-sitter>=0.22", "tree-sitter-java", "tree-sitter-kotlin", "tree-sitter-javascript", "tree-sitter-typescript"]
 
 [project.urls]
 Homepage = "https://github.com/deepankar17/crewchat"
@@ -29,7 +32,7 @@ Issues = "https://github.com/deepankar17/crewchat/issues"
 crewchat = "crewchat:main"
 
 [tool.setuptools]
-py-modules = ["crewchat", "crewchat_cloud", "crewchat_peers"]
+py-modules = ["crewchat", "crewchat_cloud", "crewchat_map", "crewchat_peers"]
 
 [tool.setuptools.dynamic]
 version = { attr = "crewchat.__version__" }
