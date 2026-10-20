@@ -1,7 +1,8 @@
 # Roadmap
 
-> **Every task below is done, and ships in the coming release.** This file stays as the record of
-> what was planned, what was decided and how each task was built.
+> **Status, 20 October 2026.** Every task up to P8 is done and released in crewchat 1.0.0. Process
+> learning (L1 to L7) is planned and not started: L1 comes first. For the finished tasks this file
+> stays as the record of what was planned, what was decided and how each was built.
 
 The plan for crewchat's next releases: speed fixes, storage rules, code-aware coordination,
 multi-machine sync gaps and an analytics page. Each task has a goal, where it lives in the code,
