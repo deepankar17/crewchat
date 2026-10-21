@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2 (2026-10-21)
+
+- **A settings file that holds crewchat's token stays private.** Refreshing an agent's hooks (at every upgrade and
+  server start) wrote its settings file back readable by every user of the machine. For Gemini CLI and Qwen Code that
+  file holds crewchat's token. A settings file that holds a token is now always written readable by you only, and
+  the first refresh after upgrading makes one that 1.0.0 or 1.0.1 left readable private again.
+
 ## 1.0.1 (2026-10-20)
 
 - **A reopened agent comes back as itself.** Reopen, Reconnect and Switch model resume an agent's conversation, which

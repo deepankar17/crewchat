@@ -223,7 +223,9 @@ class Sync(unittest.TestCase):
         # A piece changed in the cloud does not open.
         small = self.a.hub.add_file("notes.txt", b"tamper with me", "text/plain")
         self.a.hub.send(crewchat.OWNER, "all", "the notes", files=[small])
-        wait_until(lambda: self.store.get("files/%s-0" % small["id"]), message="the notes in the cloud")
+        # Both: the other machine must know the file (from its message) before it can try the cloud.
+        wait_until(lambda: self.b.has("the notes") and self.store.get("files/%s-0" % small["id"]),
+                   message="the notes in the cloud")
         doc = dict(self.store.get("files/%s-0" % small["id"]))
         doc["ct"] = doc["ct"][:-4] + ("AAAA" if not doc["ct"].endswith("AAAA") else "BBBB")
         self.store.set("files/%s-0" % small["id"], doc)

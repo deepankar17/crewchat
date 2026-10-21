@@ -847,6 +847,50 @@ class EditPaths(unittest.TestCase):
         self.assertEqual([e["agent"] for e in crewchat.EventStore(store.path).edits()], ["maya", "teo", "lu", "ana"])
 
 
+class PrivateSettings(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "file modes")
+    def test_refreshing_hooks_keeps_a_settings_file_with_a_token_private(self):
+        # A Gemini CLI or Qwen Code folder's settings hold crewchat's token: written readable by this user only. An
+        # upgrade's hooks refresh (edit_json) wrote it back readable by everyone.
+        for client, rel in (("gemini", ".gemini/settings.json"), ("qwen", ".qwen/settings.json")):
+            folder = Path(tempfile.mkdtemp(prefix="private-%s-" % client, dir=TMP)).resolve()
+            crewchat.install_client(client, folder, "http://127.0.0.1:9", "secret-token")
+            path = folder / rel
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, client)
+            data = json.loads(path.read_text())
+            del data["hooks"]  # connected before crewchat had them: the refresh adds them
+            path.write_text(json.dumps(data))
+            os.chmod(path, 0o600)
+            self.assertIn(rel, crewchat.update_hooks(folder))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, client)
+
+    @unittest.skipIf(os.name == "nt", "file modes")
+    def test_a_token_file_an_older_version_left_readable_is_made_private(self):
+        # 1.0.0 and 1.0.1 left such a file readable by everyone (or a person made it group-readable): the next
+        # refresh writes it back for this user only, as it holds a token.
+        for mode in (0o644, 0o640):
+            folder = Path(tempfile.mkdtemp(prefix="widened-", dir=TMP)).resolve()
+            crewchat.install_client("gemini", folder, "http://127.0.0.1:9", "secret-token")
+            path = folder / ".gemini/settings.json"
+            data = json.loads(path.read_text())
+            del data["hooks"]
+            path.write_text(json.dumps(data))
+            os.chmod(path, mode)
+            self.assertIn(".gemini/settings.json", crewchat.update_hooks(folder))
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, oct(mode))
+
+    @unittest.skipIf(os.name == "nt", "file modes")
+    def test_a_private_write_is_private_even_over_a_leftover_temporary_file(self):
+        # A write cut short leaves settings.json.tmp behind, readable by everyone: the next private write reuses
+        # it and must not carry that mode into place.
+        folder = Path(tempfile.mkdtemp(prefix="leftover-", dir=TMP)).resolve()
+        tmp = folder / "settings.json.tmp"
+        tmp.write_text("{}")
+        os.chmod(tmp, 0o644)
+        crewchat.write_json(folder / "settings.json", {"token": "x"}, private=True)
+        self.assertEqual((folder / "settings.json").stat().st_mode & 0o777, 0o600)
+
+
 class Faces(unittest.TestCase):
     """A new agent's face, made of parts (a skin, hair, a hat, glasses, clothes, ...) at random, and drawn as SVG."""
 

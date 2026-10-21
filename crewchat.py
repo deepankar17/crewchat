@@ -54,7 +54,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -8176,6 +8176,8 @@ def write_json(path, data, private=False, indent=2):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    if private and hasattr(os, "fchmod"):  # the mode above is only for a new file; one left by a write cut short keeps its own
+        os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(data, indent=indent) + "\n")
     retry_on_windows(lambda: os.replace(tmp, path))
@@ -8783,7 +8785,11 @@ def edit_json(path, change):
     if json.dumps(data, sort_keys=True) == before:
         return False
     if any(v not in ({}, [], None) for k, v in data.items() if k != "version"):
-        write_json(path, data)
+        try:  # a file only its owner reads stays so; one holding a token (an Authorization header) becomes so
+            private = not os.stat(path).st_mode & 0o077
+        except OSError:
+            private = True
+        write_json(path, data, private=private or '"authorization"' in json.dumps(data).lower())
     else:
         path.unlink()
     return True
