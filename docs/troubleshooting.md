@@ -179,7 +179,9 @@ connected to Tailscale. Open the Tailscale app on the phone and check it is conn
 
 ## Projects
 
-**A project is not shared with the other machine.** Go through these in order:
+**A project is not shared with the other machine.** Open **Machines** on the chat page and click
+**Check everything**: it lists how each project pairs with each machine, and why one does not.
+Or go through these in order:
 
 1. **Same name on both machines?** Projects pair by name (any case): `t4` and `t4`. Run
    `crewchat projects` on each machine.

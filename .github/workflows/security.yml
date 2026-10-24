@@ -1,0 +1,30 @@
+name: security
+
+on:  # main only (owner, 23 Oct 2026): pushes to it and pull requests into it, like tests.yml
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          fetch-depth: 0  # the code and secrets checks compare with the base of the change
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809  # v4.2.4
+        with:
+          path: ~/.cache/security-scan
+          key: security-scan-${{ hashFiles('scripts/security-scan.sh') }}
+      # Secrets, dependencies and code; see scripts/security-scan.sh. Only code findings the base
+      # does not already have fail the run.
+      - env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # A manual run has no base to compare with: it checks everything, not nothing.
+          SCAN_FULL: ${{ github.event_name == 'workflow_dispatch' && '1' || '' }}
+        run: bash scripts/security-scan.sh

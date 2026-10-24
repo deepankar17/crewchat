@@ -1,5 +1,56 @@
 # Changelog
 
+## Next: 1.1.0 (on the branch `m1-machines-panel`)
+
+- **Process notes: what one agent works out, every agent gets.** An agent that got something to work the hard way
+  (a build, a release, a fix for a failure that keeps coming back, a setup step) records it with the new
+  `hub_process` tool: when to use it, the steps, the exact commands, the pitfalls, the files it touches. Once
+  approved, every agent of the project gets it, on every linked machine, as a skill in its folder and a line in its
+  guide; taking a task names the notes it may need, and agents working in a note's files hear of it when it is
+  approved. The lead approves ordinary notes; you approve notes shared with all your projects and ones whose
+  commands may release, deploy, publish, delete data or touch credentials or production, from Needs you (with the
+  exact commands), and can change the rule per project. A hard task asks its agent for a note when it is done.
+  Agents report whether a note worked: two failures in a row take it back until it is fixed, and notes whose files
+  changed a lot are flagged. You can make a note's commands a project command agents run with `crewchat run NAME`
+  (never by the server). The chat page lists every note, `crewchat processes` manages them, and the analytics view
+  shows how much they are used.
+- **Link your machines from the chat page.** Machines, in the project menu: Tailscale (Invite a machine, Join a
+  machine) or cloud sync (the Firebase files, Google sign-in, approval with the fingerprint), every machine's state,
+  version, projects and coordinator, Make coordinator, Remove, Unlink, and Check everything, each problem with its
+  fix. The `crewchat peers` and `cloud` commands run the same code.
+- **A project made on one machine is offered on the others**, to set up there in a click; a name that would not pair
+  (another machine's first project) is caught first.
+- **Several Claude Code accounts on one machine** (say `claude` and `claude-personal`, each its own settings folder):
+  **+ New agent** asks which one an agent runs in, and Reopen, Reconnect, Start again and Switch model keep it.
+  `crewchat accounts` lists them; folders named `~/.claude-NAME` are found, others added with `crewchat accounts add`.
+- **The advisor sees what the asking agent did.** When an agent calls `hub_ask`, crewchat reads that agent's own
+  conversation (Claude Code, Codex CLI, Gemini CLI, Qwen Code, Cursor or OpenCode), boils it down (since the task
+  it holds, else its last 40 KB; tool results cut to their first and last lines; text that looks like a secret
+  replaced with `[secret left out]`) and attaches it to the question as `conversation-NAME.txt`. Only the advisor
+  and you can open it, on every machine; you open it from the question on the page. Questions go without it, and
+  say why, when the conversation is not known or readable, or while a linked machine runs an older crewchat.
+  Other text the agent saw is sent as it is: read [Privacy](https://github.com/deepankar17/crewchat/blob/main/docs/privacy.md#what-the-advisor-is-shown).
+- **Engine → Advisor is gone from New agent**, with Claude Code's `--advisor` behind it. The advisor role is now the
+  one advisor: it reads the conversation too, and its questions and answers are in the chat, which Claude Code's
+  own advisor was not. An agent started with `--advisor` keeps it until it is restarted; Reopen, Switch model, Start
+  again and Reconnect start it without. `/api/launch` ignores an `advisor` field from a page loaded before.
+- **Open folder.** A button next to each of the project's folders (the side panel) and an agent's folder (its
+  settings) opens it in Finder, File Explorer or the Linux file manager, on the machine that hosts the page. Only the
+  project's connected folders there, and only for you (the owner), never one on a linked machine. A folder named like
+  an application (`Tool.app`) is revealed in Finder, never launched.
+- **Agents in your browser.** Turn the browser on for an agent (+ New agent, or its card) and it works in your own
+  Chrome, with your logins: a Jenkins build, GitHub or Firebase setup, a video or a song. Claude Code uses Claude in
+  Chrome (`--chrome`); the other tools use the Playwright MCP Bridge extension, whose token you paste once in the new
+  **Browser** panel. One agent drives at a time on each machine. A site it has not opened before asks you in Needs
+  you, and its first change on a site (a click, typing, a form) asks once for that task; trusted sites never ask.
+  A task can need the browser, and the agent holding it posts progress notes (crewchat reminds it after 5 minutes).
+  Agents never type passwords. The Browser panel shows who drives and lets the browser go, the sites, and what was
+  asked and answered.
+- **The code map reads source files up to 2 MB** (was 1 MB), so `crewchat.py` itself, now over 1 MB, is still mapped.
+- **Real OS logos** on agents' pictures when the chat spans machines, instead of an apple and a window emoji.
+- **Fixed:** joining while the server still synced with cloud sync used the code and needed a restart; it is now
+  refused before the code is used.
+
 ## 1.0.2 (2026-10-21)
 
 - **A settings file that holds crewchat's token stays private.** Refreshing an agent's hooks (at every upgrade and

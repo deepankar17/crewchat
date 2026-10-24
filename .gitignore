@@ -17,3 +17,5 @@ venv/
 /hosting/public/
 # The Firebase CLI's deploy cache
 .firebase/
+functions/agent/
+functions/venv/

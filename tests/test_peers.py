@@ -1,4 +1,6 @@
 """Linking machines over a private network: three real servers in one process, talking HTTP."""
+import argparse
+import io
 import json
 import os
 import shutil
@@ -172,6 +174,29 @@ class Linked(unittest.TestCase):
         row = next(r for r in self.a.hub.rows() if r["agent"] == agent)
         self.assertEqual((row["remote"], row["device"]), (True, "gamma"))
 
+    def test_check_everything_reaches_each_member(self):
+        self.a.projects = self.a.server.RequestHandlerClass.projects
+        checks = crewchat.link_checks(self.a.projects, deep=True)
+        reach = [c for c in checks if c["id"].startswith("reach:")]
+        self.assertEqual(len(reach), 2)
+        for c in reach:
+            self.assertIs(c["ok"], True, c)
+            self.assertRegex(c["detail"], r"\d+ ms")
+
+    def test_a_process_note_approved_on_one_machine_is_written_on_the_others(self):
+        # Roadmap L1: a note is a message, so the link carries it with no sync code of its own.
+        folder = Path(tempfile.mkdtemp(prefix="beta-folder-", dir=TMP)).resolve()
+        config = crewchat.load_config(self.b.root)
+        config["folders"] = {str(folder): "beta"}
+        crewchat.save_config(config, self.b.root)
+        self.b.hub.roster.refresh()
+        self.a.hub.propose_process(crewchat.OWNER, {"name": "peer-note", "when": "When you work on beta",
+                                                    "steps": ["Run it on beta too"], "pitfalls": ["None yet"]})
+        skill = folder / ".claude" / "skills" / "crewchat-process-peer-note" / "SKILL.md"
+        eventually(skill.exists, what="beta to write alpha's note")
+        self.assertIn("Run it on beta too", skill.read_text())
+        self.assertEqual(self.b.hub.process_rows()[0]["approved_by"], crewchat.OWNER)
+
     def test_messages_reach_every_machine_once(self):
         to = self.c.agent()
         eventually(lambda: self.a.sees(to), what="alpha to see gamma's agent")
@@ -286,6 +311,100 @@ class Linked(unittest.TestCase):
         self.assertEqual(status_of(self.c.url + "/peer/file", {"id": meta["id"]}, mesh.data["secret"],
                                    mesh.me["id"]), 404)
 
+    # A2: the asking agent's conversation goes with its question for the advisor only, on every machine ------------
+    def transcript(self):
+        config = Path(tempfile.mkdtemp(prefix="claude-config-", dir=TMP))
+        path = config / "projects" / "x" / "s.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}}]}}) + "\n")
+        return config, path
+
+    def tell_marks(self, *machines):
+        """These machines tell the others what they are (machine_info, with the marks they keep), as a server does."""
+        for m in machines:
+            m.sync.info_source = (lambda m=m: crewchat.machine_info(m.server.RequestHandlerClass.projects))
+            self.addCleanup(setattr, m.sync, "info_source", None)
+
+    def test_the_advisors_mark_travels(self):
+        config, path = self.transcript()
+        asker, advisor, other = self.a.agent(), self.b.agent(), self.b.agent()
+        self.tell_marks(*self.machines)
+        self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
+        try:
+            eventually(lambda: advisor in self.a.hub._advisors(), what="alpha to know beta's advisor")
+            eventually(lambda: not self.a.sync.older_machines(), what="alpha to hear the others keep the mark")
+            with self.a.hub.lock:
+                self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
+                question, _ = self.a.hub.ask(asker, "Is npm test enough here?", to=advisor, wait=0)
+            fid = question["files"][0]["id"]
+            got = eventually(lambda: self.b.has(question["text"]), what="beta to get the question")
+            self.assertEqual(got["files"][0]["for"], advisor)
+            self.assertIn("tool Bash: npm test", crewchat.open_shared_file(self.b.hub, fid, advisor))
+            self.assertEqual(self.b.hub.file(fid)[0]["for"], advisor)  # the fetched copy keeps its mark too
+            with self.assertRaises(crewchat.HubError) as e:
+                crewchat.open_shared_file(self.b.hub, fid, other)
+            self.assertEqual(str(e.exception), "that file is for the advisor")
+            self.assertNotIn("conversation-", crewchat.fmt(got, other))
+        finally:
+            self.b.hub.set_role(crewchat.OWNER, advisor, "none")
+
+    def test_a_machine_starting_up_is_not_taken_for_an_older_one(self):
+        # Review of the owner's decisions: a 1.1 machine answers its first pulls before it knows its own info; that
+        # "nothing yet" made the others forget what it said, as if it ran a crewchat before 1.1.
+        self.tell_marks(*self.machines)
+        eventually(lambda: not self.a.sync.older_machines(), what="alpha to hear the others keep the mark")
+        self.b.sync.info_source = None  # beta restarted: its info is not known yet
+        msg = self.b.say("all", "back, but still starting up")
+        eventually(lambda: self.a.has(msg["text"]), what="alpha to pull from beta again")
+        self.assertNotIn(self.b.sync.device_id, self.a.sync.older_machines())
+        self.assertIn("for", self.a.sync.info_of(self.b.sync.device_id)["marks"])
+
+    def test_with_an_older_machine_linked_the_question_goes_without_it(self):
+        # Review of A2: a crewchat before it drops the mark, lists the file for every agent and relays its copy.
+        config, path = self.transcript()
+        asker, advisor = self.a.agent(), self.b.agent()
+        self.tell_marks(self.a, self.b)
+        # Gamma says nothing of itself, as a crewchat before 1.1 does: its pulls carry no "info" at all (a 1.1 one that
+        # is starting up says null, which alpha keeps waiting on), so alpha hears none and forgets what gamma said.
+        self.a.sync.keep_info(self.c.sync.device_id, None)
+        self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
+        try:
+            eventually(lambda: advisor in self.a.hub._advisors(), what="alpha to know beta's advisor")
+            eventually(lambda: self.a.sync.older_machines() == [self.c.sync.device_id], what="only gamma to be older")
+            with self.a.hub.lock:
+                self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
+            with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
+                question, _ = self.a.hub.ask(asker, "Older machine about?", to=advisor, wait=0)
+            self.assertNotIn("files", question)
+            self.assertTrue(question["text"].endswith(
+                "(%s's conversation is not available: a linked machine runs an older crewchat, which would show it "
+                "to every agent. You have what %s wrote.)" % (asker, asker)), question["text"])
+        finally:
+            self.b.hub.set_role(crewchat.OWNER, advisor, "none")
+
+    def test_a_file_for_one_agent_is_not_sent_to_an_older_machine(self):
+        meta = self.a.hub.add_file("conversation-x.txt", b"for the advisor", "text/plain", meant="someone")
+        self.a.hub.send(crewchat.OWNER, "all", "a file for one agent", files=[meta])
+        mesh = peers.Mesh(self.c.root)
+
+        def ask():  # as gamma asks alpha for it (PeerSync.fetch_file): the status, as the file's bytes are no JSON
+            req = urllib.request.Request(self.a.url + "/peer/file", data=json.dumps({"id": meta["id"]}).encode(),
+                                         method="POST", headers={"Content-Type": "application/json",
+                                                                 "Authorization": "Bearer " + mesh.data["secret"],
+                                                                 "X-Crewchat-Device": mesh.me["id"]})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as answer:
+                    return answer.status
+            except urllib.error.HTTPError as e:
+                return e.code
+        eventually(lambda: "for" not in self.a.sync.info_of(mesh.me["id"])["marks"], what="gamma to say nothing")
+        self.assertEqual(ask(), 403)  # gamma has not said it keeps the mark
+        self.tell_marks(self.c)
+        eventually(lambda: "for" in self.a.sync.info_of(mesh.me["id"])["marks"], what="gamma to say it keeps it")
+        self.assertEqual(ask(), 200)
+
     def test_the_key_is_required(self):
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}, token="wrong"), 401)
         self.assertEqual(status_of(self.a.url + "/peer/pull", {"wait": 0}), 401)
@@ -322,6 +441,72 @@ class Projects(unittest.TestCase):
 
     def hub(self, machine, name):
         return machine.projects.get(name).hub
+
+    def row(self, machine, name):
+        return next((r for r in machine.sync.machines_status() if r["name"] == name), None)
+
+    def test_machines_tell_each_other_their_version_os_and_projects(self):
+        # M1/M2: the Machines panel shows each machine's version, OS and projects; they travel with each pull.
+        alpha = eventually(lambda: (self.row(self.b, "alpha") or {}).get("version") and self.row(self.b, "alpha"),
+                           what="beta to have alpha's version")
+        self.assertEqual(alpha["version"], crewchat.__version__)
+        self.assertEqual(alpha["os"], crewchat.os_name())
+        self.assertEqual(alpha["state"], "online")
+        self.assertEqual(alpha["tag"], "A")
+        names = {(p["name"], p["first"]) for p in alpha["projects"]}
+        self.assertTrue({("Demo", True), ("t2", False), ("solo", False)} <= names, names)
+        self.assertEqual(alpha["projects"][0]["first"], True)  # the first project first
+        self.assertTrue(all(p["pack"] for p in alpha["projects"]))
+        crewchat.create_project("made-later", self.a.root)
+        self.a.projects.refresh()
+        eventually(lambda: any(p["name"] == "made-later" for p in self.row(self.b, "alpha")["projects"]),
+                   what="a new project to reach beta")
+
+    def test_notes_shared_with_all_projects_reach_the_other_machines(self):
+        # L1: the reserved project's log is linked by its name, like t2, and listed nowhere.
+        for m in (self.a, self.b):
+            self.assertIsNotNone(m.projects.shared)
+            self.assertNotIn(crewchat.SHARED_PROJECT, [p.name for p in m.projects.all()])
+        self.a.hub.propose_process(crewchat.OWNER, {"name": "everywhere", "when": "In any project", "scope": "shared",
+                                                    "steps": ["Say hello"], "pitfalls": ["None yet"]})
+        eventually(lambda: any(n["name"] == "everywhere" for n in self.hub(self.b, "t2").live_processes()),
+                   what="beta's t2 to get the note alpha shared")
+        self.assertNotIn(crewchat.SHARED_PROJECT, [p["name"] for p in self.machines_op(self.b, "offered")["offered"]])
+
+    def machines_op(self, m, op, **body):
+        return post(m.url + "/api/machines", dict(body, op=op), crewchat.read_token(crewchat.OWNER, m.root))
+
+    def test_a_project_made_on_one_machine_is_offered_on_the_others(self):
+        # M2: made on alpha, offered on beta, set up there from beta's own page, and then one chat.
+        crewchat.create_project("video-app", self.a.root)
+        self.a.projects.refresh()
+        offer = eventually(lambda: next((o for o in self.machines_op(self.b, "offered")["offered"]
+                                         if o["name"] == "video-app"), None), what="beta to be offered video-app")
+        self.assertEqual(offer["machines"], ["alpha"])
+        self.assertFalse(any(o["name"] in ("t2", "Demo") for o in crewchat.offered(self.b.projects)))  # it has those
+        made = self.machines_op(self.b, "setup-project", name="video-app")
+        self.assertEqual(made["name"], "video-app")
+        self.b.projects.refresh()
+        for m in (self.a, self.b):
+            eventually(lambda: any("now shared" in x["text"] for x in self.hub(m, "video-app").messages),
+                       what="%s's video-app to say it is shared" % m.name)
+        self.assertFalse(any(o["name"] == "video-app" for o in crewchat.offered(self.b.projects)))
+
+    def test_dismissed_is_not_offered_again(self):
+        crewchat.create_project("not-here", self.a.root)
+        self.a.projects.refresh()
+        eventually(lambda: any(o["name"] == "not-here" for o in crewchat.offered(self.b.projects)),
+                   what="beta to be offered not-here")
+        self.machines_op(self.b, "dismiss", name="not-here")
+        self.assertFalse(any(o["name"] == "not-here" for o in crewchat.offered(self.b.projects)))
+        self.assertIn("not-here", crewchat.load_config(self.b.root)["dismissed_projects"])
+
+    def test_an_older_member_shows_without_info(self):
+        mid = next(i for i, m in self.a.sync.mesh.members().items() if m["name"] == "beta")
+        member = self.a.sync.mesh.members()[mid]
+        self.a.sync._apply(mid, member, {"agents": []})  # what a crewchat before 1.1 answers: no info
+        row = self.row(self.a, "beta")
+        self.assertEqual((row["version"], row["projects"]), ("", []))
 
     def test_a_project_with_the_same_name_is_one_chat(self):
         a2, b2 = self.hub(self.a, "t2"), self.hub(self.b, "t2")
@@ -544,6 +729,9 @@ class SharingEdges(unittest.TestCase):
             def unshare(self, name):
                 self.projects.pop(name, None)
 
+            def info_changed(self):
+                pass
+
         projects = Fake()
         projects.primary = Fake()
         projects.primary.name = "first"
@@ -576,6 +764,146 @@ class SharingEdges(unittest.TestCase):
         crewchat.create_project("two", root)
         os.utime(str(folder), ns=(before, before))  # as a one-second clock would leave it
         self.assertIsNotNone(found.get("two"))
+
+
+class FromThePage(unittest.TestCase):
+    """M1: machines are linked from the chat page (/api/machines), with the commands' own code."""
+
+    def setUp(self):
+        self.machines = []
+
+    def tearDown(self):
+        for m in self.machines:
+            m.stop()
+
+    def machine(self, name):
+        m = Machine(name)
+        config = crewchat.load_config(m.root)
+        config["url"] = m.url  # its address for the others (in real use: tailscale serve's)
+        crewchat.save_config(config, m.root)
+        m.owner = crewchat.read_token(crewchat.OWNER, m.root)
+        m.projects = m.server.RequestHandlerClass.projects
+        self.machines.append(m)
+        return m
+
+    def op(self, m, op, **body):
+        if op in ("peer-invite", "peer-join"):
+            body.setdefault("name", m.name)
+        return post(m.url + "/api/machines", dict(body, op=op), m.owner)
+
+    def test_join_and_invite_from_the_page(self):
+        a, b = self.machine("alpha"), self.machine("beta")
+        self.assertEqual(self.op(a, "status")["via"], "none")
+        invite = self.op(a, "peer-invite")
+        self.assertTrue(invite["command"].startswith("crewchat peers join %s " % a.url), invite)
+        self.assertGreater(invite["expires"], time.time() + 60)
+        joined = self.op(b, "peer-join", text=invite["command"] + "\n")
+        self.assertEqual(joined["members"], ["alpha"])
+        a.sync, b.sync = a.hub.sync, b.hub.sync
+        for m, other in ((a, "beta"), (b, "alpha")):
+            eventually(lambda: [(r["name"], r["state"]) for r in self.op(m, "status")["machines"]] == [(other, "online")],
+                       what="%s's panel to show %s online" % (m.name, other))
+        self.assertEqual(self.op(a, "status")["via"], "tailscale")
+        self.assertTrue(crewchat.load_config(b.root).get("peers"))  # it stays linked after a restart
+        beta = self.op(a, "status")["machines"][0]["id"]
+        self.op(a, "peer-remove", id=beta)
+        eventually(lambda: self.op(a, "status")["machines"] == [], what="beta to be gone from alpha's panel")
+
+    def test_join_refuses_while_cloud_sync_runs_before_using_the_code(self):
+        a, b = self.machine("alpha"), self.machine("beta")
+        command = self.op(a, "peer-invite")["command"]
+        b.hub.sync = crewchat.ProjectLink()  # a running link of another kind (cloud sync, in the owner's test)
+        b.hub.sync._init_projects(b.hub, None)
+        b.hub.sync.stopping = lambda: False
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            self.op(b, "peer-join", text=command)
+        self.assertIn("cloud sync", json.loads(e.exception.read().decode())["error"])
+        b.hub.sync = None
+        self.assertFalse(peers.Mesh(b.root).exists)
+        c = self.machine("gamma")
+        self.assertEqual(self.op(c, "peer-join", text=command)["members"], ["alpha"])  # the code was not used
+        c.sync = c.hub.sync
+        a.sync = a.hub.sync
+
+    def test_linking_keeps_a_setting_changed_meanwhile(self):
+        # Release review (C2): invite, join and leave held a copy of config.json across a network call and wrote it
+        # back, dropping what was saved meanwhile (a site the owner allowed).
+        a, b = self.machine("alpha"), self.machine("beta")
+
+        def address(config, given=None, root=None):
+            crewchat.Roster(root).update("browser_sites", lambda old: {"ci.example.com": "allowed"})
+            return crewchat.load_config(root)["url"]
+        with mock.patch.object(peers, "my_address", side_effect=address):
+            command = self.op(a, "peer-invite")["command"]
+            self.op(b, "peer-join", text=command)
+        a.sync, b.sync = a.hub.sync, b.hub.sync
+        for m in (a, b):
+            config = crewchat.load_config(m.root)
+            self.assertEqual((config.get("peers"), config.get("browser_sites")), (True, {"ci.example.com": "allowed"}))
+        real = crewchat.load_config
+
+        writer, me = [], threading.current_thread()
+
+        def load(root=None):  # the server's other request saves a setting while the leave is under way
+            config = real(root)
+            if root == b.root and not writer and threading.current_thread() is me:
+                writer.append(threading.Thread(target=lambda: crewchat.Roster(b.root).update(
+                    "browser_sites", lambda old: {"git.example.com": "trusted"})))
+                writer[0].start()
+                writer[0].join(0.3)
+            return config
+        with mock.patch.object(crewchat, "load_config", load):
+            peers.leave_here(b.hub, b.root)
+        writer[0].join(5)
+        b.sync = None
+        config = crewchat.load_config(b.root)
+        self.assertEqual((config.get("peers"), config.get("browser_sites")), (False, {"git.example.com": "trusted"}))
+
+    def test_two_invites_at_once_start_one_link(self):
+        # Release review (E2): each saw no link yet, and each made one: the second took the first's place.
+        a = self.machine("alpha")
+        real = peers.my_address
+
+        def slow(*args, **kwargs):
+            time.sleep(0.3)
+            return real(*args, **kwargs)
+        with mock.patch.object(peers, "my_address", side_effect=slow), \
+                mock.patch.object(peers.Mesh, "found", autospec=True, side_effect=peers.Mesh.found) as founded, \
+                mock.patch.object(peers, "start", wraps=peers.start) as started:
+            errors = []
+
+            def invite():
+                try:
+                    peers.invite_here(a.hub, a.root, "alpha")
+                except Exception as e:  # two at once wrote the same file
+                    errors.append(e)
+            threads = [threading.Thread(target=invite) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(10)
+        a.sync = a.hub.sync
+        self.assertEqual((errors, founded.call_count, started.call_count), ([], 1, 1))
+
+    def test_a_pasted_join_command_is_read(self):
+        url, code = "https://deepankars-mac-mini.tailb8516f.ts.net:8443", "E25F-4GVJ"
+        for text in ("crewchat peers join %s %s" % (url, code), "%s %s" % (url, code),
+                     "crewchat peers join %s %s\r\n" % (url, code), "  `crewchat peers join %s %s`  " % (url, code),
+                     'crewchat peers join "%s" "%s"' % (url, code)):
+            self.assertEqual(peers.parse_join(text), (url, code), text)
+        for bad in ("", "hello", "crewchat peers join", "E25F-4GVJ"):
+            with self.assertRaises(peers.PeerError):
+                peers.parse_join(bad)
+
+    def test_the_command_line_uses_the_same_code(self):
+        a = self.machine("alpha")
+        with mock.patch.object(crewchat, "home", return_value=a.root), mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(crewchat, "owner_call", side_effect=lambda path, body: post(a.url + path, body, a.owner)):
+            out = io.StringIO()
+            with mock.patch("sys.stdout", out):
+                peers.cmd_peers(argparse.Namespace(action="invite", target=None, code=None, name="alpha", url=None))
+        self.assertIn("crewchat peers join %s " % a.url, out.getvalue())
+        a.sync = a.hub.sync
 
 
 class OfflineAndRemoval(unittest.TestCase):
@@ -914,7 +1242,7 @@ class Setup(unittest.TestCase):
         serve = {"TCP": {"443": {"HTTPS": True}},
                  "Web": {"box.tail.ts.net:443": {"Handlers": {"/": {"Proxy": "http://127.0.0.1:8765"}}}}}
 
-        def fake_run(command):
+        def fake_run(command, timeout=None):
             calls.append(command)
             out = {"status": {"BackendState": "Running", "Self": {"DNSName": "box.tail.ts.net."}}, "serve": serve}
             kind = "serve" if command[1] == "serve" and command[2] == "status" else "status"
@@ -931,6 +1259,57 @@ class Setup(unittest.TestCase):
             self.assertIn(["tailscale", "serve", "--bg", "--https=8443", "http://127.0.0.1:8766"], calls)
         finally:
             crewchat.run, crewchat.find_tailscale = old
+
+    def test_serve_not_enabled_says_where_to_enable_it(self):
+        # Release review (E1): with Serve not enabled on the tailnet, `tailscale serve --bg` prints where to enable it
+        # and waits there for good; an invite from the page waited with it.
+        enable = "https://login.tailscale.com/f/serve?node=nABC123"
+
+        def fake_run(command, timeout=None):
+            self.assertIsNotNone(timeout, command)  # it would wait for good
+            if command[1:3] == ["serve", "--bg"]:
+                raise crewchat.subprocess.TimeoutExpired(command, timeout, output="Serve is not enabled on your tailnet.\n"
+                                                      "To enable, visit:\n\n         %s\n" % enable)
+            out = {"BackendState": "Running", "Self": {"DNSName": "box.tail.ts.net."}} if command[1] == "status" else {}
+            return type("R", (), {"returncode": 0, "stdout": json.dumps(out), "stderr": ""})()
+        with mock.patch.object(crewchat, "run", fake_run), mock.patch.object(crewchat, "find_tailscale", lambda: "tailscale"):
+            url, why = peers.tailscale_address(8765)
+            self.assertIsNone(url)
+            self.assertIn(enable, why)
+            checks = peers.tailscale_checks(8765)
+        self.assertTrue(checks[1]["ok"])
+
+
+class LinkInfo(unittest.TestCase):
+    def setUp(self):
+        self.a = Machine("solo").found()
+        self.addCleanup(self.a.stop)
+
+    def test_this_machines_info_is_made_once_until_it_changes(self):
+        # Release review (C7): every wakeup of every waiting pull made the info again, under the hub's lock.
+        sync, made = self.a.sync, []
+        sync.info_source = lambda: made.append(1) or {"version": crewchat.__version__, "projects": []}
+        first = sync._pull({"since": self.a.hub.next_seq, "wait": 0})
+        t = threading.Thread(target=lambda: sync._pull({"since": self.a.hub.next_seq, "wait": 1, "v": first["v"]}))
+        t.start()
+        for _ in range(10):
+            time.sleep(0.05)
+            with self.a.hub.lock:
+                self.a.hub.lock.notify_all()
+        t.join(5)
+        self.assertEqual(len(made), 1)
+        sync.info_changed()
+        sync._pull({"since": self.a.hub.next_seq, "wait": 0})
+        self.assertEqual(len(made), 2)
+
+    def test_the_panel_and_the_command_line_say_the_same(self):
+        # Release review (C8): the Machines panel and `crewchat peers status` each worked out a machine's state.
+        b = Machine("other").join(self.a)
+        self.addCleanup(b.stop)
+        with mock.patch.object(peers.PeerSync, "state_of", return_value="offline"):
+            self.assertEqual({r["state"] for r in self.a.sync.machines_status()}, {"offline"})
+            states = peers.admin(self.a.hub, self.a.root, "peers-status", {})["members"]
+            self.assertEqual({v["state"] for v in states.values()}, {"offline"})
 
 
 def tearDownModule():

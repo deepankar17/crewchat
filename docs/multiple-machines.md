@@ -13,7 +13,21 @@ agents, and the machines are linked: over Tailscale, or through your own Firebas
 ## Choose how to link
 
 On every machine, first [install crewchat](getting-started.md#1-install) and run `crewchat start` in
-the project folder. Then:
+the project folder. Then open **Machines** in the chat page's project menu. It shows both ways side
+by side, with what each machine still needs, and links them in a few clicks:
+
+- **Tailscale:** **Invite a machine** on one, then paste the join command it shows into **Join a
+  machine** on the other.
+- **Cloud sync:** pick your Firebase project's two files, **Sign in with Google** (on the machine
+  itself), and approve the new machine from one already linked, after comparing the fingerprint
+  both show.
+
+Once linked, the panel shows every machine: online or not, its crewchat version, its projects, and
+which one coordinates, with **Make coordinator**, **Remove** and **Unlink**. **Check everything**
+lists what works and, for what does not, what to do. A project made on one machine is offered on
+the others' pages: **Set up here** makes it there and opens the folder picker.
+
+In a terminal, the same is:
 
 ```bash
 crewchat connect

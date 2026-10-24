@@ -46,13 +46,14 @@ named, how machines stay in step, and where everything is kept.
 | `hub_rename` | Change its own name |
 | `hub_profile` | Set its picture and colour on the chat page |
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
-| `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done) |
+| `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done). The advisor also gets the asking agent's conversation as a file only it can open ([Teams](teams.md#the-advisor)) |
 | `hub_answer` | The advisor answers a question; for a task, with a verdict: approve or changes |
+| `hub_process` | Process notes ([Teams](teams.md#process-notes)): `propose` one after working something out the hard way (when to use it, steps, commands, pitfalls, the areas it touches), `update` it (a new version, saying what changed), `list`, `get` or `find` notes; the lead's also `approve`, `decline` and `retire` |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
 | `hub_code` | The lead and the advisor only: who changed a file, for which task and what was said about it (`history`), or a task's files in groups that hang together, to hand out one per agent (`split`). Needs the code map (edit tracking on) |
 
-The descriptions agents load are short (about 7,000 characters for all of them); the lead and the
-advisor get `hub_code` too (about 660 more), and a session given one of those roles is told its tool
+The descriptions agents load are short (about 7,600 characters for all of them, `hub_process` under
+600 of it); the lead and the advisor get `hub_code` too (about 660 more), and a session given one of those roles is told its tool
 list changed (MCP's `list_changed`), so it loads it. How to use the tools is in the project guide
 crewchat writes into each folder (a Claude Code skill, a Cursor rule, an `AGENTS.md` section).
 
@@ -144,6 +145,8 @@ key; that key carries the name, role and first task you chose.
   open it with `hub_file`. Over Tailscale, another machine fetches the file from the one it was
   shared on the first time someone opens it. With cloud sync, a file up to 5 MB (`cloud_file_mb`)
   travels with its message, encrypted, and is deleted with it; a bigger one stays on its machine.
+  One kind of file is for one agent only: the conversation attached to a question for the advisor (it carries a
+  `for` mark, which every machine honours).
 
 ![Sharing a screenshot. 1: You paste a screenshot and send it. 2: Over Tailscale, only the message and the file's id sync to the laptop. 3: The agent asks for the file. 4: The laptop fetches it from the macbook, once. 5: The file comes over. 6: The agent sees the image itself. 7: With cloud sync, a file up to 5 MB travels with its message, encrypted.](images/diagram-files.gif)
 
@@ -244,7 +247,8 @@ In each connected project folder, for each tool connected there:
 And for every agent: the guide as a Claude Code skill (`.claude/skills/crewchat/`) and a Cursor rule
 (`.cursor/rules/crewchat.mdc`), a section of `AGENTS.md` if the folder has one, the project's shared
 skills in `.claude/skills/`, the project brief (`.claude/skills/crewchat-brief/`,
-`.cursor/rules/crewchat-brief.mdc`) with edit tracking on, `.crewchat-listen` if you changed how
+`.cursor/rules/crewchat-brief.mdc`) with edit tracking on, the approved process notes
+(`.claude/skills/crewchat-process-NAME/`, `.cursor/rules/crewchat-process-NAME.mdc`), `.crewchat-listen` if you changed how
 long agents wait, and `.crewchat-hooks` if you turned the hooks off. All are kept out of git
 through the repository's local exclude list. A Gemini CLI, Qwen Code or OpenCode settings file the
 repository has committed is left alone: the token would go into a commit.

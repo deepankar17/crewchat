@@ -416,6 +416,20 @@ class Signatures(Sample):
 
 
 @unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs git and a POSIX shell")
+class PrivateMap(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "file modes")
+    def test_the_map_of_a_project_is_this_users_only(self):
+        # Argus scan: the map holds the project's code; one an older version left readable by others is tightened.
+        folder = Path(tempfile.mkdtemp(prefix="private-map-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        path = folder / "maps" / "map.sqlite"
+        path.parent.mkdir()
+        path.write_bytes(b"")
+        os.chmod(path, 0o644)
+        crewchat_map.CodeMap(path, folder).close()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
 class PlantedGitConfig(unittest.TestCase):
     """An agent that may edit files but not run commands could write a command into .git/config: the map's own git
     calls, which run by themselves every 30 s, must never run it."""

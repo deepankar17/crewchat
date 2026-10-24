@@ -125,8 +125,17 @@ jobs:
             sleep 10
           done
           echo "PyPI here does not list ${TAG#v} after 10 minutes"; exit 1
+      # The README pipes install.sh into sh. Here it is downloaded first and run only if it is
+      # byte for byte the install.sh of the commit this run is for (the release's tag, or main).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: source
       - name: The README's command
-        run: curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+        run: |
+          curl -LsSf -o "$RUNNER_TEMP/install.sh" https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh
+          want=$(shasum -a 256 source/install.sh | cut -d' ' -f1)
+          echo "$want  $RUNNER_TEMP/install.sh" | shasum -a 256 -c -
+          sh "$RUNNER_TEMP/install.sh"
       - name: A first chat
         run: |
           export PATH="$HOME/.local/bin:$PATH"

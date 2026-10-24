@@ -25,7 +25,7 @@ import hmac
 import json
 import re
 import secrets
-import socket
+import subprocess
 import sys
 import threading
 import time
@@ -64,14 +64,6 @@ class PeerError(Exception):
 
 def log(text):
     sys.stderr.write("%s peers: %s\n" % (crewchat.now_iso(), text))
-
-
-def machine_name():
-    try:
-        host = socket.gethostname()
-    except OSError:
-        host = "machine"
-    return crewchat.place_label(host.split(".")[0])
 
 
 def clean_url(url):
@@ -352,6 +344,45 @@ class PeerSync(crewchat.ProjectLink):
                            for mid, m in members.items() if mid != self.device_id), key=lambda m: m["name"].lower())
         return {"via": "tailscale", "me": self.mesh.me.get("name", ""), "machines": machines}
 
+    def info_changed(self):
+        super().info_changed()  # made again when next asked for
+        with self.hub.lock:  # pulls waiting here look again: their answer carries the new info
+            self.hub.lock.notify_all()
+
+    def state_of(self, mid, now):
+        """A member's link: offline (its last pulls failed), online (heard from lately) or connecting. The Machines
+        panel and `crewchat peers status` both say it so."""
+        remote = self.hub.remote.get(mid)
+        if self.failures.get(mid, 0) >= OFFLINE_AFTER:
+            return "offline"
+        return "online" if remote and now - remote["updated"] < PULL_WAIT * 3 else "connecting"
+
+    def machines_status(self):
+        members, now = self.mesh.members(), time.time()
+        try:
+            coordinator = self.coordinator()["id"]
+        except Exception:  # a link stopping: nobody coordinates
+            coordinator = ""
+        rows = []
+        for mid, m in members.items():
+            remote = self.hub.remote.get(mid) or {}
+            state = self.state_of(mid, now)
+            rows.append(dict(self.info_of(mid), id=mid, name=m.get("name", ""), tag=m.get("tag", ""), state=state,
+                             seen=float(remote.get("updated") or 0), coordinator=mid == coordinator,
+                             address=m.get("url", "")))
+        return sorted(rows, key=lambda r: r["name"].lower())
+
+    def reach(self, mid, timeout=5):
+        """Ask a member's server whether it answers, now: (ok, milliseconds, why not)."""
+        member = self.mesh.members().get(mid) or {}
+        started = time.time()
+        try:
+            with urllib.request.urlopen(clean_url(member.get("url")) + "/health", timeout=timeout) as answer:
+                answer.read()
+            return True, int((time.time() - started) * 1000), ""
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return False, int((time.time() - started) * 1000), str(getattr(e, "reason", e))
+
     def reachable(self, mid):
         """Is this member answering: it has a puller and its last pulls worked (the chat page's dot)."""
         return mid in self.threads and self.failures.get(mid, 0) < OFFLINE_AFTER
@@ -404,7 +435,12 @@ class PeerSync(crewchat.ProjectLink):
         return self.stopped.is_set()
 
     def _project_link(self, hub, name):
-        return PeerSync(hub, self.mesh, self.log, chat=name)
+        link = PeerSync(hub, self.mesh, self.log, chat=name)
+        link.machine = self
+        return link
+
+    def linked_ids(self):
+        return [mid for mid in self.mesh.members() if mid != self.device_id]
 
     def _member_joined(self, mid, name):
         """A machine joined the link (by code, by its own request, or heard of from another member):
@@ -627,6 +663,8 @@ class PeerSync(crewchat.ProjectLink):
                     self.mesh.save()
         for gone in removed:
             self.hub.drop_remote(gone)
+        if self.chat is None and not ("info" in out and out["info"] is None):  # null: not known there yet
+            self.keep_info(mid, out.get("info"))
         self._settle(out.get("decisions"))
         if "decided" in out:  # an older crewchat sends no number: it sends all its decisions each time
             try:
@@ -706,10 +744,13 @@ class PeerSync(crewchat.ProjectLink):
             meta, local = self.hub.file(str(body.get("id") or ""))
             with self.hub.lock:  # only files shared here: a member never relays another's
                 ours = meta is not None and any(
-                    m.get("origin") == self.device_id and any(f["id"] == meta["id"] for f in m.get("files") or [])
+                    m.get("origin") == self.device_id and any(f.get("id") == meta["id"] for f in m.get("files") or [])
                     for m in self.hub.messages)
             if not ours:
                 return 404, {"error": "no such file here"}
+            if crewchat.file_for(self.hub, meta["id"]) is not None and "for" not in (
+                    self.machine.info_of(device).get("marks") or []):  # it would show it to every agent (A2)
+                return 403, {"error": crewchat.FOR_THE_ADVISOR}
             return 200, local.read_bytes()
         if path == "/peer/claim":
             task = crewchat.clean_id(body.get("id", ""))
@@ -799,7 +840,8 @@ class PeerSync(crewchat.ProjectLink):
                 while True:
                     own = [m for m in hub.messages[hub._after(since):] if m.get("origin") == self.device_id]
                     agents = hub.local_state()
-                    key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock")])
+                    info = self.my_info()
+                    key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock"), info])
                     if own or key != known or time.time() >= deadline or self.stopped.is_set():
                         break
                     hub.lock.wait(timeout=max(0.0, deadline - time.time()))
@@ -807,9 +849,11 @@ class PeerSync(crewchat.ProjectLink):
             # More than memory holds was written while this pull waited: its first ones are in the log only.
             older = self._older(since) if own else []
         if older:
-            own, agents, key = older, hub.local_state(), ""  # "" : the roster comes again with the next pull
+            own, agents, key, info = older, hub.local_state(), "", self.my_info()  # "": the roster comes again next pull
         out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
                "preferred": self.mesh.data.get("preferred")}
+        if self.chat is None:  # this machine's version, OS and projects (M1, M2): the machine's link only; null while
+            out["info"] = info  # it is not known yet (an older crewchat sends no "info" at all)
         try:
             after = int(body.get("decided"))
         except (TypeError, ValueError):  # an older crewchat asks for none: all of them, as it expects
@@ -871,6 +915,12 @@ def admin(hub, root, op, data):
             raise PeerError("this server still syncs through the cloud: `crewchat cloud logout` takes effect when it "
                             "restarts. Run `crewchat restart`, then join again; the code still works.")
         return {"ok": True}
+    if op == "peers-invite":
+        return invite_here(hub, root, data.get("name"), data.get("url"))
+    if op == "peers-join":
+        return join_here(hub, root, data.get("target"), data.get("code"), data.get("name"), data.get("url"))
+    if op == "peers-leave":
+        return leave_here(hub, root)
     if op == "peers-start":
         if sync is None:
             if hub.sync is not None:
@@ -882,16 +932,8 @@ def admin(hub, root, op, data):
     if op == "peer-invite":
         return {"code": sync.new_invite()}
     if op == "peers-status":
-        now, states = time.time(), {}
-        for mid in sync.mesh.members():
-            remote = hub.remote.get(mid)
-            if sync.failures.get(mid, 0) >= OFFLINE_AFTER:
-                states[mid] = {"state": "offline"}
-            elif remote and now - remote["updated"] < PULL_WAIT * 3:
-                states[mid] = {"state": "online"}
-            else:
-                states[mid] = {"state": "connecting"}
-        return {"members": states}
+        now = time.time()
+        return {"members": {mid: {"state": sync.state_of(mid, now)} for mid in sync.mesh.members()}}
     if op == "peer-remove":
         told, missed = sync.remove(str(data.get("id") or ""))
         return {"told": told, "missed": missed}
@@ -926,41 +968,89 @@ def start(hub, root=None):
     return sync
 
 
-def tailscale_address(port):
-    """This machine's https address on the tailnet for the local server, setting up
-    `tailscale serve` for it if needed. Returns (url, None) or (None, why not)."""
-    exe = crewchat.find_tailscale()
-    if not exe:
-        return None, "Tailscale is not installed (https://tailscale.com/download)"
-    try:
-        status = json.loads(crewchat.run([exe, "status", "--json"]).stdout or "{}")
-        host = (status.get("Self") or {}).get("DNSName", "").rstrip(".")
-    except (OSError, ValueError):
-        host = ""
-    if not host or status.get("BackendState") not in (None, "Running"):
-        return None, "Tailscale is not signed in on this machine"
-    try:
-        serve = json.loads(crewchat.run([exe, "serve", "status", "--json"]).stdout or "{}")
-    except (OSError, ValueError):
-        serve = {}
+def served_url(serve, port):
+    """The https address `tailscale serve` already gives the local server on this port, or "" (from
+    `tailscale serve status --json`)."""
     targets = ("http://127.0.0.1:%d" % port, "http://localhost:%d" % port, "127.0.0.1:%d" % port,
                "localhost:%d" % port, "%d" % port)
     for site, conf in (serve.get("Web") or {}).items():
         proxy = ((conf.get("Handlers") or {}).get("/") or {}).get("Proxy", "")
         if proxy.rstrip("/") in targets:
             name, _, https = site.rpartition(":")
-            return "https://%s%s" % (name, "" if https == "443" else ":" + https), None
+            return "https://%s%s" % (name, "" if https == "443" else ":" + https)
+    return ""
+
+
+TAILSCALE_WAIT = 20  # seconds a tailscale command may take: asked from the page, it must not wait for good
+
+
+def _tailscale_json(exe, *args):
+    """What `tailscale <args> --json` answers, or {} when it cannot be run, read, or does not answer in time."""
+    try:
+        return json.loads(crewchat.run([exe, *args, "--json"], timeout=TAILSCALE_WAIT).stdout or "{}")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def tailscale_checks(port):
+    """Is Tailscale ready for crewchat here: installed, connected, signed in, serving crewchat's port? Checks
+    for the Machines panel (M1), each {id, ok, title, detail, fix}; ok None when it cannot be known yet."""
+    check = crewchat.check_item
+    exe = crewchat.find_tailscale()
+    if not exe:
+        return [check("tailscale-installed", False, "Tailscale is installed",
+                      fix="Install Tailscale from https://tailscale.com/download and sign in to the same account on "
+                          "every machine")]
+    out = [check("tailscale-installed", True, "Tailscale is installed", exe)]
+    status = _tailscale_json(exe, "status")
+    state = str(status.get("BackendState") or "")
+    running = state == "Running"
+    out.append(check("tailscale-running", running, "Tailscale is connected", state or "no answer",
+                     "Sign in: click the Tailscale icon (menu bar or tray) and Log in" if state == "NeedsLogin" else
+                     "Click Connect in the Tailscale menu (menu bar or tray), or run `tailscale up`"))
+    host = str((status.get("Self") or {}).get("DNSName") or "").rstrip(".")
+    out.append(check("tailscale-signed-in", bool(host) if running else None, "Signed in, with a name on the tailnet",
+                     host, "Sign in to Tailscale with the account your other machines use"))
+    served = served_url(_tailscale_json(exe, "serve", "status"), port) if running else ""
+    out.append(check("tailscale-serve", bool(served) if running else None, "Tailscale Serve gives crewchat an address",
+                     served, "Invite a machine from this panel: it sets up Serve for crewchat's port (Tailscale may "
+                             "ask you, in the browser, to allow Serve)"))
+    return out
+
+
+def tailscale_address(port):
+    """This machine's https address on the tailnet for the local server, setting up
+    `tailscale serve` for it if needed. Returns (url, None) or (None, why not)."""
+    exe = crewchat.find_tailscale()
+    if not exe:
+        return None, "Tailscale is not installed (https://tailscale.com/download)"
+    status = _tailscale_json(exe, "status")
+    host = (status.get("Self") or {}).get("DNSName", "").rstrip(".")
+    if not host or status.get("BackendState") not in (None, "Running"):
+        return None, "Tailscale is not signed in on this machine"
+    serve = _tailscale_json(exe, "serve", "status")
+    served = served_url(serve, port)
+    if served:
+        return served, None
     used = set((serve.get("TCP") or {}).keys())
     https = next((p for p in ("443", "8443", "10000", "4443") if p not in used), None)
     if https is None:
         return None, "Tailscale's https ports 443, 8443, 10000 and 4443 are all in use here"
-    out = crewchat.run([exe, "serve", "--bg", "--https=%s" % https, "http://127.0.0.1:%d" % port])
+    try:
+        out = crewchat.run([exe, "serve", "--bg", "--https=%s" % https, "http://127.0.0.1:%d" % port],
+                           timeout=TAILSCALE_WAIT)
+    except subprocess.TimeoutExpired as e:  # Serve not enabled on the tailnet: it says where, and waits for good
+        said = "%s %s" % (e.stdout or "", e.stderr or "")
+        said = said.decode("utf-8", "replace") if isinstance(said, bytes) else said
+        enable = re.search(r"https://login\.tailscale\.com/\S+", said)
+        return None, ("Tailscale Serve is not enabled on your tailnet: allow it at %s, then try again" % enable.group(0)
+                      if enable else "`tailscale serve` did not answer in %d seconds" % TAILSCALE_WAIT)
     if out.returncode != 0:
         return None, ("`tailscale serve` did not start: %s" % (out.stderr.strip() or out.stdout.strip()))
     return "https://%s%s" % (host, "" if https == "443" else ":" + https), None
 
 
-def my_address(config, given=None):
+def my_address(config, given=None, root=None):
     """The address other members use to reach this machine, saved in config.json."""
     url = clean_url(given or config.get("url"))
     if not url:
@@ -970,7 +1060,7 @@ def my_address(config, given=None):
                             "https://<this machine's private address>." % why)
     if url != config.get("url"):
         config["url"] = url
-        crewchat.save_config(config)
+        crewchat.change_config(lambda saved: saved.update(url=url), root)
     return url
 
 
@@ -994,17 +1084,103 @@ def ready_to_link():
         raise PeerError("cannot reach the server here (%s); the code still works" % getattr(e, "reason", e))
 
 
-def turn_on(config):
-    """Mark peers on and start them in the running server (no restart needed)."""
-    if config.get("cloud"):
-        raise PeerError("this machine uses cloud sync; a machine syncs one way. Turn it off first with "
-                        "`crewchat cloud logout`")
-    config["peers"] = True
-    crewchat.save_config(config)
-    if crewchat.server_up(config):
-        server_call("peers-start")
-    else:
-        raise PeerError("the server is not running here; start it with `crewchat start` or `crewchat serve`")
+OTHER_WAY = ("this machine syncs with cloud sync; a machine syncs one way. Unlink it from cloud sync first: "
+             "Unlink in the Machines panel, or `crewchat cloud logout` and then `crewchat restart`")
+JOIN_RE = re.compile(r"(https?://[^\s\"'`]+)[\"'`]?\s+[\"'`]?([A-Za-z0-9]{4}-?[A-Za-z0-9]{4})(?![A-Za-z0-9])")
+
+
+def parse_join(text):
+    """The address and the code in a pasted join command (`crewchat peers join URL CODE`, or `URL CODE`)."""
+    found = JOIN_RE.search(str(text or ""))
+    if not found:
+        raise PeerError("paste the whole join command the other machine shows: crewchat peers join ADDRESS CODE")
+    return clean_url(found.group(1)), found.group(2)
+
+
+def other_way(hub, config):
+    """Does this machine sync another way (cloud sync), in its settings or in the running server?"""
+    return bool(config.get("cloud")) or (hub.sync is not None and not isinstance(hub.sync, PeerSync))
+
+
+LINK_LOCK = threading.Lock()  # one invite, join or leave at a time: two at once would each make a link
+
+
+def linked_setting(root, on):
+    """config.json's "peers" (the link starts again after a restart), saved as config.json is now (CONFIG_LOCK)."""
+    crewchat.change_config(lambda config: config.update(peers=on), root)
+
+
+def invite_here(hub, root, name=None, url=None):
+    """In the server: start the chat between machines if need be, and make a join code for another machine.
+    For `crewchat peers invite` and the Machines panel alike."""
+    with LINK_LOCK:
+        return _invite_here(hub, root, name, url)
+
+
+def _invite_here(hub, root, name, url):
+    config = crewchat.load_config(root)
+    if other_way(hub, config):
+        raise PeerError(OTHER_WAY)
+    mesh = Mesh(root)
+    if not mesh.exists:
+        mesh.found(name or crewchat.machine_name(), my_address(config, url, root))
+    linked_setting(root, True)
+    sync = hub.sync if isinstance(hub.sync, PeerSync) else start(hub, root)
+    code = sync.new_invite()
+    return {"command": "crewchat peers join %s %s-%s" % (sync.mesh.me["url"], code[:4], code[4:]),
+            "code": code, "expires": time.time() + INVITE_TTL, "me": sync.mesh.me["name"]}
+
+
+def join_here(hub, root, target, code, name=None, url=None):
+    """In the server: join the machines another one invited this one to. Everything that can fail here is
+    checked before the code is used: the other machine counts this one in as soon as it is."""
+    with LINK_LOCK:
+        return _join_here(hub, root, target, code, name, url)
+
+
+def _join_here(hub, root, target, code, name, url):
+    config, mesh = crewchat.load_config(root), Mesh(root)
+    if mesh.exists:
+        raise PeerError("this machine is already linked (as %s). To move it, leave first" % mesh.me["name"])
+    if not target or not code:
+        raise PeerError("usage: crewchat peers join URL CODE (from `crewchat peers invite` on a member)")
+    if other_way(hub, config):
+        raise PeerError(OTHER_WAY)
+    url = my_address(config, url, root)
+    target = clean_url(target)
+    body = json.dumps({"code": code, "device": {"name": name or crewchat.machine_name(), "url": url}})
+    req = urllib.request.Request(target + "/peer/join", data=body.encode("utf-8"), method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as answer:
+            out = json.loads(answer.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            reason = json.loads(e.read().decode("utf-8")).get("error")
+        except ValueError:
+            reason = None
+        raise PeerError(reason or "%s refused (HTTP %d)" % (target, e.code))
+    except (urllib.error.URLError, OSError) as e:
+        raise PeerError("cannot reach %s (%s). Is that machine on, with Tailscale connected?"
+                        % (target, getattr(e, "reason", e)))
+    you = out["you"]
+    mesh.adopt(out, {"id": you["id"], "name": you["name"], "tag": you["tag"], "url": url})
+    linked_setting(root, True)
+    start(hub, root)
+    return {"joined": you["name"], "tag": you["tag"], "members": sorted(m["name"] for m in mesh.members().values())}
+
+
+def leave_here(hub, root):
+    """In the server: take this machine out of the chat between machines (the others are told if one can be
+    reached), and forget it. Its own chat carries on."""
+    with LINK_LOCK:
+        mesh = Mesh(root)
+        if not mesh.exists:
+            raise PeerError("this machine is not linked to other machines")
+        told = admin(hub, root, "peer-leave", {})["told"] if isinstance(hub.sync, PeerSync) else []
+        mesh.path.unlink()
+        linked_setting(root, False)
+        return {"told": told, "me": mesh.me["name"]}
 
 
 # --------------------------------------------------------------------------------------------
@@ -1025,57 +1201,32 @@ def _cmd_peers(args):
     mesh = Mesh(root)
     action = args.action
 
+    if action in ("invite", "join") and not crewchat.server_up(config):
+        # Before a code is made or used: the other machine would count this one in, and it could not start.
+        raise PeerError("the server is not running here. Start it with `crewchat start` in your project "
+                        "folder, then run this again%s." % ("; the code still works" if action == "join" else ""))
     if action == "invite":
-        if not mesh.exists:
-            url = my_address(config, args.url)
-            mesh.found(args.name or machine_name(), url)
-            print("Started a chat between your machines, with this one (%s) as the first member." % mesh.me["name"])
-        turn_on(config)
-        code = server_call("peer-invite")["code"]
+        first = not mesh.exists
+        out = server_call("peers-invite", name=args.name, url=args.url)
+        if first:
+            print("Started a chat between your machines, with this one (%s) as the first member." % out["me"])
         print("On the other machine, after installing crewchat and running `crewchat start` in its project")
         print("folder, run this within %d minutes (the code works once):" % (INVITE_TTL // 60))
         print()
-        print("  crewchat peers join %s %s-%s" % (mesh.me["url"], code[:4], code[4:]))
+        print("  " + out["command"])
         print()
         print("Both machines must be signed in to the same Tailscale account (or private network).")
 
     elif action == "join":
-        if mesh.exists:
-            raise PeerError("this machine is already linked (as %s). To move it, run `crewchat peers leave` first"
-                            % mesh.me["name"])
         if not args.target or not args.code:
             raise PeerError("usage: crewchat peers join URL CODE (from `crewchat peers invite` on a member)")
         if config.get("cloud"):
             raise PeerError("this machine uses cloud sync; a machine syncs one way. Turn it off first with "
                             "`crewchat cloud logout`")
-        if not crewchat.server_up(config):
-            # Before the code is used: the other machine would count this one in, and it could not start.
-            raise PeerError("the server is not running here. Start it with `crewchat start` in your project "
-                            "folder, then run this again; the code still works.")
-        ready_to_link()
-        url = my_address(config, args.url)
-        target = clean_url(args.target)
-        body = json.dumps({"code": args.code, "device": {"name": args.name or machine_name(), "url": url}})
-        req = urllib.request.Request(target + "/peer/join", data=body.encode("utf-8"), method="POST",
-                                     headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=30) as answer:
-                out = json.loads(answer.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            try:
-                reason = json.loads(e.read().decode("utf-8")).get("error")
-            except ValueError:
-                reason = None
-            raise PeerError(reason or "%s refused (HTTP %d)" % (target, e.code))
-        except (urllib.error.URLError, OSError) as e:
-            raise PeerError("cannot reach %s (%s). Is that machine on, with Tailscale connected?"
-                            % (target, getattr(e, "reason", e)))
-        you = out["you"]
-        mesh.adopt(out, {"id": you["id"], "name": you["name"], "tag": you["tag"], "url": url})
-        turn_on(config)
-        others = ", ".join(m["name"] for m in mesh.members().values())
-        print("This machine joined as \"%s\". Its agents now share the chat with: %s." % (you["name"], others))
-        print("Messages written here are numbered %s1, %s2, ..." % (you["tag"], you["tag"]))
+        ready_to_link()  # a server still running cloud sync says so before the code is used (join_here checks too)
+        out = server_call("peers-join", target=args.target, code=args.code, name=args.name, url=args.url)
+        print("This machine joined as \"%s\". Its agents now share the chat with: %s." % (out["joined"], ", ".join(out["members"])))
+        print("Messages written here are numbered %s1, %s2, ..." % (out["tag"], out["tag"]))
 
     elif action == "status":
         if not mesh.exists:

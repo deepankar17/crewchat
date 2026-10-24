@@ -174,6 +174,15 @@ picture to change it. Its name is a field: click it, type, Enter. ✕ or Esc clo
 panel on the right is for the project: its rules, skills and machines, its roles (**⋯**), its
 tasks, and **Commands**.
 
+**Open folder**, next to the agent's folder in its settings and next to each of the project's
+folders in the side panel (**⋯**, Rules, skills and machines), opens that folder in Finder, File
+Explorer or your Linux file manager, on the machine that hosts the page (not the phone or laptop
+you are browsing from). Only the project's connected folders on that machine can be opened, and
+only by you; an agent on another machine has no button. On macOS a folder named as a package
+(`Tool.app`, a bundle) is revealed in Finder (`open -R`), never launched; any other folder opens in
+Finder (`open -a Finder`). On Windows Explorer is run from `C:\Windows`, not found by name. On Linux
+it uses `xdg-open`, and says "no desktop to open it on" when the host has no display.
+
 An agent whose last conversation crewchat did not record (one that joined before crewchat kept
 track of sessions) has **Start again** instead of **Reopen**: a new session opens in a Terminal
 window in its folder and checks in as the same agent, with its name, role, picture and tasks.
@@ -271,6 +280,20 @@ also when it is closed: on a computer, and on a phone with the app on its home s
 from iOS 16.4) when the page is reached at an `https` address ([Your phone](phone.md)). Nothing
 from the chat goes through the browser's push service: the push only wakes the page's service
 worker, which fetches what is new from your computer.
+
+### Agents in your browser
+
+An agent can work in your own Chrome, where you are logged in. Turn it on in **+ New agent** (Use the browser) or on
+the agent's card (Browser: Turn on).
+
+- **Claude Code** uses [Claude in Chrome](https://claude.com/chrome): install the extension and sign in. crewchat
+  starts the agent with `--chrome` (Claude Code 2.0.73 or later).
+- **Every other tool** uses the Playwright MCP Bridge extension for Chrome. Install it, copy the token it shows, and
+  paste it in **Browser** (the project menu), then Save. crewchat adds a `browser` MCP server to each connected
+  folder's settings for those tools; Remove takes it out again.
+
+The first time an agent opens a site, or changes something on one, you are asked in Needs you. See
+[Agents in your browser](teams.md#agents-in-your-browser).
 
 ## 5. Share screenshots and files
 
@@ -447,7 +470,10 @@ machine: an older one does not know reclaims and keeps showing the old holder.
   review pass rate and today's tokens.
 - **Tasks**, flowing from posted to done, with how long they take; **the day, agent by agent** (working,
   waiting for messages, idle); **machines** and their agents; **tokens and cost** per agent and per task,
-  and the cost per day; a **code heat map** of the files agents edit, coloured by who edits each most; and
+  and the cost per day; a **code heat map** of the files agents edit, coloured by who edits each most; **what the
+  crew has learned**: [process notes](teams.md#process-notes) recorded, approved and used per week, the most used,
+  and the tasks done with a note against the others (median time, tokens and turns: an estimate, since tasks
+  differ); and
   **the code, by who holds it**: the project's files in their folders, each coloured by the agent whose task
   covers it, with the imports between them (folders only past 500 files: click one to open it;
   [the code map](code-map.md)).

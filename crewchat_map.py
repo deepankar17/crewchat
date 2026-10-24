@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 MAX_FILES = 20000  # read at most this many source files of one repository
-MAX_FILE_BYTES = 1024 * 1024  # bigger source files are skipped (generated, minified)
+MAX_FILE_BYTES = 2 * 1024 * 1024  # bigger source files are skipped (generated, minified); crewchat.py is over 1 MB
 MAX_GUESSES = 3  # a name defined in more files than this is not linked at all
 CERTAIN, GUESS = 2, 1  # how two areas are linked (CodeMap.link)
 MAX_GRAPH_FILES = 3000  # files C8's view is sent at most
@@ -600,6 +600,9 @@ class CodeMap:
         self.path, self.top, self.repo, self.branch = Path(path), Path(top), repo, branch
         self.lock = threading.RLock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.close(os.open(str(self.path), os.O_WRONLY | os.O_CREAT, 0o600))  # the project's code: this user's only
+        if os.name != "nt":
+            os.chmod(str(self.path), 0o600)  # one an older crewchat made readable by others too
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         # Derived data, built again when lost (docs/storage.md): no waiting on the disk at each commit, which
         # costs most of a one-file update on Windows.
@@ -608,8 +611,9 @@ class CodeMap:
         self.db.executescript(SCHEMA)
         if self.meta("version") != MAP_VERSION or self.meta("parser", parser_name()) != parser_name():
             # Made by another version, or with other readers (the map extra came or went): build it again.
-            for table in ("nodes", "edges", "refs", "files", "signatures", "meta"):
-                self.db.execute("DELETE FROM %s" % table)
+            for statement in ("DELETE FROM nodes", "DELETE FROM edges", "DELETE FROM refs", "DELETE FROM files",
+                              "DELETE FROM signatures", "DELETE FROM meta"):
+                self.db.execute(statement)
             self._set_meta("version", MAP_VERSION)
             self._set_meta("parser", parser_name())
             self.db.commit()
@@ -727,8 +731,9 @@ class CodeMap:
             chunk = ids[start:start + 400]
             marks = ",".join("?" * len(chunk))
             self.db.execute("DELETE FROM edges WHERE src IN (%s) OR dst IN (%s)" % (marks, marks), chunk + chunk)
-        for table in ("nodes", "refs", "files", "signatures"):
-            self.db.execute("DELETE FROM %s WHERE path = ?" % table, (rel,))
+        for statement in ("DELETE FROM nodes WHERE path = ?", "DELETE FROM refs WHERE path = ?",
+                          "DELETE FROM files WHERE path = ?", "DELETE FROM signatures WHERE path = ?"):
+            self.db.execute(statement, (rel,))
 
     def signatures(self, rel):
         """name -> parameters of each function, method and class of a Python file, as last read."""

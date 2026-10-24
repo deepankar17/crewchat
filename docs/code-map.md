@@ -48,7 +48,7 @@ map of the code: each file, the classes and functions in it, and which file impo
 - **JavaScript and TypeScript** (`.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`), React and Angular;
 - **Angular templates** (`.html`): which components a template uses.
 
-It skips folders such as `node_modules`, `build`, `dist` and `.venv`, files over 1 MB (generated or
+It skips folders such as `node_modules`, `build`, `dist` and `.venv`, files over 2 MB (generated or
 minified code), and stops at 20,000 source files.
 
 Ask it from a terminal:

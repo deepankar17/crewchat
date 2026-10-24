@@ -1,4 +1,5 @@
 """One machine: setup, agents joining, messages, tasks, roles, files, listening, restarts."""
+import datetime
 import json
 import re
 import threading
@@ -468,6 +469,77 @@ class Files(unittest.TestCase):
         self.assertEqual(self.m.owner.upload("ok.bin", b"y" * (20 * 1024 * 1024), "application/octet-stream")["size"],
                          20 * 1024 * 1024)
         self.assertFalse(list((self.m.home / "files").glob("*/big.txt")))
+
+
+class Advisor(unittest.TestCase):
+    """A2: the advisor reads what the asking agent did, through the hooks the agent really runs."""
+
+    def setUp(self):
+        self.m = H.Machine("advisor")
+        self.m.start()
+
+    def tearDown(self):
+        self.m.stop()
+
+    def record(self, when, role, part):
+        return json.dumps({"type": role, "timestamp": when.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+                           "message": {"role": role, "content": [part]}}) + "\n"
+
+    def test_the_advisor_reads_what_the_agent_did(self):
+        asker, advisor, other = self.m.agent(), self.m.agent(), self.m.agent()
+        for a in (asker, advisor, other):
+            a.link()
+        self.m.owner.role(advisor.name, "advisor")
+        # Claude Code keeps the transcript under its config folder: the machine's home, as its hooks see it.
+        transcript = self.m.dir / "user-home" / ".claude" / "projects" / "notes-app" / (asker.session + ".jsonl")
+        transcript.parent.mkdir(parents=True)
+        long_ago = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        transcript.write_text(self.record(long_ago, "assistant", {"type": "tool_use", "name": "Bash",
+                                                                  "input": {"command": "rm -rf an-old-job"}}))
+        asker.stop_hook(extra={"transcript_path": str(transcript)})  # the hook says where its conversation is
+        tid = self.m.owner.task(asker.name, "make the unit tests pass")
+        asker.call("hub_task", action="take", id=tid)
+        later = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=30)
+        with open(str(transcript), "a") as f:
+            f.write(self.record(later, "assistant", {"type": "tool_use", "name": "Bash",
+                                                     "input": {"command": "./gradlew test"}}))
+            f.write(self.record(later, "user", {"type": "tool_result", "content": "BUILD FAILED\nsecret=sk-abcdefghijklmnopqrstuvwx"}))
+        asked = {}
+        thread = threading.Thread(target=lambda: asked.update(text=asker.call(
+            "hub_ask", question="Is gradlew test enough?", to=advisor.name)))
+        thread.start()
+        failed = True
+        try:
+            shown = eventually(lambda: advisor.stop_hook() or None, what="the advisor to be shown the question")
+            self.assertIn("Is gradlew test enough?", shown)
+            found = re.search(r"\[file (\w+): conversation-%s\.txt" % re.escape(asker.name), shown)
+            self.assertTrue(found, shown)  # the question brings its conversation
+            file_id = found.group(1)
+            conversation = advisor.call("hub_file", id=file_id)
+            self.assertIn("./gradlew test", conversation)
+            self.assertIn("BUILD FAILED", conversation)
+            self.assertIn("since taking task #%s" % tid, conversation)
+            self.assertNotIn("an-old-job", conversation)  # before the task
+            self.assertNotIn("sk-abcdefgh", conversation)  # a secret-looking token is replaced where it stands
+            self.assertIn("secret=[secret left out]", conversation)
+            with self.assertRaises(ToolError) as refused:  # it is for the advisor only
+                other.call("hub_file", id=file_id)
+            self.assertIn("that file is for the advisor", str(refused.exception))
+            self.assertNotIn("conversation-%s.txt" % asker.name, other.call("hub_history"))
+            status, body, _ = H.request(self.m.url + "/files/%s/conversation-%s.txt" % (file_id, asker.name),
+                                        opener=self.m.owner.opener)
+            self.assertEqual(status, 200)  # the owner may open it from the page
+            self.assertIn(b"./gradlew test", body)
+            failed = False
+        finally:
+            try:  # answer the question, so the asker's wait ends
+                ask = eventually(lambda: self.m.owner.find(kind="ask"), what="the question in the chat")
+                advisor.call("hub_answer", id=ask["id"], text="Run the whole suite.")
+            except Exception:
+                if not failed:  # else the failure above is the one to report, not this one
+                    raise
+            thread.join(30)
+        self.assertIn("Run the whole suite.", asked.get("text", ""))
 
 
 class Restarts(unittest.TestCase):

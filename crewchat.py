@@ -29,6 +29,8 @@ See README.md for the full guide.
 """
 import argparse
 import base64
+import collections
+import datetime
 import functools
 import gzip
 import hashlib
@@ -41,6 +43,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -96,8 +99,27 @@ MAX_LISTEN = 55 * 60
 CREATE_NO_WINDOW = 0x08000000
 HIDDEN = {"creationflags": CREATE_NO_WINDOW} if os.name == "nt" else {}
 SAVE_DELAY = 1.0  # seconds state.json may lag behind read positions, status lines and presence (Hub._save_soon)
+MACHINES_FILE = "machines.json"  # what each linked machine last said of its version and marks (rebuildable, local)
 USAGE_FILE = "usage.json"  # the agents' token counts by day, and each task's (X4): out of state.json, which is
 # rewritten on nearly every call, and written only when they change
+BROWSER_NOTE_EVERY = 5 * 60  # seconds at the browser without a progress note before the agent is reminded (B3)
+# The tools whose after-tool hook can add to the agent's turn, and that hook's event name.
+CONTEXT_EVENTS = {"claude": "PostToolUse", "codex": "PostToolUse", "qwen": "PostToolUse", "gemini": "AfterTool"}
+BROWSER_IDLE = 10 * 60  # seconds without a browser call after which its driver lets it go (B2)
+
+
+def browser_idle(holder, now):
+    """Whether the browser's driver has let it go: no browser call for BROWSER_IDLE, and none waiting on the owner."""
+    return now - holder["last"] > BROWSER_IDLE and not holder.get("asking")
+BROWSER = {}  # this machine's browser: "holder" -> {hub, agent, task, since, last, project} (one Chrome, every project)
+BROWSER_LOCK = threading.Lock()
+SERVING_PORTS = set()  # the ports this process's servers listen on (make_server): crewchat's own page (Hub.own_page)
+BROWSER_LOG = collections.deque(maxlen=200)  # what agents opened and what the owner was asked (memory only, B4)
+
+
+def browser_log(project, agent, what, decision):
+    with BROWSER_LOCK:
+        BROWSER_LOG.append({"ts": time.time(), "project": project, "agent": agent, "what": what, "decision": decision})
 PERMISSION_WAIT = 10 * 60  # how long a permission prompt waits for Allow or Deny on the page (then: the agent's own)
 MAX_PERMISSION_TEXT = 2000  # of what the agent asks to run or change, shown with Allow and Deny
 DEFAULT_LISTEN = 30 * 60  # how long a Claude Code agent waits for messages after a turn, unless set
@@ -113,12 +135,14 @@ ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at mo
 DOING_EVERY = 4  # ... and what it is doing, when that changed, at most this often (seconds)
 DOING_FRESH = 120  # seconds the page shows what an agent was doing
 DOING_WAKE = 8  # a new "doing" wakes the chat pages at most this often per agent (seconds)
+HOOK_PLACE_KEPT = 600  # seconds a link key's hooks' word on where its conversation is waits for hub_link (A2)
+MAX_HOOK_PLACES = 512  # link keys whose conversation place is kept so (the oldest go first)
 SERVICE_LABEL = "io.crewchat.hub"
 SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app does), name it %s."
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed", "settled")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed", "settled", "browser", "process")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -138,6 +162,9 @@ You are the team lead. Your job is to plan and coordinate, not to write most of 
   with hub_send: what was done, what is left, anything the owner must decide.
 - Splitting code work: hub_code split id=<task> gives groups of files that hang together, one per agent;
   hub_code history path=<file> says who changed it, for which task, and what was said about it.
+- Process notes: agents propose them with hub_process. Read each one (hub_process get) and approve it
+  or decline it; ones that need Owner go to Owner. After a hard task (blocked, sent back, slow), ask its
+  agent for a note if it worked out something others will need.
 - Tell Owner early if something is unclear or risky. Do not invent requirements."""),
     "developer": ("Developer", """\
 You are a developer.
@@ -164,8 +191,12 @@ You are the advisor: the other agents ask you before they commit to an approach,
 keeps coming back, and before they say a task is done.
 - Questions come as messages marked [QUESTION]. Answer each one with hub_answer and its id: short
   and concrete, most important first, with the reason. The asker waits for you, so answer soon.
-- You see only what the asker sends you. If it is not enough to judge, say what you need in your
-  answer rather than guessing; read the files it names if they are on your machine.
+- When crewchat can read the asker's conversation, its question comes with the part since it took
+  its task as a file, conversation-<agent>.txt (hub_file opens it): read it before you judge. It is
+  for you and the owner only, and the chat shows your answer to everyone, so do not repeat from it
+  anything private. Otherwise you have only what the asker sends. If that is not enough to judge,
+  say what you need in your answer rather than guessing; read the files it names if they are on
+  your machine.
 - A question about a task (it names one) is a check before done: set verdict approve when the
   work is ready, or changes with what is missing. Be honest; a wrong approve costs more than a delay.
 - hub_code history path=<file> says who changed a file, for which task, and what was said about it.
@@ -205,6 +236,8 @@ Your job is to plan and hand out the work, not to do most of it yourself.
   hub_task assign right away. Nobody should sit idle while there is work. If nothing is left, tell Owner.
 - When everything is done, check the result and report to Owner with hub_send: what was done,
   what is left, anything the owner must decide.
+- Process notes: agents propose them with hub_process. Read each one (hub_process get) and approve it
+  or decline it. After a hard task (blocked, sent back, slow), ask its agent for one.
 - Tell Owner early if something is unclear or risky. Do not invent requirements."""
 
 GENERAL_MEMBER = """
@@ -705,21 +738,21 @@ their owner, who reads it on a chat page and writes as Owner.
   call hub_link with a key, do it once. If your owner names you, use hub_rename.
 - Always answer the owner in the chat (hub_send to Owner or all), even in one line: Owner reads
   the chat page, not your session.
-- Tasks are one tool, hub_task, by action: view (show next, mine or all), add, take, assign (the
-  lead's), update (in_progress, blocked, review, done, or todo to give it back, with a note).
-  The project guide has the details.
+- Tasks: hub_task, by action: view (next, mine or all), add, take, assign (the lead's), update
+  (in_progress, blocked, review, done; todo gives it back). The project guide has the details.
 - Before you work on a task (taken, assigned or addressed to you), first hub_task update it to
-  in_progress with one line on your plan. Then report blocked, review and done the same way.
+  in_progress with one line on your plan; report blocked, review and done the same way.
 - An open [TASK] is the owner's. With a [lead] in the chat, leave it to the lead. Otherwise reply
   to all "BID #<id>: yes" or "no" with one line of why, read the other bids, and take it if you
   are best placed; if someone has it, stop. A task addressed only to you is yours.
 - Nothing to do? hub_task view, and take the top one. Work you find: hub_task add.
+- Worked something out the hard way? Record it with hub_process propose; stuck, hub_process find.
 - If you get a role, follow it (hub_role shows it again); take one only when the owner says so.
 - Hooks hand you new messages after each turn; also check hub_inbox when you start and finish,
-  and again while it says there is more.
+  and while it says there is more.
 - Use hub_send when someone needs to know: you will touch their files, changed what they
-  depend on, found a bug in their work, or have a question. Keep it short: no replies just to
-  acknowledge, and no secrets."""
+  depend on, found a bug in their work, or have a question. Keep it short: no mere
+  acknowledgements, no secrets."""
 
 
 def home():
@@ -814,6 +847,15 @@ def place_label(text):
         cut = word[:17].rfind("-")
         word = word[:cut] if cut >= 3 else word[:16].strip("-")
     return word
+
+
+def machine_name():
+    """This machine's short name, from its host name ("machine" if it has none to give)."""
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = "machine"
+    return place_label(host.split(".")[0])
 
 
 def load_config(root=None):
@@ -945,7 +987,7 @@ def roles_listing(config, packs, table):
 
 def save_roles_change(root, data):
     """change_roles on a project's config.json, saved (a new pack in the machine's config.json)."""
-    with ROLES_LOCK:
+    with ROLES_LOCK, CONFIG_LOCK:  # (CONFIG_LOCK: other settings saved meanwhile are not lost)
         config = load_config(root)
         answer, effects = change_roles(config, data, role_packs())
         if "saved_pack" in effects:
@@ -1065,8 +1107,25 @@ def change_roles(config, data, packs):
     return answer, {"changed": True}
 
 
+# os.open's files in binary mode on Windows, where a file opened without it is in text mode: Python's own newline
+# translation then doubles every line end (\r\r\n), and a byte 10 in an image becomes 13 10.
+O_BINARY = getattr(os, "O_BINARY", 0)
+CONFIG_LOCK = threading.RLock()  # a change to a config.json, read and written whole: one at a time in this process
+
+
 def save_config(config, root=None):
-    write_json((root or home()) / "config.json", config)
+    path = (root or home()) / "config.json"
+    write_json(path, config, private=True)  # the project's settings, and the bridge's token when there is one
+
+
+def change_config(change, root=None):
+    """change(config) on a config.json, read and written whole one change at a time (CONFIG_LOCK), so a change made
+    meanwhile is never written over with an old copy. Not written when change returns False. Returns the config."""
+    with CONFIG_LOCK:
+        config = load_config(root)
+        if change(config) is not False:
+            save_config(config, root)
+    return config
 
 
 def token_path(name, root=None):
@@ -1080,7 +1139,7 @@ def ensure_token(name, root=None):
     if path.exists():
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    fd = os.open(str(path), O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(secrets.token_urlsafe(32) + "\n")
     return True
@@ -1124,6 +1183,22 @@ class Roster:
             except OSError:
                 out.append(None)
         return tuple(out)
+
+    def set(self, key, value):
+        """Set one of the project's settings (None: back to its default), and read them again."""
+        self.update(key, lambda old: value)
+
+    def update(self, key, change):
+        """Set a project setting to change(its value now), the read and the write one change at a time (CONFIG_LOCK):
+        two at once (the owner allowing a site while an agent's Allow does) would lose one."""
+        def apply(config):
+            value = change(config.get(key))
+            if value is None:
+                config.pop(key, None)
+            else:
+                config[key] = value
+        change_config(apply, self.root)
+        self.refresh(force=True)
 
     def refresh(self, force=False):
         """Read the settings and tokens again if they changed on disk (or force: a change was just
@@ -1178,8 +1253,21 @@ def list_projects(base=None):
         name = str(load_config(base)["project"])
         out.append({"id": project_id(name), "name": name, "root": base, "chat": ""})
     for path in project_folders(base / PROJECTS_DIR):
-        out.append({"id": path.name, "name": str(load_config(path)["project"]), "root": path, "chat": path.name})
+        config = load_config(path)
+        if not config.get("reserved"):  # the shared notes' project (L1) is crewchat's, never one of the owner's
+            out.append({"id": path.name, "name": str(config["project"]), "root": path, "chat": path.name})
     return out
+
+
+def ensure_shared_project(base=None):
+    """The reserved project whose log holds the process notes the owner shares with all projects (L1): made on every
+    machine, so its log links with the others' like any project's (by its name). Nobody connects folders to it, and
+    it is listed nowhere. Returns its folder."""
+    base = Path(base) if base else home()
+    for path in project_folders(base / PROJECTS_DIR):
+        if load_config(path).get("reserved") == "processes":
+            return path
+    return create_project(SHARED_PROJECT, base, reserved="processes")["root"]
 
 
 def project_folders(folder):
@@ -1196,9 +1284,9 @@ def find_chat(text, base=None):
     return next((p for p in list_projects(base) if want in (p["id"], p["name"].lower())), None)
 
 
-def create_project(name, base=None, pack=DEFAULT_PACK):
+def create_project(name, base=None, pack=DEFAULT_PACK, reserved=""):
     """A new, empty project called name, its roles from pack, in projects/<id>/. Returns its
-    list_projects() entry."""
+    list_projects() entry ({root} only for a reserved one, which list_projects leaves out)."""
     base = Path(base) if base else home()
     folder = base / PROJECTS_DIR
     folder.mkdir(parents=True, exist_ok=True)
@@ -1220,7 +1308,8 @@ def create_project(name, base=None, pack=DEFAULT_PACK):
     try:
         (temp / "tokens").mkdir()
         save_config(dict({"project": str(name), "forget_hours": FORGET_HOURS},
-                         **({"pack": pack} if pack != DEFAULT_PACK else {})), temp)
+                         **({"pack": pack} if pack != DEFAULT_PACK else {}), **({"reserved": reserved} if reserved else {})),
+                    temp)
         if os.name != "nt":
             os.chmod(temp, 0o700)
             os.chmod(temp / "tokens", 0o700)
@@ -1237,6 +1326,8 @@ def create_project(name, base=None, pack=DEFAULT_PACK):
     except BaseException:
         shutil.rmtree(str(temp), ignore_errors=True)
         raise
+    if reserved:
+        return {"id": pid, "root": folder / pid}
     return next(p for p in list_projects(base) if p["id"] == pid)
 
 
@@ -1332,8 +1423,14 @@ class Projects:
 
     def __init__(self, root=None):
         self.base = Path(root) if root else home()
+        if (self.base / "config.json").exists():
+            try:
+                ensure_shared_project(self.base)
+            except OSError as e:  # shared notes wait; everything else works
+                sys.stderr.write("%s could not make the shared notes' project: %s\n" % (now_iso(), e))
         self.primary = Project(self.base, primary=True)
-        self.others = {}
+        self.others = {}  # the reserved project too (it links like the others), but listed() leaves it out
+        self.shared = None  # the reserved project: the process notes shared with all projects (L1)
         self._stamp = None
         self.lock = threading.Lock()
         self.on_change = None  # called after projects appear or go (cmd_serve: their links follow)
@@ -1364,13 +1461,39 @@ class Projects:
             names = {p.name for p in found}
             for gone in [k for k in self.others if k not in names]:
                 del self.others[gone]  # its folder was removed: its tokens stop working
+            self.shared = next((p for p in self.others.values() if p.roster.config.get("reserved") == "processes"), None)
+            for project in [self.primary] + list(self.others.values()):
+                project.hub.shared_hub = self._shared_hub
+                project.hub.on_published = self._shared_published
+            if self.shared is not None:
+                self.shared.hub.on_processes = self._shared_changed
             self._stamp = stamp
         if self.on_change is not None:
             self.on_change(self)
 
     def all(self):
         self.refresh()
-        return [self.primary] + [self.others[k] for k in sorted(self.others)]
+        return self.listed()
+
+    def listed(self):
+        """The projects as last read, without reading the folder again (not the reserved one; under the lock: a link's
+        threads ask while a refresh may change them)."""
+        with self.lock:
+            return [self.primary] + [self.others[k] for k in sorted(self.others) if self.others[k] is not self.shared]
+
+    def _shared_hub(self):
+        return self.shared.hub if self.shared is not None else None
+
+    def _shared_published(self, note):
+        """A note shared with all projects was approved on this machine: each project's agents working in its areas
+        hear of it (L4)."""
+        for project in self.listed():
+            project.hub.tell_note_holders(note)
+
+    def _shared_changed(self):
+        """A shared note became live or went: it is in every project's folders."""
+        for project in self.listed():
+            project.hub.refresh_guides()
 
     def get(self, pid):
         """The project with this id (the first one for None or ""), or None."""
@@ -1477,6 +1600,630 @@ def usage_tokens(by_model):
     return sum(sum(counts) for counts in by_model.values())
 
 
+# --- The agent's conversation, read from its tool's own files (A2) ---------------------------------------------------
+# An entry is (time as epoch seconds or None, who, text): who is "user", "agent", "tool NAME" (text: what it was given,
+# as JSON for a tool that takes named arguments) or "result". Each reader turns one record of a tool's JSONL into the
+# entries it holds, oldest first; a record it does not know gives [].
+
+EXCERPT_BYTES = 40 * 1024  # of the conversation the advisor is shown
+MAX_CONVERSATION_SCAN = 32 * 1024 * 1024  # of a file, read from its end, before giving up on finding more entries
+NOT_AVAILABLE = "(%s's conversation is not available: %s. You have what %s wrote.)"  # added to a question without it
+FOR_THE_ADVISOR = "that file is for the advisor"  # hub_file, for anyone but the agent a file is for (and the owner)
+OLDER_MACHINE = "a linked machine runs an older crewchat, which would show it to every agent"
+MARKS = ["for"]  # the marks on a message's files this crewchat keeps and honours, as it tells linked machines
+
+
+class ConversationUnavailable(Exception):
+    """The conversation cannot be read at all; `reason` says why, in words the advisor can be told."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
+
+
+_TIME_RE = re.compile(r"(\d{4}-\d\d-\d\d)[T ](\d\d:\d\d:\d\d)(?:\.(\d+))?(Z|[+-]\d\d:?\d\d)?")
+
+
+def conversation_time(value):
+    """An ISO 8601 time as epoch seconds (UTC when it names no zone), else None. Python 3.9's fromisoformat takes
+    neither a trailing Z nor fractions of other lengths than 3 or 6 digits, so the text is put in one form first."""
+    found = _TIME_RE.fullmatch(value) if isinstance(value, str) else None
+    if not found:
+        return None
+    day, clock, fraction, zone = found.groups()
+    zone = "+00:00" if zone in (None, "Z") else (zone if ":" in zone else zone[:3] + ":" + zone[3:])
+    try:
+        return datetime.datetime.fromisoformat("%sT%s.%s%s" % (day, clock, (fraction or "")[:6].ljust(6, "0"), zone)).timestamp()
+    except ValueError:
+        return None
+
+
+def _call_text(arguments):
+    """What a tool was given, as one line of JSON (keys in order), or the text itself when it is text."""
+    if isinstance(arguments, str):
+        return arguments
+    if arguments is None:
+        return ""
+    try:
+        return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return ""
+
+
+def _result_text(value):
+    """A tool result as text: a string, the text parts of a list (Claude Code's), a dict's output, else its JSON."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(t for t in (_result_text(p.get("text") if isinstance(p, dict) else p) for p in value) if t)
+    if isinstance(value, dict):
+        for key in ("output", "text"):
+            if isinstance(value.get(key), str) and len(value) == 1:
+                return value[key]
+    return "" if value is None else _call_text(value)
+
+
+def _role(role):
+    """Who a message's role is (a role that is not text is no one)."""
+    return {"user": "user", "assistant": "agent"}.get(role) if isinstance(role, str) else None
+
+
+def _call_who(name):
+    return "tool " + (str(name)[:60] if name else "?")
+
+
+def _claude_entries(record):
+    """Claude Code: type user/assistant, message.content a string or parts text, thinking (left out), tool_use and
+    tool_result."""
+    message = record.get("message")
+    if record.get("type") not in ("user", "assistant") or not isinstance(message, dict):
+        return []
+    when, who = conversation_time(record.get("timestamp")), "agent" if record["type"] == "assistant" else "user"
+    return _content_entries(when, who, message.get("content"))
+
+
+def _content_entries(when, who, content, results=True):
+    """The entries of a message's content (Claude Code's and Cursor's): a string, or parts text, tool_use and, when
+    `results`, tool_result."""
+    if isinstance(content, str):
+        return [(when, who, content)] if content else []
+    out = []
+    for part in content if isinstance(content, list) else []:
+        kind = part.get("type") if isinstance(part, dict) else None
+        if kind == "text" and isinstance(part.get("text"), str) and part["text"]:
+            out.append((when, who, part["text"]))
+        elif kind == "tool_use":
+            out.append((when, _call_who(part.get("name")), _call_text(part.get("input"))))
+        elif kind == "tool_result" and results:
+            result = _result_text(part.get("content"))
+            if result:
+                out.append((when, "result", result))
+    return out
+
+
+def _codex_entries(record):
+    """Codex: a rollout line {timestamp, type, payload}; of the response_item payloads, messages, tool calls and what
+    they gave back are kept, reasoning is left out."""
+    payload = record.get("payload")
+    if record.get("type") != "response_item" or not isinstance(payload, dict):
+        return []
+    when, kind = conversation_time(record.get("timestamp")), payload.get("type")
+    if kind == "message":
+        who = _role(payload.get("role"))
+        text = _parts_text(payload.get("content") if isinstance(payload.get("content"), list) else [])
+        return [(when, who, text)] if who and text else []
+    if kind == "function_call":
+        arguments = payload.get("arguments")
+        try:  # a JSON string of named arguments: put in the same form as the other tools' (sorted keys)
+            arguments = json.loads(arguments) if isinstance(arguments, str) else arguments
+        except ValueError:
+            pass
+        return [(when, _call_who(payload.get("name")), _call_text(arguments))]
+    if kind == "custom_tool_call":
+        return [(when, _call_who(payload.get("name")), _call_text(payload.get("input")))]
+    if kind == "local_shell_call":
+        return [(when, _call_who("local_shell"), _call_text(payload.get("action")))]
+    result = _result_text(payload.get("output")) if kind in ("function_call_output", "custom_tool_call_output") else ""
+    return [(when, "result", result)] if result else []
+
+
+def _qwen_entries(record):
+    """Qwen Code: type user/assistant/tool_result (system left out), message.parts with text (a thought: true one is
+    left out), functionCall{name,args} and functionResponse{response}."""
+    message = record.get("message")
+    if record.get("type") not in ("user", "assistant", "tool_result") or not isinstance(message, dict):
+        return []
+    when, who = conversation_time(record.get("timestamp")), "agent" if record["type"] == "assistant" else "user"
+    out = []
+    for part in message.get("parts") if isinstance(message.get("parts"), list) else []:
+        if not isinstance(part, dict):
+            continue
+        call, response = part.get("functionCall"), part.get("functionResponse")
+        if isinstance(call, dict):
+            out.append((when, _call_who(call.get("name")), _call_text(call.get("args"))))
+        elif isinstance(response, dict):
+            result = _result_text(response.get("response"))
+            if result:
+                out.append((when, "result", result))
+        elif isinstance(part.get("text"), str) and part["text"] and not part.get("thought"):
+            out.append((when, who, part["text"]))
+    return out
+
+
+def _cursor_entries(record):
+    """Cursor's agent transcript: {role, message: {content: parts text and tool_use}}. No times, no results."""
+    message = record.get("message")
+    who = _role(record.get("role"))
+    if not who or not isinstance(message, dict):
+        return []
+    return _content_entries(None, who, message.get("content"), results=False)
+
+
+CONVERSATION_READERS = {"claude": _claude_entries, "codex": _codex_entries, "qwen": _qwen_entries,
+                        "cursor": _cursor_entries}  # tool -> its reader of one JSONL record
+
+
+def _parts_text(content):
+    """A message's content as text: a string, or the text of its parts (a list of them, or one)."""
+    if isinstance(content, str):
+        return content
+    parts = content if isinstance(content, list) else [content]
+    return "\n".join(p["text"] for p in parts if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"])
+
+
+def _gemini_result(call):
+    """What a Gemini tool call gave back: the response of its functionResponse parts, else resultDisplay."""
+    result, texts = call.get("result"), []
+    for part in result if isinstance(result, list) else [result]:
+        response = part.get("functionResponse") if isinstance(part, dict) else None
+        text = _result_text(response.get("response") if isinstance(response, dict) else part)
+        if text:
+            texts.append(text)
+    if not texts and isinstance(call.get("resultDisplay"), str):
+        texts.append(call["resultDisplay"])
+    return "\n".join(texts)
+
+
+def _gemini_patch(messages, patch):
+    """One single patch of a Gemini `$patch` (as Gemini CLI applies it): of the message with its id, if there is one,
+    `content` (when given) is replaced, and on a gemini message with toolCalls, each tool call named by id in the
+    patch's toolCalls gets the `result` the patch has for it. Nothing else is merged."""
+    if not isinstance(patch, dict) or not isinstance(patch.get("id"), str):
+        return
+    target = next((m for m in messages if m.get("id") == patch["id"]), None)
+    if target is None:
+        return
+    if patch.get("content") is not None:
+        target["content"] = patch["content"]
+    if isinstance(patch.get("toolCalls"), list) and target.get("type") == "gemini" and isinstance(target.get("toolCalls"), list):
+        for new in patch["toolCalls"]:
+            if not isinstance(new, dict) or "result" not in new:
+                continue
+            for call in target["toolCalls"]:
+                if isinstance(call, dict) and call.get("id") == new.get("id"):
+                    call["result"] = new["result"]
+
+
+def _gemini_apply(messages, record):
+    """One line of a Gemini session file applied to the list of messages so far (dicts, in order), by the rules of
+    Gemini CLI's own replay: `$rewindTo` id deletes that message and all after it (an unknown id clears all);
+    `$patch` carries a single patch (with `id`), then `updates` (a list of single patches), `removeIds`, and `orderIds`
+    (the messages not listed first, in their order, then the listed ones that exist, in the listed order); a line
+    with a string `id` is a message, which replaces the one with that id in its place; `$set` with `messages`
+    replaces them all (its other keys are the session's own); a line with `messages` and nothing else of these
+    appends them."""
+    if isinstance(record.get("$rewindTo"), str):
+        wanted = record["$rewindTo"]
+        found = next((i for i, m in enumerate(messages) if m.get("id") == wanted), 0)
+        del messages[found:]
+    elif isinstance(record.get("$patch"), dict):
+        patch = record["$patch"]
+        _gemini_patch(messages, patch)
+        for single in patch["updates"] if isinstance(patch.get("updates"), list) else []:
+            _gemini_patch(messages, single)
+        if isinstance(patch.get("removeIds"), list):
+            gone = {i for i in patch["removeIds"] if isinstance(i, str)}
+            messages[:] = [m for m in messages if m.get("id") not in gone]
+        if isinstance(patch.get("orderIds"), list):
+            order = [i for i in patch["orderIds"] if isinstance(i, str)]
+            by_id = {m.get("id"): m for m in messages}
+            messages[:] = [m for m in messages if m.get("id") not in order] + [by_id[i] for i in order if i in by_id]
+    elif isinstance(record.get("id"), str):
+        for i, message in enumerate(messages):
+            if message.get("id") == record["id"]:
+                messages[i] = record
+                return
+        messages.append(record)
+    elif isinstance(record.get("$set"), dict):
+        if isinstance(record["$set"].get("messages"), list):
+            messages[:] = [m for m in record["$set"]["messages"] if isinstance(m, dict)]
+    elif isinstance(record.get("messages"), list):
+        messages.extend(m for m in record["messages"] if isinstance(m, dict))
+
+
+def _gemini_entries(message):
+    """The entries of one Gemini message: what the user said, what Gemini said (its thoughts left out), and each tool
+    call with what it gave back. Info, error and warning messages are the tool's own and are left out."""
+    when = conversation_time(message.get("timestamp"))
+    who = {"user": "user", "gemini": "agent"}.get(message.get("type"))
+    if who is None:
+        return []
+    text = _parts_text(message.get("content"))
+    out = [(when, who, text)] if text else []
+    calls = message.get("toolCalls") if who == "agent" else None  # (only Gemini's own messages call tools)
+    for call in calls if isinstance(calls, list) else []:
+        if not isinstance(call, dict):
+            continue
+        call_when = conversation_time(call.get("timestamp")) or when
+        out.append((call_when, _call_who(call.get("name")), _call_text(call.get("args"))))
+        result = _gemini_result(call)
+        if result:
+            out.append((call_when, "result", result))
+    return out
+
+
+def _gemini_conversation(path, since):
+    """Gemini CLI's session file as entries, oldest first, from `since` (epoch seconds, or None). Gemini changes earlier
+    messages by id (`$patch`, `$set`, `$rewindTo`), so the file is replayed forward, not read from its end. It only
+    grows, so at most the last MAX_CONVERSATION_SCAN bytes are read, from the first whole line in them: a patch of a
+    message before that point finds no message and changes nothing. The older form is one .json file with
+    {"messages": [...]} (already merged); one larger than that is not read. Raises ConversationUnavailable."""
+    messages = []
+    try:
+        with open(path, "rb") as f:
+            size = f.seek(0, os.SEEK_END)
+            f.seek(max(0, size - MAX_CONVERSATION_SCAN))
+            data = f.read(MAX_CONVERSATION_SCAN + 1)
+            cut = size > MAX_CONVERSATION_SCAN
+    except OSError:
+        raise ConversationUnavailable("its conversation file cannot be read")
+    if path.suffix == ".json":
+        try:
+            whole = json.loads(data.decode("utf-8")) if not cut else None
+        except (ValueError, RecursionError):
+            whole = None
+        if not isinstance(whole, dict) or not isinstance(whole.get("messages"), list):
+            raise ConversationUnavailable("its conversation file is not a Gemini CLI session")
+        messages = [m for m in whole["messages"] if isinstance(m, dict)]
+    else:
+        lines = data.split(b"\n")
+        for raw in lines[1:] if cut else lines:  # (a cut file starts inside a line)
+            try:
+                record = json.loads(raw.decode("utf-8"))
+                if isinstance(record, dict):
+                    _gemini_apply(messages, record)
+            except (ValueError, RecursionError, AttributeError, TypeError):  # not JSON, or a shape not expected
+                continue
+    out = []
+    for message in messages:
+        try:
+            out += [e for e in _gemini_entries(message) if since is None or e[0] is None or e[0] >= since]
+        except Exception:  # a message of a shape the reader did not expect is skipped
+            continue
+    return out
+
+
+def _newest_within(groups, budget):
+    """Of lists of entries, newest list first, the newest lists whose texts add up to `budget` bytes (the oldest taken
+    may take it past), each text cut to `budget`; their entries oldest first. Stops reading `groups` there."""
+    newest_first, size = [], 0
+    for entries in groups:
+        entries = [(when, who, text[:budget]) for when, who, text in entries]
+        newest_first.append(entries)
+        size += sum(len(text.encode("utf-8", "replace")) for _, _, text in entries)
+        if size > budget:
+            break
+    return [entry for entries in reversed(newest_first) for entry in entries]
+
+
+def opencode_database(home=None):
+    """OpenCode's database: OPENCODE_DB, else ~/.local/share/opencode/opencode.db."""
+    if os.environ.get("OPENCODE_DB"):
+        return Path(os.environ["OPENCODE_DB"]).expanduser()
+    return (home or user_home()) / ".local" / "share" / "opencode" / "opencode.db"
+
+
+def _opencode_time(value):
+    """OpenCode's times are milliseconds; epoch seconds out (a number below 1e11 is already seconds), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value / 1000 if value > 1e11 else value
+
+
+def _opencode_entries(role, when, part):
+    """The entries of one part of an OpenCode message: text by the message's role, a tool as a call and what it gave
+    back; reasoning and the rest are left out."""
+    kind = part.get("type")
+    if kind == "text" and isinstance(part.get("text"), str) and part["text"]:
+        who = _role(role)
+        return [(when, who, part["text"])] if who else []
+    if kind != "tool":
+        return []
+    state = part.get("state") if isinstance(part.get("state"), dict) else {}
+    out = [(when, _call_who(part.get("tool")), _call_text(state.get("input")))]
+    result = _result_text(state.get("output")) if state.get("status") == "completed" else \
+        _result_text(state.get("error")) if state.get("status") == "error" else ""
+    if result:
+        out.append((when, "result", result))
+    return out
+
+
+def _opencode_conversation(session_id, since, budget=4 * EXCERPT_BYTES, home=None):
+    """An OpenCode session as entries, oldest first: its `message` rows (newest first, back to `since` or until
+    `budget` bytes of text are in hand) and their `part` rows, from the database opened read-only. Raises
+    ConversationUnavailable when the database is missing, locked (waited for 2 s) or damaged."""
+    if not isinstance(session_id, str) or conversation_place("opencode", {"session": session_id}) != session_id:
+        raise ConversationUnavailable("crewchat does not know where this conversation is")
+    try:
+        import sqlite3  # (lazily, as the message index does: a Python built without it still runs crewchat)
+    except ImportError:
+        raise ConversationUnavailable("this Python has no sqlite3, which reads OpenCode's database")
+    path = opencode_database(home)
+    try:
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            raise ConversationUnavailable("OpenCode's database is not a regular file")
+    except OSError:
+        raise ConversationUnavailable("OpenCode's database is missing")
+    newest_first, size = [], 0
+    db = None
+    try:
+        db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(path)), uri=True, timeout=2)
+        db.text_factory = lambda raw: raw.decode("utf-8", "replace")
+        messages = db.execute("SELECT id, time_created, data FROM message WHERE session_id = ? "
+                              "ORDER BY time_created DESC, id DESC", (session_id,))
+        for message_id, created, data in messages:
+            when = _opencode_time(created)
+            if since is not None and when is not None and when < since:
+                break
+            try:
+                role = json.loads(data).get("role")
+            except (ValueError, RecursionError, AttributeError):
+                continue
+            entries = []
+            parts = db.execute("SELECT time_created, data FROM part WHERE message_id = ? ORDER BY time_created, id",
+                               (message_id,)).fetchall()
+            for part_created, part_data in parts:
+                try:
+                    part = json.loads(part_data)
+                    entries += _opencode_entries(role, _opencode_time(part_created) or when, part) if isinstance(part, dict) else []
+                except Exception:  # a part of a shape the reader did not expect is skipped
+                    continue
+            if entries:
+                newest_first.append([(w, who, text[:budget]) for w, who, text in entries])
+                size += sum(len(text.encode("utf-8", "replace")) for _, _, text in entries)
+                if size > budget:
+                    break
+    except sqlite3.Error:
+        raise ConversationUnavailable("OpenCode's database cannot be read (locked or damaged)")
+    finally:
+        if db is not None:
+            db.close()
+    return [entry for entries in reversed(newest_first) for entry in entries]
+
+
+def _newest(paths):
+    best, best_time = None, -1.0
+    for path in paths:
+        try:
+            when = path.stat().st_mtime
+        except OSError:
+            continue
+        if when > best_time:
+            best, best_time = path, when
+    return best
+
+
+def _codex_file(session_id, home=None):
+    """The rollout file of a Codex session: the newest CODEX_HOME/sessions/*/*/*/rollout-*-<id>.jsonl (a .jsonl.zst
+    is an old, compressed session and is not read), else None."""
+    if not isinstance(session_id, str) or not CONVERSATION_ID_RE.fullmatch(session_id):  # nothing a glob could use
+        return None
+    root = Path(os.environ["CODEX_HOME"]).expanduser() if os.environ.get("CODEX_HOME") else (home or user_home()) / ".codex"
+    try:
+        return _newest((root / "sessions").glob("*/*/*/rollout-*-%s.jsonl" % session_id))
+    except OSError:
+        return None
+
+
+def _cursor_file(conversation_id, home=None):
+    """The transcript of a Cursor conversation: ~/.cursor/projects/*/agent-transcripts/<id>/<id>.jsonl, else None."""
+    if not isinstance(conversation_id, str) or not CONVERSATION_ID_RE.fullmatch(conversation_id):
+        return None
+    try:
+        return _newest(((home or user_home()) / ".cursor" / "projects").glob(
+            "*/agent-transcripts/%s/%s.jsonl" % (conversation_id, conversation_id)))
+    except OSError:
+        return None
+
+
+def _conversation_file(tool, place, home=None, config=None):
+    """The file to read for a place (a path, or a session id for the tools that name one), checked again now: it must
+    still be where the tool keeps its conversations once links are followed, and a regular file, as it may have been
+    swapped for a link, a pipe or a device since the hook sent it. Raises ConversationUnavailable."""
+    if isinstance(place, str):
+        finder = {"codex": _codex_file, "cursor": _cursor_file}.get(tool)
+        found = finder(place, home) if finder else None
+        if found is None:
+            raise ConversationUnavailable("no %s conversation file is known for that id" % tool)
+        place = found.resolve()
+    elif not isinstance(place, Path):
+        raise ConversationUnavailable("crewchat does not know where this conversation is")
+    if conversation_place(tool, {"path": str(place)}, home, config) != place:
+        raise ConversationUnavailable("its conversation file is not where %s keeps its conversations" % tool)
+    try:
+        mode = os.stat(place).st_mode
+    except FileNotFoundError:
+        raise ConversationUnavailable("its conversation file is missing")
+    except OSError:
+        raise ConversationUnavailable("its conversation file cannot be read")
+    if not stat.S_ISREG(mode):
+        raise ConversationUnavailable("its conversation file is not a regular file")
+    return place
+
+
+def read_conversation(tool, place, since, budget=4 * EXCERPT_BYTES, home=None, config=None):
+    """The entries of an agent's conversation, oldest first: from the end of its file back to the first entry before
+    `since` (epoch seconds; None reads on), or until `budget` bytes of text are in hand (the last record read may take
+    it past), or MAX_CONVERSATION_SCAN bytes of the file are read. `place` is what conversation_place gave: a path, or a
+    session id. `home` and `config` steer conversation_place the way they do there. Records that are not JSON (a
+    half-written last line, bad UTF-8) are skipped. Raises ConversationUnavailable when the place cannot be read at all."""
+    if tool == "opencode":  # a database, not a file the hook named
+        return _opencode_conversation(place, since, budget, home)
+    if tool == "gemini":  # a file changed by id as it grows: replayed forward
+        entries = _gemini_conversation(_conversation_file(tool, place, home, config), since)
+        return _newest_within(([entry] for entry in reversed(entries)), budget)
+    reader = CONVERSATION_READERS.get(tool)
+    if reader is None:
+        raise ConversationUnavailable("crewchat cannot read %s conversations" % tool)
+    path = _conversation_file(tool, place, home, config)
+
+    def records():  # each record's entries, newest first, back to `since` or MAX_CONVERSATION_SCAN
+        scanned = 0
+        for raw in read_back(path):
+            scanned += len(raw) + 1
+            if scanned > MAX_CONVERSATION_SCAN:
+                return
+            try:
+                record = json.loads(raw.decode("utf-8"))
+            except (ValueError, RecursionError):  # not JSON, not UTF-8, or nested too deep
+                continue
+            try:
+                entries = reader(record) if isinstance(record, dict) else []
+            except Exception:  # a record of a shape the reader did not expect is skipped, not the whole excerpt
+                continue
+            if not entries:
+                continue
+            if since is not None and entries[0][0] is not None and entries[0][0] < since:
+                return
+            yield entries
+    try:
+        return _newest_within(records(), budget)
+    except OSError:
+        raise ConversationUnavailable("its conversation file cannot be read")
+
+
+# --- Boiling it down for the advisor (A2) -----------------------------------------------------------------------------
+
+RESULT_LINES = 10  # of a tool's result kept at each end
+RESULT_BYTES = 2048  # of a result, as shown
+CALL_CHARS = 200  # of a tool call's arguments, as shown
+SECRET_MARK = "[secret left out]"
+SECRET_RE = re.compile(
+    r"(?s:-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z))"  # a cut-off block goes to its end
+    r"|(?<![A-Za-z0-9])sk-[A-Za-z0-9_-]{16,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}"
+    r"|xox[abprs]-[A-Za-z0-9-]{10,}|(?i:Bearer) [A-Za-z0-9._~+/=-]{16,}")
+_INJECTED_USER_TEXT = ("<environment_context>", "<user_instructions>", "# AGENTS.md instructions")  # Codex's own context
+_USER_QUERY_RE = re.compile(r"\s*<user_query>(.*?)(?:</user_query>|\Z)", re.S)  # Cursor wraps what the user typed
+_INDENT = " " * 8
+
+
+def redact(text):
+    """`text` with anything that looks like a secret replaced by [secret left out]."""
+    return SECRET_RE.sub(SECRET_MARK, text)
+
+
+def _cut_bytes(text, limit, tail=False):
+    """The start (or, with `tail`, the end) of `text` in at most `limit` UTF-8 bytes, without half a character."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return text
+    return (raw[-limit:] if tail else raw[:limit]).decode("utf-8", "ignore") if limit > 0 else ""
+
+
+def _own_words(who, text):
+    """The text of an entry as the person or agent wrote it; "" when it is context the tool injected (R8)."""
+    if who != "user":
+        return text
+    found = _USER_QUERY_RE.match(text)
+    if found:
+        return found.group(1).strip()
+    return "" if text.lstrip().startswith(_INJECTED_USER_TEXT) else text
+
+
+def _call_summary(text):
+    """A tool call in a few words: its command, path, URL, else the start of what it was given."""
+    try:
+        arguments = json.loads(text)
+    except ValueError:
+        arguments = None
+    if isinstance(arguments, dict):
+        for key in ("command", "file_path", "path", "url"):
+            if isinstance(arguments.get(key), str) and arguments[key]:
+                return redact(arguments[key])[:CALL_CHARS]
+    return redact(text)[:CALL_CHARS]
+
+
+def _result_block(text):
+    """A tool's result: how long it was, then its first and last RESULT_LINES lines, all in at most RESULT_BYTES."""
+    lines = redact(text).splitlines()
+    cut = max(0, len(lines) - 2 * RESULT_LINES)
+    shown = lines if not cut else lines[:RESULT_LINES] + ["..."] + lines[-RESULT_LINES:]
+    head = "result (%d lines, %d cut):" % (len(lines), cut)
+    room = RESULT_BYTES
+    while True:
+        body = "\n".join(shown)
+        if len(body.encode("utf-8")) > room:
+            body = _cut_bytes(body, room // 2) + "\n...\n" + _cut_bytes(body, room // 2, tail=True)
+        block = "\n".join(_INDENT + line for line in [head] + body.splitlines())
+        over = len(block.encode("utf-8")) + 1 - RESULT_BYTES  # and its newline
+        if over <= 0:
+            return block
+        room = max(0, room - over - 1)
+
+
+def _clock(when):
+    try:
+        return datetime.datetime.fromtimestamp(when, datetime.timezone.utc).strftime("%H:%M")
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
+def _entry_block(agent, entry):
+    """One entry as the lines it shows, or None when it holds nothing to show."""
+    when, who, text = entry
+    text = _own_words(who, text)
+    if who in ("user", "agent") and not text.strip():
+        return None
+    if who == "result":
+        return _result_block(text)
+    clock = _clock(when) if when is not None else None
+    label = agent if who == "agent" else who
+    text = _call_summary(text) if who.startswith("tool") else redact(text)
+    first, _, rest = text.partition("\n")
+    lines = [("%s%s: %s" % ("[%s] " % clock if clock else "", label, first)).rstrip()]
+    lines += [_INDENT + line for line in rest.split("\n")] if rest else []
+    return "\n".join(lines)
+
+
+def boil_down(entries, agent, tool_label, task, since):
+    """What the advisor is shown of an agent's conversation: `entries` (oldest first) as a text of at most EXCERPT_BYTES
+    bytes (older entries left out first), with tool results cut and secrets left out. `task` and `since` (epoch seconds)
+    say where the excerpt starts; without them it is the last of the conversation, and so it is when no entry has a
+    time (Cursor's), since nothing could be cut at the task."""
+    untimed = bool(entries) and all(entry[0] is None for entry in entries)
+    if task and since is not None and _clock(since) and not untimed:
+        where = "since taking task #%s at %s UTC" % (str(task).lstrip("#"), _clock(since))
+        head = "%s's conversation (%s) %s, as crewchat boiled it down for the advisor." % (agent, tool_label, where)
+    else:
+        head = "%s's conversation (%s), its last 40 KB, as crewchat boiled it down for the advisor." % (agent, tool_label)
+    head += "\nTool results are cut; secrets are left out.\n\n"
+    notice = "(older steps left out to keep this under 40 KB)\n"
+    blocks = [block + "\n" for block in (_entry_block(agent, entry) for entry in entries) if block]
+    sizes = [len(block.encode("utf-8")) for block in blocks]
+    total = len(head.encode("utf-8")) + sum(sizes)
+    start = 0
+    if total > EXCERPT_BYTES:
+        head += notice
+        total += len(notice.encode("utf-8"))
+        while start < len(blocks) - 1 and total > EXCERPT_BYTES:  # the oldest go first; the newest stays
+            total -= sizes[start]
+            start += 1
+        if total > EXCERPT_BYTES:  # the newest alone is over the limit: cut its end
+            room = EXCERPT_BYTES - (total - sizes[-1]) - 1
+            blocks[-1] = _cut_bytes(blocks[-1].rstrip("\n"), room) + "\n"
+    return head + "".join(blocks[start:])
+
+
 def clean_usage(value):
     """A hook's usage report as the server keeps it: at most 20 models, whole non-negative counts."""
     if not isinstance(value, dict):
@@ -1513,6 +2260,9 @@ class Analytics:
         self.hours, self.days, self.pairs, self.tasks, self.agents = {}, {}, {}, {}, {}
         self.verdicts, self.kinds = {}, {}
         self.reclaims = self.files = self.total = 0
+        self.learning = {}  # week (its Monday, UTC) -> {recorded, approved, used}: process notes (L7)
+        self.note_uses = {}  # note name -> reports that an agent followed it
+        self.note_tasks = set()  # tasks whose holder reported following a note
 
     def build(self):
         """Count every message in the log (once; new ones arrive by add while it runs)."""
@@ -1553,6 +2303,8 @@ class Analytics:
                 self.files += len(msg["files"])
             if kind == "answer" and msg.get("verdict"):
                 self.verdicts[msg["verdict"]] = self.verdicts.get(msg["verdict"], 0) + 1
+            if kind == "process" and msg.get("process"):
+                self._learned(msg, ts)
             task_id = mid if kind == "task" else msg.get("task")
             if not task_id:
                 return
@@ -1572,10 +2324,58 @@ class Analytics:
                 task.setdefault(status, ts)
                 task["history"].append(status)
 
+    def _learned(self, msg, ts):
+        """A process message in the learning totals (L7). Caller holds the lock."""
+        try:
+            data = json.loads(msg["process"])
+        except ValueError:
+            return
+        op = data.get("op") if isinstance(data, dict) else None
+        what = {"propose": "recorded", "approve": "approved", "publish": "approved", "report": "used"}.get(op)
+        if not what:
+            return
+        week = time.strftime("%Y-%m-%d", time.gmtime(ts - time.gmtime(ts).tm_wday * 86400))
+        row = self.learning.setdefault(week, {"recorded": 0, "approved": 0, "used": 0})
+        row[what] += 1
+        if what == "used":
+            name = str(data.get("name") or "")
+            self.note_uses[name] = self.note_uses.get(name, 0) + 1
+            if msg.get("task"):
+                self.note_tasks.add(str(msg["task"]))
+
+    @staticmethod
+    def learning_inputs(hub):
+        """What learning_report needs from the hub: each task's tokens and turns, and the live notes' count. Read
+        before the analytics lock is taken: _append takes the hub's lock and then this one (_store), so taking
+        the hub's while holding this one could deadlock (release review)."""
+        with hub.lock:
+            sheet = {mid: (usage_tokens(row.get("usage") or {}), int(row.get("turns") or 0)) for mid, row in hub.sheet.items()}
+        return sheet, len(hub.live_processes())
+
+    def learning_report(self, inputs, weeks=8):
+        """What the crew has learned (L7): notes recorded, approved and used per week, the most used, and the tasks
+        that used a note against the others done, by median time, tokens and turns. Rough: tasks differ in size, so
+        it is labelled an estimate. `inputs`: learning_inputs(hub). Caller holds the lock."""
+        sheet, notes = inputs
+        sides = {"with": [], "without": []}
+        for mid, t in self.tasks.items():
+            if "done" not in t:
+                continue
+            start = min(t.get("taken", t["done"]), t.get("in_progress", t["done"]))
+            tokens, turns = sheet.get(mid, (0, 0))
+            sides["with" if mid in self.note_tasks else "without"].append((t["done"] - start, tokens, turns))
+        compare = {side: {"tasks": len(rows), "time": median([r[0] for r in rows if r[0] > 0]),
+                          "tokens": median([r[1] for r in rows if r[1]]), "turns": median([r[2] for r in rows if r[2]])}
+                   for side, rows in sides.items()}
+        return {"weeks": [dict(week=w, **v) for w, v in sorted(self.learning.items())][-weeks:],
+                "top": [{"name": n, "used": u} for n, u in sorted(self.note_uses.items(), key=lambda kv: (-kv[1], kv[0]))][:5],
+                "compare": dict(compare, estimate=True), "notes": notes}
+
     def report(self, hub, days=7):
         """The totals, the last days by hour and by day, and the crew now (from the hub)."""
         self.build()
         now = time.time()
+        learning = self.learning_inputs(hub)  # before self.lock: see learning_inputs
         with self.lock:
             since = now - days * 86400
             hours = [{"hour": h, **v} for h, v in sorted(self.hours.items()) if h >= since - 3600]
@@ -1601,6 +2401,7 @@ class Analytics:
                     "done_today": sum(1 for t in done if time.gmtime(t["done"])[:3] == time.gmtime(now)[:3]),
                 },
                 "agents": {name: dict(row) for name, row in self.agents.items() if name not in (OWNER, SERVER_NAME)},
+                "learning": self.learning_report(learning),
             }
         for row in hub.rows():  # the crew now: what each agent is doing, and whether it is online
             agent = out["agents"].setdefault(row["agent"], {"messages": 0, "first": None, "last": None})
@@ -1626,6 +2427,16 @@ HISTORY_KINDS = ("task", "take", "assign", "update", "ask", "answer", "msg")  # 
 MAX_HISTORY = 30  # messages a file's history shows at most
 
 
+NOTE_STOP_WORDS = frozenset(
+    "the and for with from that this into when before after your you what how its are was not but all any can our "
+    "use run make get set new one two out off via per then than them they each only also just".split())
+
+
+def note_words(text):
+    """The words of a text worth matching notes by (L4): lowercase, three letters or more, the commonest left out."""
+    return {w for w in re.findall(r"[a-z0-9]{3,}", str(text or "").lower()) if w not in NOTE_STOP_WORDS}
+
+
 class History:
     """The chat's messages, short, in SQLite for lookups by task and by words (roadmap C5): what was said about a
     file. Derived (docs/storage.md): read from messages.jsonl on demand, from where it got to (log_from), so it
@@ -1639,14 +2450,48 @@ class History:
     def _conn(self):
         if self.db is None:
             import sqlite3
+            open_private(self.path).close()  # the chat's messages: this user's only (SQLite's own files follow it)
             self.db = sqlite3.connect(str(self.path), check_same_thread=False)
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=OFF")  # derived: built again if lost
             self.db.execute("CREATE TABLE IF NOT EXISTS messages (id TEXT PRIMARY KEY, seq INTEGER, ts REAL, sender TEXT, "
                             "recipient TEXT, kind TEXT, task TEXT, status TEXT, text TEXT)")
             self.db.execute("CREATE INDEX IF NOT EXISTS messages_task ON messages (task)")
+            # The live process notes' words (L4): head is their name and when to use them, the rest their body.
+            self.db.execute("CREATE TABLE IF NOT EXISTS note_words (name TEXT, word TEXT, head INTEGER)")
+            self.db.execute("CREATE INDEX IF NOT EXISTS note_words_word ON note_words (word)")
             self.db.commit()
         return self.db
+
+    def index_notes(self, notes):
+        """The live process notes in the word index, again whenever they changed (L4). Derived: from the notes,
+        which come from the log."""
+        mark = tuple((n["name"], n["id"]) for n in notes)
+        with self.lock:
+            if getattr(self, "_notes_mark", None) == mark:
+                return
+            db = self._conn()
+            rows = set()
+            for n in notes:
+                head = " ".join([n["name"].replace("-", " "), n["when"]])
+                body = " ".join(n["steps"] + n["commands"] + n["pitfalls"] + n["files"] + n["areas"])
+                rows |= {(n["name"], w, 1) for w in note_words(head)}
+                rows |= {(n["name"], w, 0) for w in note_words(body) - note_words(head)}
+            db.execute("DELETE FROM note_words")
+            db.executemany("INSERT INTO note_words VALUES (?, ?, ?)", sorted(rows))
+            db.commit()
+            self._notes_mark = mark
+
+    def match_notes(self, words, head_only=False, least=1):
+        """The notes sharing at least `least` of these words, most first: [(name, hits)]."""
+        words = sorted(note_words(words))
+        if not words:
+            return []
+        with self.lock:
+            marks = ",".join("?" * len(words))
+            sql = ("SELECT name, COUNT(DISTINCT word) AS hits FROM note_words WHERE word IN (" + marks + ")"
+                   + (" AND head = 1" if head_only else "") + " GROUP BY name HAVING hits >= ? ORDER BY hits DESC, name")
+            return [(n, h) for n, h in self._conn().execute(sql, words + [least]).fetchall()]
 
     def catch_up(self):
         """Read the log from the last message stored."""
@@ -1770,7 +2615,13 @@ class EventStore:
                     self.wake.notify()
         except Exception:
             if self.db is not None:
-                self.db.rollback()  # everything since the last commit, and what this batch did not reach: queued again
+                try:
+                    self.db.rollback()  # everything since the last commit, and what this batch did not reach: queued again
+                except Exception:  # refused too: closing the connection drops what it had not committed
+                    try:
+                        self.db.close()
+                    finally:
+                        self.db = None
             back, self.unsaved, self.uncommitted = self.unsaved + rows[done:], [], False
             with self.wake:
                 self.pending[:0] = back
@@ -1784,6 +2635,7 @@ class EventStore:
     def _conn(self):
         if self.db is None:
             import sqlite3
+            open_private(self.path).close()  # the chat's messages: this user's only (SQLite's own files follow it)
             self.db = sqlite3.connect(str(self.path), check_same_thread=False)
             # Written a row at a time on the hook path: WAL syncs once a row rather than three times, and with
             # synchronous FULL (some builds lower it under WAL) a row written survives a power cut: it cannot be rebuilt.
@@ -1803,8 +2655,9 @@ class EventStore:
 
     def rename(self, name, new):
         """An agent renamed: its edits and states are the new name's."""
-        for table in ("edits", "activity"):  # after the rows already queued, by the writer: never under the hub's lock
-            self._add("UPDATE %s SET agent = ? WHERE agent = ?" % table, (new, name))
+        # After the rows already queued, by the writer: never under the hub's lock.
+        for statement in ("UPDATE edits SET agent = ? WHERE agent = ?", "UPDATE activity SET agent = ? WHERE agent = ?"):
+            self._add(statement, (new, name))
 
     def add_edit(self, agent, path, task="", ts=None):
         self._add("INSERT INTO edits (ts, agent, path, task) VALUES (?, ?, ?, ?)",
@@ -1975,6 +2828,149 @@ def log_message(line):
     return msg
 
 
+# Process notes (roadmap L1) -------------------------------------------------------------------
+# What one agent worked out (a build, a release, a fix for a failure that keeps coming back, a setup step), written
+# down so every agent can follow it instead of working it out again. A note is a message of the kind "process" in
+# messages.jsonl, so it travels between machines like any message; what it says is in the message's `process`
+# field, as JSON. Each such message is one step in a note's life, its `op`: propose (a new version), approve, ask (a
+# lead's approval that needs the owner: it waits in Needs you), retire, mark (owner-only or not), rule (who
+# approves, for the whole project) and publish (a version the owner shared with all projects, in the shared log).
+# The newest approved version of a name is the one agents get; the older ones stay in the log.
+PROCESS_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+PROCESS_SKILL = "crewchat-process-"  # + a note's name: its skill folder in .claude/skills/, and its Cursor rule
+PROCESS_RULES = {"owner": "the owner approves every note",
+                 "default": "the lead approves notes, and the owner the ones that need the owner",
+                 "lead": "the lead approves every note but shared ones, owner-only ones and project commands"}
+PROCESS_LISTS = ("steps", "commands", "pitfalls", "files", "areas")  # a note's fields that are lists of lines
+MAX_PROCESS = 4000  # characters of a note's fields, as JSON: a few KB
+MAX_PROCESS_LINE = 600  # characters of one step, command or pitfall
+MAX_PROCESS_LINES = 30  # of each list
+MAX_PROCESS_VERSIONS = 10  # versions of a note kept in state.json besides the live one (every one stays in the log)
+MAX_PENDING_PROCESS = 50  # a note's messages kept until the version they name arrives (out of order)
+FAILS_TO_REOPEN = 2  # failed reports in a row that put a note back to proposed (L5)
+STALE_EVERY = 600  # seconds between looks for notes that may be out of date (L5)
+STALE_EDITS = 20  # agents' edits to a note's files since it was approved that make it possibly stale
+STALE_CHURN = 0.5  # lines changed in its files since its commit, against the lines they have now
+STALE_DAYS = 90  # days since a note was approved or last reported working
+UNUSED_DAYS = 14  # an approved note nobody reported on this long is "unused" on the page
+SHARED_PROJECT = "crewchat-shared"  # the reserved project whose log holds the notes shared with all projects
+COMMAND_PARAM_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,31}$")  # a project command's parameter, {NAME} in its commands (L6)
+MAX_PARAM_VALUE = 200
+# Commands that may release, deploy, publish, delete data or touch credentials or production: a note holding one
+# needs the owner's approval (L1). A pattern misses some, so the owner can mark any note owner-only, and the lead can
+# always ask the owner.
+SENSITIVE_RE = re.compile(
+    r"\b(releas\w*|deploy\w*|publish\w*|upload\w*|push(?:es|ed|ing)?|ship|rollout|rollback|"
+    r"delet\w*|drop|truncate|destroy\w*|prune|purge|wipe|erase|rmdir|reset\s+--hard|"
+    r"credential\w*|secrets?|tokens?|passwords?|passwd|api[_-]?keys?|private[_-]?keys?|keychain|ssh|sudo|"
+    r"prod|production|kubectl|terraform|helm|gcloud|aws|heroku|vercel|netlify|firebase|twine)\b"
+    r"|--force\b|\brm\s+-\w*[rf]|\.env\b", re.I)
+
+
+def clean_note(fields):
+    """A process note's fields, checked: {name, scope, when, steps, commands, pitfalls, files, areas, commit}. Lists
+    come as lists of lines (a string is split at newlines; files and areas at commas too). Raises HubError saying
+    what is wrong."""
+    if not isinstance(fields, dict):
+        raise HubError("a note is an object")
+    name = str(fields.get("name") or "").strip().lower()
+    if not PROCESS_NAME_RE.match(name):
+        raise HubError("a note's name is lowercase letters, digits and -, 40 at most, like release-build")
+    scope = fields.get("scope") or "project"
+    if scope not in ("project", "shared"):
+        raise HubError("scope is project (this project's agents) or shared (every project's)")
+    when = " ".join(str(fields.get("when") or "").split())
+    if not when:
+        raise HubError("say when to use the note (when): one line, like \"before a release\"")
+    if len(when) > 300:
+        raise HubError("when is one line: 300 characters at most")
+    note = {"name": name, "scope": scope, "when": when}
+    for key in PROCESS_LISTS:
+        value = fields.get(key) or []
+        if isinstance(value, str):
+            value = value.split("\n") if key in ("steps", "commands", "pitfalls") else split_list(value.replace("\n", ","))
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise HubError("%s is a list of lines" % key)
+        value = [v.strip() for v in value if v.strip()]
+        if len(value) > MAX_PROCESS_LINES or any(len(v) > MAX_PROCESS_LINE for v in value):
+            raise HubError("%s: %d lines at most, %d characters each" % (key, MAX_PROCESS_LINES, MAX_PROCESS_LINE))
+        note[key] = value
+    if not note["steps"]:
+        raise HubError("a note needs its steps: what to do, in order, so another agent can follow it")
+    if not note["pitfalls"]:
+        raise HubError("a note needs its pitfalls: what went wrong or is easy to get wrong (one line is enough)")
+    commit = str(fields.get("commit") or "").strip()
+    if commit and not re.match(r"^[0-9a-f]{4,40}$", commit):
+        raise HubError("commit is a git commit id")
+    note["commit"] = commit
+    command = fields.get("command")
+    if command:  # the owner made its commands a project command (L6): {"params": [NAME, ...]}
+        params = command.get("params") if isinstance(command, dict) else None
+        if not isinstance(params, list) or not all(isinstance(p, str) and COMMAND_PARAM_RE.match(p) for p in params):
+            raise HubError("a project command's parameters are names in capitals, like VERSION")
+        if not note["commands"]:
+            raise HubError("only a note with commands can become a project command")
+        missing = [p for p in params if not any("{%s}" % p in c for c in note["commands"])]
+        if missing:
+            raise HubError("each parameter is written {NAME} in the commands: %s is not" % ", ".join(missing))
+        note["command"] = {"params": list(dict.fromkeys(params))}
+    if len(json.dumps(note, ensure_ascii=False)) > MAX_PROCESS:
+        raise HubError("the note is too long: %d characters at most. Keep the steps that matter" % MAX_PROCESS)
+    return note
+
+
+def note_from(data):
+    """A note's fields from a process message, unchecked beyond their types (it was checked where it was written)."""
+    note = {"name": str(data.get("name") or ""), "scope": "shared" if data.get("scope") == "shared" else "project",
+            "when": str(data.get("when") or ""), "commit": str(data.get("commit") or "")}
+    for key in PROCESS_LISTS:
+        value = data.get(key)
+        note[key] = [str(v) for v in value] if isinstance(value, list) else []
+    command = data.get("command")
+    if isinstance(command, dict) and isinstance(command.get("params"), list):
+        note["command"] = {"params": [str(p) for p in command["params"] if COMMAND_PARAM_RE.match(str(p))]}
+    return note
+
+
+def sensitive_line(note):
+    """The first command or step of a note that may release, deploy, publish, delete data or touch credentials or
+    production, or ""."""
+    return next((line for line in note.get("commands", []) + note.get("steps", []) if SENSITIVE_RE.search(line)), "")
+
+
+def process_body(note):
+    """What a note says, in Markdown: the same in its skill, its Cursor rule and what hub_process gets."""
+    made = " at commit `%s`" % note["commit"][:10] if note.get("commit") else ""
+    lines = ["# Process note: %s (v%s)" % (note["name"], note.get("version", 1)), "",
+             "**When to use it:** %s" % note["when"], "",
+             "Written by %s%s, approved by %s. crewchat writes this from the chat's log: to change it, update the note "
+             "(hub_process), not this file." % (note.get("by") or "an agent", made, note.get("approved_by") or "the owner"),
+             "", "## Steps", ""]
+    lines += ["%d. %s" % (i, step) for i, step in enumerate(note["steps"], 1)]
+    if note.get("commands"):
+        lines += ["", "## Commands", "", "```sh"] + [c.replace("```", "` ` `") for c in note["commands"]] + ["```"]
+    if note.get("command"):
+        call = " ".join(["crewchat run %s" % note["name"]] + ["%s=..." % p for p in note["command"]["params"]])
+        lines += ["", "## As a project command", "", "The owner approved these exact commands as a project command. Run them "
+                  "all, in order, from your folder: `%s`. It stops at the first that fails and says which." % call]
+    lines += ["", "## Pitfalls", ""] + ["- %s" % p for p in note["pitfalls"]]
+    touches = note.get("files", []) + note.get("areas", [])
+    if touches:
+        lines += ["", "## Files and areas it touches", ""] + ["- `%s`" % f.replace("`", "'") for f in touches]
+    return lines
+
+
+def process_skill(note, project):
+    """A live note as a Claude Code skill (SKILL.md) and as a Cursor rule its agent reads when it applies."""
+    where = "shared by the owner with all projects" if note["scope"] == "shared" else "in the project %s" % project
+    about = "A process the crew worked out (%s): %s. Follow it step by step when it applies." % (
+        where, note["when"].rstrip("."))
+    body = "\n".join(process_body(note)) + "\n"
+    skill = "---\nname: %s%s\ndescription: %s\n---\n\n" % (PROCESS_SKILL, note["name"], json.dumps(about)) + body
+    rule = "---\ndescription: %s\nalwaysApply: false\n---\n\n" % json.dumps(about) + body
+    return skill, rule
+
+
 class Hub:
     """Messages, the live roster of agents, and how sessions map to agents.
 
@@ -2004,6 +3000,7 @@ class Hub:
         self.agents = {}  # name -> {place, client, created, seen, active, cursor, status, checked, role, listen}
         self.sessions = {}  # MCP session id -> {agent (None until first tool call), place, client, created}
         self.links = {}  # hook link key -> agent name
+        self.hook_places = {}  # hook link key -> (place, conversation its hooks named, when), oldest first (A2, memory)
         self.taken = {}  # task message id -> agent
         self.progress = {}  # task message id -> {status, by, note, ts}: the latest hub_task update on it
         self.sheet = {}  # task id -> {title, from, to, ts, depends, areas, where, order, parent, origin[, removed]}
@@ -2028,6 +3025,11 @@ class Hub:
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
         self.permissions = {}  # id -> an agent's permission prompt waiting for Allow or Deny (memory only)
+        self.browser_asks = {}  # id -> a browser call waiting for the owner (B2): a new site, or a change (memory only)
+        self.browser_site = {}  # agent -> the site its browser was last taken to (B2), or None when it cannot be told
+        self.browser_tabs = {}  # agent -> {Claude in Chrome tab id: its site, or None}: each call names its tab (B2)
+        self.browser_ok = set()  # (agent, task, site): changes the owner allowed there for that task (B2)
+        self.browser_refused = set()  # (agent, site): a site the owner refused when a link took the agent there (B2)
         self.page_seen = 0  # when a chat page of this project last polled (Web Push skips an open page)
         self.next_seq = 1
         self.version = 0  # bumped on every change the chat page should show
@@ -2048,6 +3050,12 @@ class Hub:
         self._editors = {}  # a path in the project -> the agent that edited it last (memory only)
         self._iface = {}  # (map, path) -> a Python file's interface change not told yet (C3): before, after, when
         self._iface_told = {}  # (map, path) -> when agents were last told of a change to it
+        self.processes = {}  # process note name -> {name, owner_only, versions: [{id, version, by, ts, state, ...}]} (L1)
+        self.process_rule = "default"  # who approves this project's notes (PROCESS_RULES), set by a "process" message
+        self.shared_hub = None  # () -> the shared project's Hub, its log the notes shared with all projects (Projects)
+        self.on_processes = None  # the shared project's: called when its notes change, to rewrite every project's guides
+        self.on_published = None  # (note) -> tell every project's holders of a shared note approved here (Projects)
+        self._guides_due = False  # a guide rewrite is on its way (_guides_soon)
         self._load()
         self.analytics.cutoff = self.next_seq - 1  # what the log holds now; what comes after, _store adds
 
@@ -2101,6 +3109,11 @@ class Hub:
         self.advisor_check = bool(data.get("advisor_check"))
         self.renamed = {str(k): str(v) for k, v in data.get("renamed", {}).items()}
         self.owner_cursor = int(data.get("owner_cursor", 0))
+        if isinstance(data.get("processes"), dict):
+            self.processes = {str(k): v for k, v in data["processes"].items() if isinstance(v, dict)}
+            self.process_rule = data.get("process_rule") if data.get("process_rule") in PROCESS_RULES else "default"
+        elif data:  # written by a crewchat before process notes (one run after a downgrade, too): from the log
+            self._replay_processes()
         now = time.time()
         self.web = {k: float(v) for k, v in data.get("web", {}).items() if float(v) > now}
         try:
@@ -2148,10 +3161,13 @@ class Hub:
         """Write state.json now, with everything in it (what _save_soon let wait too). Caller holds the lock."""
         sheet = {mid: {k: v for k, v in row.items() if k != "usage"} if "usage" in row else row
                  for mid, row in self.sheet.items()}  # the tasks' token counts are in usage.json
+        agents = {n: {k: v for k, v in a.items() if k != "conversation"} if "conversation" in a else a
+                  for n, a in self.agents.items()}  # where an agent's conversation is stays in memory (A2)
         write_json(self.home / "state.json", {
-            "agents": self.agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
+            "agents": agents, "sessions": self.sessions, "links": self.links, "taken": self.taken,
             "progress": self.progress, "owner_cursor": self.owner_cursor, "web": self.web, "sheet": sheet, "claim_gen": self.claim_gen,
             "renamed": self.renamed, "reclaim": self.reclaim, "advisor_check": self.advisor_check,
+            "processes": self.processes, "process_rule": self.process_rule,
         }, private=True, indent=None)
         self._dirty = False  # only once written: a failed write is tried again
 
@@ -2217,7 +3233,7 @@ class Hub:
                 if old["id"] not in self.sheet:  # a task on the sheet keeps its state
                     self.progress.pop(old["id"], None)
             del self.messages[:-KEEP_MESSAGES]
-        with open(self.home / "messages.jsonl", "a", encoding="utf-8") as f:
+        with open_private(self.home / "messages.jsonl") as f:
             f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
     def _append(self, sender, to, text, kind, task=None, role=None, status=None, files=None, **extra):
@@ -2245,6 +3261,10 @@ class Hub:
         with self.lock:
             mid = str(msg.get("id", ""))
             if not mid or mid in self.by_id:
+                return False
+            if msg.get("kind") == "process" and not msg.get("process"):
+                # Relayed by a crewchat before process notes, which drops the note itself: not kept, so the whole
+                # message, from its own machine or a newer one, is not taken for one already here (release review).
                 return False
             seq = self.next_seq
             self.next_seq += 1
@@ -2308,6 +3328,8 @@ class Hub:
                     self.taken.pop(msg["task"], None)
                 if reclaim and msg["task"] in self.sheet:
                     self.sheet[msg["task"]]["reclaimed"] = reclaim
+            if msg["status"] in ("todo", "review", "done"):
+                self._task_moved_on(msg["task"], msg["status"])
             self._save()
         elif kind == "assign" and msg.get("task") in self.sheet:
             self.taken.setdefault(msg["task"], msg["to"])
@@ -2325,6 +3347,8 @@ class Hub:
             if msg.get("areas"):  # the owner or the lead set them
                 row["areas"] = split_list(msg["areas"])
                 row.pop("suggested", None)
+            if msg.get("browser") in ("on", "off"):  # the owner: it needs the browser (B3), on every machine
+                row["browser"] = msg["browser"] == "on"
             self._save()
         elif kind == "ask" and msg.get("task") in self.sheet:
             row = self.sheet[msg["task"]]  # the task's newest check before done; an older answer no longer counts
@@ -2345,6 +3369,12 @@ class Hub:
         elif kind == "plan" and not msg.get("task") and msg.get("reclaim"):
             self.reclaim = int(msg["reclaim"]) if msg["reclaim"].isdecimal() else 0  # the project's setting
             self._save()
+        elif kind == "process" and msg.get("process"):
+            before = self._live_signature()
+            if self._process_effect(msg):
+                self._save()
+                if self._live_signature() != before:  # a report or a proposal changes no folder: only what agents get does
+                    self._guides_soon()
         if kind == "task" and msg["id"] not in self.sheet:
             title = " ".join(str(msg["text"]).split())
             self.sheet[msg["id"]] = {
@@ -2549,6 +3579,7 @@ class Hub:
                     self._forget(mine, "is %s (session resumed)" % owner)
                 self.agents[owner]["checked"] = time.time()
                 self.agents[owner].pop("starting", None)  # a session it was started again in is here
+                self._linked_conversation(owner, key, row["place"])
                 self._save()
                 self._changed()
                 return owner, "Linked. This session is %s again, in the project %s.%s%s" % (
@@ -2557,10 +3588,31 @@ class Hub:
                 mine = row["agent"] = self._new_agent(row["place"], row["client"])
             self.links[key] = mine
             self.agents[mine]["checked"] = time.time()
+            self._linked_conversation(mine, key, row["place"])
             self._save()
             self._changed()
             return mine, "Linked. You are %s, in the project %s.%s%s" % (mine, self.roster.project,
                                                                           SESSION_NAME_NOTE % mine, self.rules_note())
+
+    def _hook_place(self, key, place, conversation):
+        """Keep where this key's hooks say its conversation is, linked or not yet (A2): a new agent's first prompt
+        hook comes before its hub_link. Caller holds the lock."""
+        now = time.time()
+        self.hook_places.pop(key, None)
+        for old in list(self.hook_places):  # oldest first: what has waited too long, or is one too many, goes
+            if len(self.hook_places) < MAX_HOOK_PLACES and now - self.hook_places[old][2] <= HOOK_PLACE_KEPT:
+                break
+            del self.hook_places[old]
+        self.hook_places[key] = (place, conversation, now)
+
+    def _linked_conversation(self, name, key, place):
+        """On hub_link (A2): the agent's conversation is the one this key's own hooks named lately (a new agent's
+        first turn, a Reopen), never a place another session's hooks gave (R7). Caller holds the lock."""
+        held = self.hook_places.get(key)
+        if held and held[0] == place and time.time() - held[2] <= HOOK_PLACE_KEPT:
+            self.agents[name]["conversation"] = held[1]
+        else:
+            self.agents[name].pop("conversation", None)
 
     def _remote_rows(self, name):
         """(device, roster row) for each other machine that lists this agent (cloud sync)."""
@@ -2700,7 +3752,7 @@ class Hub:
              "session": self._session_state(a), "startable": self.startable(n),
              "picture": a.get("picture", ""), "colour": a.get("colour", ""),
              "os": os_name(), "permissions": a.get("permissions", ""), "doing": self._doing(a, now),
-             "usage": self._usage_row(n)}
+             "usage": self._usage_row(n), "account": a.get("account", ""), "browser": bool(a.get("browser"))}
             for n, a in self.agents.items()
         ]
         for dev in self.remote.values():
@@ -2823,10 +3875,28 @@ class Hub:
                 if not ask["answer"]:
                     items.append({"kind": "permission", "id": ask["id"], "agent": ask["agent"], "tool": ask["tool"],
                                   "text": ask["text"], "ts": ask["ts"], "blocking": 0})
+            for ask in self.browser_asks.values():
+                if not ask["answer"]:
+                    items.append(dict(ask, kind="browser", blocking=0))
+            for rec in self.processes.values():  # notes only the owner may approve, or that the lead asks about (L1)
+                v = self._latest(rec)
+                if v is None or v["state"] != "proposed":
+                    continue
+                who, why = self._process_approver(rec, v)
+                if who == "owner" or v.get("asked"):
+                    items.append({"kind": "process", "id": v["name"], "of": v["id"], "version": v["version"],
+                                  "agent": v["by"] if v["by"] != OWNER else "", "title": v["when"],
+                                  "text": why if who == "owner" else "%s asks: %s" % (v["asked"]["by"], v["asked"]["reason"]),
+                                  "scope": v["scope"], "steps": v["steps"], "commands": v["commands"],
+                                  "pitfalls": v["pitfalls"], "ts": v["ts"], "blocking": 0,
+                                  # Everything the agents' skill will say, as it is written (release review: the files
+                                  # and areas went into it unseen).
+                                  "body": "\n".join(process_body(v))})
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
-        order = {"permission": -1, "blocked": 0, "review": 1, "message": 2, "reclaimed": 3, "given_back": 3}
+        order = {"permission": -1, "browser": -1, "blocked": 0, "review": 1, "process": 2, "message": 2, "reclaimed": 3,
+                 "given_back": 3}
         items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
         self._needs = (version, items)
         return items
@@ -2858,15 +3928,326 @@ class Hub:
 
     def answer_permission(self, pid, answer):
         """The owner's Allow or Deny for a permission prompt in Needs you."""
-        if answer not in ("allow", "deny"):
-            raise HubError("answer is allow or deny")
+        return self._answer_ask(self.permissions, pid, answer, ("allow", "deny"), "answer is allow or deny",
+                                "that permission prompt is not waiting any more")
+
+    def _answer_ask(self, asks, aid, answer, answers, wrong, gone):
+        """The owner's answer to one of `asks` in Needs you: one of `answers` (else HubError `wrong`), to an ask
+        still waiting (else HubError `gone`)."""
+        if answer not in answers:
+            raise HubError(wrong)
         with self.lock:
-            ask = self.permissions.get(pid) if isinstance(pid, str) else None
+            ask = asks.get(aid) if isinstance(aid, str) else None
             if ask is None or ask["answer"]:
-                raise HubError("that permission prompt is not waiting any more")
+                raise HubError(gone)
             ask["answer"] = answer
             self._changed()
         return {"agent": ask["agent"], "answer": answer}
+
+    # The browser (B1-B2) --------------------------------------------------------------------------
+    def browser_sites(self):
+        """This project's sites for agents' browsers: {host: "allowed" | "trusted"}."""
+        sites = self.roster.config.get("browser_sites")
+        return {str(h): str(v) for h, v in sites.items() if v in ("allowed", "trusted")} if isinstance(sites, dict) else {}
+
+    def set_browser_site(self, host, state):
+        """The owner allows a site, trusts it (changes there never ask), or takes it away (state "remove")."""
+        host = site_of(host if "://" in str(host) else "https://" + str(host))
+        if not host or state not in ("allowed", "trusted", "remove"):
+            raise HubError("a site is a host name (ci.example.com, or localhost:3000 on this machine), and allowed, "
+                           "trusted or remove")
+        def change(old):
+            sites = dict(old or {})
+            if state == "remove":
+                sites.pop(host, None)
+            else:
+                sites[host] = state
+            return sites
+        self.roster.update("browser_sites", change)
+        with self.lock:
+            self._changed()
+        return {"sites": self.browser_sites()}
+
+    def set_task_browser(self, mid, on):
+        """The owner says a task needs the browser (B3): only agents with the browser on take it, each on its own
+        machine. A plan message, so every linked machine's sheet says so, and messages.jsonl can rebuild it."""
+        mid = self._id(mid)
+        with self.lock:
+            if mid not in self.sheet:
+                raise HubError("no task #%s on the sheet" % mid)
+            self._append(OWNER, "all", "", "plan", task=mid, browser="on" if on else "off")
+            self._changed()
+        return {"id": mid, "browser": bool(on)}
+
+    def _browser_remind(self, name, now):
+        """What to remind the agent driving the browser of, when it has posted no progress note for a while (B3)."""
+        with BROWSER_LOCK:
+            holder = self._browser_holder(name)
+            if not holder or browser_idle(holder, now):
+                return ""  # not the holder, or it has not used the browser for a while (it is let go then)
+            quiet = now - holder.get("noted", holder["since"])
+            if quiet <= BROWSER_NOTE_EVERY or now - holder.get("reminded", 0) <= BROWSER_NOTE_EVERY:
+                return ""
+            holder["reminded"] = now
+            task = holder["task"]
+        return ("crewchat: you have been working in the browser for %d minutes without a progress note. Post one now "
+                "%swith hub_task update (what you did, what is next; a screenshot helps), then carry on."
+                % (quiet // 60, "on #%s " % task if task else ""))
+
+    def set_browser(self, name, on):
+        """The owner turns an agent's browser on or off (B1). A Claude Code agent gets Claude in Chrome when it starts or
+        is reopened (--chrome); the other tools have the bridge in their folder's settings already."""
+        with self.lock:
+            agent = self._local_agent(name, "turn the browser on for")
+            agent["browser"] = bool(on)
+            self._event("Owner turned the browser %s for %s" % ("on" if on else "off", name))
+            self._save()
+            self._changed()
+        if not on:
+            self.release_browser(name)
+
+    def _browser_holder(self, name):
+        """This machine's browser holder when it is this project's agent `name`, else None. (Under BROWSER_LOCK.)"""
+        holder = BROWSER.get("holder")
+        return holder if holder and holder["hub"] == id(self) and holder["agent"] == name else None
+
+    def release_browser(self, name):
+        """An agent is done with the browser (it said so, or its browser was turned off): another may take it."""
+        with BROWSER_LOCK:
+            if self._browser_holder(name):
+                del BROWSER["holder"]
+
+    def _task_moved_on(self, mid, status):
+        """A task went for review, was done, or is back on the sheet, whoever moved it: the agent driving the browser
+        for it lets the browser go, unless the task is still its own (a stray give-back). Caller holds the lock."""
+        with BROWSER_LOCK:
+            holder = BROWSER.get("holder")
+            if holder and holder["hub"] == id(self) and holder["task"] == mid and (
+                    status != "todo" or self.taken.get(mid) != holder["agent"]):
+                del BROWSER["holder"]
+
+    def browser_check(self, place, key, tool, args, wait=PERMISSION_WAIT):
+        """A browser call an agent's before-hook asks about (B2): {"decision": "allow" | "deny", "reason"}. One agent
+        drives this machine's browser at a time; a site not allowed asks the owner, whether the agent opens it or a link
+        takes it there (then before any call on it, reads too); the first change on a site that is not trusted asks
+        once for the agent's task; nothing answered in time is a deny. crewchat's own page is never used. The owner is
+        waited for up to `wait` seconds in all, however many questions the call asks; a call that is refused does not
+        take the browser."""
+        kind, url = browser_action(tool, args)
+        allow = {"decision": "allow", "reason": ""}
+        if kind == "other" or not isinstance(key, str) or not KEY_RE.match(key):
+            return allow
+        with self.lock:
+            name = self.links.get(key)
+            agent = self.agents.get(name) if name else None
+            if agent is None or agent["place"] != place:
+                # A session not in the chat: Claude in Chrome asks in Chrome itself, but the bridge's token skips the
+                # extension's own approval, so the bridge is only for the chat's agents.
+                return allow if str(tool).startswith("mcp__claude-in-chrome__") else {
+                    "decision": "deny", "reason": BRIDGE_ONLY}
+            if not agent.get("browser"):
+                return {"decision": "deny", "reason": "the browser is not on for %s: the owner turns it on, on its card "
+                                                      "in crewchat" % name}
+            task = self._usage_task(name) or ""
+            self.touch(name, active=True)
+        now = time.time()
+        with BROWSER_LOCK:
+            holder = BROWSER.get("holder")
+            if holder and browser_idle(holder, now):
+                holder = None
+            if holder and (holder["hub"], holder["agent"]) != (id(self), name):
+                return {"decision": "deny", "reason": "%s is using the browser%s; wait until it is done, or ask it in "
+                                                      "the chat" % (holder["agent"], " for #%s" % holder["task"]
+                                                                    if holder["task"] else "")}
+            # The same agent keeps its start, its last note and its last reminder; another starts afresh. Taken while
+            # the call is checked (so nobody else drives while the owner is asked), and given back if it is refused.
+            mine = BROWSER["holder"] = dict(holder or {"since": now}, hub=id(self), agent=name, task=task, last=now,
+                                            project=self.roster.project)
+        out = self._browser_gate(name, task, kind, url, tool, args, now + wait)
+        if out["decision"] == "deny" and holder is None:
+            with BROWSER_LOCK:
+                if BROWSER.get("holder") is mine:
+                    del BROWSER["holder"]
+        return out
+
+    def _browser_gate(self, name, task, kind, url, tool, args, deadline):
+        """browser_check's questions for one call of an agent that may drive the browser."""
+        allow = {"decision": "allow", "reason": ""}
+        left = lambda: deadline - time.time()  # noqa: E731  (what is left of the call's wait for the owner)
+        sites = self.browser_sites()
+        if kind == "navigate":
+            previous = url.strip().lower() in ("", "back", "forward")  # Claude in Chrome's back and forward
+            host = "" if previous else site_of(url)
+            if not host and not previous:
+                browser_log(self.roster.project, name, "open %s" % url[:200], "refused")
+                return {"decision": "deny", "reason": "crewchat cannot tell the site of %s: open a plain http or "
+                                                      "https address (no user name, backslash, %%-escape or space in "
+                                                      "its host)" % url[:200]}
+            if host and self.own_page(host):
+                browser_log(self.roster.project, name, "open %s" % url[:200], "refused")
+                return {"decision": "deny", "reason": OWN_PAGE}
+            if host and host not in sites:
+                denied = self._browser_new_site(name, host, task, left(), "open %s (a new site)", "open %s")
+                if denied:
+                    return denied
+            else:
+                browser_log(self.roster.project, name, "open %s" % (url or "the previous page")[:200], "allowed")
+            with self.lock:
+                self.browser_site[name] = host or None
+                tab = browser_tab(tool, args)
+                if tab:
+                    self.browser_tabs.setdefault(name, {})[tab] = host or None
+                # It went elsewhere: a refused site it reaches again is asked about again, unless another of its tabs
+                # is still on it (each tab is checked as it is, so a refused one left open is not used unasked).
+                still = set((self.browser_tabs.get(name) or {}).values())
+                self.browser_refused = {r for r in self.browser_refused if r[0] != name or r[1] in still}
+            return allow
+        with self.lock:
+            here = self._browser_here(name, tool, args)
+            refused = (name, here) in self.browser_refused
+        tabs_only = browser_tool_name(tool) in BROWSER_TAB_TOOLS
+        if here and not tabs_only and self.own_page(here):
+            return {"decision": "deny", "reason": OWN_PAGE}
+        if here and here not in sites and not tabs_only:
+            # A link, a form or a redirect took it to a site never allowed: ask, as an open does (a change asks again,
+            # below, for the task); once refused, refuse there without asking again.
+            if refused:
+                return self._browser_denied("deny", "use %s: open an allowed site instead" % here)
+            denied = self._browser_new_site(name, here, task, left(), "use %s (a new site, reached from another)",
+                                            "use %s: open an allowed site instead")
+            if denied:
+                return denied
+            sites = self.browser_sites()
+        if kind == "change":
+            with self.lock:
+                host = self._browser_here(name, tool, args)
+                if host and (sites.get(host) == "trusted" or (name, task, host) in self.browser_ok):
+                    return allow
+            answer = self._browser_ask(name, "change", host or "", task, left())
+            browser_log(self.roster.project, name, "change things on %s%s" % (host or "a page", " for #%s" % task if task else ""),
+                        answer or "no answer")
+            if answer not in ("allow_task", "allow_site"):
+                return self._browser_denied(answer, "make changes on %s" % (host or "this page"))
+            if host and task:  # with no task, there is nothing for the allow to last for: it asks again
+                with self.lock:
+                    self.browser_ok.add((name, task, host))
+        return allow
+
+    def own_page(self, site):
+        """Is a site crewchat's own page here: this machine at the server's port, or the address tailscale serve gives
+        it? Agents never use it: it is signed in as the owner, who answers the browser's questions there."""
+        config, mine = self.roster.config, self.machine_config()
+        port = loopback_port(site)
+        if port is not None:
+            return port in SERVING_PORTS | {int(c.get("port") or 0) for c in (config, mine)}
+        return any(site == site_of(c.get("url") or "") for c in (config, mine) if c.get("url"))
+
+    def _browser_here(self, name, tool, args):
+        """The site of the page a call acts on: its own tab's for Claude in Chrome (each call names one), else the
+        agent's current page. A tab crewchat has not seen is a page it cannot name. (Under self.lock.)"""
+        tab = browser_tab(tool, args)
+        if tab:
+            return (self.browser_tabs.get(name) or {}).get(tab)
+        return self.browser_site.get(name)
+
+    def _browser_new_site(self, name, host, task, wait, logged, refused):
+        """Ask the owner about a site not allowed (Allow the site / Deny), and allow it for the project on a yes.
+        Returns the deny for the agent, or None. `logged` and `refused` say what the agent did, with %s for the site."""
+        answer = self._browser_ask(name, "site", host, task, wait)
+        browser_log(self.roster.project, name, logged % host, answer or "no answer")
+        if answer == "deny":  # refused there from now on, without asking again, until it opens another site
+            with self.lock:
+                self.browser_refused.add((name, host))
+        if answer not in ("allow_site", "allow_task"):
+            return self._browser_denied(answer, refused % host)
+        self.set_browser_site(host, "allowed")
+        return None
+
+    def _browser_seen(self, name, browser):
+        """Where a browser call left the agent (B2), from its after-tool hook: a link, a form or a redirect may have
+        taken it to another site, which its next change is then asked about. The page's address when the call's
+        result gave one; a change that gave none forgets the site, so the next change asks. A read's address that is
+        not sure (browser_seen) may be the page's own text: it can only take the agent off its site. (Under self.lock.)"""
+        tool = str(browser.get("tool") or "")
+        kind, _ = browser_action(tool, {"action": str(browser.get("action") or "")})
+        url = str(browser.get("url") or "")
+        if kind == "other":
+            return
+        agent = self.agents.get(name) or {}
+        folder = (agent.get("session") or {}).get("folder")
+        if folder and not bridge_here(folder, agent.get("client"), tool):
+            return  # the user's own browser, not the owner's Chrome: not where its next call is checked
+        tabs = browser.get("tabs")
+        if isinstance(tabs, dict) and tabs:  # Claude in Chrome's tabs, as its extension lists them after each call
+            self.browser_tabs[name] = {str(k)[:20]: site_of(v) or None for k, v in list(tabs.items())[:50]
+                                       if str(k).isdigit() and isinstance(v, str)}
+        tab = str(browser.get("tab") or "")[:20]
+        if not url:
+            if kind == "change":  # it may have left the page: the next change asks
+                self.browser_site[name] = None
+                if tab.isdigit():
+                    self.browser_tabs.setdefault(name, {})[tab] = None
+            return
+        host = site_of(url) or None  # an address without a site (about:blank) names none
+        if kind == "read" and not browser.get("sure") and host != self.browser_site.get(name) and not (
+                host and self.own_page(host)):  # crewchat's own page is believed: it only stops the agent there
+            host = None
+        self.browser_site[name] = host
+
+    def _browser_denied(self, answer, what):
+        return {"decision": "deny", "reason": ("the owner denied this: do not %s" % what) if answer == "deny" else
+                ("the owner did not answer in time; ask in the chat before you %s" % what)}
+
+    def _browser_ask(self, name, kind, host, task, wait):
+        """Ask the owner in Needs you about an agent's browser, and wait for the answer: allow_site, allow_task or deny,
+        or "" when nobody answered in time (or the call has no time left to wait)."""
+        if wait <= 0:
+            return ""
+        with BROWSER_LOCK:  # the agent keeps the browser while it waits for the owner
+            holder = self._browser_holder(name)
+            if holder:
+                holder["asking"] = holder.get("asking", 0) + 1
+        try:
+            return self._browser_ask_owner(name, kind, host, task, wait)
+        finally:
+            with BROWSER_LOCK:
+                holder = self._browser_holder(name)
+                if holder:
+                    holder["asking"] = max(0, holder.get("asking", 0) - 1)
+                    holder["last"] = time.time()  # its call goes on now, or the agent hears it may not
+
+    def _browser_ask_owner(self, name, kind, host, task, wait):
+        title = (self.sheet.get(task) or {}).get("title", "") if task else ""
+        text = ("%s wants to open %s" % (name, host) if kind == "site" else
+                "%s wants to make changes on %s%s" % (name, host or "a page crewchat cannot name",
+                                                     " for #%s: %s" % (task, title) if task else ""))
+        with self.lock:
+            # Calls made at once (a screenshot and a page's text) wait on the same question: the owner answers once.
+            ask = next((a for a in self.browser_asks.values() if host and not a["answer"] and
+                        (a["agent"], a["ask"], a["host"], a["task"]) == (name, kind, host, task)), None)
+            mine = ask is None
+            if mine:
+                ask = {"id": secrets.token_hex(6), "agent": name, "ask": kind, "host": host, "task": task,
+                       "text": text, "ts": time.time(), "answer": ""}
+                self.browser_asks[ask["id"]] = ask
+                self._changed()
+            try:
+                self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self.browser_asks, timeout=wait)
+            finally:
+                if mine:
+                    self.browser_asks.pop(ask["id"], None)
+                    self._changed()
+        return ask["answer"]
+
+    def answer_browser(self, aid, answer):
+        """The owner's answer to a browser ask in Needs you: allow_site (a new site), allow_task (changes there for
+        this task) or deny."""
+        with self.lock:
+            ask = self.browser_asks.get(aid) if isinstance(aid, str) else None
+            if ask and ask["ask"] == "change" and answer == "allow_site":
+                raise HubError("changes are allowed for the task: answer is allow_task or deny")
+        return self._answer_ask(self.browser_asks, aid, answer, ("allow_site", "allow_task", "deny"),
+                                "answer is allow_site, allow_task or deny", "that is not waiting any more")
 
     def _drop_permissions(self, name):
         """A turn of the agent began or ended: what it asked was answered elsewhere (in its terminal).
@@ -2874,6 +4255,11 @@ class Hub:
         for ask in list(self.permissions.values()):
             if ask["agent"] == name and not ask["answer"]:
                 del self.permissions[ask["id"]]
+        dropped = [a for a in self.browser_asks.values() if a["agent"] == name and not a["answer"]]
+        for ask in dropped:  # its browser call is gone with the turn: its hook waits no more (_browser_ask_owner)
+            del self.browser_asks[ask["id"]]
+        if dropped:
+            self._changed()
 
     # Edit events (C0) ---------------------------------------------------------------------------
     def edits_on(self):
@@ -2945,7 +4331,7 @@ class Hub:
                 if write_brief(folder, self.roster.project, text):
                     written.append(folder)
                     if new:  # its AGENTS.md, if it has one, now points to it
-                        write_guides(folder, self.roster.root)
+                        write_guides(folder, self.roster.root, self.live_processes())
             except Exception as e:  # a folder that cannot be written now: the next update tries again
                 sys.stderr.write("%s could not write the project brief in %s: %s\n" % (now_iso(), folder, e))
         return written
@@ -3029,6 +4415,8 @@ class Hub:
             task = self._usage_task(name)
             if task:
                 add_usage(self.sheet[task].setdefault("usage", {}), usage)
+                self.sheet[task]["turns"] = int(self.sheet[task].get("turns") or 0) + 1  # a turn on it (L7)
+                self._save_soon()
             self._save_usage_soon()
             self._changed()
             return {"kept": True, "task": task or ""}
@@ -3080,6 +4468,7 @@ class Hub:
         return [
             m for m in self.messages
             if m["seq"] > cur and m["kind"] not in ("event", "plan") and m["from"] != name and m["to"] in (name, "all")
+            and (m["kind"] != "process" or m["to"] == name)  # a note's news only for whom it is meant (L1)
             and not m.get("history")  # from before the chat was linked: on the page and the sheet, never news
         ]
 
@@ -3093,26 +4482,29 @@ class Hub:
 
     # Shared files ------------------------------------------------------------------------------
     # Each file is kept in files/<id>/ with its own name, next to meta.json. Messages carry only
-    # {id, name, size, type}; a machine that does not have a file asks the one it came from.
+    # {id, name, size, type} (and `for`: one agent's only, A2); a machine that does not have a file asks the one it
+    # came from.
     def _file_dir(self, fid):
         return self.home / "files" / fid
 
-    def _keep_file(self, fid, name, data, kind):
+    def _keep_file(self, fid, name, data, kind, meant=None):
         folder = self._file_dir(fid)
         folder.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(folder / name), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(str(folder / name), O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         meta = {"id": fid, "name": name, "size": len(data), "type": kind}
+        if meant:  # for one agent only (A2): kept with the file, so it holds once its message is out of memory
+            meta["for"] = str(meant)[:64]
         write_json(folder / "meta.json", meta, private=True)
         return meta
 
-    def add_file(self, name, data, kind=""):
-        """Keep a file someone shares. Returns what a message carries about it."""
+    def add_file(self, name, data, kind="", meant=None):
+        """Keep a file someone shares (`meant`: for that agent only). Returns what a message carries about it."""
         if len(data) > MAX_UPLOAD:
             raise HubError("%s is too big: %s at most" % (clean_filename(name), human_size(MAX_UPLOAD)))
         name = clean_filename(name)
-        return self._keep_file(secrets.token_hex(8), name, data, file_type(name, kind))
+        return self._keep_file(secrets.token_hex(8), name, data, file_type(name, kind), meant)
 
     def file(self, fid):
         """(meta, path) of a file kept on this machine, or (None, None)."""
@@ -3152,12 +4544,12 @@ class Hub:
         if fetch is None or not msg.get("origin"):
             raise HubError("%s was shared on another machine, and files only travel between machines linked "
                            "over Tailscale" % info["name"])
-        self._keep_file(fid, clean_filename(info["name"]), fetch(msg["origin"], fid), info["type"])
+        self._keep_file(fid, clean_filename(info["name"]), fetch(msg["origin"], fid), info["type"], info.get("for"))
         return self.file(fid)
 
     # Agents launched from the chat page --------------------------------------------------------
     def new_start(self, name="", role="", task="", permissions="ask", picture="", colour="", instructions="", model="",
-                  advisor=""):
+                  account="", browser=False):
         """A one-time key for an agent about to be launched: when its session calls hub_link with
         it, it gets this name, role, picture and colour, then the owner's instructions and first task."""
         name, role, task, instructions = (str(x or "").strip() for x in (name, role, task, instructions))
@@ -3179,29 +4571,31 @@ class Hub:
             key = "start-" + secrets.token_hex(8)
             self.starts[key] = {"name": name, "role": role, "task": task, "permissions": permissions,
                                 "picture": picture, "colour": colour,
-                                "instructions": instructions, "model": model, "advisor": advisor,
-                                "expires": now + START_TTL}
+                                "instructions": instructions, "model": model,
+                                "account": account, "browser": bool(browser), "expires": now + START_TTL}
             return key
 
     def launch(self, tool, folder, name="", role="", task="", permissions="ask", model="", picture="",
-               colour="", instructions="", advisor=""):
+               colour="", instructions="", account="", browser=False):
         """Open a new agent session in a connected folder on this machine; it checks in with a
         start key and gets this name, role, picture, instructions and first task, and may do what
-        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool),
-        advisor one of tool_advisors(tool)."""
+        permissions says without asking (LAUNCH_PERMISSIONS). model is one of tool_models(tool)."""
         if tool not in LAUNCH_TOOLS:
             raise HubError("unknown agent tool %s" % tool)
         if model:
             check_model(tool, model)
-        if advisor:
-            check_advisor(tool, advisor)
         if not isinstance(permissions, str) or permissions not in LAUNCH_PERMISSIONS[tool]:
             raise HubError("%s takes permissions %s" % (LAUNCH_TOOLS[tool][0], ", ".join(LAUNCH_PERMISSIONS[tool])))
         if not self._connected_folder(folder):
             raise HubError("that folder is not connected to this chat on this machine")
-        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model, advisor)
+        account = str(account or "").lower()
+        env = account_env(self.machine_config(), account, tool)  # which Claude Code account (1.1): checked first
+        if browser and tool != "claude" and not browser_token():
+            raise HubError("%s works in your browser through the Playwright MCP Bridge: install it in Chrome (%s) and "
+                           "paste its token in the Browser panel first" % (LAUNCH_TOOLS[tool][0], BRIDGE_STORE))
+        key = self.new_start(name, role, task, permissions, picture, colour, instructions, model, account, browser)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
+            launch_agent(tool, folder, key, permissions, self.home, model, env=env, chrome=browser)
         except (HubError, OSError) as e:
             with self.lock:
                 self.starts.pop(key, None)
@@ -3247,8 +4641,10 @@ class Hub:
                 self.agents[name]["permissions"] = spec.get("permissions") or "ask"
                 if spec.get("model"):
                     self.agents[name]["model"] = spec["model"]  # Reopen starts it on the same model
-                if spec.get("advisor"):
-                    self.agents[name]["advisor"] = spec["advisor"]  # and with the same advisor
+                if spec.get("account"):
+                    self.agents[name]["account"] = spec["account"]  # and in the same Claude Code account
+                if spec.get("browser"):
+                    self.agents[name]["browser"] = True  # it may work in the owner's browser (B1)
                 self._save()
         if spec.get("picture") is not None or spec.get("colour"):
             try:
@@ -3384,7 +4780,7 @@ class Hub:
         """messages.jsonl after adopt_open_tasks: references renamed, the moved messages at the end."""
         log = self.home / "messages.jsonl"
         temp = log.with_name(log.name + ".new")
-        with open(temp, "w", encoding="utf-8") as out:  # a line at a time: a long log is never all in memory
+        with open_private(temp, "w") as out:  # a line at a time: a long log is never all in memory
             if log.exists():
                 with open(log, "rb") as f:
                     for raw in f:
@@ -3460,7 +4856,7 @@ class Hub:
     # The advisor ---------------------------------------------------------------------------------
     # Agents ask the agent with the advisor role at decision points (hub_ask) and wait for its
     # answer (hub_answer). Questions and answers are ordinary messages, so they travel between
-    # machines and the owner reads them. The advisor sees only what the asker sends.
+    # machines and the owner reads them. The advisor also gets the asker's conversation as a file, when it can be read.
     def _advisors(self):
         """The agents with the advisor role, here or on another machine. Caller holds the lock."""
         local = {n for n, a in self.agents.items() if a.get("role") == "advisor"}
@@ -3475,6 +4871,49 @@ class Hub:
     def _approved(self, mid):
         """Has the advisor approved the task's latest check before done? Caller holds the lock."""
         return (self.sheet.get(mid) or {}).get("verdict") == "approve"
+
+    def _excerpt_start(self, agent, task=None):
+        """(task, epoch seconds) the agent took the task it holds now (`task`, if it holds that one; else the one it
+        took or was given last), or (None, None) when it holds none. Caller holds the lock."""
+        held = {mid for mid, holder in self.taken.items() if holder == agent
+                and (self.progress.get(mid) or {}).get("status") != "done" and not (self.sheet.get(mid) or {}).get("removed")}
+        if task in held:
+            held = {task}
+        for m in reversed(self.messages):
+            if m["kind"] in ("take", "assign") and m.get("task") in held:
+                return m["task"], m["ts"]
+            if m["kind"] == "task" and m["id"] in held and m.get("status") == "assigned" and m["to"] == agent:
+                return m["id"], m["ts"]
+        return None, None
+
+    def conversation_excerpt(self, agent, task=None):
+        """What the advisor is shown of an agent's conversation (A2): (the excerpt's UTF-8 bytes, ""), or (None, why
+        not). From where its hooks said its conversation is, read now, since it took the task it holds (`task`, for a
+        question about one). Called without the lock: the read may take a moment."""
+        with self.lock:
+            row = self.agents.get(agent) or {}
+            known = row.get("conversation")
+            client = row.get("client")
+            task, since = self._excerpt_start(agent, task)
+        # Only a place its own tool's hook gave (a hook of another tool in the same folder is not its conversation).
+        if not known or known.get("tool") != client:
+            return None, "no conversation of it is known here"
+        tool, place = known["tool"], known["place"]
+        if isinstance(place, Path) and not place.exists():
+            return None, "its conversation file is missing"
+        try:
+            entries = read_conversation(tool, place, since, config=self.machine_config())
+            own = [re.escape(t.decode("ascii", "ignore")) for t in stored_tokens(crewchat_homes(self))]
+            if own:  # crewchat's own tokens (an agent that printed its .mcp.json), as share_file refuses them
+                own = re.compile("|".join(own))
+                entries = [(when, who, own.sub(SECRET_MARK, text)) for when, who, text in entries]
+            text = boil_down(entries, agent, LAUNCH_TOOLS.get(tool, (tool,))[0], task, since)
+        except ConversationUnavailable as e:
+            return None, e.reason
+        except Exception as e:  # a bug reading it or boiling it down must not stop the question
+            sys.stderr.write("%s could not read %s's conversation: %s: %s\n" % (now_iso(), agent, type(e).__name__, e))
+            return None, "crewchat could not read it"
+        return text.encode("utf-8"), ""
 
     def ask(self, agent, question, task=None, to=None, wait=MAX_WAIT):
         """An agent asks the advisor and waits up to wait seconds for the answer. Returns (question
@@ -3507,7 +4946,23 @@ class Hub:
                     if m["kind"] == "ask" and m["to"] in waiting and m["id"] not in answered:
                         waiting[m["to"]] += 1
                 to = min(advisors, key=lambda a: (waiting[a], a))
-            msg = self._append(agent, to, question, "ask", task=mid)
+        # Read outside the lock: the read may take a moment, and the lock serves every poll and hook (A2). Not for a
+        # machine that would drop the mark (an older crewchat lists and opens the file for every agent; it also
+        # relays what it has to the others).
+        older = getattr(self.sync, "older_machines", lambda: [])()
+        data, reason = (None, OLDER_MACHINE) if older else self.conversation_excerpt(agent, mid)
+        files = None
+        if data is not None:
+            try:
+                files = [self.add_file("conversation-%s.txt" % agent, data, "text/plain", meant=to)]
+            except (HubError, OSError) as e:
+                reason = "crewchat could not keep it (%s)" % (getattr(e, "strerror", None) or e)
+        if files is None:  # the note, within the limit: what is cut is the end of the question
+            note = "\n\n" + NOT_AVAILABLE % (agent, str(reason)[:300], agent)
+            question = (question if len(question) + len(note) <= MAX_TEXT
+                        else question[:MAX_TEXT - len(note) - 1] + "\u2026") + note
+        with self.lock:
+            msg = self._append(agent, to, question, "ask", task=mid, files=files)
             self._changed()
             deadline = time.time() + wait
             answer = self._answer_to(msg["id"])
@@ -3600,7 +5055,11 @@ class Hub:
                 to = OWNER
             msg = self._append(agent, to, note, "update", task=mid, status=status)
             if status in ("review", "done"):
-                self._suggest_areas(mid)
+                self._suggest_areas(mid)  # (and its browser work is over: _effects lets the browser go)
+            with BROWSER_LOCK:  # a progress note from the agent at the browser: its reminder waits again (B3)
+                holder = self._browser_holder(agent)
+                if holder:
+                    holder["noted"] = time.time()
             self._changed()
             return msg, to
 
@@ -3985,12 +5444,30 @@ class Hub:
         return [Path(path) for path, p in sorted((config.get("folders") or {}).items())
                 if (place is None or p == place) and folder_chat(config, path) == self.chat_key and Path(path).is_dir()]
 
+    def folder_rows(self):
+        """This project's connected folders on this machine, for the page's Open folder: path, name and place."""
+        places = self.machine_config().get("folders") or {}
+        return [{"path": str(f), "name": f.name, "place": places.get(str(f), "")} for f in self.project_folders()]
+
+    def open_folder(self, folder):
+        """Open one of this project's connected folders on this machine in the system's file manager (the owner's
+        Open folder). Only those: the request is compared as a resolved full path, so `..` and a link pointing out
+        of a connected folder are refused, and the opener gets the project's own path, never the request's."""
+        try:
+            want = Path(folder).resolve() if isinstance(folder, str) and os.path.isabs(folder) else None
+        except (OSError, ValueError, RuntimeError):
+            want = None
+        found = want and next((f for f in self.project_folders() if f.resolve() == want), None)
+        if not found:
+            raise HubError("%s is not a folder of this project on this machine" % (str(folder)[:200] or "that"))
+        show_folder(found)
+
     def refresh_guides(self):
-        """Rewrite the guide and skills in every folder of the project on this machine."""
-        done = 0
+        """Rewrite the guide, skills and process notes in every folder of the project on this machine."""
+        done, notes = 0, self.live_processes()
         for folder in self.project_folders():
             try:
-                write_guides(folder, self.roster.root)
+                write_guides(folder, self.roster.root, notes)
                 done += 1
             except OSError as e:
                 sys.stderr.write("%s could not update crewchat's guide in %s: %s\n" % (now_iso(), folder, e))
@@ -4001,12 +5478,7 @@ class Hub:
         text = str(text or "").strip()
         if len(text) > MAX_TEXT * 4:
             raise HubError("the rules are too long: %d characters at most" % (MAX_TEXT * 4))
-        config = load_config(self.roster.root)
-        if text:
-            config["rules"] = text
-        else:
-            config.pop("rules", None)
-        save_config(config, self.roster.root)
+        change_config(lambda config: config.update(rules=text) if text else config.pop("rules", None), self.roster.root)
         self.roster.refresh()
         folders = self.refresh_guides()
         with self.lock:
@@ -4060,6 +5532,599 @@ class Hub:
         rules = project_rules(self.roster.root)
         return ("\n\nThe owner's rules for this project (follow them):\n%s" % rules) if rules else ""
 
+    # Process notes (roadmap L1) ----------------------------------------------------------------
+    def _replay_processes(self):
+        """The notes, from every process message in the log (state.json, written by an older crewchat, had none).
+        Read once, from the log's first line; only lines that name a process are parsed. A machine with no state.json
+        reads only the end of its log (P3), as before."""
+        try:
+            f = open(self.home / "messages.jsonl", "rb")
+        except OSError:
+            return
+        with f:
+            for line in f:
+                if b'"process"' in line:
+                    msg = log_message(line.rstrip(b"\n"))
+                    if msg is not None and msg["kind"] == "process" and msg.get("process"):
+                        self._process_effect(msg)
+
+    def _process_effect(self, msg):
+        """A process message on the notes it keeps. Returns whether they changed. Caller holds the lock. Every
+        machine gets the same notes from the same messages, whatever order they come in: versions are kept in the
+        order of their numbers (then time and id), and an approval names the version it approves."""
+        try:
+            data = json.loads(msg["process"])
+        except ValueError:
+            return False
+        if not isinstance(data, dict):
+            return False
+        op, name = data.get("op"), str(data.get("name") or "")
+        if op == "rule":
+            if data.get("rule") not in PROCESS_RULES:
+                return False
+            self.process_rule = data["rule"]
+            return True
+        if not PROCESS_NAME_RE.match(name):
+            return False
+        rec = self.processes.setdefault(name, {"name": name, "owner_only": False, "versions": []})
+        if op in ("propose", "publish"):
+            if any(v["id"] == msg["id"] for v in rec["versions"]):
+                return False
+            v = dict(note_from(data), name=name, id=msg["id"], by=msg["from"], ts=msg["ts"],
+                     version=int(data.get("version") or 1) if str(data.get("version") or "1").isdecimal() else 1,
+                     state="approved" if op == "publish" else "proposed")
+            if op == "publish":
+                v["approved_by"], v["project"], v["approved_at"] = msg["from"], str(data.get("project") or ""), msg["ts"]
+            rec["versions"].append(v)
+            rec["versions"].sort(key=lambda x: (x["version"], x["ts"], x["id"]))
+            live = self._live(rec)
+            rec["versions"] = [x for x in rec["versions"][:-MAX_PROCESS_VERSIONS - 1] if x is live] + \
+                rec["versions"][-MAX_PROCESS_VERSIONS - 1:]
+            waiting = [m for m in rec.get("pending", []) if m["of"] == msg["id"]]
+            if waiting:  # what came for this version before it did (another machine's messages, out of order)
+                rest = [m for m in rec["pending"] if m["of"] != msg["id"]]
+                if rest:
+                    rec["pending"] = rest
+                else:
+                    del rec["pending"]
+                for m in sorted(waiting, key=lambda m: (m["ts"], m["id"])):
+                    self._process_effect(m)
+            return True
+        v = next((x for x in rec["versions"] if x["id"] == str(data.get("of") or "")), None)
+        if v is None and op in ("approve", "report", "stale", "decline", "ask") and str(data.get("of") or ""):
+            # Its version has not come yet (linked machines' messages arrive in any order): kept until it does.
+            if not any(m["id"] == msg["id"] for m in rec.get("pending", [])):
+                rec.setdefault("pending", []).append({"id": msg["id"], "ts": msg["ts"], "from": msg["from"],
+                                                      "process": msg["process"], "of": str(data["of"])})
+                del rec["pending"][:-MAX_PENDING_PROCESS]
+            return False
+        if op == "approve" and v is not None and v["state"] == "proposed":
+            v["state"], v["approved_by"], v["approved_at"] = "approved", msg["from"], msg["ts"]
+            v.pop("asked", None)
+            v["fails_in_row"] = 0
+            rec.pop("held", None)
+        elif op == "report" and v is not None and v["state"] == "approved":  # an agent followed it (L5)
+            if data.get("ok"):
+                v["ok"], v["fails_in_row"], v["checked"] = v.get("ok", 0) + 1, 0, msg["ts"]
+                v.pop("stale", None)  # it still works
+            else:
+                v["failed"], v["fails_in_row"] = v.get("failed", 0) + 1, v.get("fails_in_row", 0) + 1
+                v["why_failed"] = str(data.get("why") or "")[:300]
+                if v["fails_in_row"] >= FAILS_TO_REOPEN:  # out of the folders until it is fixed and approved again
+                    v["state"] = "proposed"
+                    v["asked"] = {"by": SERVER_NAME, "reason": "%d reports in a row say it failed: %s" % (
+                        v["fails_in_row"], v["why_failed"])}
+                    rec["held"] = True
+        elif op == "stale" and v is not None and v["state"] == "approved":
+            v["stale"] = str(data.get("why") or "")[:300]
+        elif op == "decline" and v is not None and v["state"] == "proposed":
+            v["state"] = "retired"
+            v.pop("asked", None)
+        elif op == "ask" and v is not None and v["state"] == "proposed":
+            v["asked"] = {"by": msg["from"], "reason": str(data.get("reason") or "")[:300]}
+        elif op == "retire":
+            for x in rec["versions"]:
+                x["state"] = "retired"
+        elif op == "mark":
+            rec["owner_only"] = bool(data.get("owner_only"))
+        else:
+            return False
+        return True
+
+    def _live_signature(self):
+        """What the folders' notes are written from: each live version (its content never changes once written) and
+        who approved it. Caller holds the lock."""
+        return tuple((n, v["id"], v.get("approved_by")) for n, v in sorted(
+            (n, self._live(r)) for n, r in self.processes.items()) if v is not None)
+
+    @staticmethod
+    def _live(rec):
+        """A note's newest approved version: the one agents get. None while none is, and while it is held back for
+        failing (L5): an older version is not given in its place."""
+        if rec.get("held"):
+            return None
+        return next((v for v in reversed(rec["versions"]) if v["state"] == "approved"), None)
+
+    @staticmethod
+    def _latest(rec):
+        return rec["versions"][-1] if rec["versions"] else None
+
+    def _is_lead(self, name):
+        if (self.agents.get(name) or {}).get("role") == "lead":
+            return True
+        return any(row.get("agent") == name and row.get("role") == "lead"
+                   for dev in self.remote.values() for row in dev["agents"])
+
+    def _process_approver(self, rec, v):
+        """Who must approve a version of a note, by the project's rule: ("owner", why) or ("lead", ""). The server
+        checks it, not the agent. Caller holds the lock."""
+        if v.get("scope") == "shared":
+            return "owner", "it is shared with all your projects"
+        if rec.get("owner_only"):
+            return "owner", "you marked it owner-only"
+        if v.get("command"):
+            return "owner", "it is a project command: agents run its commands as they are written"
+        if self.process_rule == "owner":
+            return "owner", "this project's rule: you approve every note"
+        risky = sensitive_line(v) if self.process_rule == "default" else ""
+        if risky:
+            return "owner", "it may release, deploy, publish, delete data or touch credentials or production: %s" % risky[:200]
+        if not self._lead():
+            return "owner", "the project has no lead"
+        return "lead", ""
+
+    def _process_message(self, by, to, text, data, task=None):
+        return self._append(by, to, text, "process", task=task, process=json.dumps(data, ensure_ascii=False))
+
+    def propose_process(self, by, fields, changed=None):
+        """A new version of a note, proposed (by the owner: approved at once). Returns (version, who approves it,
+        why). The version goes to whoever approves it: the lead, or else the owner's Needs you. changed: the fields
+        an update changed (update_process); without it, a name already in use is refused."""
+        note = clean_note(fields)
+        with self.lock:
+            rec = self.processes.get(note["name"]) or {"owner_only": False, "versions": []}
+            if changed is None and any(v["state"] != "retired" for v in rec["versions"]):
+                raise HubError("a note called %s exists: hub_process update it (get shows it)" % note["name"])
+            number = max([v["version"] for v in rec["versions"]] or [0]) + 1
+            who, why = self._process_approver(rec, note)
+            lead = self._lead() if who == "lead" else None
+            to = lead if lead and lead != by else OWNER if who == "owner" else "all"
+            what = ("Updated the process note %s (v%d: %s)" % (note["name"], number, ", ".join(changed) + " changed")
+                    if changed else "Proposed the process note %s (v%d): %s" % (note["name"], number, note["when"]))
+            msg = self._process_message(by, to, what, dict(note, op="propose", version=number))
+            self._changed()
+            version = self._version(note["name"], msg["id"])
+        if by == OWNER:
+            self.approve_process(OWNER, note["name"], msg["id"])
+            return version, "owner", ""
+        return version, who, why
+
+    def report_process(self, by, name, ok, why=""):
+        """An agent followed a note (L5): it worked, or it failed and why. Counts show on the note; a failure asks the
+        reporter to fix it and tells the lead (else the owner); FAILS_TO_REOPEN in a row put it back to proposed."""
+        why = " ".join(str(why or "").split())
+        if not isinstance(ok, bool):
+            raise HubError("report: note.ok is true (it worked) or false (it failed, with note.why)")
+        if not ok and not why:
+            raise HubError("say why it failed (note.why): the step, and what happened")
+        if len(why) > 500:
+            raise HubError("why: 500 characters at most")
+        home = self._note_home(name)
+        if home is not self:
+            return home.report_process(by, name, ok, why)
+        with self.lock:
+            rec = self.processes.get(str(name or "").strip().lower())
+            v = self._live(rec) if rec else None
+            if v is None:
+                raise HubError("%s has no approved version to report on" % str(name or "that note")[:40])
+            lead = self._lead()
+            to = "all" if ok else (lead if lead and lead != by else OWNER)
+            self._process_message(by, to, "Followed the process note %s (v%d): %s" % (
+                v["name"], v["version"], "it worked" if ok else "it failed: " + why),
+                {"op": "report", "name": v["name"], "of": v["id"], "ok": ok, "why": why},
+                task=self._usage_task(by) or None)  # the task it was for, for the learning totals (L7)
+            self._changed()
+            held = bool(rec.get("held"))
+        if ok:
+            return "Thanks: %s v%d is marked as working." % (v["name"], v["version"])
+        return ("Thanks. If you know the fix, update the note (hub_process update with the steps that change); %s "
+                "has been told.%s" % ("the lead" if to != OWNER else "the owner",
+                                       " It failed %d times in a row, so agents no longer get it until it is fixed and "
+                                       "approved again." % FAILS_TO_REOPEN if held else ""))
+
+    def stale_reason(self, v, now=None):
+        """Why a live note may be out of date, or "" (L5): the files it names changed a lot (agents' edits since it
+        was approved, or the lines changed in git since its commit), or nobody checked it for STALE_DAYS."""
+        now = now or time.time()
+        paths = v["files"] + v["areas"]
+        since = v.get("approved_at", v["ts"])
+        if paths and self.edits_on():
+            try:
+                edits = sum(1 for e in self.events.edits(since=since) if area_covered(e["path"], paths))
+            except Exception:  # a locked events.sqlite: the next look
+                edits = 0
+            if edits >= STALE_EDITS:
+                return "agents edited its files %d times since it was approved" % edits
+        if paths and v.get("commit"):
+            for folder in self.project_folders():
+                churn = git_churn(folder, v["commit"], paths)
+                if churn is not None and churn[0] == 0 and churn[1] == 0:
+                    continue
+                if churn is not None and churn[1] == 0:
+                    return "its files are gone since commit %s" % v["commit"][:10]
+                if churn is not None and churn[0] >= STALE_CHURN * churn[1]:
+                    return "its files were largely rewritten since commit %s" % v["commit"][:10]
+        if now - max(since, v.get("checked", 0)) > STALE_DAYS * 86400:
+            return "nobody has reported it working for %d days" % STALE_DAYS
+        return ""
+
+    def check_stale(self, now=None):
+        """Flag the live notes that may be out of date (L5), once each: the flag is a message, so the other machines
+        see it and do not flag it again. The lead (else the owner) is asked to check it. It only flags, never retires."""
+        with self.lock:
+            live = [dict(v) for v in (self._live(r) for r in self.processes.values()) if v is not None and not v.get("stale")]
+        flagged = []
+        for v in live:
+            why = self.stale_reason(v, now)
+            if not why:
+                continue
+            with self.lock:
+                lead = self._lead()
+                self._process_message(SERVER_NAME, lead or OWNER, "The process note %s (v%d) may be out of date: %s. "
+                                      "Check it, and update it (hub_process update) or report it working." % (
+                                          v["name"], v["version"], why),
+                                      {"op": "stale", "name": v["name"], "of": v["id"], "why": why})
+                self._changed()
+            flagged.append(v["name"])
+        return flagged
+
+    def was_hard(self, mid):
+        """Why a task looked hard, in a few words, or "" (L3): it was blocked, reclaimed from a silent holder, sent
+        back by a review or the advisor, or took much longer than the median of the tasks done before it."""
+        with self.lock:
+            said = [m for m in self.messages if m.get("task") == mid and m["kind"] in ("update", "answer")]
+            reclaimed = bool((self.sheet.get(mid) or {}).get("reclaimed"))
+        steps = [m["status"] for m in said if m["kind"] == "update" and m.get("status") in STATUSES]
+        if "blocked" in steps:
+            return "It was blocked on the way"
+        if reclaimed or any(m.get("reclaimed") for m in said):
+            return "It was reclaimed on the way"
+        if any(m["kind"] == "answer" and m.get("verdict") == "changes" for m in said) or any(
+                a == "review" and b in ("in_progress", "blocked") for a, b in zip(steps, steps[1:])):
+            return "It was sent back from review"
+        stats = self.analytics
+        if stats.built.is_set():
+            with stats.lock:
+                spans = {k: t["done"] - min(t.get("taken", t["done"]), t.get("in_progress", t["done"]))
+                         for k, t in stats.tasks.items() if "done" in t}
+            mine, others = spans.get(str(mid)), [s for k, s in spans.items() if k != str(mid) and s > 0]
+            if mine and len(others) >= SLOW_TASKS_KNOWN and mine > SLOW_TASK * median(others):
+                return "It took much longer than most tasks"
+        return ""
+
+    def update_process(self, by, name, fields, base=None):
+        """A new version of a note: its newest one (or `base`) with the fields given changed. Says which changed."""
+        home = self._note_home(name) if base is None else self
+        if home is not self:
+            return home.update_process(by, name, fields)
+        with self.lock:
+            if base is None:  # the newest version not declined or retired: an update never brings back declined text
+                newest = self._version(name)
+                base = next((x for x in reversed(self.processes[newest["name"]]["versions"])
+                             if x["state"] != "retired"), newest)
+            latest = dict(base)
+        old = {k: latest.get(k) for k in ("when", "scope", "commit", "command") + PROCESS_LISTS}
+        command = fields.pop("command", old["command"])  # only the owner's promote_process sets it
+        fields = {k: v for k, v in fields.items() if k in old and v not in (None, "")}
+        new = clean_note(dict(old, **fields, name=latest["name"], command=command))
+        changed = [k for k in ("when", "steps", "commands", "pitfalls", "files", "areas", "scope", "command")
+                   if new.get(k) != old.get(k)]
+        if not changed:
+            raise HubError("that is what %s v%d says already: give the fields that change" % (latest["name"], latest["version"]))
+        return self.propose_process(by, new, changed)
+
+    def _indexed_notes(self):
+        """The live notes (this project's and the shared ones), and the word index brought up to date with them."""
+        notes = self.live_processes()
+        self.chat_index.index_notes(notes)
+        return {n["name"]: n for n in notes}
+
+    def find_processes(self, words, limit=5):
+        """The live notes sharing words with what an agent is stuck on, in their name, use, steps, commands, pitfalls
+        or areas, best first (the word index, L4): process_rows' rows, the shared ones' too."""
+        if not note_words(words):
+            raise HubError("say what you are stuck on, in a few words (name)")
+        live = self._indexed_notes()
+        rows = {r["name"]: r for r in self.process_rows()}
+        found = []
+        for name, _ in self.chat_index.match_notes(words)[:limit]:
+            n = live.get(name)
+            if n is not None:
+                found.append(rows.get(name) if name in rows and rows[name]["scope"] == "project" else dict(
+                    name=name, state="approved", version=n["version"], live=n["version"], scope=n["scope"],
+                    when=n["when"], approver="", why=""))
+        return found
+
+    def notes_for_task(self, mid):
+        """The live notes a task may need (L4): their areas overlap the task's, or two words of their name and use are
+        in its title. [note]"""
+        with self.lock:
+            row = self.sheet.get(mid) or {}
+            title, areas = row.get("title") or (self.by_id.get(mid) or {}).get("text", ""), row.get("areas") or []
+        live = self._indexed_notes()
+        names = [n for n, v in sorted(live.items()) if areas and any(
+            areas_overlap([a], areas) for a in v["areas"] + v["files"])]
+        names += [n for n, _ in self.chat_index.match_notes(title, head_only=True, least=2) if n not in names]
+        return [live[n] for n in names[:5] if n in live]
+
+    def notes_note(self, mid):
+        """What a take answer adds (L4): the notes the task may need, or ""."""
+        notes = self.notes_for_task(mid)
+        if not notes:
+            return ""
+        return "\nProcess notes for this task: %s. Read each before you start (hub_process get NAME)." % "; ".join(
+            "%s (%s)" % (n["name"], n["when"].rstrip(".")) for n in notes)
+
+    def tell_note_holders(self, note):
+        """A note just became live here (L4): each agent holding a task in progress or in review over its areas hears
+        of it, through its hooks, within a turn. Sent from the machine where it was approved only, so a linked machine
+        never tells it twice."""
+        touches = note["areas"] + note["files"]
+        if not touches:
+            return []
+        out = []
+        with self.lock:
+            holders = {}
+            for mid, holder in self.taken.items():
+                row = self.sheet.get(mid)
+                if row is None or not row["areas"] or self._row_status(mid) not in ("doing", "review"):
+                    continue
+                if any(areas_overlap([t], row["areas"]) for t in touches):
+                    holders.setdefault(holder, []).append(mid)
+            for holder, mids in sorted(holders.items()):
+                text = ("A process note for the files of your task%s %s is approved: %s (%s). Read it before you go "
+                        "on: .claude/skills/%s%s/SKILL.md, or hub_process get %s." % (
+                            "s" if len(mids) > 1 else "", ", ".join("#" + m for m in mids), note["name"],
+                            note["when"].rstrip("."), PROCESS_SKILL, note["name"], note["name"]))
+                out.append(self._append(SERVER_NAME, holder, text[:MAX_NOTICE], "msg", task=mids[0]))
+            if out:
+                self._changed()
+        return out
+
+    def agent_commit(self, name):
+        """The commit an agent's folder on this machine is at, for a note it writes; "" when it is on another machine
+        or not in git."""
+        for folder in self.agent_folders(name)[:1]:
+            return git_commit(folder)
+        return ""
+
+    def _version(self, name, of=""):
+        """A note's version by its message id, or its newest; HubError if the note has none. Caller holds the lock."""
+        rec = self.processes.get(str(name or "").strip().lower())
+        if not rec or not rec["versions"]:
+            raise HubError("no process note is called %s: hub_process list shows them" % (str(name or "")[:40] or "that"))
+        if not of:
+            return rec["versions"][-1]
+        found = next((v for v in rec["versions"] if v["id"] == str(of)), None)
+        if found is None:
+            raise HubError("the note %s has no version #%s" % (rec["name"], of))
+        return found
+
+    def approve_process(self, by, name, of=""):
+        """Approve a proposed version (its newest without of): the owner always; the lead when the rule lets it,
+        else it waits for the owner, with the reason. Returns what happened, in a line."""
+        shared = None
+        with self.lock:
+            v = self._version(name, of)
+            rec = self.processes[v["name"]]
+            if v["state"] != "proposed":
+                raise HubError("%s v%d is %s, not waiting for approval" % (v["name"], v["version"], v["state"]))
+            who, why = self._process_approver(rec, v)
+            if by != OWNER and not self._is_lead(by):
+                raise HubError("the lead or the owner approves process notes")
+            if by != OWNER and who == "owner":
+                self._process_message(by, OWNER, "Asks you to approve the process note %s (v%d): %s"
+                                      % (v["name"], v["version"], why), {"op": "ask", "name": v["name"], "of": v["id"],
+                                                                        "reason": why})
+                self._changed()
+                return "The note %s v%d needs the owner's approval (%s): it waits in the owner's Needs you." % (
+                    v["name"], v["version"], why)
+            author = v["by"] if v["by"] not in (by, OWNER, SERVER_NAME) else "all"
+            self._process_message(by, author, "Approved the process note %s (v%d): it is in every agent's folder now, "
+                                  "as the skill %s%s." % (v["name"], v["version"], PROCESS_SKILL, v["name"]),
+                                  {"op": "approve", "name": v["name"], "of": v["id"]})
+            self._changed()
+            if v["scope"] == "shared":
+                shared = dict(v)
+        if shared is not None and self.shared_hub is not None:
+            hub = self.shared_hub()
+            if hub is not None and hub is not self:
+                hub.publish_process(shared, self.roster.project)
+        if shared is None or self.on_published is None:
+            self.tell_note_holders(v)
+        else:
+            self.on_published(v)  # every project's holders, a shared note being every project's
+        return "Approved %s v%d: every agent's folder gets it now." % (v["name"], v["version"])
+
+    def decline_process(self, by, name, of=""):
+        """A proposed version is not taken (the note's live version, if any, stays): the owner, or the lead for a
+        version it may approve."""
+        with self.lock:
+            v = self._version(name, of)
+            rec = self.processes[v["name"]]
+            if v["state"] != "proposed":
+                raise HubError("%s v%d is %s, not waiting for approval" % (v["name"], v["version"], v["state"]))
+            if by != OWNER and not (self._is_lead(by) and self._process_approver(rec, v)[0] == "lead"):
+                raise HubError("the owner declines this note%s" % ("" if self._is_lead(by) else ", or the lead"))
+            author = v["by"] if v["by"] not in (by, OWNER, SERVER_NAME) else "all"
+            self._process_message(by, author, "Declined the process note %s (v%d)." % (v["name"], v["version"]),
+                                  {"op": "decline", "name": v["name"], "of": v["id"]})
+            self._changed()
+
+    def publish_process(self, note, project=""):
+        """The shared project's log: a version the owner shared with all projects, approved as it is written."""
+        with self.lock:
+            rec = self.processes.get(note["name"]) or {"versions": []}
+            number = max([v["version"] for v in rec["versions"]] or [0]) + 1
+            self._process_message(OWNER, "all", "Shared the process note %s (v%d) with all projects: %s" % (
+                note["name"], number, note["when"]), dict(note_from(note), op="publish", version=number, project=project))
+            self._changed()
+
+    def retire_process(self, by, name):
+        """No agent gets the note any more (it stays in the log). The owner, or the lead for a note it may approve;
+        a shared note is retired in the shared log too."""
+        shared = False
+        with self.lock:
+            v = self._version(name)
+            rec = self.processes[v["name"]]
+            if by != OWNER and not (self._is_lead(by) and self._process_approver(rec, v)[0] == "lead"):
+                raise HubError("the owner retires this note%s" % ("" if self._is_lead(by) else ", or the lead"))
+            self._process_message(by, "all", "Retired the process note %s: agents no longer get it." % v["name"],
+                                  {"op": "retire", "name": v["name"]})
+            self._changed()
+            shared = any(x["scope"] == "shared" and x.get("approved_by") for x in rec["versions"])
+        hub = self.shared_hub() if shared and self.shared_hub is not None else None
+        if hub is not None and hub is not self and v["name"] in hub.processes:
+            hub.retire_process(OWNER, v["name"])
+
+    def mark_process(self, name, owner_only):
+        """The owner: only the owner may approve this note's versions (or no longer only)."""
+        with self.lock:
+            v = self._version(name)
+            self._process_message(OWNER, "all", "Process note %s: %s" % (
+                v["name"], "only the owner approves it" if owner_only else "approved by the project's rule"),
+                {"op": "mark", "name": v["name"], "owner_only": bool(owner_only)})
+            self._changed()
+
+    def set_process_rule(self, rule):
+        """The owner: who approves this project's notes, on every machine."""
+        if rule not in PROCESS_RULES:
+            raise HubError("the rule is %s" % ", ".join(PROCESS_RULES))
+        with self.lock:
+            if rule != self.process_rule:
+                self._process_message(OWNER, "all", "Process notes: from now on %s." % PROCESS_RULES[rule],
+                                      {"op": "rule", "rule": rule})
+                self._changed()
+            return self.process_rule
+
+    def promote_process(self, name, params=None):
+        """The owner makes a note's commands a project command (L6): a new version, approved as the owner writes it.
+        params: its parameters, {NAME} in the commands; None makes it a plain note again."""
+        with self.lock:
+            v = self._live(self.processes.get(str(name or "").strip().lower()) or {"versions": []})
+        if v is None:
+            raise HubError("only an approved note can become a project command")
+        # On the approved version, not the newest: an agent's proposal after it (other commands) must not become an
+        # approved project command because the owner promoted the version they saw (release review).
+        return self.update_process(OWNER, v["name"], {"command": {"params": list(params)} if params is not None else None},
+                                   base=v)[0]
+
+    def process_command(self, name):
+        """A project command, for `crewchat run` in an agent's shell (L6): the approved commands exactly as the owner saw
+        them, and their parameters. The server never runs them."""
+        home = self._note_home(name)
+        if home is not self:
+            return home.process_command(name)
+        with self.lock:
+            rec = self.processes.get(str(name or "").strip().lower())
+            v = self._live(rec) if rec else None
+        if v is None or not v.get("command"):
+            raise HubError("this project has no command called %s: crewchat processes lists the notes, and the owner "
+                           "makes one a command" % (str(name or "")[:40] or "that"))
+        return {"name": v["name"], "version": v["version"], "lines": v["commands"], "params": v["command"]["params"]}
+
+    def share_process(self, name):
+        """The owner makes a project note shared with all projects: a new version, scope shared, approved."""
+        with self.lock:
+            v = self._live(self.processes.get(str(name or "").strip().lower()) or {"versions": []})
+        if v is None:
+            raise HubError("only an approved note can be shared")
+        return self.propose_process(OWNER, dict(v, scope="shared"), ["scope"])[0]  # an update: the name is in use
+
+    def process_rows(self):
+        """Every note, newest version first, for the owner and hub_process list: name, state, versions, who approves."""
+        with self.lock:
+            rows = []
+            for name in sorted(self.processes):
+                rec = self.processes[name]
+                latest, live = self._latest(rec), self._live(rec)
+                if latest is None:
+                    continue
+                who, why = self._process_approver(rec, latest)
+                rows.append({"name": name, "state": latest["state"], "version": latest["version"], "of": latest["id"],
+                             "live": live["version"] if live else 0, "scope": latest["scope"], "when": latest["when"],
+                             "by": latest["by"], "approved_by": (live or {}).get("approved_by", ""),
+                             "owner_only": rec.get("owner_only", False), "approver": who, "why": why,
+                             "asked": latest.get("asked"), "ts": latest["ts"],
+                             "ok": (live or latest).get("ok", 0), "failed": (live or latest).get("failed", 0),
+                             "stale": (live or {}).get("stale", ""), "held": bool(rec.get("held")),
+                             "commands": (live or latest)["commands"],
+                             "body": "\n".join(process_body(latest)) if latest["state"] == "proposed" else "",
+                             "command": ((live or {}).get("command") or {}).get("params"),
+                             "unused": bool(live and not live.get("ok") and not live.get("failed")
+                                            and time.time() - live.get("approved_at", live["ts"]) > UNUSED_DAYS * 86400)})
+            return rows
+
+    def _note_home(self, name):
+        """The hub that keeps a note an agent names: this project's, or else the shared project's when the note is one
+        shared with all projects (it lives only in the shared log), so agents of every project get, report on, update
+        and run it (release review: only the sharing project could)."""
+        key = str(name or "").strip().lower()
+        with self.lock:
+            if any(v["state"] != "retired" for v in (self.processes.get(key) or {}).get("versions", [])):
+                return self
+        shared = self.shared_hub() if self.shared_hub is not None else None
+        if shared is not None and shared is not self:
+            with shared.lock:
+                if any(v["state"] != "retired" for v in (shared.processes.get(key) or {}).get("versions", [])):
+                    return shared
+        return self
+
+    def process_note(self, name, of=""):
+        """One version of a note, its fields and where it stands (its newest without of)."""
+        home = self._note_home(name)
+        if home is not self:
+            return home.process_note(name, of)
+        with self.lock:
+            v = dict(self._version(name, of))
+            rec = self.processes[v["name"]]
+            live = self._live(rec)
+            v["live"] = live["version"] if live else 0
+            return v
+
+    def live_processes(self):
+        """The notes this project's agents get: its own approved notes, then the ones shared with all projects (from
+        the shared log; a project note of the same name wins), by name."""
+        with self.lock:
+            own = {n: self._live(r) for n, r in self.processes.items()}
+        shared_hub = self.shared_hub() if self.shared_hub is not None else None
+        shared = {}
+        if shared_hub is not None and shared_hub is not self:
+            with shared_hub.lock:
+                shared = {n: shared_hub._live(r) for n, r in shared_hub.processes.items()}
+            own = {n: v for n, v in own.items() if v is not None and v["scope"] == "project"}
+        notes = [v for _, v in sorted(own.items()) if v is not None]
+        notes += [v for n, v in sorted(shared.items()) if v is not None and n not in own]
+        return [dict(v) for v in notes]
+
+    def _guides_soon(self):
+        """The guides again in a moment, outside the lock: a note became live or went (here, or on another machine).
+        The shared project's notes are in every project's guides. Caller holds the lock."""
+        if self._guides_due:
+            return
+        self._guides_due = True
+
+        def run():
+            with self.lock:
+                self._guides_due = False
+            try:
+                (self.on_processes or self.refresh_guides)()
+            except Exception as e:  # the next change, or the next start, writes them
+                sys.stderr.write("%s could not write the process notes: %s\n" % (now_iso(), e))
+        timer = threading.Timer(0.2, run)
+        timer.daemon = True
+        timer.start()
+
     # The task sheet ----------------------------------------------------------------------------
     # Every task is a row: what the owner posts, what the lead hands out, what agents add. An agent
     # with nothing to do takes the top row it may (hub_task view, then hub_task take). A row waits for the
@@ -4109,6 +6174,8 @@ class Hub:
                 return "its files import, or are imported by, those of #%s, which %s is working on" % (other, holder)
         if not self._row_machine_ok(agent, row):
             return "it needs the machine %s" % row["where"]
+        if row.get("browser") and not (self.agents.get(agent) or {}).get("browser"):
+            return "it needs the browser, which is not on for %s (the owner turns it on)" % agent
         return ""
 
     def sheet_rows(self, agent=None, view="all"):
@@ -4129,7 +6196,8 @@ class Hub:
                 if status == "todo" and any(d in self.sheet and self._row_status(d) != "done" for d in row["depends"]):
                     status = "waiting"  # shown so: it cannot start before what it waits for is done
                 rows.append(dict(row, id=mid, status=status, holder=self.taken.get(mid) or "",
-                                 note=(self.progress.get(mid) or {}).get("by", ""), reclaimed=row.get("reclaimed", "")))
+                                 note=(self.progress.get(mid) or {}).get("by", ""), reclaimed=row.get("reclaimed", ""),
+                                 browser=bool(row.get("browser"))))
             return rows
 
     def add_row(self, sender, title, depends="", areas="", where="", to="all"):
@@ -4391,24 +6459,36 @@ class Hub:
         data = {"roles": roles, "statuses": STATUSES, "tools": TOOLS_INFO, "presets": PICTURE_PRESETS,
                 "art": ART_PICTURES, "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
-                "advisors": {tool: tool_advisors(tool) for tool in LAUNCH_TOOLS},
                 "names": AGENT_NAMES, "images": INLINE_IMAGES, "max_upload": MAX_UPLOAD, "releases": RELEASES}
         data["tag"] = sha(__version__ + json.dumps(data, sort_keys=True))[:12]
         self._boot = (roles, data)
         return data
 
-    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing="", path=None):
+    def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing="", path=None,
+             conversation=None, browser=None):
         """What an agent's hook asks: are there messages for the session with this link key?
         event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
-        only a sign of life, or the session report it was asked for)."""
+        only a sign of life, or the session report it was asked for). `conversation` is where the agent's
+        conversation is ({"tool", "path" or "session"}, from its hook): kept in memory when conversation_place
+        accepts it (A2), else ignored. `browser` is a browser call's {"tool", "action", "url"} after it ran: the page
+        it left the agent on (browser_seen)."""
         table = _PROCESSES  # as the server last read it: never ps here
         if not isinstance(key, str) or not KEY_RE.match(key):
             raise HubError("bad key")
+        kept = None
+        if isinstance(conversation, dict) and conversation.get("tool") in HOOK_CLIENTS:
+            found = conversation_place(conversation["tool"], conversation, config=self.machine_config())
+            if found is not None:
+                kept = {"tool": conversation["tool"], "place": found}
         with self.lock:
+            if kept:
+                self._hook_place(key, place, kept)
             name = self.links.get(key)
             agent = self.agents.get(name) if name else None
             if agent is None or agent["place"] != place:
                 return {"link": True}
+            if kept:
+                agent["conversation"] = kept  # (memory only: _save leaves it out)
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
                 doing = clean_doing(doing)
@@ -4426,7 +6506,14 @@ class Hub:
                 clean = clean_edit_path(path) if tracking and path else ""
                 if clean:  # a file it edited, inside its project (C0): kept on this machine only
                     self._edited(name, clean)
-                return {"edits": tracking}  # the hook sends edited paths only while this is true
+                if isinstance(browser, dict):
+                    self._browser_seen(name, browser)
+                remind = self._browser_remind(name, time.time())
+                if remind and agent["client"] not in CONTEXT_EVENTS:  # no way into its turn: the chat says it
+                    self._append(SERVER_NAME, name, remind, "msg")
+                    self._changed()
+                    remind = ""
+                return dict({"edits": tracking}, **({"remind": remind} if remind else {}))  # edits: send paths while true
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
             self._drop_permissions(name)
@@ -4520,7 +6607,7 @@ class Hub:
 
     def _reopen_plan(self, name, model=None):
         """What reopening an agent takes, all checked before anything is stopped: (its session,
-        its folder, the command, its link key). HubError if it cannot be reopened."""
+        its folder, the command, its link key, its account's environment). HubError if it cannot be reopened."""
         with self.lock:
             session = dict(self._session_of(name, "reopen"))
         if time.time() - float(session.get("reopening") or 0) < REOPEN_WAIT:
@@ -4533,25 +6620,25 @@ class Hub:
             raise HubError("%s's folder is no longer connected to this chat on this machine" % name)
         with self.lock:
             key = self._link_key(name)  # the prompt and its hooks (_open_again) both link with this one
-            permissions = (self.agents.get(name) or {}).get("permissions", "ask")
-            model = model or (self.agents.get(name) or {}).get("model") or None
-            advisor = (self.agents.get(name) or {}).get("advisor") or ""
+            agent = dict(self.agents.get(name) or {})
+        permissions = agent.get("permissions", "ask")
         permissions = permissions if permissions in LAUNCH_PERMISSIONS[tool] else "ask"
+        model = model or agent.get("model") or None
         if model and model not in [m for m, _ in tool_models(tool)]:
             model = None
-        if advisor not in [m for m, _ in tool_advisors(tool)]:
-            advisor = ""
+        chrome, account = bool(agent.get("browser")), agent.get("account") or ""
+        env = account_env(self.machine_config(), account, tool) if tool == "claude" else {}
         exe, base = agent_tool(tool, folder, permissions, self.home)
-        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, advisor, key), key
+        return session, folder, resume_command(exe, tool, session["id"], permissions, base, model, key, chrome), key, env
 
     def reopen_agent(self, name):
         """The owner reopens an agent's own conversation in a terminal window on this machine: same
         memory, same name (its hooks get its own link key), same permissions. It is told to carry
         on, so its hooks report the new process and read the chat."""
-        session, folder, command, key = self._reopen_plan(name)
+        session, folder, command, key, env = self._reopen_plan(name)
         if process_running(session):
             raise HubError("%s is still running: stop it first" % name)
-        self._open_again(name, None, session, folder, command, key)
+        self._open_again(name, None, session, folder, command, key, env=env)
 
     def reconnect_agent(self, name):
         """The owner wakes an agent whose session is open but asleep (past its listening time, it only reads the chat at
@@ -4571,10 +6658,10 @@ class Hub:
     def _restart_session(self, name, model, done):
         """Stop an agent's session if it runs and reopen its conversation (on model): everything reopening needs is
         checked first, so a failure never leaves it stopped. Its tasks stay its own."""
-        session, folder, command, key = self._reopen_plan(name, model)
+        session, folder, command, key, env = self._reopen_plan(name, model)
         if process_running(session):
             end_session(name, session)
-        self._open_again(name, model, session, folder, command, key, done)
+        self._open_again(name, model, session, folder, command, key, done, env)
 
     def startable(self, name):
         """Can the owner start a new session for this local agent (Start again)? Its tool can be
@@ -4605,7 +6692,8 @@ class Hub:
                 raise HubError("%s is running or starting already" % name)
             tool = agent["client"]
             permissions, model = agent.get("permissions") or "ask", agent.get("model") or ""
-            advisor = agent.get("advisor") or ""
+            account = agent.get("account") or ""
+            chrome = bool(agent.get("browser"))
         connected = {f["path"] for f in launch_folders(self.machine_config(), self.home, self.chat_key)}
         folder = next((str(f) for f in self.agent_folders(name) if str(f) in connected), None)
         if folder is None:
@@ -4614,12 +6702,11 @@ class Hub:
             permissions = "ask"
         if model not in [m for m, _ in tool_models(tool)]:
             model = ""
-        if advisor not in [m for m, _ in tool_advisors(tool)]:
-            advisor = ""
         with self.lock:
             key = self._link_key(name)
         try:
-            launch_agent(tool, folder, key, permissions, self.home, model, advisor)
+            env = account_env(self.machine_config(), account, tool) if tool == "claude" else {}
+            launch_agent(tool, folder, key, permissions, self.home, model, env=env, chrome=chrome)
         except (HubError, OSError) as e:
             raise HubError(str(e))
         with self.lock:
@@ -4639,11 +6726,13 @@ class Hub:
             self._save()
         return key
 
-    def _open_again(self, name, model, session, folder, command, key, done="reopened"):
-        """Open the reopened conversation's window, its hooks given key: the one its prompt links with (_reopen_plan)."""
+    def _open_again(self, name, model, session, folder, command, key, done="reopened", env=None):
+        """Open the reopened conversation's window, its hooks given key: the one its prompt links with (_reopen_plan);
+        env: its Claude Code account's (account_env)."""
         # OpenCode does not send a prompt given with the session it continues: crewchat's plugin does,
         # once (the nonce), to that session.
-        env = {"CREWCHAT_REOPEN": "%s:%s" % (session["id"], secrets.token_hex(8))} if session.get("tool") == "opencode" else {}
+        env = dict(env or {}, **({"CREWCHAT_REOPEN": "%s:%s" % (session["id"], secrets.token_hex(8))}
+                                 if session.get("tool") == "opencode" else {}))
         open_terminal(folder, command, key, title=name, root=self.home, env=env)
         with self.lock:
             if (self.agents.get(name) or {}).get("session"):
@@ -4822,7 +6911,8 @@ def fmt(msg, viewer=None, compact=False):
     elif msg["kind"] == "answer":
         tag = "[ANSWER to #%s%s] " % (msg.get("answers"), ", " + VERDICTS[msg["verdict"]] if msg.get("verdict") in VERDICTS else "")
     files = "".join("\n    [file %s: %s, %s, %s; open it with hub_file]" % (
-        f["id"], f["name"], f["type"], human_size(f["size"])) for f in msg.get("files") or [])
+        f["id"], f["name"], f["type"], human_size(f["size"])) for f in msg.get("files") or []
+        if f.get("for") in (None, "", viewer) or viewer == OWNER)  # (a file for the advisor: for it only)
     return "%s %s -> %s: %s%s%s%s" % (stamp, msg["from"], to, tag, msg["text"], files, after)
 
 
@@ -4869,8 +6959,11 @@ def clean_files(files):
                 size = max(0, int(f.get("size") or 0))
             except (TypeError, ValueError):
                 size = 0
-            out.append({"id": str(f["id"]), "name": clean_filename(f.get("name")), "size": size,
-                        "type": file_type(str(f.get("name", "")), f.get("type"))[:100]})
+            entry = {"id": str(f["id"]), "name": clean_filename(f.get("name")), "size": size,
+                     "type": file_type(str(f.get("name", "")), f.get("type"))[:100]}
+            if f.get("for") not in (None, ""):  # for one agent only (A2): kept, so every machine refuses the others
+                entry["for"] = str(f["for"])[:64]
+            out.append(entry)
     return out[:MAX_FILES]
 
 
@@ -4918,6 +7011,8 @@ READ = {"readOnlyHint": True, "openWorldHint": False}
 WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False}
 SETTING = dict(WRITE, idempotentHint=True)
 TASK_ACTIONS = ("view", "add", "take", "assign", "areas", "update")
+PROCESS_ACTIONS = ("propose", "update", "list", "get", "find", "report")  # hub_process (L2); the lead's has LEAD_PROCESS_ACTIONS too
+LEAD_PROCESS_ACTIONS = ("approve", "decline", "retire")
 OLD_TASK_TOOLS = {"hub_tasks": "view", "hub_task_add": "add", "hub_take": "take", "hub_assign": "assign",
                   "hub_update": "update"}  # merged into hub_task in 1.0; a session started before asks for them
 
@@ -4983,6 +7078,19 @@ TOOLS = [
     _tool("hub_link", "Link this session with the key a crewchat hook gave you, once.", SETTING,
           {"key": {"type": "string", "description": "Exactly as given."}}, ("key",)),
 ]
+
+
+def _process_tool(actions):
+    """hub_process (L2): one tool for the process notes, its fields in one object to keep what agents load short."""
+    return _tool("hub_process", "Process notes: how the crew does things. Record yours.", WRITE, {
+        "action": {"type": "string", "enum": list(actions), "description": "What to do."},
+        "name": {"type": "string", "description": "A note (release-build); find: words."},
+        "note": {"type": "object", "description": "when, steps, commands, pitfalls, areas, scope."}},
+        ("action",))
+
+
+TOOLS.append(_process_tool(PROCESS_ACTIONS))
+LEAD_PROCESS = _process_tool(PROCESS_ACTIONS + LEAD_PROCESS_ACTIONS)  # the lead approves notes
 # Only the lead and the advisor get these (owner, 18 Oct): the others' tool list stays as short as it is.
 LEAD_TOOLS = [
     _tool("hub_code", "Lead and advisor: who changed a file and why (history), or files to hand out together (split).",
@@ -5002,7 +7110,9 @@ def tools_for(hub, sid, owner=False):
     Remembered, so the session can be told when its role changes what it should have."""
     kind = "lead" if owner else hub.tool_kind(sid)
     hub.listed(sid, kind)
-    return TOOLS + LEAD_TOOLS if kind == "lead" else TOOLS
+    if kind != "lead":
+        return TOOLS
+    return [LEAD_PROCESS if t["name"] == "hub_process" else t for t in TOOLS] + LEAD_TOOLS
 
 
 def days_arg(data, default=7):
@@ -5093,7 +7203,9 @@ def call_tool(hub, sid, name, args, owner=False):
         return "Your profile: picture %s, colour %s." % (done["picture"] or "initials",
                                                          done["colour"] or "the tool's colour")
     if name == "hub_file":
-        return open_shared_file(hub, args.get("id"))
+        return open_shared_file(hub, args.get("id"), me)
+    if name == "hub_process":
+        return process_call(hub, me, args)
     if name == "hub_inbox":
         unread = hub.inbox(me, int_arg(args, "wait_seconds", 0, 0, MAX_WAIT), True)
         if not unread:
@@ -5110,8 +7222,8 @@ def call_tool(hub, sid, name, args, owner=False):
         mid = clean_id(args.get("id"))
         hub.take(me, mid)
         return ("Task #%s is yours and everyone has been told. Before any other work, send hub_task "
-                "action=update id=%s status=in_progress with one line on your plan; then start.%s%s"
-                % (mid, mid, hub.reclaim_note(mid), hub.heads_up(me, mid)))
+                "action=update id=%s status=in_progress with one line on your plan; then start.%s%s%s"
+                % (mid, mid, hub.reclaim_note(mid), hub.heads_up(me, mid), hub.notes_note(mid)))
     if name == "hub_agents":
         return roster_text(hub.rows(), me) or "No agents yet."
     if name == "hub_history":
@@ -5147,7 +7259,8 @@ def call_tool(hub, sid, name, args, owner=False):
         if args.get("take") and not owner:
             hub.take(me, msg["id"])
             return ("Task #%s is on the sheet and yours. Send hub_task action=update id=%s status=in_progress with your plan, "
-                    "then start.%s%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"]), hub.heads_up(me, msg["id"])))
+                    "then start.%s%s%s" % (msg["id"], msg["id"], hub.reclaim_note(msg["id"]), hub.heads_up(me, msg["id"]),
+                                           hub.notes_note(msg["id"])))
         return "Task #%s is on the sheet for whoever can take it." % msg["id"]
     if name == "hub_answer":
         msg = hub.answer(me, args.get("id"), args.get("text"), args.get("verdict") or "")
@@ -5201,11 +7314,77 @@ def call_tool(hub, sid, name, args, owner=False):
         if not isinstance(note, str) or len(note) > MAX_TEXT:
             raise HubError("note must be a string of at most %d characters" % MAX_TEXT)
         msg, to = hub.update(me, args.get("id"), args.get("status"), note.strip() or STATUSES.get(args.get("status"), ""))
-        return "Task #%s marked %s; %s has been told." % (msg["task"], STATUSES[msg["status"]],
-                                                          "the owner" if to == OWNER else to)
+        hard = hub.was_hard(msg["task"]) if msg["status"] == "done" and not owner else ""
+        return "Task #%s marked %s; %s has been told.%s" % (msg["task"], STATUSES[msg["status"]],
+                                                            "the owner" if to == OWNER else to,
+                                                            NOTE_PROMPT % hard if hard else "")
     new = args.get("name")
     hub.rename(me, new)
     return "You are now %s. Everyone has been told.%s" % (new, SESSION_NAME_NOTE % new)
+
+
+# Asked when a hard task is done (L3), and only then: asked every time, agents learn to skip it. Two lines at most.
+NOTE_PROMPT = ("\n%s. Did you work out a process another agent would need (steps, commands, a trap)? If so, "
+               "record it: hub_process propose.")
+SLOW_TASK = 2.0  # a task that took this many times the median of the tasks done before it looked hard (L3)
+SLOW_TASKS_KNOWN = 3  # tasks done before, at least, for the median to count
+
+
+def process_line(row):
+    """One process note, as hub_process list and find show it."""
+    live = "" if row["live"] in (0, row["version"]) else ", v%d live" % row["live"]
+    if row.get("stale"):
+        live += ", may be out of date: " + row["stale"]
+    wait = (" (waits for %s%s)" % ("the owner" if row["approver"] == "owner" else "the lead",
+                                   ": " + row["why"] if row["why"] else "")) if row["state"] == "proposed" else ""
+    return "- %s v%d, %s%s%s%s: %s" % (row["name"], row["version"], row["state"], live, wait,
+                                       ", all projects" if row["scope"] == "shared" else "", row["when"])
+
+
+def process_call(hub, me, args):
+    """hub_process (L2): propose, update, list, get, find; the lead's also approve, decline and retire."""
+    action, name, note = args.get("action"), args.get("name"), args.get("note")
+    if action not in PROCESS_ACTIONS + LEAD_PROCESS_ACTIONS:
+        raise HubError("action is %s" % ", ".join(PROCESS_ACTIONS))
+    if note is not None and not isinstance(note, dict):
+        raise HubError("note is an object: when, steps, commands, pitfalls, areas, scope")
+    if note and "command" in note:
+        raise HubError("only the owner makes a note's commands a project command")
+    if action == "list":
+        rows = hub.process_rows()
+        if not rows:
+            return "No process notes yet. Worked something out the hard way? hub_process propose."
+        return "The process notes (hub_process get NAME for one):\n" + "\n".join(process_line(r) for r in rows)
+    if action == "find":
+        found = hub.find_processes(name)
+        return ("Notes that may help (hub_process get NAME):\n" + "\n".join(process_line(r) for r in found) if found
+                else "No note matches. When you work it out, hub_process propose it.")
+    if not isinstance(name, str) or not name.strip():
+        raise HubError("name the note, like release-build")
+    if action == "get":
+        v = hub.process_note(name)
+        state = v["state"] + ("" if v["live"] in (0, v["version"]) else "; agents get v%d until this one is approved"
+                              % v["live"])
+        return "\n".join(process_body(v)) + "\n\nState: %s." % state
+    if action == "propose":
+        v, who, why = hub.propose_process(me, dict(note or {}, name=name, commit=hub.agent_commit(me)))
+    elif action == "update":
+        v, who, why = hub.update_process(me, name, dict(note or {}, commit=hub.agent_commit(me)))
+    elif action == "report":
+        return hub.report_process(me, name, (note or {}).get("ok"), (note or {}).get("why", ""))
+    elif action == "approve":
+        return hub.approve_process(me, name)
+    elif action == "decline":
+        hub.decline_process(me, name)
+        return "Declined %s's proposed version; its author has been told." % name
+    else:
+        hub.retire_process(me, name)
+        return "Retired %s: agents no longer get it." % name
+    if me == OWNER:
+        return "%s v%d is approved: every agent's folder gets it." % (v["name"], v["version"])
+    return "%s v%d is proposed: %s approves it%s. Until then agents %s." % (
+        v["name"], v["version"], "the owner" if who == "owner" else "the lead", " (%s)" % why if why else "",
+        "keep the approved version" if v["version"] > 1 else "do not get it")
 
 
 def sheet_line(row):
@@ -5232,8 +7411,14 @@ def sheet_line(row):
     return "#%s [%s] %s (%s)" % (row["id"], row["status"], row["title"], "; ".join(extra))
 
 
+def crewchat_homes(hub):
+    """crewchat's own folders for this hub, which hold its keys: the crewchat home and the project's."""
+    return {home().resolve(), hub.roster.root.resolve()}
+
+
 def stored_tokens(roots):
-    """Every token kept under these crewchat folders (the owner's, and each place's), as bytes."""
+    """Every token kept under these crewchat folders (the owner's, and each place's), and the browser bridge's, as
+    bytes."""
     found = set()
     for root in roots:
         for path in itertools.chain(root.glob("tokens/*.token"), root.glob("projects/*/tokens/*.token")):
@@ -5243,6 +7428,9 @@ def stored_tokens(roots):
                 continue
             if len(token) >= 20:  # an empty or hand-made stub must not match every file
                 found.add(token)
+    bridge = browser_token().encode("utf-8")  # the Playwright bridge's: it drives the owner's Chrome (B1)
+    if len(bridge) >= 20:
+        found.add(bridge)
     return found
 
 
@@ -5283,7 +7471,7 @@ def share_file(hub, path, folders):
     # are compared by identity, not by name: a path in another case (macOS, Windows) is the same folder.
     name = Path(path).name
     path = Path(path).expanduser().resolve()
-    homes = {home().resolve(), hub.roster.root.resolve()}
+    homes = crewchat_homes(hub)
     if inside_any(path, homes):
         raise HubError("%s is in crewchat's own folder, which holds its keys, so it cannot be shared" % name)
     # Nothing from elsewhere on the machine either (~/.ssh, ~/.aws, another project's .env): what an
@@ -5305,11 +7493,28 @@ def share_file(hub, path, folders):
     return hub.add_file(name, data)
 
 
-def open_shared_file(hub, fid):
-    """hub_file: an image to look at, a text file's contents, or else where the file is."""
+def file_for(hub, fid):
+    """The agent a shared file is for (A2), or None for a file for all: from the file's own meta.json when it is kept
+    here, else from its entry in the messages that carry it. One mark on any of them holds."""
+    meta, _ = hub.file(fid)
+    if meta is not None and meta.get("for") not in (None, ""):
+        return meta["for"]
+    with hub.lock:
+        for m in hub.messages:
+            for f in m.get("files") or []:
+                if f.get("id") == fid and f.get("for") not in (None, ""):
+                    return f["for"]
+    return None
+
+
+def open_shared_file(hub, fid, viewer):
+    """hub_file, for `viewer`: an image to look at, a text file's contents, or else where the file is."""
     fid = str(fid or "").strip().lower()
     if not FILE_ID_RE.match(fid):
         raise HubError("id must be the file id a message shows, like [file 1a2b3c4d5e6f7a8b: ...]")
+    meant = file_for(hub, fid)
+    if meant is not None and viewer not in (meant, OWNER):
+        raise HubError(FOR_THE_ADVISOR)
     meta, path = hub.open_file(fid)
     if meta is None:
         raise HubError("no shared file with id %s" % fid)
@@ -5429,6 +7634,11 @@ COMMANDS = [
          "--accept-edits lets Claude Code edit files without asking (+ Add an agent does the same).", None),
         ("agent rename OLD NEW", "Rename an agent.", None),
         ("agent remove NAME", "Drop an agent from the chat (a running session comes back under a new name).", None),
+        ("accounts [list]", "This machine's Claude Code accounts (their own settings folders, such as ~/.claude-personal), "
+         "which + New agent can start Claude Code agents in.", {"argv": ["accounts"]}),
+        ("accounts add NAME FOLDER", "Add a Claude Code account by its settings folder (one named .claude-NAME in "
+         "your home is found by itself).", None),
+        ("accounts remove NAME", "Forget an account you added.", None),
     ]),
     ("Teams", [
         ("role AGENT ROLE", "Give an agent a role (none takes it away); the menu on an agent's card does the same.", None),
@@ -5454,6 +7664,18 @@ COMMANDS = [
         ("skills [list]", "Skills shared with every agent of the project.", {"argv": ["skills"], "chat": True}),
         ("skills add PATH [--name NAME]", "Share a skill (a SKILL.md, or a folder holding one) with every agent.", None),
         ("skills remove NAME", "Stop sharing a skill.", None),
+        ("processes [list]", "The process notes the crew wrote down: what each is for, its state, who approves it.",
+         {"argv": ["processes"], "chat": True}),
+        ("processes show NAME", "A note's steps, commands and pitfalls.", None),
+        ("processes approve|decline|retire|share NAME", "Approve or decline a proposed note, stop giving it to agents, or "
+         "share it with all your projects.", None),
+        ("processes owner-only NAME on|off", "Only you approve this note's versions (or the project's rule again).", None),
+        ("processes promote NAME [PARAMS] [--yes]", "Make a note's commands a project command agents run with crewchat run "
+         "(it shows the exact commands first; PARAMS like VERSION,TARGET, written {VERSION} in them).", None),
+        ("processes unpromote NAME", "Make a project command a plain note again.", None),
+        ("run NAME [PARAM=VALUE ...]", "In an agent's folder: run a project command's commands, in order, in this shell.", None),
+        ("processes rule [owner|default|lead]", "Who approves the project's notes: you, the lead but for notes that need "
+         "you (default), or the lead.", None),
         ("tasks [list]", "The task sheet.", {"argv": ["tasks"], "chat": True}),
         ("tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]",
          "Put a task on the sheet: what it waits for, the files it touches, the machine it needs, who gets it.", None),
@@ -5678,6 +7900,178 @@ def connect_folder(path, chat, root=None, create=False):
     return str(folder)
 
 
+def machines_status(hub, local=False):
+    """What the Machines panel shows (M1): how this machine links (none, tailscale, cloud), itself, the others
+    (link.machines_status) and who coordinates; local: the page is on this machine (Google sign-in works)."""
+    info = link_info(hub)
+    link = hub.sync
+    me = {"name": hub.device or machine_name(), "os": os_name(), "version": __version__}
+    mesh = getattr(link, "mesh", None)
+    if mesh is not None and mesh.exists:
+        me.update(name=mesh.me.get("name", ""), tag=mesh.me.get("tag", ""), address=mesh.me.get("url", ""))
+    device = getattr(link, "device", None)
+    if device is not None and getattr(device, "exists", False):
+        me.update(name=device.name, tag=device.tag, fp=device.fp)
+    return {"via": info["via"], "me": me, "machines": link.machines_status() if link is not None else [],
+            "coordinator": info.get("coordinator"), "local": bool(local)}
+
+
+def pairs_with(name, machine):
+    """Would a project of this name (not this machine's first) pair with that machine's project of the name? Not
+    when it is that machine's first project, which pairs only with the others' first projects."""
+    first = next((p["name"] for p in machine.get("projects") or [] if p.get("first")), None)
+    return first is None or first.strip().lower() != str(name).strip().lower()
+
+
+def pair_name(name, machines, taken=()):
+    """A name like this one that pairs with every machine and is not taken here: "test1.0 2", "test1.0 3", ..."""
+    taken = {str(t).strip().lower() for t in taken}
+    for number in range(2, 100):
+        candidate = "%s %d" % (name, number)
+        if candidate.lower() not in taken and all(pairs_with(candidate, m) for m in machines):
+            return candidate
+    return name + " (here)"
+
+
+def pairing(projects, machines):
+    """How each project of this machine pairs with each other machine (M1): [{project, machine, machine_id, state,
+    fix}], state shared, missing (only here), gone (removed there), first-project (that machine's first project has
+    this name: they cannot pair) or older (that machine's crewchat does not say)."""
+    link = projects.primary.hub.sync
+    local = projects.listed()
+    names = [p.name for p in local]
+    rows = []
+    for project in local:
+        for m in machines:
+            if m.get("state") == "waiting":
+                continue
+            key, fix = project.name.strip().lower(), ""
+            theirs = {p["name"].strip().lower(): p for p in m.get("projects") or []}
+            if project.primary:
+                state = "shared"  # the first projects pair with each other, whatever their names
+            elif not m.get("version"):
+                state, fix = "older", "Update crewchat on %s to see how its projects pair with these" % m["name"]
+            elif key in theirs and theirs[key]["first"]:
+                state = "first-project"
+                fix = ("On %s, %s is its first project, and a first project pairs only with the others' first projects. "
+                       "Rename this one to %s and set it up on %s with that name, or work in the first project"
+                       % (m["name"], project.name, pair_name(project.name, machines, names), m["name"]))
+            elif key in theirs:
+                state = "shared"
+            else:
+                was = getattr(link, "projects", {}).get(key) if link is not None else None
+                if was is not None and m["id"] in getattr(was, "shared_with", ()):
+                    state, fix = "gone", "It was removed on %s; nothing is removed here" % m["name"]
+                else:
+                    state, fix = "missing", "Only on this machine: set it up on %s from its Machines panel" % m["name"]
+            rows.append({"project": project.name, "machine": m["name"], "machine_id": m["id"], "state": state, "fix": fix})
+    return rows
+
+
+def offered(projects):
+    """Projects the other linked machines have and this one has not (M2), to set up here: [{name, pack, machines}].
+    Not their first projects (those pair with this machine's first), nor the ones the owner said are not for this
+    machine (config.json's dismissed_projects)."""
+    link = projects.primary.hub.sync
+    if link is None:
+        return []
+    here = {p.name.strip().lower() for p in projects.listed()}
+    dismissed = {str(n).strip().lower() for n in projects.primary.roster.config.get("dismissed_projects") or []}
+    out = {}
+    for m in link.machines_status():
+        if m.get("state") == "waiting":
+            continue
+        for p in m.get("projects") or []:
+            key = p["name"].strip().lower()
+            if p.get("first") or key in here or key in dismissed:
+                continue
+            out.setdefault(key, {"name": p["name"], "pack": p.get("pack") or DEFAULT_PACK, "machines": []})["machines"].append(m["name"])
+    return sorted(out.values(), key=lambda r: r["name"].lower())
+
+
+def setup_offered(projects, name):
+    """Make here a project another machine offers, with its pack, so it pairs (M2). Refused when the name is another
+    machine's first project: a project of that name here would stay apart, as in the owner's 1.0 test."""
+    name = " ".join(str(name or "").split())
+    offer = next((o for o in offered(projects) if o["name"].lower() == name.lower()), None)
+    if offer is None:
+        raise HubError("no linked machine offers a project called %s" % name)
+    machines = projects.primary.hub.sync.machines_status()
+    clash = [m["name"] for m in machines if not pairs_with(offer["name"], m)]
+    if clash:
+        better = pair_name(offer["name"], machines, [p.name for p in projects.all()])
+        raise HubError("%s is the first project on %s, and a first project pairs only with the others' first projects, "
+                       "so a project of that name here would stay apart. Give it another name on every machine, such as "
+                       "%s" % (offer["name"], ", ".join(clash), better))
+    base = projects.base
+    pack = offer["pack"] if offer["pack"] in role_packs(base) else DEFAULT_PACK
+    try:
+        chosen = create_project(offer["name"], base, pack)
+    except OSError as e:
+        raise HubError("the project was not made (%s)" % (e.strerror or e))
+    projects.refresh()
+    return {"id": chosen["id"], "name": chosen["name"]}
+
+
+def dismiss_offer(projects, name):
+    """The owner said a project another machine has is not for this one: it is not offered again."""
+    name = " ".join(str(name or "").split())
+
+    def dismissed(old):
+        kept = [str(n) for n in old or []]
+        return kept + [name] if name.lower() not in {n.lower() for n in kept} else old
+    if name:
+        projects.primary.roster.update("dismissed_projects", dismissed)
+    return {"dismissed": name}
+
+
+def check_item(cid, ok, title, detail="", fix=""):
+    """One of the Machines panel's checks (M1): ok True, False, or None when it cannot be known; no fix when ok."""
+    return {"id": cid, "ok": ok, "title": title, "detail": detail, "fix": "" if ok else fix}
+
+
+def link_checks(projects, deep=False):
+    """Everything the Machines panel's "Check everything" lists (M1): {id, ok (True, False, or None when it is
+    not known or not a fault), title, detail, fix}. deep: also reach each machine now, and the cloud."""
+    hub = projects.primary.hub
+    link = hub.sync
+    via = link_info(hub)["via"]
+    checks = []
+    if via in ("none", "tailscale"):
+        try:
+            import crewchat_peers
+            checks += crewchat_peers.tailscale_checks(int(load_config(projects.base)["port"]))
+        except ImportError:  # crewchat.py copied alone: no linking from here
+            pass
+    if via == "cloud" and hasattr(link, "cloud_checks"):
+        checks += link.cloud_checks(deep)
+    machines = link.machines_status() if link is not None else []
+    if deep and hasattr(link, "reach"):
+        found = {}
+        threads = [threading.Thread(target=lambda m=m: found.__setitem__(m["id"], link.reach(m["id"])), daemon=True)
+                   for m in machines]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(15)
+        for m in machines:
+            ok, ms, why = found.get(m["id"], (False, 0, "no answer within 15 s"))
+            checks.append(check_item("reach:" + m["id"], ok, "%s answers" % m["name"], "%d ms" % ms if ok else why,
+                                     "Is %s on, with crewchat running and Tailscale connected?" % m["name"]))
+    for m in machines:
+        if m.get("state") == "waiting":
+            continue
+        version = m.get("version") or ""
+        checks.append(check_item("version:" + m["id"], version == __version__, "%s runs this crewchat" % m["name"],
+                                 "an older version" if not version else "%s there, %s here" % (version, __version__),
+                                 "Update crewchat on the machine with the older one"))
+    for r in pairing(projects, machines):
+        checks.append({"id": "pairing:%s:%s" % (r["project"], r["machine_id"]),
+                       "ok": True if r["state"] == "shared" else False if r["state"] == "first-project" else None,
+                       "title": "%s with %s" % (r["project"], r["machine"]), "detail": r["state"], "fix": r["fix"]})
+    return checks
+
+
 def link_info(hub, shared=True):
     """How this machine reaches the others, for the page: the link says (over Tailscale, with cloud
     sync through Firestore), or not at all."""
@@ -5690,7 +8084,7 @@ def link_info(hub, shared=True):
     return dict(hub.sync.link_status(), shared=shared, coordinator=coordinator)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map", "/api/coordinator")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map", "/api/coordinator", "/api/machines", "/api/open-folder", "/api/browser", "/api/processes", "/api/process-command")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file", "/peer/relay")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -6175,13 +8569,23 @@ class Handler(BaseHTTPRequestHandler):
             config = self.hub.machine_config()
             if folder not in [f["path"] for f in launch_folders(config, self.roster.root, self.hub.chat_key)]:
                 folder = ""  # only this project's folders on this machine
-            self._json(200, {"tool": tool, "folder": folder, "items": tool_readiness(
-                tool, folder, config, fresh=(query.get("fresh") or [""])[0] == "1")})
+            try:
+                items = tool_readiness(tool, folder, config, fresh=(query.get("fresh") or [""])[0] == "1",
+                                       account=(query.get("account") or [""])[0] if tool == "claude" else "",
+                                       browser=(query.get("browser") or [""])[0] == "1")
+            except HubError as e:  # an account that is not on this machine (any more)
+                self._json(400, {"error": str(e)})
+                return
+            self._json(200, {"tool": tool, "folder": folder, "items": items})
         elif url.path == "/api/commands":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
                 return
-            self._json(200, {"groups": commands_catalog()})
+            mine = [{"usage": " ".join(["run", r["name"]] + ["%s=VALUE" % p for p in r["command"]]),
+                     "text": "%s. Runs: %s" % (r["when"].rstrip("."), " && ".join(r["commands"])), "run": False,
+                     "ask": False, "needs": []} for r in self.hub.process_rows() if r["command"] is not None]
+            self._json(200, {"groups": commands_catalog() + ([{"group": "This project's commands (process notes)",
+                                                               "commands": mine}] if mine else [])})
         elif url.path == "/api/boot":
             if not self._owner_session():
                 self._json(401, {"error": "sign in"})
@@ -6208,11 +8612,17 @@ class Handler(BaseHTTPRequestHandler):
             data["rules"] = project_rules(self.roster.root)
             data["sheet"] = self.hub.sheet_rows()
             data["skills"] = project_skills(self.roster.root)
+            shared = self.projects.shared
+            data["processes"] = {"rule": self.hub.process_rule, "notes": self.hub.process_rows(),
+                                 "shared": shared.hub.process_rows() if shared is not None else []}
             linked = lambda hub: hub.sync is not None and hub.sync.shared  # noqa: E731
             # Tailscale, cloud sync (Firestore) or none: machines link as a whole, through the first project.
             primary = self.projects.primary
             data["link"] = link_info(primary.hub if primary.hub.sync is not None else self.hub, shared=linked(self.hub))
             data["needs"] = self.hub.needs_you()
+            offers = offered(self.projects) if primary.hub.sync is not None else []
+            if offers:  # projects the other machines have, to set up here (M2)
+                data["offered"] = offers
             data["projects"] = [{"id": p.id, "name": p.name, "last": p.hub.last_seq(), "linked": linked(p.hub),
                                  "needs": len(data["needs"]) if p.hub is self.hub else len(p.hub.needs_you())}
                                 for p in self.projects.all()]
@@ -6292,8 +8702,10 @@ class Handler(BaseHTTPRequestHandler):
         elif op == "areas":
             mid, areas = self.hub.set_areas(OWNER, task, data.get("areas", ""), data.get("accept") is True)
             return {"id": mid, "areas": areas}
+        elif op == "browser":
+            return self.hub.set_task_browser(task, data.get("value") is True)
         else:
-            raise HubError("op is add, assign, move, status, remove, reclaim, advisor or areas")
+            raise HubError("op is add, assign, move, status, remove, reclaim, advisor, areas or browser")
         return {"ok": True}
 
     def _rules(self, data):
@@ -6308,6 +8720,51 @@ class Handler(BaseHTTPRequestHandler):
         else:
             raise HubError("op must be add or remove")
         return {"project": self.roster.project, "name": name, "folders": folders}
+
+    def _processes(self, data):
+        """The owner and the process notes (L1): list, get, propose, approve, retire, mark (owner-only), share
+        (with all projects), the project's rule, refresh (write them into the folders again). shared: the notes
+        shared with all projects, in the reserved project."""
+        op, name = data.get("op") or "list", data.get("name")
+        shared = self.projects.shared
+        hub = self.hub
+        if data.get("shared"):
+            if shared is None:
+                raise HubError("this machine has no shared notes")
+            hub = shared.hub
+        if op == "list":
+            out = {"notes": hub.process_rows(), "rule": hub.process_rule}
+            if not data.get("shared"):
+                out["shared"] = shared.hub.process_rows() if shared is not None else []
+            return out
+        if op == "get":
+            return {"note": hub.process_note(name, data.get("of") or "")}
+        if op == "propose":
+            v, _, _ = hub.propose_process(OWNER, data.get("note"))
+            return {"note": hub.process_note(v["name"])}
+        if op == "approve":
+            return {"said": hub.approve_process(OWNER, name, data.get("of") or "")}
+        if op == "retire":
+            hub.retire_process(OWNER, name)
+        elif op == "decline":
+            hub.decline_process(OWNER, name, data.get("of") or "")
+        elif op == "mark":
+            hub.mark_process(name, data.get("owner_only") is True)
+        elif op == "share":
+            hub.share_process(name)
+        elif op == "promote":
+            params = data.get("params") or []
+            hub.promote_process(name, split_list(params) if isinstance(params, str) else params)
+        elif op == "unpromote":
+            hub.promote_process(name, None)
+        elif op == "rule":
+            return {"rule": hub.set_process_rule(data.get("rule"))}
+        elif op == "refresh":
+            return {"folders": hub.refresh_guides()}
+        else:
+            raise HubError("op is list, get, propose, approve, decline, retire, mark, share, promote, unpromote, rule or "
+                           "refresh")
+        return {"ok": True}
 
     def _agent_op(self, data):
         """The owner on an agent's card: rename, remove, listening, the session, and its picture and colour."""
@@ -6324,6 +8781,8 @@ class Handler(BaseHTTPRequestHandler):
             self.hub.reopen_agent(name)
         elif op == "reconnect":
             self.hub.reconnect_agent(name)
+        elif op == "browser":
+            self.hub.set_browser(name, data.get("mode") == "on")
         elif op == "start":
             self.hub.start_again(name)
         elif op == "model":
@@ -6331,7 +8790,7 @@ class Handler(BaseHTTPRequestHandler):
         elif op == "profile":
             self.hub.set_profile(name, data.get("picture"), data.get("colour"))
         else:
-            raise HubError("op is rename, remove, listen, stop, reopen, reconnect, start, model or profile")
+            raise HubError("op is rename, remove, listen, stop, reopen, reconnect, start, model, profile or browser")
         return {"ok": True}
 
     def _role(self, data):
@@ -6342,7 +8801,7 @@ class Handler(BaseHTTPRequestHandler):
         edited in the last days. Only paths inside the project, kept on this machine."""
         op = data.get("op") or "show"
         if op in ("auto", "on", "off"):
-            self._set_project("edit_tracking", None if op == "auto" else op)
+            self.roster.set("edit_tracking", None if op == "auto" else op)
         elif op != "show":
             raise HubError("op is show, auto, on or off")
         days = days_arg(data)
@@ -6390,20 +8849,10 @@ class Handler(BaseHTTPRequestHandler):
         """The agents' tokens and estimated cost (op view), or the project's switch for keeping them (on, off)."""
         op = data.get("op") or "view"
         if op in ("on", "off"):
-            self._set_project("usage", "off" if op == "off" else None)
+            self.roster.set("usage", "off" if op == "off" else None)
         elif op != "view":
             raise HubError("op is view, on or off")
         return self.hub.usage_report(days_arg(data))
-
-    def _set_project(self, key, value):
-        """Set one of the project's settings (None: back to its default), and let the roster read it again."""
-        config = load_config(self.roster.root)
-        if value is None:
-            config.pop(key, None)
-        else:
-            config[key] = value
-        save_config(config, self.roster.root)
-        self.roster.refresh(force=True)
 
     def _coordinator(self, data):
         """Which linked machine coordinates (roadmap Y1), and the owner's choice of the one that should when it
@@ -6421,6 +8870,124 @@ class Handler(BaseHTTPRequestHandler):
             raise
         except Exception as e:  # the link's own errors (no machine of that name, the cloud unreachable)
             raise HubError(str(e))
+
+    def _browser(self, data):
+        """The Browser panel (B4): who drives this machine's browser and where, the project's sites, the bridge token
+        (set, never sent back), and what was asked and answered."""
+        op = str(data.get("op") or "")
+        if op == "site":
+            return self.hub.set_browser_site(str(data.get("host") or ""), str(data.get("state") or ""))
+        if op == "token":
+            value = str(data.get("value") or "").strip()
+            if len(value) > 500 or any(c.isspace() for c in value):
+                raise HubError("that is not a Playwright MCP Bridge token")
+            roster = self.projects.primary.roster
+            roster.update("browser_token", lambda old: value)
+            kept = []  # files git tracks that still hold an old token: the owner is told, as crewchat leaves them
+            for folder in (roster.config.get("folders") or {}):  # every connected folder here gets the bridge, or loses it
+                if Path(folder).is_dir():
+                    sync_browser_server(folder, value, kept)
+            refresh_codex()  # the bridge in crewchat's block of Codex's settings, if crewchat is there (not added)
+            if kept:
+                sys.stderr.write("%s the bridge's old token is still in %s: git tracks %s, so crewchat leaves %s\n"
+                                 % (now_iso(), ", ".join(kept), "it" if len(kept) == 1 else "them",
+                                    "it" if len(kept) == 1 else "them"))
+            return {"token": bool(value), "kept": kept}
+        if op == "release":
+            with BROWSER_LOCK:
+                BROWSER.pop("holder", None)
+            return {"holder": None}
+        if op != "status":
+            raise HubError("op is status, site, token or release")
+        with BROWSER_LOCK:
+            holder = dict(BROWSER["holder"]) if BROWSER.get("holder") else None
+            log = list(BROWSER_LOG)[-50:]
+        if holder:
+            if holder.pop("hub", None) == id(self.hub):
+                holder["site"] = self.hub.browser_site.get(holder["agent"])
+            if browser_idle(holder, time.time()):
+                holder = None
+        return {"holder": holder, "sites": self.hub.browser_sites(), "token": bool(browser_token()), "log": log,
+                "idle": BROWSER_IDLE}
+
+    def _permission(self, data):
+        """The owner's answer in Needs you: to a browser ask (the page says so; its answers are a browser ask's own),
+        or to a permission prompt. By kind, not by what still waits, so an ask that is gone says so."""
+        answer = data.get("answer")
+        if data.get("kind") == "browser" or answer in ("allow_site", "allow_task"):
+            return self.hub.answer_browser(data.get("id"), answer)
+        return self.hub.answer_permission(data.get("id"), answer)
+
+    def _local_page(self):
+        """Is the page asking served to this machine itself (not a phone or another machine over the tailnet)? By the
+        connection, not the Host a client sets: from this machine, and not through tailscale serve, which connects from
+        here too but says whom it passes on (X-Forwarded-For, Tailscale-User-*)."""
+        host = str(self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        served = any(k.lower() in ("x-forwarded-for", "forwarded") or k.lower().startswith("tailscale-")
+                     for k in self.headers.keys())
+        return (host in ("127.0.0.1", "localhost", "::1") and not served
+                and str(self.client_address[0]) in ("127.0.0.1", "::1", "::ffff:127.0.0.1"))
+
+    def _machines(self, data):
+        """The Machines panel (roadmap M1): this machine's links to the owner's others, linked from the page with
+        the commands' own code. Ops: status, check, peer-invite, peer-join, peer-remove, peer-leave, prefer,
+        restart, offered, setup-project, dismiss, and the cloud-* ones (see crewchat_cloud.page_op). Whatever goes
+        wrong comes back as a message for the panel, never a dropped request."""
+        try:
+            return self._machines_op(str(data.get("op") or ""), data)
+        except HubError:
+            raise
+        except Exception as e:  # a cloud client's own error, a process that would not start, a missing module
+            raise HubError("%s: %s" % (type(e).__name__, e) if not str(e) else str(e))
+
+    def _machines_op(self, op, data):
+        primary = self.projects.primary
+        if op == "status":
+            return machines_status(primary.hub, self._local_page())
+        if op == "check":
+            return {"checks": link_checks(self.projects, deep=True)}
+        if op == "offered":
+            return {"offered": offered(self.projects)}
+        if op == "setup-project":
+            return setup_offered(self.projects, data.get("name"))
+        if op == "dismiss":
+            return dismiss_offer(self.projects, data.get("name"))
+        if op == "restart":
+            restart_soon()
+            return {"restarting": True}
+        if op == "prefer":
+            return self._coordinator({"op": "prefer", "name": data.get("name")})
+        if op.startswith("peer-"):
+            import crewchat_peers
+            name = str(data.get("name") or "") or None  # this machine's name for the others (default: its host's)
+            try:
+                if op == "peer-invite":
+                    ask, args = "peers-invite", {"name": name}
+                elif op == "peer-join":
+                    target, code = crewchat_peers.parse_join(data.get("text"))
+                    ask, args = "peers-join", {"target": target, "code": code, "name": name}
+                elif op == "peer-leave":
+                    ask, args = "peers-leave", {}
+                elif op == "peer-remove":
+                    ask, args = "peer-remove", {"id": str(data.get("id") or "")}
+                else:
+                    raise HubError("unknown operation %s" % op)
+                out = crewchat_peers.admin(primary.hub, primary.roster.root, ask, args)
+            except crewchat_peers.PeerError as e:
+                raise HubError(str(e))
+            if op in ("peer-invite", "peer-join"):
+                link_projects(self.projects)
+            return out
+        if op.startswith("cloud-"):
+            try:
+                import crewchat_cloud
+            except ImportError as e:
+                raise HubError("cloud sync needs its extra: %s" % e)
+            try:
+                return crewchat_cloud.page_op(primary.hub, primary.roster.root, op, data, self._local_page())
+            except crewchat_cloud.CloudError as e:
+                raise HubError(str(e))
+        raise HubError("unknown operation %s" % op)
 
     def _push(self, data):
         """Web Push for the chat page: this machine's key to subscribe with, a browser's notifications for
@@ -6479,8 +9046,10 @@ class Handler(BaseHTTPRequestHandler):
             return list_folders(data.get("path"), base)
         if op == "mkdir":
             return {"path": make_folder(data.get("path"), data.get("name"), base)}
+        if op == "project":  # this project's folders here, for Open folder
+            return {"folders": self.hub.folder_rows()}
         if op != "connect":
-            raise HubError("op is list, mkdir or connect")
+            raise HubError("op is list, mkdir, connect or project")
         path = connect_folder(data.get("path"), self.project.id, base, create=data.get("create") is True)
         self.projects.primary.roster.refresh()  # the machine's folders and the folder's token, just written
         return {"path": path, "folders": launch_folders(self.hub.machine_config(), self.roster.root, self.hub.chat_key)}
@@ -6490,7 +9059,8 @@ class Handler(BaseHTTPRequestHandler):
         permissions = data.get("permissions") or ("edits" if data.get("accept_edits") else "ask")  # accept_edits: before 0.14
         self.hub.launch(data.get("tool"), data.get("folder"), data.get("name"), data.get("role"),
                         data.get("task"), permissions, str(data.get("model") or ""), data.get("picture") or "",
-                        data.get("colour") or "", data.get("instructions") or "", str(data.get("advisor") or ""))
+                        data.get("colour") or "", data.get("instructions") or "",
+                        str(data.get("account") or ""), data.get("browser") is True)
         return {"ok": True}
 
     def _admin(self, raw):
@@ -6503,7 +9073,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     first = self.projects.primary
                     result = crewchat_peers.admin(first.hub, first.roster.root, op, data)
-                    if op == "peers-start":
+                    if op in ("peers-start", "peers-invite", "peers-join"):
                         link_projects(self.projects)
                 except crewchat_peers.PeerError as e:
                     raise HubError(str(e))
@@ -6696,11 +9266,14 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/projects": self._projects_op, "/api/agent": self._agent_op, "/api/launch": self._launch,
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
-                         "/api/permission": lambda data: self.hub.answer_permission(data.get("id"), data.get("answer")),
+                         "/api/processes": self._processes,
+                         "/api/permission": self._permission,
                          "/api/push": self._push, "/api/usage": self._usage,
                          "/api/analytics": self._analytics, "/api/edits": self._edits,
                          "/api/map": self._map,
-                         "/api/coordinator": self._coordinator}
+                         "/api/coordinator": self._coordinator, "/api/machines": self._machines,
+                         "/api/open-folder": lambda data: self.hub.open_folder(data.get("folder")) or {"ok": True},
+                         "/api/browser": self._browser}
         if path in owner_actions:
             if not self._owner_request():
                 return
@@ -6713,6 +9286,12 @@ class Handler(BaseHTTPRequestHandler):
         who = self._bearer()
         if who is None:
             return
+        if path == "/api/process-command":  # crewchat run in an agent's folder (L6): what to run, never run here
+            try:
+                self._json(200, self.hub.process_command(self._object(raw).get("name")))
+            except HubError as e:
+                self._json(400, {"error": str(e)})
+            return
         if path == "/api/hook":
             if who[0] != "place":
                 self._json(403, {"error": "hooks use a place token"})
@@ -6723,6 +9302,13 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(200, self.hub.record_usage(who[1], data.get("key"), data.get("usage")))
                 except HubError as e:
                     self._json(400, {"error": str(e)})
+                return
+            if data.get("event") == "browser":  # a browser call, before it runs (B2)
+                try:
+                    self._json(200, self.hub.browser_check(who[1], data.get("key"), str(data.get("tool") or ""),
+                                                           data.get("args") if isinstance(data.get("args"), dict) else {}))
+                except HubError:
+                    self._json(400, {"error": "bad request"})
                 return
             if data.get("event") == "permission":
                 try:
@@ -6738,8 +9324,9 @@ class Handler(BaseHTTPRequestHandler):
                 session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
+                conversation = data.get("conversation") if isinstance(data.get("conversation"), dict) else None
                 out = self.hub.hook(who[1], data.get("key"), ack, wait, event, capped, session, data.get("doing"),
-                                    data.get("path"))
+                                    data.get("path"), conversation, data.get("browser"))
                 out["capped"] = capped
                 self._json(200, out)
             except (HubError, TypeError, ValueError):
@@ -6776,7 +9363,9 @@ def make_server(port, root=None):
     first = projects.primary
     handler = type("BoundHandler", (Handler,), {"projects": projects, "project": first, "roster": first.roster,
                                                 "hub": first.hub, "failures": {}})
-    return Server((BIND, port), handler)
+    server = Server((BIND, port), handler)
+    SERVING_PORTS.add(server.server_address[1])
+    return server
 
 
 # --------------------------------------------------------------------------------------------
@@ -6953,11 +9542,8 @@ def server_up(config=None):
         return False
 
 
-def start_background():
-    """Run the server detached from this terminal, until log out or restart."""
-    python, script = self_command()
-    log = home() / "hub.log"
-    log.parent.mkdir(parents=True, exist_ok=True)
+def detached(python):
+    """(python, Popen flags) for a process that outlives this one, with no window: pythonw on Windows."""
     flags = {}
     if os.name == "nt":
         if Path(python).name.lower() == "python.exe" and Path(python).with_name("pythonw.exe").exists():
@@ -6967,18 +9553,38 @@ def start_background():
         flags["creationflags"] = 0x00000008 | CREATE_NO_WINDOW | 0x01000000
     else:
         flags["start_new_session"] = True
-    command = [python, script, "serve", "--log", str(log)]
+    return python, flags
+
+
+def spawn_detached(command):
+    """Start a process that outlives this one, with no window, its output to hub.log. On Windows a job that may
+    not be left (Claude Code and CI run commands in one) refuses CREATE_BREAKAWAY_FROM_JOB: start inside it then."""
+    python, flags = detached(command[0])
+    log = home() / "hub.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    command = [python] + list(command[1:])
     # Anything it says before it opens its own log (a broken install, say) goes to the log too.
-    with open(log, "a", encoding="utf-8") as err:
+    with open_private(log) as err:
         try:
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
                              close_fds=True, **flags)
         except OSError:
-            if os.name != "nt":
+            if not flags.get("creationflags", 0) & 0x01000000:  # (Windows only sets it)
                 raise
             flags["creationflags"] &= ~0x01000000  # a job that may not be left: start inside it
             subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err,
                              close_fds=True, **flags)
+
+
+def restart_soon():
+    """Restart this server from the page (the Machines panel, after linking another way): `crewchat restart`
+    in a process of its own, which stops this one and starts it again, through its login service if it has one."""
+    spawn_detached(self_command() + ["restart"])
+
+
+def start_background():
+    """Run the server detached from this terminal, until log out or restart."""
+    spawn_detached(self_command() + ["serve", "--log", str(home() / "hub.log")])
 
 
 def log_tail(lines=6):
@@ -7072,26 +9678,31 @@ def remember(project, place, root=None, chat=""):
     """Note a folder connected to this machine's chat, and which project it is in (chat: "" for
     the first), and where Claude Code and Cursor's agent are (as found in the user's own shell),
     so the chat page can start agents there."""
-    config = load_config(root)
-    folders = dict(config.get("folders") or {}, **{str(project): place})
-    chats = {k: v for k, v in dict(config.get("folder_chats") or {}, **{str(project): chat}).items() if v}
-    tools = dict(config.get("tools") or {})
-    tools.update({t: path for t, path in ((t, shutil.which(exe)) for t, (_, exe) in LAUNCH_TOOLS.items()) if path})
-    if (folders, chats, tools) != (config.get("folders"), config.get("folder_chats") or {}, config.get("tools") or {}):
+    found = {t: path for t, path in ((t, shutil.which(exe)) for t, (_, exe) in LAUNCH_TOOLS.items()) if path}
+
+    def change(config):
+        folders = dict(config.get("folders") or {}, **{str(project): place})
+        chats = {k: v for k, v in dict(config.get("folder_chats") or {}, **{str(project): chat}).items() if v}
+        tools = dict(config.get("tools") or {}, **found)
+        if (folders, chats, tools) == (config.get("folders"), config.get("folder_chats") or {}, config.get("tools") or {}):
+            return False
         config["folders"], config["folder_chats"], config["tools"] = folders, chats, tools
-        save_config(config, root)
+    change_config(change, root)
 
 
 def forget_folders(place, chat="", root=None):
     """A removed place's folders are no longer connected. Its name can be given out again, and must
     not bring the old folders with it (agents share files only from their own place's folders)."""
-    config = load_config(root)
-    folders = config.get("folders") or {}
-    gone = [path for path, p in folders.items() if p == place and folder_chat(config, path) == chat]
-    if gone:
+    gone = []
+
+    def change(config):
+        folders = config.get("folders") or {}
+        gone.extend(path for path, p in folders.items() if p == place and folder_chat(config, path) == chat)
+        if not gone:
+            return False
         config["folders"] = {path: p for path, p in folders.items() if path not in gone}
         config["folder_chats"] = {path: c for path, c in (config.get("folder_chats") or {}).items() if path not in gone}
-        save_config(config, root)
+    change_config(change, root)
     return gone
 
 
@@ -7126,6 +9737,39 @@ def launch_folders(config, root=None, chat=""):
     return folders
 
 
+# Folder names macOS treats as a package (one item, which Finder would open or launch): revealed rather than opened.
+MAC_PACKAGES = (".app", ".bundle", ".framework", ".plugin", ".kext", ".pkg", ".mpkg", ".prefpane", ".appex",
+                ".xcodeproj", ".xcworkspace", ".playground", ".photoslibrary", ".rtfd", ".pages", ".numbers", ".key")
+
+
+def show_folder(folder):
+    """Open a folder in the system's file manager, on this machine, detached and not waited for, its output thrown away.
+    No shell, and the opener by absolute path where there is one (looked up by name, Windows tries the server's
+    current directory first, which can be a cloned repository): Windows, C:\\Windows\\explorer.exe, as one command
+    line with the folder in quotes (a comma in a folder's name would split an unquoted argument; a file name cannot hold
+    a quote), without a console window; macOS, /usr/bin/open -R for a folder named as a package (X.app, a bundle: it is
+    revealed in Finder and never launched), else /usr/bin/open -a Finder; Linux, xdg-open, which needs a desktop."""
+    folder = str(folder)
+    if sys.platform == "win32":
+        import ntpath
+        opener = ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+        command = '"%s" "%s"' % (opener, folder)
+    elif sys.platform == "darwin":
+        opener = "/usr/bin/open"
+        package = Path(folder).suffix.lower() in MAC_PACKAGES
+        command = [opener, "-R", folder] if package else [opener, "-a", "Finder", folder]
+    else:
+        opener = "xdg-open"
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            raise HubError("no desktop to open it on: this machine has no display (DISPLAY or WAYLAND_DISPLAY is not set)")
+        command = [opener, folder]
+    try:
+        subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True, start_new_session=os.name != "nt", **HIDDEN)
+    except OSError as e:
+        raise HubError("could not open the folder with %s: %s" % (opener, e.strerror or e))
+
+
 TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
               "cursor": "Needs Cursor's command-line agent: curl https://cursor.com/install -fsS | bash",
               "codex": "Needs Codex CLI: npm install -g @openai/codex",
@@ -7134,15 +9778,55 @@ TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
               "opencode": "Needs OpenCode: curl -fsSL https://opencode.ai/install | bash"}
 
 
+ACCOUNT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
+CLAUDE_ACCOUNT_SIGNS = (".claude.json", ".credentials.json")  # in a Claude Code settings folder that was signed in
+
+
+def claude_accounts(config, home=None):
+    """This machine's Claude Code accounts (1.1): the default one, each settings folder in the user's home named like
+    .claude-personal that holds a sign-in (found), and the ones the owner added (`crewchat accounts add`, config.json's
+    claude_accounts), which win over a found one of the same name. [{id, label, dir}]; the default's id and dir are ""."""
+    out = [{"id": "", "label": "default", "dir": ""}]
+    try:
+        entries = sorted((home or user_home()).iterdir())
+    except OSError:
+        entries = []
+    for path in entries:
+        aid = path.name[len(".claude-"):].lower() if path.name.startswith(".claude-") else ""
+        if ACCOUNT_RE.fullmatch(aid) and path.is_dir() and any((path / f).exists() for f in CLAUDE_ACCOUNT_SIGNS):
+            out.append({"id": aid, "label": aid, "dir": str(path)})
+    for aid, folder in sorted((config.get("claude_accounts") or {}).items()):
+        aid = str(aid).lower()
+        if ACCOUNT_RE.fullmatch(aid) and isinstance(folder, str) and folder:
+            out = [a for a in out if a["id"] != aid] + [{"id": aid, "label": aid, "dir": folder}]
+    return out
+
+
+def account_env(config, account, tool="claude"):
+    """The environment an agent of this Claude Code account runs with ({} for the default): its settings folder, where
+    its sign-in and its conversations are (so Reopen finds them there)."""
+    account = str(account or "").lower()
+    if not account:
+        return {}
+    if tool != "claude":
+        raise HubError("an account is only for Claude Code agents")
+    found = next((a for a in claude_accounts(config) if a["id"] == account), None)
+    if found is None:
+        raise HubError("there is no Claude Code account called %s on this machine (`crewchat accounts` lists them)" % account)
+    return {"CLAUDE_CONFIG_DIR": found["dir"]}
+
+
 def launch_options(config, root=None, chat=""):
     """What the chat page's "Add an agent" offers on this machine, for one project. A tool that
     is not installed is listed with how to get it (Cursor's app alone has no command-line agent)."""
     tools = []
     for t, (label, _) in LAUNCH_TOOLS.items():
         exe = find_tool(t, config)
+        accounts = claude_accounts(config) if t == "claude" and exe else []
         tools.append(dict({"id": t, "label": label, "permissions": [[k, v[0]] for k, v in LAUNCH_PERMISSIONS[t].items()],
-                           "models": tool_models(t) if exe else [], "advisors": tool_advisors(t) if exe else []},
-                          **({} if exe else {"missing": TOOL_HINTS[t]})))
+                           "models": tool_models(t) if exe else []},
+                          **({} if exe else {"missing": TOOL_HINTS[t]}),
+                          **({"accounts": [[a["id"], a["label"]] for a in accounts]} if len(accounts) > 1 else {})))
     return {"tools": tools, "folders": launch_folders(config, root, chat)}
 
 
@@ -7167,10 +9851,12 @@ def ready_item(state, text, fix=""):
     return {"state": state, "text": text, "fix": fix}
 
 
-def status_of(command):
-    """(exit code, what it printed) of a tool's own status command, or (None, "") if it did not run."""
+def status_of(command, env=None):
+    """(exit code, what it printed) of a tool's own status command, or (None, "") if it did not run. env: added to
+    this one's (a Claude Code account's settings folder)."""
     try:
-        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL, **HIDDEN)
+        out = subprocess.run(command, capture_output=True, text=True, timeout=15, stdin=subprocess.DEVNULL,
+                             env=dict(os.environ, **env) if env else None, **HIDDEN)
     except (OSError, subprocess.SubprocessError):
         return None, ""
     return out.returncode, out.stdout + out.stderr
@@ -7192,11 +9878,12 @@ def auth_settings(settings):
     return str(chosen or settings.get("selectedAuthType") or "")
 
 
-def signed_in(tool, exe, folder=""):
-    """Whether the tool can reach its model: signed in, or set up with a key or a provider."""
+def signed_in(tool, exe, folder="", env=None):
+    """Whether the tool can reach its model: signed in, or set up with a key or a provider (env: a Claude Code
+    account's)."""
     name = LAUNCH_TOOLS[tool][0]
     if tool == "claude":
-        code, out = status_of([exe, "auth", "status"])
+        code, out = status_of([exe, "auth", "status"], env)
         try:
             status = json.loads(out[out.index("{"):])
         except ValueError:
@@ -7258,11 +9945,12 @@ def signed_in(tool, exe, folder=""):
     return ready_item("note", "crewchat cannot check %s" % name)
 
 
-def folder_ready(tool, folder):
-    """What the tool asks once in this folder (trust, crewchat's hooks), and whether it already has."""
+def folder_ready(tool, folder, env=None):
+    """What the tool asks once in this folder (trust, crewchat's hooks), and whether it already has (env: a Claude Code
+    account's, whose settings folder keeps its own list of trusted folders)."""
     home_dir, items = user_home(), []
     if tool == "claude":
-        config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+        config_dir = (env or {}).get("CLAUDE_CONFIG_DIR") or os.environ.get("CLAUDE_CONFIG_DIR")
         projects = json_file(Path(config_dir) / ".claude.json" if config_dir else home_dir / ".claude.json").get("projects") or {}
         trusted = isinstance(projects, dict) and any(isinstance(v, dict) and v.get("hasTrustDialogAccepted")
                                                      and within(folder, k) for k, v in projects.items())
@@ -7316,25 +10004,41 @@ def folder_ready(tool, folder):
     return items
 
 
-def tool_readiness(tool, folder="", config=None, fresh=False):
+def browser_readiness(tool, exe):
+    """What an agent of this tool needs to work in the owner's browser (B1)."""
+    if tool == "claude":
+        code, out = status_of([exe, "--version"])
+        found = re.search(r"(\d+)\.(\d+)\.(\d+)", out or "")
+        version = version_tuple(found.group(0)) if found else None
+        items = [ready_item("todo", "Claude in Chrome needs Claude Code 2.0.73 or later (this one is %s)" % found.group(0),
+                            "claude update")] if version and version < (2, 0, 73) else []
+        return items + [ready_item("note", "Claude in Chrome: its extension in Chrome or Edge, signed in to your Claude "
+                                           "account (a Pro, Max, Team or Enterprise plan)", "https://claude.ai/chrome")]
+    if not browser_token():
+        return [ready_item("todo", "The Playwright MCP Bridge token is not set: install the extension in Chrome and "
+                                   "paste its token in the Browser panel", BRIDGE_STORE)]
+    return [ready_item("ok", "The Playwright MCP Bridge token is set (the extension asks nothing more)")]
+
+
+def tool_readiness(tool, folder="", config=None, fresh=False, account="", browser=False):
     """What is left before an agent of this tool can work, on this machine and in folder (one of this
-    project's): installed, signed in, and what it asks once in the folder."""
+    project's): installed, signed in (in account, for Claude Code), and what it asks once in the folder."""
     exe = find_tool(tool, config or {})
     if not exe:
         return [ready_item("todo", "%s is not installed here" % LAUNCH_TOOLS[tool][0], TOOL_HINTS[tool].split(": ", 1)[-1])]
-    kept = _READY.get(tool)
+    env = account_env(config or {}, account, tool)
+    kept = _READY.get((tool, account))
     if fresh or not kept or time.time() - kept[0] > READY_EVERY or kept[2] != folder:
-        kept = (time.time(), signed_in(tool, exe, folder), folder)
-        _READY[tool] = kept
-    return [kept[1]] + (folder_ready(tool, folder) if folder else [])
+        kept = (time.time(), signed_in(tool, exe, folder, env), folder)
+        _READY[(tool, account)] = kept
+    return [kept[1]] + (folder_ready(tool, folder, env) if folder else []) + (browser_readiness(tool, exe) if browser else [])
 
 
-def tool_options(tool, permissions="ask", base=None, model="", advisor=""):
+def tool_options(tool, permissions="ask", base=None, model=""):
     """The options an agent tool starts with: its base options (as this copy knows them), the
-    chosen permissions, a model from tool_models and an advisor from tool_advisors. The same for a
-    new agent and a reopened one."""
+    chosen permissions and a model from tool_models. The same for a new agent and a reopened one."""
     return ((LAUNCH_BASE[tool] if base is None else base) + LAUNCH_PERMISSIONS[tool][permissions][1]
-            + (["--model", model] if model else []) + (["--advisor", advisor] if advisor else []))
+            + (["--model", model] if model else []))
 
 
 def check_model(tool, model):
@@ -7343,17 +10047,17 @@ def check_model(tool, model):
         raise HubError("%s has no model called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], model))
 
 
-def check_advisor(tool, advisor):
-    """An advisor model the owner chose for an agent tool, checked (tool_advisors)."""
-    if advisor not in [m for m, _ in tool_advisors(tool)]:
-        raise HubError("%s has no advisor called %s" % (LAUNCH_TOOLS.get(tool, (tool,))[0], advisor))
+def launch_command(exe, tool, key, permissions="ask", base=None, model="", chrome=False):
+    """The agent's command line. Only the fixed prompt, the key, fixed options and a model from
+    tool_models reach it: no text typed on the chat page is ever passed to a shell. chrome: Claude Code
+    with Claude in Chrome (B1)."""
+    return [exe] + tool_options(tool, permissions, base, model) + chrome_option(tool, chrome) + \
+        PROMPT_OPTION.get(tool, []) + [LAUNCH_PROMPT % key]
 
 
-def launch_command(exe, tool, key, permissions="ask", base=None, model="", advisor=""):
-    """The agent's command line. Only the fixed prompt, the key, fixed options and a model and an
-    advisor from tool_models and tool_advisors reach it: no text typed on the chat page is ever
-    passed to a shell."""
-    return [exe] + tool_options(tool, permissions, base, model, advisor) + PROMPT_OPTION.get(tool, []) + [LAUNCH_PROMPT % key]
+def chrome_option(tool, chrome):
+    """Claude Code's --chrome, for an agent with the browser on (the other tools get the bridge as an MCP server)."""
+    return ["--chrome"] if chrome and tool == "claude" else []
 
 
 def macos_script(folder, command, key, title="", env=None):
@@ -7442,9 +10146,6 @@ RESUME_ARGS = {"claude": lambda session: ["--resume=" + session], "gemini": lamb
 REOPEN_TOOLS = ("claude", "codex", "gemini", "qwen", "opencode")
 CLAUDE_MODELS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"],
                  ["haiku", "Haiku (latest)"]]  # Claude Code's aliases for the latest of each
-# The models Claude Code's own advisor (--advisor) can be: its aliases that can act as one (Haiku 4.5
-# cannot, so the haiku alias is left out). One ranked below the agent's model only gets a warning.
-CLAUDE_ADVISORS = [["fable", "Fable (latest)"], ["opus", "Opus (latest)"], ["sonnet", "Sonnet (latest)"]]
 
 
 def tool_models(tool):
@@ -7453,18 +10154,207 @@ def tool_models(tool):
     return CLAUDE_MODELS if tool == "claude" else []
 
 
-def tool_advisors(tool):
-    """The models an agent tool's own advisor can be: [[id, label], ...]. Only Claude Code has one
-    (--advisor: it consults that model at decision points, reading its whole conversation)."""
-    return CLAUDE_ADVISORS if tool == "claude" else []
+BROWSER_READS = {"read_page", "find", "get_page_text", "tabs_context_mcp", "tabs_context", "tabs_create_mcp",
+                 "tabs_close_mcp", "read_console_messages", "read_network_requests", "gif_creator", "resize_window",
+                 "shortcuts_list", "snapshot", "take_screenshot", "tabs", "wait_for", "console_messages",
+                 "network_requests", "hover", "resize", "close", "list_connected_browsers", "select_browser",
+                 "switch_browser", "generate_locator"}  # anything else may change something: it asks
+# The calls that only list, open, close or pick tabs and browsers: free on any page, so an agent on a site the owner
+# refused can still get away from it.
+BROWSER_TAB_TOOLS = {"tabs_context_mcp", "tabs_context", "tabs_create_mcp", "tabs_close_mcp", "tabs", "close",
+                     "list_connected_browsers", "select_browser", "switch_browser", "resize_window", "resize"}
+COMPUTER_READS = {"screenshot", "scroll", "scroll_to", "zoom", "wait", "hover"}
 
 
-def resume_command(exe, tool, session, permissions="ask", base=None, model=None, advisor="", key=""):
+def browser_tool_name(tool):
+    """A browser tool's own name (navigate, computer, click, tabs_context_mcp), or "" for a tool that is not a
+    browser's. Claude in Chrome's tools (mcp__claude-in-chrome__NAME) and the Playwright bridge's (browser_NAME,
+    mcp__browser__browser_NAME, or OpenCode's server-first browser_browser_NAME)."""
+    tool = str(tool or "")
+    if tool.startswith("mcp__claude-in-chrome__"):
+        return tool[len("mcp__claude-in-chrome__"):]
+    name = tool[len("mcp__browser__"):] if tool.startswith("mcp__browser__") else tool
+    if not name.startswith("browser_"):
+        return ""
+    while name.startswith("browser_"):
+        name = name[len("browser_"):]
+    return name
+
+
+def browser_tab(tool, args):
+    """The tab a Claude in Chrome call names (its tabId), as text, or "": the bridge's calls act on its current tab."""
+    if not str(tool or "").startswith("mcp__claude-in-chrome__") or not isinstance(args, dict):
+        return ""
+    tab = args.get("tabId")
+    if isinstance(tab, bool) or not isinstance(tab, (int, str)) or not str(tab).isdigit():
+        return ""
+    return str(tab)[:20]
+
+
+def browser_action(tool, args):
+    """What a browser tool call does (B2): ("navigate", its address), ("change", ""), ("read", ""), or ("other", "")
+    for a call that is not a browser's (browser_tool_name); Claude in Chrome's computer tool by its action."""
+    args = args if isinstance(args, dict) else {}
+    name = browser_tool_name(tool)
+    if not name:
+        return "other", ""
+    if name in ("navigate", "navigate_back", "navigate_forward"):
+        return "navigate", str(args.get("url") or "")
+    if name == "computer":
+        return ("read" if str(args.get("action") or "") in COMPUTER_READS else "change"), ""
+    if name in BROWSER_READS or name.startswith("verify_"):
+        return "read", ""
+    return "change", ""  # a tool it does not know (the bridge is @latest) asks, as a change does
+
+
+def site_of(url):
+    """The site of an address, what sites are allowed by: its host, lower case, without its port; on this machine
+    (loopback_host) its host and port, 127.0.0.1:3000, as each port there is another server. An address without a
+    scheme is a web address (a browser takes github.com so); "" for another scheme (file:, javascript:) or no host. Also
+    "" wherever a browser could read another host than Python does (release review): its host part ends at the first
+    /, \\, ? or # (Chrome's rule; Python reads on past a backslash), and a user name (evil.com@github.com), a %-escape,
+    whitespace or a control character in it names no site. A host a browser reads as an IP address is written as one
+    (127.1 is 127.0.0.1), and one it would refuse (1.2.3.4.5) names no site. The gate refuses an address with no site."""
+    url = str(url or "").strip()
+    if re.search(r"[\x00-\x20\x7f]", url):
+        return ""  # a browser drops tabs and line breaks from an address: what it opens is not what was read
+    if not re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+        if re.match(r"[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d)", url):
+            return ""  # javascript:..., data:..., about:blank (host:port is a web address)
+        url = "https://" + url
+    authority = re.match(r"[^:]*://([^/\\?#]*)", url).group(1)  # as a browser reads it
+    if not authority or re.search(r"[@%]", authority):
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or parts.netloc != authority:
+        return ""  # Python and a browser would part ways
+    host = host.lower()
+    host = host[:-1] if host.endswith(".") else host  # github.com. is github.com
+    if ":" in host:
+        host = ip_text(host, 6)
+    elif re.fullmatch(r"(?:.*\.)?(?:\d+|0x[0-9a-f]*)\.?", host):  # ends in a number: an IPv4 address to a browser
+        host = whatwg_ipv4(host)
+    if not re.fullmatch(r"[a-z0-9._-]+|[0-9a-f:.]+", host):
+        return ""
+    if not loopback_host(host):
+        return host
+    try:
+        port = parts.port or (443 if parts.scheme.lower() == "https" else 80)
+    except ValueError:
+        return ""
+    return "%s:%d" % ("[%s]" % host if ":" in host else host, port)
+
+
+def ip_text(host, version):
+    """An IP address as Python writes it (::1, 127.0.0.1), or "" for none."""
+    import ipaddress
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return ""
+    return str(address) if address.version == version else ""
+
+
+def whatwg_ipv4(host):
+    """A host ending in a number, as a browser reads it (the URL standard's IPv4 parser): 127.1, 0x7f.1 and 2130706433
+    are 127.0.0.1. "" for one a browser refuses."""
+    labels = host.split(".")
+    if labels[-1] == "" and len(labels) > 1:
+        labels.pop()
+    if len(labels) > 4:
+        return ""
+    numbers = []
+    for label in labels:
+        try:
+            if label[:2] == "0x":
+                numbers.append(int(label[2:] or "0", 16))
+            elif len(label) > 1 and label.startswith("0"):
+                numbers.append(int(label[1:], 8))
+            else:
+                numbers.append(int(label, 10))
+        except ValueError:
+            return ""
+    if any(n > 255 for n in numbers[:-1]) or numbers[-1] >= 256 ** (5 - len(numbers)):
+        return ""
+    value = numbers[-1] + sum(n * 256 ** (3 - i) for i, n in enumerate(numbers[:-1]))
+    return ".".join(str(value >> shift & 255) for shift in (24, 16, 8, 0))
+
+
+def loopback_host(host):
+    """Is a host (as site_of writes it, without brackets) this machine itself, where a browser goes: localhost and its
+    names, 127.x, ::1, and 0.0.0.0 and ::, which browsers take for this machine too."""
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    import ipaddress
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    address = getattr(address, "ipv4_mapped", None) or address  # ::ffff:127.0.0.1
+    return address.is_loopback or address.is_unspecified
+
+
+def loopback_port(site):
+    """The port of a site on this machine (127.0.0.1:3000, [::1]:8080), else None."""
+    host, _, port = site.rpartition(":")
+    host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+    return int(port) if port.isdigit() and host and loopback_host(host) else None
+
+
+BROWSER_MATCHER = "mcp__claude-in-chrome__.*|mcp__browser__.*|browser_.*"  # the tools a browser before-hook watches
+BROWSER_DOWN = "crewchat is not running here: start it (crewchat start), then try again"
+BRIDGE_ONLY = ("only an agent in the chat, with the browser on, may use crewchat's browser bridge: link to the chat "
+               "(hub_link) and ask the owner to turn your browser on")
+OWN_PAGE = ("that is crewchat's own page, which agents never use: the owner answers the browser's questions there. "
+            "Open another site")
+
+
+def browser_deny(client, reason):
+    """A before-hook's refusal of a browser call, in the agent's tool's own words."""
+    if client in ("claude", "codex"):
+        return json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                                  "permissionDecisionReason": reason}})
+    if client == "cursor":
+        return json.dumps({"permission": "deny", "user_message": reason, "agent_message": reason})
+    return json.dumps({"decision": "deny", "reason": reason})  # Gemini, Qwen, and crewchat's OpenCode plugin
+
+
+def browser_hook(client, data, base, token, key, project=None):
+    """A tool's before-hook for a browser call (B2): ask the server, and return what to print (a deny in the tool's
+    format), or "" to let the call go on. A server that cannot be reached stops changes and opening a site, not reads
+    of the page the agent is on. A bare browser_
+    tool in a folder without the bridge is the user's own browser (bridge_here): not crewchat's to stop."""
+    tool = str(data.get("tool_name") or data.get("tool") or "")
+    args = data.get("tool_input") if "tool_input" in data else data.get("args")
+    if isinstance(args, str):  # Cursor gives it as JSON text
+        try:
+            args = json.loads(args)
+        except ValueError:
+            args = {}
+    args = args if isinstance(args, dict) else {}
+    kind, _ = browser_action(tool, args)
+    if kind == "other":
+        return ""
+    if project is not None and not bridge_here(project, client, tool):
+        return ""
+    try:
+        out = post_json(base + "/api/hook", token, {"key": key, "event": "browser", "tool": tool, "args": args},
+                        timeout=PERMISSION_WAIT + 20) or {}
+    except (urllib.error.URLError, OSError, ValueError):
+        out = {"decision": "deny", "reason": BROWSER_DOWN} if kind in ("change", "navigate") else {}
+    return browser_deny(client, str(out.get("reason") or "")) if out.get("decision") == "deny" else ""
+
+
+def resume_command(exe, tool, session, permissions="ask", base=None, model=None, key="", chrome=False):
     """The command line that reopens an agent's own conversation (Reopen, Switch model, Reconnect); key: its link key,
     which the prompt asks it to link again with."""
     if not SESSION_RE.fullmatch(str(session)) or tool not in REOPEN_TOOLS:
         raise HubError("that session cannot be reopened")
-    options = tool_options(tool, permissions, base, model or "", advisor or "")
+    options = tool_options(tool, permissions, base, model or "") + chrome_option(tool, chrome)
     if tool == "codex":  # codex resume [options] <id> <prompt>; an id never starts with "-" (SESSION_RE)
         return [exe, "resume"] + options + [session, reopen_prompt(key)]
     # The id in one argument with its option, so it can never be taken for an option of its own.
@@ -7473,10 +10363,11 @@ def resume_command(exe, tool, session, permissions="ask", base=None, model=None,
     return [exe] + options + RESUME_ARGS[tool](session) + PROMPT_OPTION.get(tool, []) + [reopen_prompt(key)]
 
 
-def launch_agent(tool, folder, key, permissions="ask", root=None, model="", advisor=""):
-    """Open a terminal window on this machine with a new agent session in folder."""
+def launch_agent(tool, folder, key, permissions="ask", root=None, model="", env=None, chrome=False):
+    """Open a terminal window on this machine with a new agent session in folder (env: its account's, account_env;
+    chrome: Claude in Chrome)."""
     exe, base = agent_tool(tool, folder, permissions, root)
-    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, advisor), key, root=root)
+    open_terminal(folder, launch_command(exe, tool, key, permissions, base, model, chrome), key, root=root, env=env)
 
 
 def open_terminal(folder, command, key, title="", root=None, env=None):
@@ -7617,6 +10508,11 @@ def cmd_start(args):
                   "of git." % (", AGENTS.md" if (project / "AGENTS.md").is_file() else ""))
     except OSError as e:
         print("- Could not write the project's guide for its agents (%s)." % e)
+    try:  # the process notes are the server's to write, from the log (L1)
+        post_json(local_url(config) + "/api/processes", owner_token(), {"op": "refresh"},
+                  headers={"X-Crewchat-Chat": chosen["id"]}, timeout=10)
+    except Exception:  # an older server: its next start writes them
+        pass
     for client in [c for c in clients_for(args.client, config) if c in CLIENT_FILES]:
         note = duplicate_note(project, client)
         if note:
@@ -7640,6 +10536,16 @@ def cmd_start(args):
         print("Agents on your other machines too? Run `crewchat start` there, then `crewchat connect`.")
 
 
+def _version_marks(info):
+    """A machine's version and marks as it said them (machine_info), cleaned: {version, marks}."""
+    marks = info.get("marks")
+    return {"version": str(info.get("version") or "")[:20],
+            "marks": [m[:20] for m in marks[:20] if isinstance(m, str)] if isinstance(marks, list) else []}
+
+
+INFO_EVERY = 60  # seconds this machine's info (ProjectLink.my_info) is kept before it is made again
+
+
 class ProjectLink:
     """What the Tailscale and cloud links (crewchat_peers.PeerSync, crewchat_cloud.CloudSync) share
     about projects. The first project's link is the machine's and keeps `projects` (name -> that
@@ -7649,9 +10555,94 @@ class ProjectLink:
     def _init_projects(self, hub, chat):
         self.hub = hub
         self.chat = chat  # a project's name; None for the first project, which is the machine's link
+        self.machine = self  # the machine's link (a project's link: set by the machine's)
         self.projects = {}  # the machine's link only: project name -> its link
         self.projects_lock = threading.Lock()  # one link per project, however many requests ask at once
         self.shared_with = set()  # other machines that have this project
+        self.infos = {}  # the machine's link only: other machine's id -> what it told of itself (machine_info)
+        self.info_source = None  # the machine's link only: () -> this machine's machine_info (share_projects sets it)
+        self.info_made = None  # (info_source, when, what it made): my_info's last
+        self.remembered = None  # the machine's link only: other machine's id -> its last version and marks (on disk)
+        self.remembered_lock = threading.Lock()  # each peer's puller thread reports
+
+    def my_info(self):
+        """What this machine tells the others about itself, or None (a project's link, or not set yet). Made once and
+        kept, as every wakeup of every waiting pull asks for it: made again after info_changed, or after INFO_EVERY
+        (a project's role pack changed)."""
+        if self.chat is not None or self.info_source is None:
+            return None
+        made, now = self.info_made, time.time()
+        if made is None or made[0] is not self.info_source or now - made[1] > INFO_EVERY:
+            made = self.info_made = (self.info_source, now, self.info_source())
+        return made[2]
+
+    def keep_info(self, device_id, info):
+        """What another machine told of itself (machine_info), cleaned; none from a crewchat before 1.1."""
+        if not isinstance(info, dict):
+            self.infos.pop(device_id, None)
+            self._remember(device_id, None)
+            return
+        projects = [{"name": str(p.get("name") or "")[:MAX_PROJECT_NAME], "pack": str(p.get("pack") or ""),
+                     "first": bool(p.get("first"))} for p in (info.get("projects") or [])[:200]
+                    if isinstance(p, dict) and str(p.get("name") or "").strip()]
+        said = _version_marks(info)
+        self.infos[device_id] = {"version": said["version"], "os": clean_os(info.get("os")),
+                                 "projects": projects, "marks": said["marks"]}
+        self._remember(device_id, said)
+
+    def _remembered(self):
+        """What each machine last said of its version and marks, kept on disk (MACHINES_FILE) so a machine switched
+        off since this server started is not taken for an unknown one (older_machines). Rebuilt as machines report."""
+        with self.remembered_lock:
+            if self.remembered is None:
+                self.remembered = {str(k): _version_marks(v) for k, v in
+                                   json_file(self.hub.roster.root / MACHINES_FILE).items() if isinstance(v, dict)}
+            return self.remembered
+
+    def _remember(self, device_id, info):
+        if self.chat is not None:
+            return  # a project's link: the machine's link keeps them
+        known = self._remembered()
+        with self.remembered_lock:
+            before = known.get(device_id)
+            if info is None:
+                known.pop(device_id, None)
+            else:
+                known[device_id] = info
+            if info != before:  # written only when what it said changed
+                try:
+                    write_json(self.hub.roster.root / MACHINES_FILE, known, private=True)
+                except OSError:
+                    pass
+
+    def info_changed(self):
+        """This machine's machine_info may have changed (a project made or removed): tell the others soon. A subclass
+        calls this too."""
+        self.info_made = None
+
+    def info_of(self, device_id):
+        """What a machine said of itself since this server started; else its version and marks as it last said them
+        (_remembered), and nothing else."""
+        if device_id in self.infos:
+            return self.infos[device_id]
+        known = self._remembered().get(device_id) if self.chat is None else None
+        return {"version": "", "os": "", "projects": [], "marks": [], **(known or {})}
+
+    def linked_ids(self):
+        """Every other machine of this link, whether or not it has this project: messages pass through any of them
+        (relays, catch-ups). See the subclasses."""
+        return []
+
+    def older_machines(self):
+        """The machines linked here that have not said they keep a file's `for` mark (MARKS): a crewchat before A2,
+        or one never heard from. The machine's link knows what each said (keep_info), and remembers it across
+        restarts, so one that is off is judged by what it last said."""
+        return [d for d in self.linked_ids() if "for" not in (self.machine.info_of(d).get("marks") or [])]
+
+    def machines_status(self):
+        """The other machines, for the Machines panel (M1): [{id, name, tag, state, seen, version, os, projects,
+        coordinator, ...}], sorted by name. See the subclasses."""
+        return []
 
     @property
     def shared(self):
@@ -7698,6 +10689,16 @@ class ProjectLink:
             self.hub.drop_remote(device_id)
 
 
+def machine_info(projects):
+    """What this machine tells its linked machines about itself (M1, M2): its crewchat version, its OS, and its
+    projects (name, the role pack, which is the first), the first project first. Read without refreshing the
+    projects: it is asked for on the link's threads, and a refresh may share projects again."""
+    rows = projects.listed()
+    return {"version": __version__, "os": os_name(), "marks": list(MARKS),
+            "projects": [{"name": p.name, "pack": str(p.roster.config.get("pack") or DEFAULT_PACK), "first": p.primary}
+                         for p in rows]}
+
+
 def link_projects(projects):
     """Link this machine's projects with the same-named ones on the other machines, now and
     whenever projects appear or go."""
@@ -7715,6 +10716,8 @@ def share_projects(projects):
         link = projects.primary.hub.sync
         if not hasattr(link, "share"):
             return
+        link.info_source = lambda: machine_info(projects)
+        link.info_changed()  # the projects may have changed: the others hear at once (M2)
         first = projects.primary.name.strip().lower()
         wanted = {}
         for project in list(projects.others.values()):
@@ -7732,7 +10735,7 @@ def cmd_serve(args):
     if getattr(args, "log", None) or sys.stderr is None:
         path = Path(getattr(args, "log", None) or (home() / "hub.log"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        sys.stderr = open(path, "a", encoding="utf-8", buffering=1)
+        sys.stderr = open_private(path, buffering=1)
     config = load_config()
     port = args.port or int(config["port"])
     try:
@@ -7758,6 +10761,7 @@ def cmd_serve(args):
     if not os.environ.get("CREWCHAT_NO_UPDATE_CHECK"):
         threading.Thread(target=update_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=reclaim_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
+    threading.Thread(target=process_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=map_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=upgrade_folders, args=(server.RequestHandlerClass.projects,), daemon=True).start()
     threading.Thread(target=session_checks, args=(server.RequestHandlerClass.projects,), daemon=True).start()
@@ -8129,6 +11133,11 @@ MCP_FILES = {"gemini": (".gemini/settings.json", "mcpServers", "httpUrl", {"trus
              "qwen": (".qwen/settings.json", "mcpServers", "httpUrl", {"trust": True}),
              "opencode": ("opencode.json", "mcp", "url", {"type": "remote", "enabled": True})}
 ALL_CLIENTS = list(CLIENT_FILES) + list(MCP_FILES)  # every tool whose folder file can hold crewchat's entry
+# Where the browser bridge goes in a folder (B1): tool -> (settings file, its table of MCP servers). Claude Code has
+# Claude in Chrome; Codex's bridge is in its own settings (install_codex), under CODEX_BRIDGE.
+BRIDGE_FILES = {"cursor": (CLIENT_FILES["cursor"], "mcpServers"), "gemini": (MCP_FILES["gemini"][0], "mcpServers"),
+                "qwen": (MCP_FILES["qwen"][0], "mcpServers"), "opencode": (MCP_FILES["opencode"][0], "mcp")}
+CODEX_BRIDGE = "[mcp_servers.browser]"
 
 
 def connection_entry(project, client):
@@ -8172,15 +11181,37 @@ def read_json(path):
 def write_json(path, data, private=False, indent=2):
     """Write JSON in one step (a temporary file, then a rename), so a reader never sees it half
     written. A private file is readable only by this user from the moment it exists."""
+    write_text(path, json.dumps(data, indent=indent) + "\n", private)
+
+
+def write_text(path, text, private=False):
+    """write_json's way for any text: in one step, and a private file readable only by this user."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
+    fd = os.open(str(tmp), O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600 if private else 0o644)
     if private and hasattr(os, "fchmod"):  # the mode above is only for a new file; one left by a write cut short keeps its own
         os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(json.dumps(data, indent=indent) + "\n")
+        f.write(text)
     retry_on_windows(lambda: os.replace(tmp, path))
+
+
+def open_private(path, mode="a", **kwargs):
+    """open() for a text file only this user may read (0o600): a new one is made so, and one an older crewchat
+    left readable by others is tightened. Windows has no such modes: the file is in the user's own profile."""
+    fd = os.open(str(path), O_BINARY | os.O_WRONLY | os.O_CREAT | (os.O_APPEND if mode == "a" else os.O_TRUNC), 0o600)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
+    return os.fdopen(fd, mode, encoding="utf-8", **kwargs)
+
+
+def is_private(path, missing=False):
+    """Whether only this user may read a file (missing: what a file that is not there counts as)."""
+    try:
+        return not os.stat(path).st_mode & 0o077
+    except OSError:
+        return missing
 
 
 def retry_on_windows(fn, attempts=6):
@@ -8198,6 +11229,48 @@ def retry_on_windows(fn, attempts=6):
 # Git as crewchat runs it in a project folder: never running a command the repository's config names (an agent that
 # may only edit files could write one into .git/config). Reading the index (ls-files) runs core.fsmonitor.
 GIT_SAFE = ["-c", "core.fsmonitor=false"]
+
+
+def git_churn(folder, commit, paths):
+    """(lines changed in these paths since commit, lines they have now) in a folder's repository, (0, 0) when none
+    changed, or None when it cannot say (not git, an unknown commit)."""
+    try:
+        diff = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "diff", "--numstat", commit, "HEAD", "--"] + paths,
+                              capture_output=True, text=True, timeout=10, **HIDDEN)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if diff.returncode != 0:
+        return None
+    changed = sum(int(a) + int(d) for a, d, *_ in (line.split("\t") for line in diff.stdout.splitlines())
+                  if a.isdecimal() and d.isdecimal())
+    if changed == 0:  # nothing changed: (0, 0) says the same to stale_reason, without reading every file
+        return 0, 0
+    try:
+        files = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "ls-files", "-z", "--"] + paths,
+                               capture_output=True, text=True, timeout=10, **HIDDEN)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if files.returncode != 0:
+        return None
+    now = 0
+    for rel in filter(None, files.stdout.split("\0")):
+        try:
+            with open(Path(folder) / rel, "rb") as f:
+                now += f.read().count(b"\n")
+        except OSError:
+            pass
+    return changed, now
+
+
+def git_commit(folder):
+    """The commit a folder's repository is at, or ""."""
+    try:
+        out = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=5, **HIDDEN)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    head = out.stdout.strip()
+    return head if out.returncode == 0 and re.match(r"^[0-9a-f]{40}$", head) else ""
 
 
 def git_exclude(project, paths):
@@ -8261,8 +11334,10 @@ PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent", "qwen": "U
 # The hooks of the tools that keep them beside crewchat's server, in the folder's settings (MCP_FILES):
 # each event, the hook it runs, and its timeout in seconds.
 SETTINGS_HOOKS = {
-    "gemini": (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100), ("AfterTool", "tool", 10)),
-    "qwen": (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100), ("PostToolUse", "tool", 10))}
+    "gemini": (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100), ("AfterTool", "tool", 10),
+               ("BeforeTool", "browser", PERMISSION_WAIT + 30)),
+    "qwen": (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100), ("PostToolUse", "tool", 10),
+             ("PreToolUse", "browser", PERMISSION_WAIT + 30))}
 
 
 def is_our_hook(command):
@@ -8456,10 +11531,15 @@ def set_claude_hooks(settings, names=(SERVER_NAME,)):
                                                  "statusMessage": "Waiting for crewchat messages"}),
                                ("PostToolUse", "tool", {"timeout": 10}),  # a sign of life
                                ("PermissionRequest", "permission", {"timeout": PERMISSION_WAIT + 30,
-                                                                    "statusMessage": "Asking on the crewchat page"})):
+                                                                    "statusMessage": "Asking on the crewchat page"}),
+                               ("PreToolUse", "browser", {"timeout": PERMISSION_WAIT + 30,
+                                                          "statusMessage": "Checking with crewchat"})):
         groups = [g for g in hooks.get(event, [])
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
-        groups.append({"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]})
+        group = {"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]}
+        if name == "browser":
+            group["matcher"] = BROWSER_MATCHER
+        groups.append(group)
         hooks[event] = groups
 
 
@@ -8473,7 +11553,9 @@ def set_settings_hooks(settings, client):
                   if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
         group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command(client, name),
                             "timeout": timeout * 1000}]}
-        if name == "tool":
+        if name == "browser":
+            group["matcher"] = BROWSER_MATCHER
+        elif name == "tool":
             group["matcher"] = ".*"
         hooks[event] = groups + [group]
 
@@ -8551,8 +11633,15 @@ export const CrewchatPlugin = async ({client, directory}) => {
     const part = text && (output.parts || []).find((p) => p.type === "text" && !p.synthetic);
     if (part) part.text += "\n\n" + text;
   },
-  "tool.execute.after": async (input) => {
-    hook("tool", {session_id: input.sessionID, tool_name: input.tool, tool_input: input.args || {}}, directory);
+  "tool.execute.before": async (input, output) => {
+    if (!/^(browser_|mcp__browser__)/.test(input.tool)) return;
+    const refused = await hook("browser", {session_id: input.sessionID, tool_name: input.tool, tool_input: output.args || {}},
+                               directory);
+    if (refused) throw new Error(refused);
+  },
+  "tool.execute.after": async (input, output) => {
+    hook("tool", {session_id: input.sessionID, tool_name: input.tool, tool_input: input.args || {},
+                  tool_response: (output && output.output) || ""}, directory);
   },
   event: async ({event}) => {
     const sessionID = event.type === "session.idle" && event.properties && event.properties.sessionID;
@@ -8618,6 +11707,8 @@ CODEX_BLOCK = re.compile(r"\n?%s\n.*?%s\n?" % (re.escape(CODEX_BEGIN), re.escape
 # [mcp_servers."crewchat"], mcp_servers.crewchat.command = ..., crewchat = {...} under [mcp_servers]),
 # or servers given inline (mcp_servers = {...}), where a table of ours cannot be added.
 CODEX_THEIRS = re.compile(r'mcp_servers[^\n]*\bcrewchat\b|^\s*"?crewchat"?\s*=|^\s*mcp_servers\s*=', re.M)
+# A "browser" MCP server of the user's own in Codex's settings: the bridge's table is left out (TOML takes a table once).
+CODEX_THEIR_BROWSER = re.compile(r'^\s*\[\s*mcp_servers\s*\.\s*["\']?browser["\']?\s*[\].]|^\s*mcp_servers\s*\.\s*["\']?browser["\']?\s*\.', re.M)
 
 
 def install_codex():
@@ -8634,14 +11725,22 @@ def install_codex():
     outside = CODEX_BLOCK.sub("\n", text)
     # Its hooks too (messages at the end of each turn), unless the user's own hooks are written in a
     # way a table of ours can't join (hooks = {...}, Stop = [...]). Codex asks once to review them.
-    hooks = "" if re.search(r"^\s*hooks\s*=|^\s*(Stop|UserPromptSubmit|PostToolUse)\s*=", outside, re.M) else "".join(
-        "[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\ntimeout = %d\n" % (
-            event, event, string(hook_command("codex", name)), timeout)
+    # A PreToolUse of the user's own written so leaves out only the browser's hook (B2).
+    their_pre = re.search(r"^\s*PreToolUse\s*=", outside, re.M)
+    hooks = "" if re.search(r"^\s*hooks\s*=|^\s*(Stop|UserPromptSubmit|PostToolUse)\s*=", outside,
+                            re.M) else "".join(
+        "[[hooks.%s]]\n%s[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\ntimeout = %d\n" % (
+            event, "matcher = %s\n" % string(BROWSER_MATCHER) if name == "browser" else "", event,
+            string(hook_command("codex", name)), timeout)
         for event, name, timeout in (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100),
-                                     ("PostToolUse", "tool", 10)))
-    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s%s\n" % (
+                                     ("PostToolUse", "tool", 10), ("PreToolUse", "browser", PERMISSION_WAIT + 30))
+        if not (event == "PreToolUse" and their_pre))
+    bridge = browser_token()  # the browser for agents (B1): the Playwright MCP Bridge, with its token
+    browser = "\n" + CODEX_BRIDGE + "\ncommand = \"npx\"\nargs = [%s]\nenv = { PLAYWRIGHT_MCP_EXTENSION_TOKEN = %s }\n" % (
+        ", ".join(string(a) for a in BROWSER_BRIDGE), string(bridge)) if bridge and not CODEX_THEIR_BROWSER.search(outside) else ""
+    block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s%s%s\n" % (
         CODEX_BEGIN, SERVER_NAME, string(command[0]),
-        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), hooks, CODEX_END)
+        ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), browser, hooks, CODEX_END)
     if CODEX_THEIRS.search(outside):
         return False  # the user's own crewchat, or servers written inline: not ours to change
     old = CODEX_BLOCK.search(text)
@@ -8654,8 +11753,11 @@ def install_codex():
         new = text + ("\n" if text and not text.endswith("\n") else "") + ("\n" if text else "") + block
     if new == text:
         return False
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(new, encoding="utf-8")
+    if bridge or is_private(path):  # it holds the bridge's token (or the owner keeps it private): this user's only
+        write_text(path, new, private=True)
+    else:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(new, encoding="utf-8")
     return True
 
 
@@ -8684,17 +11786,112 @@ def refresh_codex():
         pass
 
 
+BROWSER_BRIDGE = ["@playwright/mcp@latest", "--extension"]  # the Playwright MCP Bridge, run with npx (B1)
+BRIDGE_STORE = "https://chromewebstore.google.com/search/Playwright%20MCP%20Bridge"
+
+
+def browser_token():
+    """The Playwright MCP Bridge's token this machine's owner pasted in the Browser panel (B1), or ""."""
+    try:
+        return str(load_config(home()).get("browser_token") or "")
+    except SystemExit:  # not set up here
+        return ""
+
+
+def is_bridge(client, entry):
+    """Whether a "browser" MCP server entry is crewchat's bridge (it carries the bridge's token), not the user's own."""
+    env = (entry.get("environment" if client == "opencode" else "env") if isinstance(entry, dict) else None) or {}
+    return isinstance(env, dict) and "PLAYWRIGHT_MCP_EXTENSION_TOKEN" in env
+
+
+def bridge_here(folder, client, tool):
+    """Whether a browser tool call may be crewchat's bridge, so its before-hook checks it (B2). A tool named with its
+    server (mcp__claude-in-chrome__..., mcp__browser__...) is. Gemini CLI, Qwen Code and Cursor name an MCP server's
+    tools bare (browser_click), as a Playwright server of the user's own does: there it is the bridge only where this
+    tool runs the bridge in this folder; elsewhere it is the user's own browser, not the owner's Chrome."""
+    if tool.startswith("mcp__"):
+        return True
+    if client != "codex" and client not in BRIDGE_FILES:
+        return True  # a tool crewchat does not set the bridge up for: checked, the safe side
+    return bridge_set_up(folder, client)
+
+
+def bridge_set_up(folder, client):
+    """Is crewchat's bridge, with its token, in this tool's settings for this folder (Codex: for every folder)?"""
+    if client == "codex":
+        try:
+            block = CODEX_BLOCK.search(codex_config().read_text(encoding="utf-8"))
+        except OSError:
+            return False
+        return bool(block) and CODEX_BRIDGE in block.group(0)
+    if client not in BRIDGE_FILES or folder is None:
+        return False
+    rel, servers = BRIDGE_FILES[client]
+    table = json_file(Path(folder) / rel).get(servers)
+    return any(is_bridge(client, entry) for entry in (table.values() if isinstance(table, dict) else ()))
+
+
+def bridge_refusal(client, data, folder):
+    """A before-hook's refusal of a call to crewchat's bridge from a session not in the chat, or "" (S2): its token
+    skips the extension's own approval, so only the chat's agents, checked, use it. Claude in Chrome asks in Chrome."""
+    tool = str(data.get("tool_name") or data.get("tool") or "")
+    if tool.startswith("mcp__claude-in-chrome__") or browser_action(tool, {})[0] == "other":
+        return ""
+    return browser_deny(client, BRIDGE_ONLY) if bridge_set_up(folder, client) else ""
+
+
+def sync_browser_server(folder, token=None, kept=None):
+    """The bridge as an MCP server "browser" beside crewchat's, in the folder's settings for every tool but Claude Code
+    (which has Claude in Chrome) and Codex (its settings are its own, install_codex): there with a token, gone
+    without one. Written private, as those files hold tokens. Returns the files changed; a file git tracks is left
+    alone, and when it still holds an old token, its path is added to `kept`."""
+    token = browser_token() if token is None else token
+    changed = []
+    for client, (rel, servers) in BRIDGE_FILES.items():
+        path = Path(folder) / rel
+        if not path.is_file() or not connection_entry(folder, client):
+            continue
+        try:
+            data = read_json(path)
+        except SystemExit:
+            continue
+        table = data.setdefault(servers, {})
+        env = {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": token}
+        want = None if not token else (
+            {"type": "local", "command": ["npx"] + BROWSER_BRIDGE, "environment": env, "enabled": True}
+            if client == "opencode" else {"command": "npx", "args": BROWSER_BRIDGE, "env": env})
+        mine = table.get("browser")
+        if mine is not None and not is_bridge(client, mine):
+            continue  # a "browser" server of the user's own: not crewchat's to change
+        if mine == want:
+            continue
+        if tracked_by_git(folder, rel):  # (git asked only when there is something to write)
+            if mine is not None and kept is not None:
+                kept.append(str(path))
+            continue
+        if want is None:
+            del table["browser"]
+        else:
+            table["browser"] = want
+        write_json(path, data, private=True)
+        changed.append(rel)
+    return changed
+
+
 def install_client(client, project, url, token):
     """Connect a folder for one agent tool. Returns the files written in it (to keep out of git)."""
     if client == "claude":
         return install_claude(project, url, token)
-    if client == "cursor":
-        return install_cursor(project, url, token)
     if client == "codex":  # its chat is the folder's .mcp.json, which `crewchat stdio` reads
         write_mcp_json(project, url, token)
         install_codex()
         return [".mcp.json"]
-    return install_mcp_settings(project, url, token, client)
+    if client == "cursor":
+        files = install_cursor(project, url, token)
+    else:
+        files = install_mcp_settings(project, url, token, client)
+    sync_browser_server(project)  # the bridge, when this machine's owner pasted its token (B1)
+    return files
 
 
 def clients_for(choice, config=None):
@@ -8722,7 +11919,8 @@ def set_cursor_hooks(hooks):
     stop hands over messages, the others tell the server the agent is alive (tool calls)."""
     hooks.setdefault("version", 1)
     for event, name, timeout in (("stop", "stop", MAX_LISTEN + 100), ("afterShellExecution", "tool", 10),
-                                 ("afterFileEdit", "tool", 10), ("afterMCPExecution", "tool", 10)):
+                                 ("afterFileEdit", "tool", 10), ("afterMCPExecution", "tool", 10),
+                                 ("beforeMCPExecution", "browser", PERMISSION_WAIT + 30)):
         kept = [h for h in hooks.setdefault("hooks", {}).get(event, []) if not is_our_hook(h.get("command", ""))]
         kept.append({"command": hook_command("cursor", name), "timeout": timeout})
         hooks["hooks"][event] = kept
@@ -8761,7 +11959,7 @@ def update_hooks(folder):
             write_opencode_plugin(folder):
         git_exclude(folder, [OPENCODE_PLUGIN_FILE])
         changed.append(OPENCODE_PLUGIN_FILE)
-    return changed
+    return changed + sync_browser_server(folder)  # the browser bridge, as this machine's token says (B1)
 
 
 def tracked_by_git(folder, rel):
@@ -8785,11 +11983,8 @@ def edit_json(path, change):
     if json.dumps(data, sort_keys=True) == before:
         return False
     if any(v not in ({}, [], None) for k, v in data.items() if k != "version"):
-        try:  # a file only its owner reads stays so; one holding a token (an Authorization header) becomes so
-            private = not os.stat(path).st_mode & 0o077
-        except OSError:
-            private = True
-        write_json(path, data, private=private or '"authorization"' in json.dumps(data).lower())
+        # a file only its owner reads stays so; one holding a token (an Authorization header) becomes so
+        write_json(path, data, private=is_private(path, True) or '"authorization"' in json.dumps(data).lower())
     else:
         path.unlink()
     return True
@@ -8896,7 +12091,79 @@ def listen_seconds(project, client="claude"):
 SERVER_GONE_SECS = 15  # a hook gives up on a server unreachable this long in a row (a restart takes less)
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None):
+CONVERSATION_ROOTS = {  # tool -> (the variable the tool reads its folder from, its folder in the home, the part where it keeps
+    # conversations): where a hook may say a conversation is (conversation_place)
+    "claude": ("CLAUDE_CONFIG_DIR", ".claude", "projects"), "codex": ("CODEX_HOME", ".codex", "sessions"),
+    "gemini": (None, ".gemini", "tmp"), "qwen": ("QWEN_RUNTIME_DIR", ".qwen", "projects"),
+    "cursor": (None, ".cursor", "projects")}
+CONVERSATION_ID_RE = re.compile(r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|ses_[A-Za-z0-9]{8,40})$")
+CONVERSATION_PATH_TOOLS = ("claude", "codex", "gemini", "qwen", "cursor")  # whose hooks may name a file
+CONVERSATION_ID_TOOLS = ("codex", "cursor", "opencode")  # whose hooks may name a session instead
+MAX_CONVERSATION_PATH = 4096
+
+
+def conversation_ref(client, data):
+    """Where this hook payload says the agent's conversation is: {"path": file} or {"session": id}, else None.
+    Claude Code, Gemini CLI and Qwen Code give transcript_path; Codex and Cursor too, else their session or
+    conversation id; OpenCode's plugin sends its session id as session_id. Nothing is checked here: the server
+    does (conversation_place)."""
+    def text(value):
+        return value if isinstance(value, str) and 0 < len(value) <= MAX_CONVERSATION_PATH else ""
+
+    path = text(data.get("transcript_path")) if client in CONVERSATION_PATH_TOOLS else ""
+    if path:
+        return {"path": path}
+    if client in CONVERSATION_ID_TOOLS:
+        session = text(data.get("conversation_id" if client == "cursor" else "session_id"))
+        if session:
+            return {"session": session}
+    return None
+
+
+def conversation_where(client, data):
+    """conversation_ref with the tool named, as the hooks send it to the server: {"path"|"session", "tool"}, else None."""
+    ref = conversation_ref(client, data)
+    return dict(ref, tool=client) if ref else None
+
+
+def conversation_place(tool, ref, home=None, config=None):
+    """Where a hook's conversation ref really is, if the tool may keep a conversation there: a resolved .jsonl path
+    (.json too for Gemini CLI) inside the tool's own folder (links followed), or a session id of the tool's form (Codex, Cursor and OpenCode:
+    the reader finds the file). Anything else is None, so an agent cannot have crewchat read and pass on another
+    file (its keys, say). `home` is where the tools' folders are (the user's home); `config` is this machine's
+    config.json, for the extra Claude Code accounts."""
+    if not isinstance(ref, dict):
+        return None
+    session, path = ref.get("session"), ref.get("path")
+    if session is not None:
+        ok = tool in CONVERSATION_ID_TOOLS and isinstance(session, str) and CONVERSATION_ID_RE.fullmatch(session)
+        return session if ok and session.startswith("ses_") == (tool == "opencode") else None  # each tool's own form
+    if tool not in CONVERSATION_ROOTS or not isinstance(path, str) or not 0 < len(path) <= MAX_CONVERSATION_PATH:
+        return None
+    home = home or user_home()
+    variable, folder, part = CONVERSATION_ROOTS[tool]
+    def bases():
+        yield home / folder
+        if variable and os.environ.get(variable):
+            yield Path(os.environ[variable]).expanduser()
+        if tool == "claude":  # another account's session, in its own settings folder: listed only when needed
+            yield from (Path(a["dir"]).expanduser() for a in claude_accounts(config or {}, home) if a["dir"])
+    try:
+        found = Path(path)
+        if not found.is_absolute():
+            return None
+        found = found.resolve()
+        if found.suffix not in (".jsonl", ".json") or (found.suffix == ".json" and tool != "gemini") or found.is_dir():
+            return None  # (Gemini CLI's older sessions are one .json file)
+        for base in bases():
+            if found.is_relative_to((base / part).resolve()):
+                return found
+    except (OSError, ValueError, RuntimeError):  # a link loop, a NUL in the path
+        pass
+    return None
+
+
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None, conversation=None):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
@@ -8906,6 +12173,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
     is how many chat-driven turns the agent has taken in a row: past the owner's limit the server
     answers "capped", and only a message from the owner ends the wait. `report` makes the
     session report (session_report) when the server asks for one: a new session, or after a Reopen.
+    `conversation` says where the agent's conversation is (conversation_ref, with the tool); it goes with each ask.
     """
     begun = time.time()
     deadline = begun + wait_total
@@ -8915,8 +12183,10 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
         wait = 0 if wait_total <= 0 else int(min(MAX_WAIT, max(1, -(-(deadline - time.time()) // 1))))
         asked = time.time()
         try:
-            out = post_json(base + "/api/hook", token, {"key": key, "ack": ack, "wait": wait, "event": event,
-                                                        "chain": chain}, timeout=MAX_WAIT + 30)
+            body = {"key": key, "ack": ack, "wait": wait, "event": event, "chain": chain}
+            if conversation:
+                body["conversation"] = conversation
+            out = post_json(base + "/api/hook", token, body, timeout=MAX_WAIT + 30)
             failing = None
             if out.get("session") == "want" and report:
                 found, report = report(), None
@@ -8958,8 +12228,8 @@ def claim_launch_key(folder, key, session):
     path = folder / ("claimed-%s" % sha(key)[:16])
     mine = sha(session)
     try:
-        folder.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)  # in the system's temporary folder: this user's only
+        fd = os.open(str(path), O_BINARY | os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
         try:
             return path.read_text().strip() == mine
@@ -9206,6 +12476,13 @@ def tool_summary(client, data):
     return "Using " + name if re.fullmatch(r"[\w.-]{1,40}", name) else ""
 
 
+def remind_output(client, text):
+    """A reminder added to the agent's turn by its after-tool hook, in its tool's words; "" where it cannot."""
+    if client not in CONTEXT_EVENTS:
+        return ""
+    return json.dumps({"hookSpecificOutput": {"hookEventName": CONTEXT_EVENTS[client], "additionalContext": text}})
+
+
 def tool_hook(client, data):
     """The hook after each tool call: a sign of life for the server (at most every ALIVE_EVERY seconds, so a
     long turn without a crewchat tool does not look silent), with what the call was when that changed (at
@@ -9227,13 +12504,17 @@ def tool_hook(client, data):
             return
         state["key"] = launched
     doing = tool_summary(client, data)
+    browser = browser_seen(data)
+    where = conversation_where(client, data)  # where its conversation is, for the advisor (A2): sent when it is new
+    moved = bool(where) and where != state.get("conversation")
     now = time.time()
     # The file an edit changed, inside the project, when the server keeps them (C0; it said so last time).
     project = find_project(client) if state.get("edits") else None
     edit = edited_path(client, data, project) if project else ""
     if now - float(state.get("alive") or 0) < ALIVE_EVERY and (
             not doing or doing == state.get("doing") or now - float(state.get("doing_at") or 0) < DOING_EVERY) and (
-            not edit or edit == state.get("edit") and now - float(state.get("edit_at") or 0) < ALIVE_EVERY):
+            not edit or edit == state.get("edit") and now - float(state.get("edit_at") or 0) < ALIVE_EVERY) and not moved \
+            and not browser:
         return  # told the server under a minute ago, and nothing new to say
     project = project or find_project(client)
     config = client_config(project, client) if project else None
@@ -9244,14 +12525,84 @@ def tool_hook(client, data):
         state["doing"], state["doing_at"] = doing, now
     if edit:
         state["edit"], state["edit_at"] = edit, now
+    if moved:
+        state["conversation"] = where
     save_hook_state(state_file, state)
     body = {"key": state["key"], "event": "tool", "doing": doing}
     if edit:
         body["path"] = edit
+    if moved:
+        body["conversation"] = where
+    if browser:
+        body["browser"] = browser
     answer = hook_post(config[0] + "/api/hook", config[1], body)
+    if answer.get("remind"):  # at the browser without a progress note for a while (B3): into this turn
+        out = remind_output(client, str(answer["remind"]))
+        if out:
+            print(out)
     if bool(answer.get("edits")) != bool(state.get("edits")):  # the owner turned edit tracking on or off
         state["edits"] = bool(answer.get("edits"))
         save_hook_state(state_file, state)
+
+
+def browser_seen(data):
+    """A browser call's after-tool hook (B2): {"tool", "action", "url"} with the address of the page the call left
+    the agent on, "" when its result does not say; None for a call that is not a browser's. Claude in Chrome ends each
+    result with its Tab Context (the tab it acted on, and each tab's address): the last one is the extension's own,
+    as the page's text comes before it ("sure"). The Playwright bridge says "- Page URL: ..." in its page state, but a
+    page's console output may say it too: two different addresses are no address ("about:unclear"), and the server
+    lets a read that is not sure only take the agent off its site, never onto another (Hub._browser_seen). "tabs":
+    Claude in Chrome's tabs and their addresses (each call names its tab), and "tab", the one it acted on. The
+    bridge's own tab list (its tabs tool) marks the tab it now works in "(current)": sure when exactly one is."""
+    name = str(data.get("tool_name") or data.get("tool") or "")
+    if not re.fullmatch(BROWSER_MATCHER, name):
+        return None
+    args = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else data.get("args")
+    action = args.get("action") if isinstance(args, dict) else ""
+    texts = []
+
+    def gather(value, depth=0):
+        if depth > 6 or len(texts) > 200:
+            return
+        if isinstance(value, str):
+            if value[:1] in "[{":  # Cursor's result_json, a bridge's JSON text
+                try:
+                    return gather(json.loads(value), depth + 1)
+                except ValueError:
+                    pass
+            texts.append(value)
+        elif isinstance(value, dict):
+            for item in value.values():
+                gather(item, depth + 1)
+        elif isinstance(value, list):
+            for item in value:
+                gather(item, depth + 1)
+    for field in ("tool_response", "tool_output", "result_json", "output"):
+        if field in data:
+            gather(data[field])
+    text = "\n".join(texts)
+    url, sure, tabs, tab = "", False, {}, ""
+    found = set(re.findall(r"^[ \t]*-[ \t]*Page URL: *(\S+)", text, re.M))
+    if found:
+        url = found.pop() if len(found) == 1 else "about:unclear"
+    listed = text.rfind("### Open tabs")
+    if re.search(r"(^|_)tabs$", name) and listed >= 0:  # the bridge's tab list: "- 1: (current) [title](address)"
+        block = re.split(r"^### ", text[listed + 4:], maxsplit=1, flags=re.M)[0]  # to the next section
+        current = set(re.findall(r"^- \d+: \(current\) \[.*\]\((\S*)\)[ \t]*$", block, re.M))
+        if current:
+            url, sure = (current.pop(), True) if len(current) == 1 else ("about:unclear", False)
+    context = text.rfind("Tab Context:")
+    if context >= 0:
+        tail = text[context:]
+        tabs = dict(re.findall(r"^[ \t]*\u2022[ \t]*tabId (\d+): .*\(\"([^\"\n]*)\"\)[ \t]*$", tail, re.M))
+        acted = re.search(r"^[ \t]*- Executed on tabId: *(\d+)[ \t]*$", tail, re.M)  # the extension's line, not a title
+        tab = acted.group(1) if acted else (list(tabs)[0] if len(tabs) == 1 else "")
+        url = tabs.get(tab, "")
+        sure = bool(url)
+    if not tab and isinstance(args, dict) and str(args.get("tabId", "")).isdigit():
+        tab = str(args["tabId"])[:20]  # the tab the call named: a change there with no address forgets its site
+    return {"tool": name[:120], "action": str(action or "")[:40], "url": url[:2000], "sure": sure, "tab": tab,
+            "tabs": {k: v[:2000] for k, v in list(tabs.items())[:50]}}
 
 
 def edited_path(client, data, project):
@@ -9320,9 +12671,12 @@ def hook_script():
     def value(v):  # sets in a fixed order, so the same crewchat writes the same file
         return "frozenset(%r)" % sorted(v) if isinstance(v, (set, frozenset)) else repr(v)
     names = ("SERVER_NAME", "KEY_RE", "EDIT_TOOLS", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
-             "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS")
+             "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS",
+             "CONVERSATION_PATH_TOOLS", "CONVERSATION_ID_TOOLS", "MAX_CONVERSATION_PATH", "BROWSER_MATCHER",
+             "CONTEXT_EVENTS", "O_BINARY")
     functions = (sha, find_project, connection_entry, client_config, hooks_off, claim_launch_key, tool_summary,
-                 edited_path, hook_post, save_hook_state, tool_hook)
+                 browser_seen, edited_path, conversation_ref, conversation_where, hook_post, open_private,
+                 save_hook_state, remind_output, tool_hook)
     return ('"""crewchat %s\'s hook after each tool call, written by crewchat from its own code (`crewchat hooks\n'
             'refresh` writes it again). Edits are not kept."""\n'
             "import hashlib\nimport json\nimport os\nimport re\nimport shlex\nimport socket\nimport sys\n"
@@ -9364,6 +12718,8 @@ def run_hook(client, event):
     if event == "tool":
         tool_hook(client, data)  # the same as the light hook script runs (HOOK_SCRIPT_FILE)
         return
+    if event == "browser" and browser_action(data.get("tool_name") or data.get("tool"), {})[0] == "other":
+        return  # not a browser call (Cursor's hook runs before every MCP call): nothing to read or ask
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
     state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
     try:
@@ -9372,6 +12728,11 @@ def run_hook(client, event):
         state = {}
     project = find_project(client)
     config = client_config(project, client) if project else None
+    if event == "browser" and config is None and not os.environ.get("CREWCHAT_HOOKS", "").lower() == "off":
+        text = bridge_refusal(client, data, project)  # a session in no chat (Codex's hooks run in every folder)
+        if text:
+            print(text)
+        return
     if config is None or hooks_off(project):
         return  # this project is not connected to a crewchat, or its hooks are switched off
     base, token = config
@@ -9385,6 +12746,12 @@ def run_hook(client, event):
         key = launched
     else:
         key = state.get("key") or secrets.token_urlsafe(12)
+    if event == "browser":  # a browser call, before it runs (B2): a session in the chat is checked by the server
+        text = (browser_hook(client, data, base, token, key, project) if state.get("key") or key == launched
+                else bridge_refusal(client, data, project))
+        if text:
+            print(text)
+        return
     if event == "permission":
         # A tool waits on a permission prompt: ask the owner on the chat page first. Allow or Deny there
         # answers it; with no answer in time (or the owner keeps prompts in the terminal), the agent's own
@@ -9416,12 +12783,13 @@ def run_hook(client, event):
     # Once per session: which session and process this agent is (Stop, Reopen on the chat page).
     report = lambda: session_report(client, session, project)  # noqa: E731  (only when the server asks)
 
+    where = conversation_where(client, data)  # where this session's conversation is, for the advisor (A2)
     state["doing"] = ""  # a turn begins or ends: the next tool call is news again, as the server forgot it too
     if event == "prompt":
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", report=report)
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", report=report, conversation=where)
         if kind != "ok":
             if ignored >= MAX_LINK_PROMPTS:
                 # Asked at several prompts and never linked: this session is not joining (or has no
@@ -9446,7 +12814,7 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
-                                                      pending, chain=chain, report=report)
+                                                      pending, chain=chain, report=report, conversation=where)
     if kind != "ok":
         # Asking here makes the agent take one more turn, which costs a whole turn's tokens. Claude
         # Code is asked at its user's prompt instead; here only a session that was linked and must
@@ -9496,9 +12864,10 @@ def save_hook_state(state_file, state):
     the hooks of parallel tool calls run at once, and one must never read it half written. A disk that will not
     take it only costs a repeat. In the light hook script too (hook_script)."""
     try:
-        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)  # the system's temporary folder: this user's only
         temp = state_file.with_name("%s.%d.tmp" % (state_file.name, os.getpid()))
-        temp.write_text(json.dumps(state))
+        with open_private(temp, "w") as f:
+            f.write(json.dumps(state))
         os.replace(str(temp), str(state_file))
     except OSError:
         pass
@@ -9798,8 +13167,8 @@ def systemd_unit():
             % (" ".join('"%s"' % p for p in run_command()), env))
 
 
-def run(command):
-    return subprocess.run(command, capture_output=True, text=True, **HIDDEN)
+def run(command, timeout=None):
+    return subprocess.run(command, capture_output=True, text=True, timeout=timeout, **HIDDEN)
 
 
 def windows_command():
@@ -10037,9 +13406,10 @@ def upgrade_folders(projects):
     crewchat hooks, and Codex's settings this copy's command. Only what changed is written."""
     refresh_codex()
     for project in projects.all():
+        notes = project.hub.live_processes()
         for folder in project.hub.project_folders():
             try:
-                write_guides(folder, project.roster.root)
+                write_guides(folder, project.roster.root, notes)
                 update_hooks(folder)
             except (OSError, SystemExit) as e:  # SystemExit: read_json on a broken file
                 sys.stderr.write("%s could not update crewchat's files in %s: %s\n" % (now_iso(), folder, e))
@@ -10047,7 +13417,7 @@ def upgrade_folders(projects):
 
 def flush_all(projects):
     """Write what every project let wait (Hub._save_soon), before the server stops."""
-    for project in projects.all():
+    for project in projects.all() + ([projects.shared] if projects.shared is not None else []):
         try:
             project.hub.flush()
         except Exception as e:  # the others still get saved
@@ -10074,6 +13444,17 @@ def map_checks(projects):
         if MAP_WAKE.wait(MAP_EVERY):
             time.sleep(MAP_SETTLE)
             MAP_WAKE.clear()
+
+
+def process_checks(projects):
+    """Every STALE_EVERY seconds, each project flags the process notes that may be out of date (L5)."""
+    while True:
+        time.sleep(STALE_EVERY)
+        for project in projects.all():
+            try:
+                project.hub.check_stale()
+            except Exception as e:  # one bad check must not stop the next
+                sys.stderr.write("%s could not check the process notes: %s\n" % (now_iso(), e))
 
 
 def reclaim_checks(projects):
@@ -10103,7 +13484,7 @@ PUSH_EVERY = 3  # how often the server looks for something new to push (seconds)
 MAX_PUSH_SUBS = 20
 MAX_PUSH_NOTICES = 10  # kept per browser until its service worker fetches them
 NEED_LABELS = {"permission": "Asks permission", "blocked": "Needs you", "review": "Ready for review", "message": "Message",
-               "given_back": "Given back", "reclaimed": "Reclaimed"}  # as the page says them (NEED_LOOK)
+               "given_back": "Given back", "reclaimed": "Reclaimed", "process": "Process note"}  # as the page says them (NEED_LOOK)
 
 # P-256 (NIST, FIPS 186-4): enough of it to make a key and sign, in plain Python. Only this machine's own
 # key is used, on what it sends; nothing received is ever verified with it.
@@ -10765,7 +14146,7 @@ RULES = """\
 
 This project's AI agents and the owner share a chat (crewchat). If your tool list has `hub_send`,
 `hub_inbox`, `hub_task`, `hub_agents`, `hub_status`, `hub_history`, `hub_rename`, `hub_profile`,
-`hub_file`, `hub_role`, `hub_ask`, `hub_answer` and `hub_link`, you are connected.
+`hub_file`, `hub_role`, `hub_ask`, `hub_answer`, `hub_process` and `hub_link`, you are connected.
 
 - **Know who is who.** `hub_agents` lists every agent with its name, tool, place and status; your
   row is marked `(you)`. You are named automatically; if the owner gives you a name, take it with
@@ -10809,10 +14190,11 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   it) goes back on the sheet; waiting on someone's answer, mark it `blocked`.
 - **The advisor.** If an agent has the advisor role (`hub_agents` shows it), ask it with `hub_ask`
   before you commit to an approach, when an error keeps coming back, and before you say a task is
-  done. It sees only what you send: the goal, what you tried, the error or the change, and the
-  files involved. If no answer comes in time, it arrives in your inbox. If the owner turned on the
-  advisor check, `hub_task` update `done` needs its approval: `hub_ask` with `task`. An advisor
-  answers with `hub_answer`: for a task, a verdict, `approve` or `changes`.
+  done. When crewchat can read your conversation, it goes with your question as a file only the
+  advisor opens; still send the goal, what you tried, the error or the change, and the files involved.
+  If no answer comes in time, it arrives in your inbox. If the owner turned on the advisor check,
+  `hub_task` update `done` needs its approval: `hub_ask` with `task`. An advisor answers with
+  `hub_answer`: for a task, a verdict, `approve` or `changes`.
 - **Roles and progress.** `hub_agents` shows each agent's role (lead, developer, qa,
   reviewer, ...). If you have one, follow its instructions (`hub_role` shows them). Report
   progress on your tasks with `hub_task` update; `hub_status` is a line on what you do in general.
@@ -10823,6 +14205,22 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
   `[file ID: name ...]`: `hub_file` opens it, an image so you can see it, a text file with its
   contents, anything else as its path on this machine (one shared from another machine is fetched
   first).
+- **Process notes: write down what you worked out.** When you got something to work the hard
+  way, record it with `hub_process` so no agent has to work it out again: a process that took
+  several tries, a command sequence you had to piece together, a trap you fell into, a setup step
+  the docs leave out. Not one-off facts, and nothing the code or its docs already say.
+  - `propose`: a new note, `name` like `release-build`, and `note` with `when` (one line: when to
+    use it), `steps` (a list, in order), `commands` (exact), `pitfalls` (what goes wrong), `areas`
+    (files and folders it touches) and `scope` (`project`, or `shared` for all the owner's projects).
+    Steps and pitfalls are required; a few KB at most.
+  - `update`: a new version of a note, with only the fields that change; it says what changed.
+  - `list`, `get` (one note's steps), `find` (`name`: a few words on what you are stuck on).
+  - After you follow a note, `report` how it went: `note` `ok` true, or `ok` false with `why` (the
+    step, and what happened). Two failures in a row take a note out of the guides until it is fixed.
+  A note reaches the other agents once approved: by the lead, or by the owner for shared notes and
+  ones whose commands release, deploy, publish, delete data or touch credentials or production.
+  The approved ones are skills in your folder (`.claude/skills/crewchat-process-*`), listed in this
+  guide: read one when it applies.
 - **Your picture.** When the owner asks, `hub_profile` sets your picture (a 3D picture, an emoji
   preset, initials, or an image in your folder: PNG, JPEG or WebP, 512 KB at most) and colour.
 - Keep it short. Do not reply to another agent just to acknowledge.
@@ -10852,9 +14250,21 @@ def project_skills(root):
     return sorted(p.name for p in folder.iterdir() if (p / "SKILL.md").is_file()) if folder.is_dir() else []
 
 
-def project_guide(root):
+BROWSER_GUIDE = """
+## Working in the owner's browser
+
+When the owner turns the browser on for you, you work in their own Chrome, where they are signed in.
+- One agent drives it at a time: if another holds it, wait, or ask in the chat.
+- A new site, and your first change on a site for a task, wait for the owner's Allow in crewchat.
+- Never type a password, a code or a card number, and never sign in: use the sessions the owner has.
+- While you work in it, post a short progress note on your task every few minutes (hub_task update: what you did,
+  what is next; a screenshot helps), and a screenshot of the result when you are done.
+"""
+
+
+def project_guide(root, processes=()):
     """What every agent in the project should know: how the chat works, the owner's rules for
-    the project, and its shared skills."""
+    the project, its shared skills, and the process notes its crew wrote down (L1, L4)."""
     config = load_config(root)
     rules, skills = project_rules(root), project_skills(root)
     parts = ["# crewchat: the project %s\n\nYou are in the project **%s**: its agents and the owner share a "
@@ -10862,9 +14272,16 @@ def project_guide(root):
              RULES.replace("## The crewchat: talking to each other\n\n", "## How the chat works\n\n", 1)]
     parts.append("\n## The owner's rules for this project\n\n%s\n" % (
         rules or "None yet. The owner sets them on the chat page, or with `crewchat rules set`."))
+    parts.append(BROWSER_GUIDE)
     if skills:
         parts.append("\n## Skills shared in this project\n\n%s\n" % "\n".join(
             "- `%s`: in `.claude/skills/%s/SKILL.md`" % (n, n) for n in skills))
+    if processes:
+        parts.append("\n## Process notes\n\nHow the crew does things it worked out before. Read a note when it applies, "
+                     "and follow its steps:\n\n%s\n" % "\n".join(
+                         "- `%s` (%s): %s. In `.claude/skills/%s%s/SKILL.md`" % (
+                             n["name"], "all projects" if n["scope"] == "shared" else "this project",
+                             n["when"].rstrip("."), PROCESS_SKILL, n["name"]) for n in processes))
     return "".join(parts)
 
 
@@ -10879,10 +14296,12 @@ def _write_if_changed(path, text):
     return True
 
 
-def write_guides(folder, root):
-    """Write the project's guide and skills into one connected folder. Returns what changed."""
+def write_guides(folder, root, processes=None):
+    """Write the project's guide and skills into one connected folder. Returns what changed. processes: the live
+    process notes (Hub.live_processes), each written as a skill and a Cursor rule; None leaves the folder's notes as
+    they are (a command with no server to ask), and the guide without their list until the server writes it."""
     folder, root = Path(folder), Path(root)
-    guide, changed = project_guide(root), []
+    guide, changed = project_guide(root, processes or ()), []
     name = load_config(root)["project"]
     skill = ("---\nname: crewchat\ndescription: How to work in the project %s's crewchat, the group chat "
              "between its AI agents and their owner, and the owner's rules for the project. Use it whenever a "
@@ -10926,11 +14345,45 @@ def write_guides(folder, root):
             (target / SKILL_MARK).write_text("installed by crewchat for the project %s\n" % name, encoding="utf-8")
             changed.append(".claude/skills/%s/" % n)
     for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
-        if old.name not in wanted and old.name != "crewchat" and (old / SKILL_MARK).exists():
+        if (old.name not in wanted and old.name != "crewchat" and not old.name.startswith(PROCESS_SKILL)
+                and (old / SKILL_MARK).exists()):
             shutil.rmtree(old, ignore_errors=True)
             changed.append(".claude/skills/%s/ (removed)" % old.name)
-    git_exclude(folder, [".claude/skills/crewchat/", GUIDE_RULE] + [".claude/skills/%s/" % n for n in wanted])
+    notes = [] if processes is None else write_processes(folder, name, processes, changed)
+    git_exclude(folder, [".claude/skills/crewchat/", GUIDE_RULE] + [".claude/skills/%s/" % n for n in wanted] + notes)
     return changed
+
+
+def write_processes(folder, project, processes, changed):
+    """The live process notes into a folder (L1): each a skill, .claude/skills/crewchat-process-NAME/, and a Cursor
+    rule, .cursor/rules/crewchat-process-NAME.mdc, made from the log; ones no longer live are removed. Adds what it
+    did to changed; returns the paths to keep out of git."""
+    folder = Path(folder)
+    skills_dir, rules_dir = folder / ".claude" / "skills", folder / ".cursor" / "rules"
+    wanted, keep_out = set(), []
+    for note in processes:
+        skill, rule = process_skill(note, project)
+        target = skills_dir / (PROCESS_SKILL + note["name"])
+        wanted.add(target.name)
+        if target.exists() and not (target / SKILL_MARK).exists():
+            continue  # a skill of the folder's own by that name: left alone
+        wrote = _write_if_changed(target / "SKILL.md", skill)
+        if wrote:
+            changed.append(".claude/skills/%s/" % target.name)
+        if wrote or not (target / SKILL_MARK).exists():
+            (target / SKILL_MARK).write_text("installed by crewchat for the project %s\n" % project, encoding="utf-8")
+        if _write_if_changed(rules_dir / (target.name + ".mdc"), rule):
+            changed.append(".cursor/rules/%s.mdc" % target.name)
+        keep_out += [".claude/skills/%s/" % target.name, ".cursor/rules/%s.mdc" % target.name]
+    for old in (skills_dir.iterdir() if skills_dir.is_dir() else []):
+        if old.name.startswith(PROCESS_SKILL) and old.name not in wanted and (old / SKILL_MARK).exists():
+            shutil.rmtree(old, ignore_errors=True)
+            changed.append(".claude/skills/%s/ (removed)" % old.name)
+    for old in (rules_dir.glob(PROCESS_SKILL + "*.mdc") if rules_dir.is_dir() else []):
+        if old.stem not in wanted:
+            old.unlink()
+            changed.append(".cursor/rules/%s (removed)" % old.name)
+    return keep_out
 
 
 BRIEF_SKILL = ".claude/skills/crewchat-brief/SKILL.md"  # the project's code at a glance (C6), as a skill
@@ -11005,6 +14458,10 @@ def remove_guides(folder):
         if (old / SKILL_MARK).exists():
             shutil.rmtree(old, ignore_errors=True)
             removed.append(".claude/skills/%s" % old.name)
+    rules_dir = folder / ".cursor" / "rules"
+    for old in (rules_dir.glob(PROCESS_SKILL + "*.mdc") if rules_dir.is_dir() else []):
+        old.unlink()
+        removed.append(".cursor/rules/%s" % old.name)
     agents = folder / "AGENTS.md"
     if agents.is_file():
         text = agents.read_text(encoding="utf-8")
@@ -11106,6 +14563,29 @@ def cmd_map(args):
         print("  none")
 
 
+def cmd_accounts(args):
+    """`crewchat accounts`: the Claude Code accounts the chat page can start agents in (claude_accounts)."""
+    config = load_config()
+    kept = dict(config.get("claude_accounts") or {})
+    if args.action in ("add", "remove"):
+        name = str(args.name or "").lower()
+        if not ACCOUNT_RE.fullmatch(name):
+            die("an account's name is a word of letters, digits, - and _ (e.g. personal)")
+        if args.action == "add":
+            folder = Path(os.path.expanduser(args.folder or "")).resolve()
+            if not args.folder or not folder.is_dir():
+                die("give its Claude Code settings folder, which must exist (e.g. ~/.claude-personal)")
+            kept[name] = str(folder)
+        elif kept.pop(name, None) is None:
+            die("no account called %s was added (found ones are not removed: they come from their folders)" % name)
+        config["claude_accounts"] = kept
+        save_config(config)
+        print("%s the Claude Code account %s." % ("Added" if args.action == "add" else "Removed", name))
+    for account in claude_accounts(config):
+        print("  %-14s %s%s" % (account["label"], account["dir"] or "Claude Code's own settings folder",
+                                "  (added)" if account["id"] in kept else ""))
+
+
 def cmd_usage(args):
     report = owner_call("/api/usage", {"op": "view" if args.mode == "show" else args.mode, "days": args.days})
     if args.mode != "show":
@@ -11195,6 +14675,123 @@ def cmd_tasks(args):
     else:
         owner_call("/api/task", {"op": "remove", "task": task})
         print("Took task #%s off the sheet." % task.lstrip("#"))
+
+
+def cmd_processes(args):
+    """The owner and the process notes (L1)."""
+    action, name = args.action, args.name
+    if action == "list":
+        out = owner_call("/api/processes", {"op": "list"})
+        print("Who approves: %s." % PROCESS_RULES[out["rule"]])
+        for title, rows in (("This project's notes", out["notes"]), ("Shared with all projects", out.get("shared") or [])):
+            print("\n%s:" % title)
+            for r in rows:
+                live = "" if r["live"] in (0, r["version"]) else ", v%d live" % r["live"]
+                wait = " (waits for %s: %s)" % (r["approver"], r["why"]) if r["state"] == "proposed" and r["why"] else ""
+                print("- %s v%d, %s%s%s: %s" % (r["name"], r["version"], r["state"], live, wait, r["when"]))
+            if not rows:
+                print("- none")
+        return
+    if action == "rule":
+        out = owner_call("/api/processes", {"op": "rule", "rule": name} if name else {"op": "list"})
+        print("Who approves this project's notes: %s." % PROCESS_RULES[out["rule"]])
+        return
+    if not name:
+        die("usage: crewchat processes %s NAME" % action)
+    if action == "show":
+        note = owner_call("/api/processes", {"op": "get", "name": name})["note"]
+        print("\n".join(process_body(note)))
+        print("\nState: %s%s." % (note["state"], "" if note["live"] in (0, note["version"]) else
+                                   " (agents get v%d)" % note["live"]))
+    elif action == "approve":
+        print(owner_call("/api/processes", {"op": "approve", "name": name})["said"])
+    elif action == "promote":
+        note = owner_call("/api/processes", {"op": "get", "name": name})["note"]
+        params = split_list(args.value or "")
+        print("Agents will run these exact commands, in order, with `crewchat run %s%s`:" % (
+            name, "".join(" %s=..." % p for p in params)))
+        print("\n".join("  " + c for c in note["commands"]) or "  (none)")
+        if not args.yes and not ask("Make them the project command %s?" % name):
+            return
+        owner_call("/api/processes", {"op": "promote", "name": name, "params": params})
+        print("%s is a project command now. A change to it needs your approval again." % name)
+    elif action == "unpromote":
+        owner_call("/api/processes", {"op": "unpromote", "name": name})
+        print("%s is a plain note again." % name)
+    elif action == "owner-only":
+        if args.value not in ("on", "off"):
+            die("usage: crewchat processes owner-only NAME on|off")
+        owner_call("/api/processes", {"op": "mark", "name": name, "owner_only": args.value == "on"})
+        print("Only you approve %s now." % name if args.value == "on" else "%s is approved by the project's rule." % name)
+    else:
+        owner_call("/api/processes", {"op": action, "name": name})
+        print({"retire": "Retired %s: agents no longer get it.", "decline": "Declined the proposed version of %s.",
+               "share": "Shared %s with all your projects."}[action] % name)
+
+
+CMD_SPECIAL = re.compile(r'[&|<>^%!"()\r\n]')  # what cmd.exe acts on even in list2cmdline's quoting
+
+
+def command_line(line, values):
+    """A project command's line with its parameters put in, each quoted for the shell it runs in (L6). On Windows a
+    value with a character cmd.exe acts on (& | < > ^ % ! " ( )) is refused: no quoting keeps it a value there."""
+    if os.name == "nt":
+        bad = next((k for k, v in values.items() if CMD_SPECIAL.search(str(v))), None)
+        if bad:
+            raise HubError("%s may not hold & | < > ^ %% ! \" ( ) on Windows: cmd.exe would run what follows" % bad)
+    quote = (lambda v: subprocess.list2cmdline([v])) if os.name == "nt" else shlex.quote
+    return re.sub(r"\{([A-Z][A-Z0-9_]{0,31})\}", lambda m: quote(values[m.group(1)]) if m.group(1) in values
+                  else m.group(0), line)
+
+
+RUN_TAIL = 15  # lines of a failed step's output `crewchat run` prints
+
+
+def cmd_run(args):
+    """Run a project command (L6): a process note's commands the owner approved as one named command, here in this
+    shell, in order, stopping at the first that fails. The server only says what they are; it never runs them."""
+    config = load_config()
+    here = Path.cwd().resolve()
+    token = chosen = None
+    for folder in [here] + list(here.parents):
+        place, token, _, chosen = connected_project(folder, config)
+        if place:
+            break
+    if not token:
+        die("this folder is not connected to a crewchat project: run it from an agent's folder")
+    values = {}
+    for pair in args.values:
+        key, eq, value = pair.partition("=")
+        if not eq or not COMMAND_PARAM_RE.match(key):
+            die("give each parameter as NAME=VALUE, like VERSION=1.2.0")
+        if len(value) > MAX_PARAM_VALUE or any(c in value for c in "\n\r\0"):
+            die("%s: one line, %d characters at most" % (key, MAX_PARAM_VALUE))
+        values[key] = value
+    try:
+        cmd = post_json(local_url(config) + "/api/process-command", token, {"name": args.name},
+                        headers={"X-Crewchat-Chat": chosen["id"]}, timeout=20)
+    except urllib.error.HTTPError as e:
+        die(http_error_reason(e))
+    except (urllib.error.URLError, OSError) as e:
+        die("the chat server is not running here (%s)" % getattr(e, "reason", e))
+    wanted, extra = [p for p in cmd["params"] if p not in values], [k for k in values if k not in cmd["params"]]
+    if wanted or extra:
+        die("%s takes %s" % (cmd["name"], " ".join("%s=..." % p for p in cmd["params"]) or "no parameters"))
+    try:
+        lines = [command_line(line, values) for line in cmd["lines"]]
+    except HubError as e:
+        die(str(e))
+    for n, line in enumerate(lines, 1):
+        print("$ " + line, flush=True)
+        done = subprocess.run(line, shell=True, cwd=str(folder), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              **HIDDEN)
+        if done.returncode != 0:
+            out = done.stdout.decode("utf-8", "replace").rstrip().splitlines()[-RUN_TAIL:]
+            print("\n".join(out))
+            print("%s v%d: step %d of %d failed (exit %d). Report it: hub_process report." % (
+                cmd["name"], cmd["version"], n, len(lines), done.returncode))
+            sys.exit(1)
+    print("%s v%d: all %d step%s ran." % (cmd["name"], cmd["version"], len(lines), "" if len(lines) == 1 else "s"))
 
 
 def cmd_skills(args):
@@ -11453,6 +15050,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #space-menu > summary:hover { background: var(--tint); color: var(--ink); }
 #banner { display: none; flex: none; background: var(--err); color: var(--panel); font-size: 13px; padding: 6px 16px; text-align: center; }
 #banner.show { display: block; }
+#offered { flex: none; display: grid; gap: 6px; padding: 8px 14px; font-size: 13px; background: var(--tint); color: var(--ink); }
+#offered[hidden] { display: none; }
+.m-offer { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; justify-content: center; }
 #update { display: none; flex: none; align-items: center; gap: 10px; justify-content: center; flex-wrap: wrap;
   background: var(--task); color: var(--task-ink); font-size: 13px; padding: 6px 16px; }
 #update.show { display: flex; }
@@ -11640,14 +15240,36 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .rolelist .avatar { width: 28px; height: 28px; }
 .prompt-text { white-space: pre-wrap; font-size: 13px; background: var(--soft); border-radius: 12px; padding: 8px 10px; max-height: 260px; overflow-y: auto; }
 .roleform textarea { min-height: 150px; resize: vertical; }
+.m-line { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 4px; }
+.m-line .oslogo, .avatar .os .oslogo { color: var(--ink); flex: none; }
+.m-state { font-size: 12.5px; color: var(--muted); }
+.m-badge { font-size: 11.5px; padding: 1px 8px; border-radius: 999px; background: var(--tint); color: var(--ink); }
+.m-error { color: var(--err); font-size: 13px; margin: 0 0 10px; }
+.m-invite code { display: block; padding: 8px 10px; border-radius: 10px; background: var(--soft); overflow-wrap: anywhere; font-size: 12.5px; margin: 6px 0; }
+.m-file { display: grid; gap: 3px; font-size: 12.5px; color: var(--muted); margin: 0 0 8px; }
+.m-file input { font-size: 12px; max-width: 100%; }
+#m-join-text { width: 100%; box-sizing: border-box; font: inherit; font-size: 12.5px; margin: 4px 0 6px; }
+#panel .card h4 { margin: 12px 0 4px; font-size: 13px; }
+.m-checks { list-style: none; padding: 0; margin: 8px 0 0; display: grid; gap: 6px; font-size: 13px; }
+.m-checks .m-mark { display: inline-block; width: 18px; font-weight: 700; }
+.m-checks .ok .m-mark { color: var(--ok); } .m-checks .bad .m-mark { color: var(--err); } .m-checks .info .m-mark { color: var(--muted); }
+.m-fix { margin: 2px 0 0 18px; color: var(--text); font-size: 12.5px; }
+#link { cursor: pointer; }
 .linkline { font-size: 12.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; margin: 0; }
 .linkline b { color: var(--ink); font-weight: 650; }
 .linkline .m { white-space: nowrap; }
 .linkline .dot { width: 7px; height: 7px; margin-right: 4px; vertical-align: 1px; }
 #setup h3 { display: flex; justify-content: space-between; align-items: center; }
 #setup .rules { font-size: 13px; white-space: pre-wrap; margin: 0; color: var(--text); max-height: 12em; overflow: auto; }
-#setup ul { list-style: none; margin: 0; padding: 0; font-size: 13px; }
-#setup li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+#setup ul, #folders-list { list-style: none; margin: 0; padding: 0; font-size: 13px; }
+#setup li, #folders-list li { display: flex; justify-content: space-between; gap: 6px; padding: 2px 0; }
+#folders-list span { min-width: 0; overflow-wrap: anywhere; }
+#process-list li { flex-wrap: wrap; }
+#process-list .what { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; }
+#process-list .meta { flex: 1 1 auto; }
+#process-list .warn { color: var(--warn); }
+#process-rule { font-size: 12px; max-width: 60%; }
+#folders-list button { white-space: nowrap; }
 
 /* Dialogs: New agent (four steps), New project, Project rules. */
 dialog { border: 0; border-radius: 22px; background: var(--panel); color: var(--text); width: min(92vw, 480px); padding: 20px 22px; box-shadow: var(--shadow); }
@@ -11912,6 +15534,8 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
     <details id="space-menu" class="menu">
       <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
       <div class="menu-list">
+        <button type="button" data-panel="machines">Machines</button>
+        <button type="button" data-panel="browser">Browser</button>
         <button type="button" data-panel="project">Rules, skills and machines</button>
         <button type="button" data-panel="roles">Roles</button>
       </div>
@@ -11920,6 +15544,7 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
   <div id="update" role="status"><span>A newer crewchat, <b id="update-version"></b>, is available. Run
     <code>crewchat update</code> on this machine. <a id="update-notes" target="_blank" rel="noopener">What's new</a></span>
     <button id="update-close" type="button" aria-label="Dismiss until the next version">×</button></div>
+  <div id="offered" role="status" hidden></div>
   <div id="banner" role="status">Can't reach the chat server. Retrying… (Is its machine on and awake, and is your private network connected?)</div>
   <p id="search-none" class="none" role="status" hidden>No message here matches the search.</p>
   <div id="log" role="log" aria-live="polite"><p class="empty" id="empty"><span class="spinner"></span>Loading the chat…</p></div>
@@ -11988,14 +15613,22 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
     <div id="cmd-list"><p class="tasks-help">Loading…</p></div>
   </div>
   <div id="pane-project" hidden>
-    <section class="card"><h3>Machines</h3><p id="link" class="linkline"></p></section>
+    <section class="card"><h3>Machines <button type="button" class="link" id="link-open">Link, status and checks</button></h3><p id="link" class="linkline"></p></section>
     <section class="card" id="setup" aria-label="What this project's agents learn">
       <h3>Project rules <button type="button" class="link" id="rules-edit">Edit</button></h3>
       <p id="rules-text" class="rules"></p>
       <h3 style="margin-top:12px">Shared skills <button type="button" class="link" id="skill-add">Add</button></h3>
       <input type="file" id="skill-file" accept=".md,text/markdown" hidden>
       <ul id="skills-list"></ul>
+      <h3 style="margin-top:12px">Process notes
+        <select id="process-rule" aria-label="Who approves this project's process notes">
+          <option value="default">The lead approves; you, the ones that need you</option>
+          <option value="owner">You approve every note</option>
+          <option value="lead">The lead approves all but shared and owner-only</option></select></h3>
+      <ul id="process-list"></ul>
     </section>
+    <section class="card" id="folders-card"><h3>Folders on this machine</h3>
+      <ul id="folders-list"></ul><p class="meta" id="folders-note" role="status"></p></section>
     <section class="card" id="edits-card"><h3>Files agents edit</h3>
       <p class="meta" id="edits-note">Loading…</p>
       <label for="edits-mode">Keep track of them</label>
@@ -12037,9 +15670,10 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
       <fieldset class="step" hidden>
         <label for="l-tool">Tool</label><div class="inline"><span class="swatch" id="l-tool-swatch"></span><select id="l-tool"></select></div>
         <div id="l-ready" class="ready" role="status" aria-live="polite" hidden></div>
+        <label for="l-account" id="l-account-label" hidden>Account</label><select id="l-account" hidden></select>
         <label for="l-model">Model</label><select id="l-model"></select>
-        <label for="l-advisor">Advisor</label><select id="l-advisor"></select>
-        <p class="meta" id="l-advisor-note" hidden>A stronger model it consults on its own at decision points; it reads the whole conversation and uses more tokens. For a chat-wide advisor everyone sees, give an agent the advisor role.</p>
+        <label class="check" for="l-use-browser"><input type="checkbox" id="l-use-browser"> Use the browser: it works in your
+          Chrome, where you are signed in (Claude in Chrome, or the Playwright MCP Bridge for the other tools)</label>
         <label for="l-perms">Without asking, it may</label><select id="l-perms"></select>
         <p class="meta" id="l-perms-note"></p>
       </fieldset>
@@ -12119,13 +15753,13 @@ function api(path) { return CHAT ? path + (path.includes("?") ? "&" : "?") + "ch
 // Projects: a tab each (a picker on a phone). Switching loads the page for the other project: say so at
 // once, so the old chat is not taken for the new one.
 function chatUrl(path, id) { return path + (id ? "?chat=" + encodeURIComponent(id) : ""); }
-function switchTo(id, name) {
+function switchTo(id, name, hash) {
   const note = $("switching");
   note.replaceChildren(el("span", "spinner"), "Opening " + name + "…");
   note.hidden = false;
   $("projects").disabled = true;
   document.body.classList.add("switching");
-  location.href = chatUrl("/", id);
+  location.href = chatUrl("/", id) + (hash || "");
 }
 $("projects").addEventListener("change", (e) => {
   const p = (state.projects || []).find((x) => x.id === e.target.value);
@@ -12676,6 +16310,32 @@ async function loadEdits(op) {
 }
 $("edits-mode").addEventListener("change", () => loadEdits($("edits-mode").value));
 
+// Open folder: the project's folders on this machine (the host's, whichever device shows the page), opened in its file
+// manager. Read when the project panel or an agent's settings open; only these folders can be opened.
+async function loadFolders(soon) {
+  if (soon && Date.now() - (state.foldersAt || 0) < 10000) return;
+  state.foldersAt = Date.now();
+  let rows;
+  try { rows = (await postJSON("/api/folders", { op: "project" })).folders; } catch (e) { return; }
+  const same = JSON.stringify(rows) === JSON.stringify(state.folders);
+  state.folders = rows;
+  $("folders-list").replaceChildren(...state.folders.map((f) => {
+    const item = el("li");
+    item.append(el("span", "", f.name + " · " + f.path));
+    openFolderButton(item, f, "link", (text) => { $("folders-note").textContent = text; });
+    return item;
+  }));
+  if (!state.folders.length) $("folders-list").append(el("li", "", "None connected on this machine yet."));
+  if (state.agentPane && !same) renderAgentPane(true);
+}
+function openFolderButton(parent, f, cls, say) {
+  const b = actButton(parent, "Open folder", "Open " + f.name + " in the file manager of " + (state.device || "this machine"), async (b) => {
+    if (await postAction("/api/open-folder", { folder: f.path }, "Folder not opened", b)) say("Opened " + f.path + " on " + (state.device || "this machine") + ".");
+  });
+  if (cls) b.className = cls;
+  return b;
+}
+
 function renderSetup(rules, skills) {
   const text = $("rules-text");
   text.textContent = rules || "None yet. Edit to tell every agent in this project how to work here.";
@@ -12695,6 +16355,67 @@ function renderSetup(rules, skills) {
   }));
   if (!(skills || []).length) list.append(el("li", "", "None yet: Add shares a SKILL.md with every agent."));
 }
+// The process notes (L5): every one, this project's and the shared ones, with where it stands, what agents reported,
+// whether it may be out of date, and Approve (a proposed one) or Retire.
+function renderProcesses(p) {
+  if (!p) return;
+  const key = JSON.stringify(p);
+  if (key === state.processesKey) return;
+  state.processesKey = key;
+  $("process-rule").value = p.rule || "default";
+  const rows = (p.notes || []).map((n) => [n, false]).concat((p.shared || []).map((n) => [n, true]));
+  $("process-list").replaceChildren(...rows.map(([n, shared]) => {
+    const item = el("li");
+    const state_ = n.held ? "held back: it failed" : n.state + (n.live && n.live !== n.version ? " (v" + n.live + " live)" : "");
+    item.append(el("span", "what", n.name + " v" + n.version + ": " + n.when));
+    const bits = [state_, shared ? "all projects" : "this project"];
+    if (n.approved_by) bits.push("approved by " + (n.approved_by === "Owner" ? "you" : n.approved_by));
+    if (n.ok || n.failed) bits.push("worked " + n.ok + ", failed " + n.failed);
+    else if (n.unused) bits.push("unused");
+    item.append(el("span", "meta", bits.join(" · ")));
+    if (n.stale) item.append(el("span", "meta warn", "May be out of date: " + n.stale));
+    if (n.command) item.append(el("span", "meta", "Project command: crewchat run " + n.name + n.command.map((p) => " " + p + "=…").join("")));
+    const act = async (op, label) => {
+      if (op === "retire" && !confirm("Stop giving the note " + n.name + " to agents?")) return;
+      try { await postJSON("/api/processes", { op, name: n.name, of: n.of, shared }); } catch (e) { alert(e.message); }
+    };
+    if (n.state === "proposed" && !shared) {
+      if (n.body) {
+        const all = el("details");
+        all.append(el("summary", "", "What agents will read"), el("pre", "cmd", n.body));
+        item.append(all);
+      }
+      const b = el("button", "link", "Approve");
+      b.type = "button"; b.setAttribute("aria-label", "Approve the process note " + n.name);
+      b.addEventListener("click", () => act("approve"));
+      item.append(b);
+    }
+    if (n.state === "approved" && !shared && !n.command && (n.commands || []).length) {
+      // L6: the exact commands are shown before they become something agents run as they are.
+      const b = el("button", "link", "Make it a command");
+      b.type = "button"; b.setAttribute("aria-label", "Make the process note " + n.name + " a project command");
+      b.addEventListener("click", async () => {
+        const params = prompt("Its parameters, written {NAME} in the commands (comma-separated, or none):", "");
+        if (params === null) return;
+        if (!confirm("Agents will run these exact commands, in order, with crewchat run " + n.name + ":\n\n" +
+                     n.commands.join("\n") + "\n\nA change to them will need your approval again.")) return;
+        try { await postJSON("/api/processes", { op: "promote", name: n.name, params }); } catch (e) { alert(e.message); }
+      });
+      item.append(b);
+    }
+    if (n.state !== "retired") {
+      const b = el("button", "link", "Retire");
+      b.type = "button"; b.setAttribute("aria-label", "Retire the process note " + n.name);
+      b.addEventListener("click", () => act("retire"));
+      item.append(b);
+    }
+    return item;
+  }));
+  if (!rows.length) $("process-list").append(el("li", "", "None yet: agents propose them with hub_process when they work something out."));
+}
+$("process-rule").addEventListener("change", async () => {
+  try { await postJSON("/api/processes", { op: "rule", rule: $("process-rule").value }); } catch (e) { alert(e.message); }
+});
 $("rules-edit").addEventListener("click", () => {
   $("rules-input").value = state.rules || "";
   $("rules-note").textContent = "";
@@ -12767,6 +16488,7 @@ async function openLaunch(role) {
   document.body.classList.remove("rail-open");
   note.textContent = ""; $("l-start").disabled = false; $("l-next").disabled = false;
   for (const id of ["l-name", "l-task", "l-instructions", "l-path"]) $(id).value = "";
+  $("l-use-browser").checked = false;
   showBrowser(false);
   $("l-folder-label").textContent = word("folder");
   $("l-machine").textContent = (state.device || "This machine") + " (the one that hosts this page)";
@@ -12903,7 +16625,8 @@ async function checkTool(fresh) {
   let out;
   try {
     out = await request("/api/tool-check?tool=" + encodeURIComponent(tool.id) + "&folder=" +
-                        encodeURIComponent($("l-folder").value) + (fresh ? "&fresh=1" : ""));
+                        encodeURIComponent($("l-folder").value) + "&account=" + encodeURIComponent($("l-account").value) +
+                        "&browser=" + ($("l-use-browser").checked ? "1" : "") + (fresh ? "&fresh=1" : ""));
   } catch (err) {
     if (seq === readySeq) box.replaceChildren(el("div", "meta", "Could not check " + tool.label + ": " + err.message));
     return;
@@ -12937,13 +16660,13 @@ function showTool() {
   const tool = launchTools.find((t) => t.id === $("l-tool").value);
   const info = own(state.tools, $("l-tool").value);
   $("l-tool-swatch").style.setProperty("--sw", info ? info.colour : "");
+  // Claude Code with more than one account on this machine (its own settings folders): which one it runs in.
+  const accounts = (tool && tool.accounts) || [];
+  $("l-account").replaceChildren(...accounts.map(([id, label]) => new Option(id ? label : "Default (" + label + ")", id)));
+  $("l-account").hidden = $("l-account-label").hidden = accounts.length < 2;
   const models = own(state.models, $("l-tool").value) || [];
   $("l-model").replaceChildren(new Option("Its default", ""), ...models.map(([id, label]) => new Option(label, id)));
   $("l-model").disabled = !models.length;
-  const advisors = own(state.advisors, $("l-tool").value) || [];
-  $("l-advisor").replaceChildren(new Option("None", ""), ...advisors.map(([id, label]) => new Option(label, id)));
-  $("l-advisor").disabled = !advisors.length;
-  $("l-advisor-note").hidden = true;
   if (launchStep === 2) checkTool();
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
@@ -12974,7 +16697,7 @@ async function startAgent(event) {
     await postJSON("/api/launch", {
       tool: $("l-tool").value, folder: $("l-folder").value, name: $("l-name").value.trim(), role: $("l-role").value,
       task: $("l-task").value.trim(), permissions: $("l-perms").value, model: $("l-model").value,
-      advisor: $("l-advisor").value,
+      account: $("l-account").value, browser: $("l-use-browser").checked,
       picture: $("l-picture").value, colour: $("l-colour-tool").checked ? "" : $("l-colour").value,
       instructions: $("l-instructions").value.trim() });
     note.textContent = "Opened. It appears in the list when it connects (if its terminal asks a question, such as whether to trust the folder, answer it there).";
@@ -13009,7 +16732,8 @@ $("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isC
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
-$("l-advisor").addEventListener("change", () => { $("l-advisor-note").hidden = !$("l-advisor").value; });
+$("l-account").addEventListener("change", () => { if (launchStep === 2) checkTool(true); });
+$("l-use-browser").addEventListener("change", () => { if (launchStep === 2) checkTool(true); });
 $("l-perms").addEventListener("change", showPermissions);
 
 function roleTitle(name) {
@@ -13197,7 +16921,27 @@ function renderAgents(force) {
 
 // An agent's picture: its uploaded image, a preset, or its initials, on its colour (the tool's own by
 // default), with its tool's lettermark, and its machine's OS when the chat spans several machines.
-const OS_BADGES = { mac: ["\u{1F34E}", "macOS"], windows: ["\u{1FA9F}", "Windows"], linux: ["\u{1F427}", "Linux"] };
+// The OS logos, one colour (currentColor): Apple's and Linux's (Tux) shapes from Simple Icons (CC0; the marks are
+// their owners'), and Windows' four panes drawn here (Simple Icons removed it at Microsoft's request).
+const OS_LOGOS = {
+  mac: ["macOS", "M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"],
+  windows: ["Windows", "M0 0h11.377v11.372H0zM12.623 0H24v11.372H12.623zM0 12.623h11.377V24H0zM12.623 12.623H24V24H12.623z"],
+  linux: ["Linux", "M12.504 0c-.155 0-.315.008-.48.021-4.226.333-3.105 4.807-3.17 6.298-.076 1.092-.3 1.953-1.05 3.02-.885 1.051-2.127 2.75-2.716 4.521-.278.832-.41 1.684-.287 2.489a.424.424 0 00-.11.135c-.26.268-.45.6-.663.839-.199.199-.485.267-.797.4-.313.136-.658.269-.864.68-.09.189-.136.394-.132.602 0 .199.027.4.055.536.058.399.116.728.04.97-.249.68-.28 1.145-.106 1.484.174.334.535.47.94.601.81.2 1.91.135 2.774.6.926.466 1.866.67 2.616.47.526-.116.97-.464 1.208-.946.587-.003 1.23-.269 2.26-.334.699-.058 1.574.267 2.577.2.025.134.063.198.114.333l.003.003c.391.778 1.113 1.132 1.884 1.071.771-.06 1.592-.536 2.257-1.306.631-.765 1.683-1.084 2.378-1.503.348-.199.629-.469.649-.853.023-.4-.2-.811-.714-1.376v-.097l-.003-.003c-.17-.2-.25-.535-.338-.926-.085-.401-.182-.786-.492-1.046h-.003c-.059-.054-.123-.067-.188-.135a.357.357 0 00-.19-.064c.431-1.278.264-2.55-.173-3.694-.533-1.41-1.465-2.638-2.175-3.483-.796-1.005-1.576-1.957-1.56-3.368.026-2.152.236-6.133-3.544-6.139zm.529 3.405h.013c.213 0 .396.062.584.198.19.135.33.332.438.533.105.259.158.459.166.724 0-.02.006-.04.006-.06v.105a.086.086 0 01-.004-.021l-.004-.024a1.807 1.807 0 01-.15.706.953.953 0 01-.213.335.71.71 0 00-.088-.042c-.104-.045-.198-.064-.284-.133a1.312 1.312 0 00-.22-.066c.05-.06.146-.133.183-.198.053-.128.082-.264.088-.402v-.02a1.21 1.21 0 00-.061-.4c-.045-.134-.101-.2-.183-.333-.084-.066-.167-.132-.267-.132h-.016c-.093 0-.176.03-.262.132a.8.8 0 00-.205.334 1.18 1.18 0 00-.09.4v.019c.002.089.008.179.02.267-.193-.067-.438-.135-.607-.202a1.635 1.635 0 01-.018-.2v-.02a1.772 1.772 0 01.15-.768c.082-.22.232-.406.43-.533a.985.985 0 01.594-.2zm-2.962.059h.036c.142 0 .27.048.399.135.146.129.264.288.344.465.09.199.14.4.153.667v.004c.007.134.006.2-.002.266v.08c-.03.007-.056.018-.083.024-.152.055-.274.135-.393.2.012-.09.013-.18.003-.267v-.015c-.012-.133-.04-.2-.082-.333a.613.613 0 00-.166-.267.248.248 0 00-.183-.064h-.021c-.071.006-.13.04-.186.132a.552.552 0 00-.12.27.944.944 0 00-.023.33v.015c.012.135.037.2.08.334.046.134.098.2.166.268.01.009.02.018.034.024-.07.057-.117.07-.176.136a.304.304 0 01-.131.068 2.62 2.62 0 01-.275-.402 1.772 1.772 0 01-.155-.667 1.759 1.759 0 01.08-.668 1.43 1.43 0 01.283-.535c.128-.133.26-.2.418-.2zm1.37 1.706c.332 0 .733.065 1.216.399.293.2.523.269 1.052.468h.003c.255.136.405.266.478.399v-.131a.571.571 0 01.016.47c-.123.31-.516.643-1.063.842v.002c-.268.135-.501.333-.775.465-.276.135-.588.292-1.012.267a1.139 1.139 0 01-.448-.067 3.566 3.566 0 01-.322-.198c-.195-.135-.363-.332-.612-.465v-.005h-.005c-.4-.246-.616-.512-.686-.71-.07-.268-.005-.47.193-.6.224-.135.38-.271.483-.336.104-.074.143-.102.176-.131h.002v-.003c.169-.202.436-.47.839-.601.139-.036.294-.065.466-.065zm2.8 2.142c.358 1.417 1.196 3.475 1.735 4.473.286.534.855 1.659 1.102 3.024.156-.005.33.018.513.064.646-1.671-.546-3.467-1.089-3.966-.22-.2-.232-.335-.123-.335.59.534 1.365 1.572 1.646 2.757.13.535.16 1.104.021 1.67.067.028.135.06.205.067 1.032.534 1.413.938 1.23 1.537v-.043c-.06-.003-.12 0-.18 0h-.016c.151-.467-.182-.825-1.065-1.224-.915-.4-1.646-.336-1.77.465-.008.043-.013.066-.018.135-.068.023-.139.053-.209.064-.43.268-.662.669-.793 1.187-.13.533-.17 1.156-.205 1.869v.003c-.02.334-.17.838-.319 1.35-1.5 1.072-3.58 1.538-5.348.334a2.645 2.645 0 00-.402-.533 1.45 1.45 0 00-.275-.333c.182 0 .338-.03.465-.067a.615.615 0 00.314-.334c.108-.267 0-.697-.345-1.163-.345-.467-.931-.995-1.788-1.521-.63-.4-.986-.87-1.15-1.396-.165-.534-.143-1.085-.015-1.645.245-1.07.873-2.11 1.274-2.763.107-.065.037.135-.408.974-.396.751-1.14 2.497-.122 3.854a8.123 8.123 0 01.647-2.876c.564-1.278 1.743-3.504 1.836-5.268.048.036.217.135.289.202.218.133.38.333.59.465.21.201.477.335.876.335.039.003.075.006.11.006.412 0 .73-.134.997-.268.29-.134.52-.334.74-.4h.005c.467-.135.835-.402 1.044-.7zm2.185 8.958c.037.6.343 1.245.882 1.377.588.134 1.434-.333 1.791-.765l.211-.01c.315-.007.577.01.847.268l.003.003c.208.199.305.53.391.876.085.4.154.78.409 1.066.486.527.645.906.636 1.14l.003-.007v.018l-.003-.012c-.015.262-.185.396-.498.595-.63.401-1.746.712-2.457 1.57-.618.737-1.37 1.14-2.036 1.191-.664.053-1.237-.2-1.574-.898l-.005-.003c-.21-.4-.12-1.025.056-1.69.176-.668.428-1.344.463-1.897.037-.714.076-1.335.195-1.814.12-.465.308-.797.641-.984l.045-.022zm-10.814.049h.01c.053 0 .105.005.157.014.376.055.706.333 1.023.752l.91 1.664.003.003c.243.533.754 1.064 1.189 1.637.434.598.77 1.131.729 1.57v.006c-.057.744-.48 1.148-1.125 1.294-.645.135-1.52.002-2.395-.464-.968-.536-2.118-.469-2.857-.602-.369-.066-.61-.2-.723-.4-.11-.2-.113-.602.123-1.23v-.004l.002-.003c.117-.334.03-.752-.027-1.118-.055-.401-.083-.71.043-.94.16-.334.396-.4.69-.533.294-.135.64-.202.915-.47h.002v-.002c.256-.268.445-.601.668-.838.19-.201.38-.336.663-.336zm7.159-9.074c-.435.201-.945.535-1.488.535-.542 0-.97-.267-1.28-.466-.154-.134-.28-.268-.373-.335-.164-.134-.144-.333-.074-.333.109.016.129.134.199.2.096.066.215.2.36.333.292.2.68.467 1.167.467.485 0 1.053-.267 1.398-.466.195-.135.445-.334.648-.467.156-.136.149-.267.279-.267.128.016.034.134-.147.332a8.097 8.097 0 01-.69.468zm-1.082-1.583V5.64c-.006-.02.013-.042.029-.05.074-.043.18-.027.26.004.063 0 .16.067.15.135-.006.049-.085.066-.135.066-.055 0-.092-.043-.141-.068-.052-.018-.146-.008-.163-.065zm-.551 0c-.02.058-.113.049-.166.066-.047.025-.086.068-.14.068-.05 0-.13-.02-.136-.068-.01-.066.088-.133.15-.133.08-.031.184-.047.259-.005.019.009.036.03.03.05v.02h.003z"],
+};
+function osLogo(os, size) {
+  const logo = Object.hasOwn(OS_LOGOS, os) ? OS_LOGOS[os] : null;
+  if (!logo) return null;
+  const ns = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(ns, "svg");
+  for (const [k, v] of [["viewBox", "0 0 24 24"], ["width", size || 12], ["height", size || 12], ["role", "img"],
+                        ["aria-label", logo[0]], ["class", "oslogo"]]) svg.setAttribute(k, v);
+  const title = document.createElementNS(ns, "title");
+  title.textContent = logo[0];
+  const path = document.createElementNS(ns, "path");
+  path.setAttribute("d", logo[1]); path.setAttribute("fill", "currentColor");
+  svg.append(title, path);
+  return svg;
+}
 
 function agentRow(name) {
   return state.agents.find((a) => a.agent === name) || { agent: name, client: "agent", picture: "", colour: "" };
@@ -13256,9 +17000,11 @@ function avatar(a, cls) {
     mark.style.setProperty("--mk", tool.colour); mark.style.setProperty("--mk-ink", inkOn(tool.colour)); mark.title = tool.label;
     box.append(mark);
   }
-  const os = OS_BADGES[a.os];
-  if (os && manyMachines()) {
-    const badge = el("span", "os", os[0]); badge.title = os[1];
+  const logo = osLogo(a.os, 9);
+  if (logo && manyMachines()) {
+    const badge = el("span", "os");
+    badge.title = OS_LOGOS[a.os][0];
+    badge.append(logo);
     box.append(badge);
   }
   box.title = a.agent + (tool.label ? " · " + tool.label : "");
@@ -13323,6 +17069,8 @@ function pictureMenu(a, agentOp) {
 function openPanel(kind, id) {
   if (kind === "agent") return openAgent(id);
   if (kind === "commands") loadCommands();
+  if (kind === "machines") watchMachines();
+  if (kind === "browser") loadBrowser();
   const from = document.activeElement;
   if (!state.panel) state.panelFrom = from && from !== document.body ? from : null;  // focus goes back there
   state.panel = { kind, id };
@@ -13346,6 +17094,7 @@ function closePanel() {
 function openAgent(name) {
   if (state.agentPane === name && $("agents").contains(document.activeElement)) return closeAgent();
   state.agentPane = name;
+  loadFolders();
   if (matchMedia("(max-width: 760px)").matches) document.body.classList.add("rail-open");  // the rail is a drawer
   renderAgentPane(true);
   markOpen();
@@ -13381,6 +17130,8 @@ function loadRolesInto() {
   return loadRoles().then(() => renderPanel(true)).catch((e) => { state.rolesError = e.message; renderPanel(true); });
 }
 $("panel-close").addEventListener("click", closePanel);
+$("link-open").addEventListener("click", () => openPanel("machines"));
+$("link").addEventListener("click", () => openPanel("machines"));
 document.addEventListener("keydown", (e) => {
   if (e.key !== "Escape" || document.querySelector("dialog[open]")) return;
   const menu = document.querySelector("details.menu[open]");
@@ -13396,7 +17147,8 @@ function panelBusy() {
 function renderPanel(force) {
   const p = state.panel;
   if (!p) return;
-  const key = JSON.stringify([p, state.version, Math.floor(state.now / 60), state.roleInfo && state.roleInfo.stamp]);
+  const key = JSON.stringify([p, state.version, Math.floor(state.now / 60), state.roleInfo && state.roleInfo.stamp,
+                              p.kind === "machines" ? mach.stamp : 0]);
   if (!force && (key === state.panelKey || panelBusy())) return;
   state.panelKey = key;
   $("panel").hidden = false;
@@ -13405,11 +17157,338 @@ function renderPanel(force) {
   $("pane-project").hidden = p.kind !== "project";
   $("commands").hidden = p.kind !== "commands";
   const draw = { task: panelTask, roles: panelRoles, role: panelRole,
-                 project: () => { loadEdits(); return ["Rules, skills and machines"]; },
-                 commands: () => ["Commands"] }[p.kind];
+                 project: () => { loadEdits(); loadFolders(true); return ["Rules, skills and machines"]; },
+                 commands: () => ["Commands"], machines: panelMachines, browser: panelBrowser }[p.kind];
   const [title, ...cards] = draw(p.id);
   $("panel-title").textContent = title;
   body.replaceChildren(...cards, el("p", "panel-note meta"));
+}
+// The Machines panel (roadmap M1): link this machine with the owner's others, over Tailscale or with cloud sync,
+// from here; each one's state, version and projects; and "Check everything", with what to do about what is wrong.
+// Everything goes through POST /api/machines, which runs the same code as the `crewchat peers` and `cloud` commands.
+const mach = { status: null, checks: null, invite: null, login: null, cloud: null, error: "", busy: "", join: "", stamp: 0, timer: 0 };
+function machChanged() { mach.stamp++; }
+async function loadMachines(force) {
+  try {
+    mach.status = await postJSON("/api/machines", { op: "status" });
+    if (mach.error && !mach.busy) mach.error = "";  // what failed before (the server restarting, say) is over
+  } catch (e) { mach.error = e.message; }
+  machChanged();
+  if (state.panel && state.panel.kind === "machines")
+    renderPanel(force || !$("panel-body").querySelector("input:focus, textarea:focus, select:focus"));
+}
+function watchMachines() {
+  clearInterval(mach.timer);
+  loadMachines(true);
+  mach.timer = setInterval(() => {
+    if (state.panel && state.panel.kind === "machines") loadMachines(false); else clearInterval(mach.timer);
+  }, 5000);
+}
+async function machOp(op, body, busy) {
+  mach.busy = busy || op; mach.error = ""; machChanged(); renderPanel(true);
+  try { return await postJSON("/api/machines", Object.assign({ op }, body || {})); }
+  catch (e) { mach.error = e.message; return null; }
+  finally { mach.busy = ""; machChanged(); renderPanel(true); }
+}
+// After linking another way or unlinking: the server restarts itself; the panel waits for it to answer again.
+async function machRestart() {
+  if (!(await machOp("restart", {}, "restart"))) return;
+  mach.busy = "restart"; machChanged(); renderPanel(true);
+  const answers = async () => { try { return (await fetch(api("/health"), { cache: "no-store" })).ok; } catch (e) { return false; } };
+  const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+  // The old server answers for a moment yet: wait until it is down, then until the new one is up.
+  let down = false;
+  for (let i = 0; i < 30 && !down; i++) { await pause(500); down = !(await answers()); }
+  for (let i = 0; i < 60 && !(await answers()); i++) await pause(1000);
+  mach.busy = ""; mach.login = null; mach.invite = null;
+  await loadMachines(true);
+}
+function machButton(parent, label, title, busy, onClick) {
+  const b = actButton(parent, label, title, onClick);
+  b.disabled = !!mach.busy;
+  if (mach.busy === busy) b.textContent = { invite: "Making a code…", join: "Joining…", check: "Checking…",
+    restart: "Restarting…", setup: "Saving…", login: "Waiting for Google…" }[busy] || "Working…";
+  return b;
+}
+const MACH_STATES = { online: "online", connecting: "connecting", offline: "offline", waiting: "waiting for approval" };
+function panelMachines() {
+  const s = mach.status;
+  const cards = [];
+  if (mach.error) cards.push(el("p", "m-error", mach.error));
+  if (!s) return ["Machines", ...cards, card("", el("p", "meta", "Loading…"))];
+  const me = card("This machine");
+  me.classList.add("m-me");
+  const line = el("p", "m-line");
+  const logo = osLogo(s.me.os, 14);
+  if (logo) line.append(logo);
+  line.append(el("b", "", s.me.name), el("span", "meta", "crewchat " + s.me.version + (s.me.tag ? " · tag " + s.me.tag : "")));
+  me.append(line, el("p", "meta", { none: "Not linked with your other machines yet.",
+    tailscale: "Linked over Tailscale" + (s.me.address ? ", at " + s.me.address : "") + ".",
+    cloud: "Linked with cloud sync (Firestore)" + (s.me.fp ? ". Fingerprint " + s.me.fp : "") + ".",
+    linked: "Linked with your other machines." }[s.via] || ""));
+  cards.push(me);
+  if (s.via === "none") {
+    cards.push(machTailscaleCard(), machCloudCard(s));
+  } else {
+    for (const m of s.machines) cards.push(machCard(m, s));
+    if (!s.machines.length) cards.push(card("", el("p", "meta", "No other machine yet.")));
+    cards.push(machLinkCard(s));
+  }
+  if (state.offered && state.offered.length) cards.push(card("Projects on your other machines", ...state.offered.map(offerRow)));
+  cards.push(machChecksCard());
+  return ["Machines", ...cards];
+}
+// The Browser panel (B4): who drives this machine's browser, the project's sites, the bridge token, what happened.
+const brow = { status: null, error: "", site: "", token: "" };
+async function loadBrowser() {
+  try { brow.status = await postJSON("/api/browser", { op: "status" }); brow.error = ""; }
+  catch (e) { brow.error = e.message; }
+  if (state.panel && state.panel.kind === "browser") renderPanel(true);
+}
+async function browserOp(body) {
+  let said = "";
+  try {
+    const out = await postJSON("/api/browser", body);
+    if (out && out.kept && out.kept.length) said = "The old token is still in " + out.kept.join(", ") +
+      ": git tracks it, so crewchat leaves it. Take the token out of it yourself.";
+  } catch (e) { said = e.message; }
+  await loadBrowser();
+  if (said) {
+    brow.error = said;
+    if (state.panel && state.panel.kind === "browser") renderPanel(true);
+  }
+}
+function panelBrowser() {
+  const s = brow.status, cards = [];
+  if (brow.error) cards.push(el("p", "m-error", brow.error));
+  if (!s) return ["Browser", ...cards, card("", el("p", "meta", "Loading…"))];
+  const who = card("Who drives");
+  if (s.holder) {
+    who.append(el("p", "", s.holder.agent + (s.holder.task ? " · task #" + s.holder.task : "") +
+      (s.holder.site ? " · on " + s.holder.site : "") + (s.holder.project ? " · in " + s.holder.project : "")),
+      el("p", "meta", "Since " + new Date(s.holder.since * 1000).toLocaleTimeString() + ". Let go after " +
+        Math.round(s.idle / 60) + " minutes without a browser call."));
+    const acts = el("div", "acts");
+    actButton(acts, "Let go", "Free the browser for another agent", () => browserOp({ op: "release" }));
+    who.append(acts);
+  } else who.append(el("p", "meta", "No agent is using the browser."));
+  cards.push(who);
+  const bridge = card("Playwright MCP Bridge");
+  bridge.append(el("p", "meta", s.token ? "A token is saved: agents of other tools than Claude Code can use Chrome." :
+    "Agents of other tools than Claude Code use Chrome through the Playwright MCP Bridge extension: paste its token here."));
+  const tok = el("input");
+  tok.type = "password"; tok.id = "b-token"; tok.autocomplete = "off"; tok.value = brow.token;
+  tok.placeholder = "The token the extension shows";
+  tok.setAttribute("aria-label", "The Playwright MCP Bridge token");
+  tok.addEventListener("input", () => { brow.token = tok.value; });
+  const tacts = el("div", "acts");
+  actButton(tacts, "Save", "Save the token on this machine", async () => {
+    await browserOp({ op: "token", value: tok.value }); brow.token = ""; renderPanel(true);
+  });
+  if (s.token) actButton(tacts, "Remove", "Remove the token", () => browserOp({ op: "token", value: "" }));
+  bridge.append(tok, tacts);
+  cards.push(bridge);
+  const sites = card("Sites");
+  sites.append(el("p", "meta", "Agents open allowed sites freely and ask before they change something there (once per " +
+    "task). On a trusted site they never ask."));
+  for (const [host, st] of Object.entries(s.sites).sort()) {
+    const row = el("div", "acts");
+    row.append(el("b", "", host), el("span", "meta", st));
+    actButton(row, st === "trusted" ? "Only allow" : "Trust", st === "trusted" ? "Ask before changes again" :
+      "Never ask on this site", () => browserOp({ op: "site", host, state: st === "trusted" ? "allowed" : "trusted" }));
+    actButton(row, "Remove", "Agents ask before opening it again", () => browserOp({ op: "site", host, state: "remove" }));
+    sites.append(row);
+  }
+  const add = el("input");
+  add.id = "b-site"; add.value = brow.site; add.placeholder = "jenkins.example.com";
+  add.setAttribute("aria-label", "A site to allow");
+  add.addEventListener("input", () => { brow.site = add.value; });
+  const sacts = el("div", "acts");
+  for (const [label, st] of [["Allow", "allowed"], ["Trust", "trusted"]])
+    actButton(sacts, label, label + " this site", async () => {
+      await browserOp({ op: "site", host: add.value, state: st }); brow.site = ""; renderPanel(true);
+    });
+  sites.append(add, sacts);
+  cards.push(sites);
+  const log = card("What happened");
+  if (!s.log.length) log.append(el("p", "meta", "Nothing yet."));
+  for (const e of s.log.slice().reverse())
+    log.append(el("p", "meta", new Date(e.ts * 1000).toLocaleTimeString() + " · " + e.agent + " · " + e.what + " · " + e.decision));
+  cards.push(log);
+  return ["Browser", ...cards];
+}
+function machInviteBox() {
+  const box = el("div", "m-invite");
+  if (mach.invite.expires * 1000 < Date.now()) {
+    box.append(el("p", "meta", "That code ran out. Make a new one."));
+    return box;
+  }
+  const until = new Date(mach.invite.expires * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const code = el("code", "", mach.invite.command);
+  code.id = "m-invite-command";
+  const acts = el("div", "acts");
+  actButton(acts, "Copy", "Copy the join command", async (b) => {
+    try { await navigator.clipboard.writeText(mach.invite.command); b.textContent = "Copied"; } catch (e) { b.textContent = "Select it"; }
+  });
+  box.append(el("p", "meta", "On the other machine, paste this in its Machines panel (Join a machine), or run it in a " +
+    "terminal. It works once, until " + until + "."), code, acts);
+  return box;
+}
+async function machInvite() {
+  const out = await machOp("peer-invite", {}, "invite");
+  if (out) { mach.invite = out; await loadMachines(true); }
+}
+function machTailscaleCard() {
+  const box = card("Link over Tailscale");
+  box.append(el("p", "meta", "Every machine runs Tailscale, signed in to the same account: the machines talk to each " +
+    "other directly, and nothing leaves them."));
+  const acts = el("div", "acts");
+  machButton(acts, "Invite a machine", "Make a join command for another machine", "invite", machInvite).id = "m-invite";
+  box.append(acts);
+  if (mach.invite) box.append(machInviteBox());
+  box.append(el("h4", "", "Join a machine"));
+  const input = el("textarea");
+  input.id = "m-join-text"; input.rows = 2; input.value = mach.join;
+  input.placeholder = "Paste the join command another machine shows";
+  input.setAttribute("aria-label", "The join command from the other machine");
+  input.addEventListener("input", () => { mach.join = input.value; });
+  const acts2 = el("div", "acts");
+  machButton(acts2, "Join", "Link this machine with the one that made the command", "join", async () => {
+    mach.join = input.value;
+    const out = await machOp("peer-join", { text: input.value }, "join");
+    if (out) { mach.join = ""; await loadMachines(true); }
+  }).id = "m-join";
+  box.append(input, acts2);
+  return box;
+}
+// A Firebase file the owner picked: JSON, or the web config as Firebase's console shows it (a script).
+async function machReadConfig(input) {
+  const file = input.files && input.files[0];
+  if (!file) return null;
+  const text = await file.text();
+  try { return JSON.parse(text); } catch (e) {}
+  const out = {};
+  for (const k of ["projectId", "apiKey"]) {
+    const m = text.match(new RegExp(k + "\\s*:\\s*[\"']([^\"']+)[\"']"));
+    if (m) out[k] = m[1];
+  }
+  return out;
+}
+function machCloudCard(s) {
+  const box = card("Link with cloud sync");
+  box.append(el("p", "meta", "Machines signed in to the same Google account share the chat through your own Firebase " +
+    "project, end to end encrypted, from anywhere."));
+  box.append(el("h4", "", "1. Your Firebase project"));
+  const guide = el("a", "", "how to make one");
+  guide.href = "https://github.com/deepankar17/crewchat/blob/main/docs/firebase-setup.md";
+  guide.target = "_blank"; guide.rel = "noopener";
+  const help = el("p", "meta", "Once for all your machines: ");
+  help.append(guide, ". Then pick its two files here.");
+  const web = el("input"); web.type = "file"; web.accept = ".json,.js,.txt,application/json"; web.id = "m-web";
+  const oauth = el("input"); oauth.type = "file"; oauth.accept = ".json,application/json"; oauth.id = "m-oauth";
+  const acts = el("div", "acts");
+  machButton(acts, "Save", "Keep the Firebase project's settings on this machine", "setup", async () => {
+    const [w, o] = [await machReadConfig(web), await machReadConfig(oauth)];
+    if (!w || !o) { mach.error = "Pick both files: the web app's config and the Desktop OAuth client."; machChanged(); renderPanel(true); return; }
+    const out = await machOp("cloud-setup", { web: w, oauth: o }, "setup");
+    if (out) mach.cloud = out;
+  });
+  const picker = (label, input) => { const l = el("label", "m-file", label); l.append(input); return l; };
+  box.append(help, picker("The web app's config", web), picker("The Desktop OAuth client", oauth), acts);
+  if (mach.cloud) box.append(el("p", "meta", "Saved: Firebase project " + mach.cloud.project + "."));
+  box.append(el("h4", "", "2. Sign in with Google"));
+  const acts2 = el("div", "acts");
+  const sign = machButton(acts2, "Sign in with Google", "Opens Google's sign-in in this machine's browser", "login", async () => {
+    const out = await machOp("cloud-login", {}, "login");
+    if (out) mach.login = out;
+  });
+  if (!s.local) sign.disabled = true;
+  box.append(acts2);
+  if (!s.local) box.append(el("p", "meta", "Do this on the machine itself: Google's sign-in opens a browser there."));
+  if (mach.login) {
+    box.append(el("h4", "", "3. Approval"));
+    box.append(el("p", "meta", "This machine is " + mach.login.device + " (tag " + mach.login.tag + "), fingerprint " +
+      mach.login.fp + ". " + (mach.login.state === "waiting" ? "Approve it from a machine already linked: its Machines " +
+      "panel lists it, with this fingerprint to compare." : "It is ready.")));
+    const acts3 = el("div", "acts");
+    machButton(acts3, "Restart to start syncing", "Restart crewchat on this machine", "restart", machRestart);
+    box.append(acts3);
+  }
+  return box;
+}
+function machCard(m, s) {
+  const box = card("");
+  box.classList.add("m-machine");
+  box.dataset.name = m.name;
+  const head = el("p", "m-line");
+  const logo = osLogo(m.os, 14);
+  if (logo) head.append(logo);
+  head.append(el("b", "", m.name), el("span", "dot" + (m.state === "online" ? " on" : m.state === "connecting" ? " recent" : "")),
+              el("span", "m-state", m.state));
+  if (m.coordinator) head.append(el("span", "m-badge", "coordinates"));
+  box.append(head);
+  const facts = el("p", "meta");
+  facts.append(m.version ? el("span", "m-version", "crewchat " + m.version) : el("span", "m-older", "an older crewchat"));
+  if (m.tag) facts.append(" · tag " + m.tag);
+  if (m.seen) facts.append(" · seen " + ago(m.seen, state.now));
+  if (m.fp) facts.append(" · fingerprint " + m.fp);
+  box.append(facts);
+  if (m.projects && m.projects.length) {
+    const here = new Set((state.projects || []).map((p) => p.name.toLowerCase()));
+    box.append(el("p", "meta", "Projects: " + m.projects.map((p) => p.name + (here.has(p.name.toLowerCase()) || p.first ? " ✓" : ""))
+      .join(", ") + "  (✓ shared with this machine)"));
+  }
+  const acts = el("div", "acts");
+  if (m.state === "waiting") {
+    machButton(acts, "Approve", "Approve this machine on the account", "approve", async () => {
+      if (!confirm("Does " + m.name + " show this fingerprint?\n\n" + m.fp + "\n\nApprove it only if it does.")) return;
+      if (await machOp("cloud-approve", { name: m.name, fingerprint: m.fp }, "approve")) await loadMachines(true);
+    });
+  } else {
+    if (!m.coordinator) machButton(acts, "Make coordinator", "This machine settles claims when the one a task came from is off",
+      "prefer", async () => { if (await machOp("prefer", { name: m.name }, "prefer")) await loadMachines(true); });
+  }
+  machButton(acts, "Remove", "Take this machine out of the chat between your machines", "remove", async () => {
+    if (!confirm("Remove " + m.name + "? Its agents stop sharing this chat; the others get a new key it never sees.")) return;
+    const out = s.via === "cloud" ? await machOp("cloud-remove", { name: m.name }, "remove")
+      : await machOp("peer-remove", { id: m.id }, "remove");
+    if (out) await loadMachines(true);
+  }).classList.add("m-remove");
+  box.append(acts);
+  return box;
+}
+function machLinkCard(s) {
+  const box = card("This machine's link");
+  const acts = el("div", "acts");
+  if (s.via === "tailscale") machButton(acts, "Invite another machine", "Make a join command for another machine", "invite", machInvite).id = "m-invite";
+  machButton(acts, "Unlink this machine", "Take this machine out; its own chat carries on", "unlink", async () => {
+    if (!confirm("Unlink this machine? Its agents then only see each other. crewchat restarts here to finish.")) return;
+    if (await machOp(s.via === "cloud" ? "cloud-logout" : "peer-leave", {}, "unlink")) await machRestart();
+  });
+  box.append(acts);
+  if (mach.invite) box.append(machInviteBox());
+  box.append(el("p", "meta", s.via === "cloud" ? "To link over Tailscale instead: Unlink, then link over Tailscale."
+    : "To use cloud sync instead: Unlink, then link with cloud sync."));
+  return box;
+}
+function machChecksCard() {
+  const box = card("Check everything");
+  const acts = el("div", "acts");
+  machButton(acts, "Check everything", "Tailscale or cloud sync, every machine reached now, versions, and how projects pair",
+    "check", async () => { const out = await machOp("check", {}, "check"); if (out) mach.checks = out.checks; });
+  box.append(acts);
+  if (mach.checks) {
+    const list = el("ul", "m-checks");
+    for (const c of mach.checks) {
+      const li = el("li", c.ok === true ? "ok" : c.ok === false ? "bad" : "info");
+      li.append(el("span", "m-mark", c.ok === true ? "✓" : c.ok === false ? "✗" : "–"), el("b", "", c.title));
+      if (c.detail) li.append(el("span", "meta", " " + c.detail));
+      if (c.fix) li.append(el("div", "m-fix", c.fix));
+      list.append(li);
+    }
+    box.append(list);
+  }
+  return box;
 }
 function card(heading, ...children) {
   const box = el("section", "card");
@@ -13477,6 +17556,22 @@ function panelAgent(name) {
   listen.addEventListener("change", () => agentOp({ op: "listen", agent: a.agent, mode: listen.value },
                                                    "Listening not changed", listen));
   const settings = [field("Role", pick), field("Listening", listen)];
+  if (a.account) settings.push(field("Account", a.account + " (Claude Code; Reopen and Reconnect keep it)"));
+  if (!a.remote) {  // the browser (B1): it works in your Chrome, under the browser's rules
+    const box = el("div", "acts");
+    box.append(el("span", "", a.browser ? "On" + (a.client === "claude" ? " (Claude in Chrome from its next start or Reopen)" : "") : "Off"));
+    actButton(box, a.browser ? "Turn off" : "Turn on", "The browser for " + a.agent, (b) =>
+      agentOp({ op: "browser", agent: a.agent, mode: a.browser ? "off" : "on" }, "Browser not changed", b));
+    settings.push(field("Browser", box));
+  }
+  for (const f of a.remote ? [] : (state.folders || []).filter((f) => f.place === a.place)) {
+    const where = el("span", "", f.path);
+    where.style.overflowWrap = "anywhere";
+    const box = el("div", "acts");  // its folder on this machine (a linked machine's agent has none here)
+    box.append(where);
+    openFolderButton(box, f, "", panelNote);
+    settings.push(field("Folder", box));
+  }
   if (!a.remote) settings.push(field("Permissions", (PERMISSIONS[a.permissions] || "As it was started") + (a.session ? " (Reopen keeps them)" : "")));
 
   const acts = el("div", "acts");
@@ -13564,6 +17659,7 @@ function panelTask(id) {
   if (r.areas.length) what.push(field("Files", r.areas.join(", ")));
   if (r.suggested && r.suggested.length) what.push(field("Suggested files", r.suggested.join(", ")));
   if (r.where) what.push(field("Machine", r.where));
+  if (r.browser) what.push(field("Browser", "Needs the browser: only an agent with it on takes it"));
   what.push(field("From", r.from === "Owner" ? "you" : r.from));
   if (r.reclaimed) what.push(field("Reclaimed", "from " + r.reclaimed));
   const history = (state.byTask[r.id] || []).map((m) => {
@@ -13577,7 +17673,9 @@ function panelTask(id) {
     actButton(acts, "Accept files", "Add the suggested files to task " + r.id + "'s",
               () => taskOp({ op: "areas", task: r.id, accept: true }));
   taskActions(r, acts);
-  const need = state.needs.find((n) => n.task === r.id);
+  actButton(acts, r.browser ? "Does not need the browser" : "Needs the browser", "Whether task " + r.id + " needs the browser",
+            () => taskOp({ op: "browser", task: r.id, value: !r.browser }));
+  const need = state.needs.find((n) => n.task === r.id && n.kind !== "browser");  // a browser ask has its own card
   const needCard = need ? [needsCard(need, r)] : [];
   return ["Task #" + r.id, ...needCard, card("", ...what), card("Actions", acts),
           card("History", ...(history.length ? history : [el("p", "meta", "Nothing yet.")]))];
@@ -13823,7 +17921,9 @@ function fileLinks(files) {
     a.href = "/files/" + f.id + "/" + encodeURIComponent(f.name);
     a.target = "_blank"; a.rel = "noopener";
     a.title = f.name + " (" + sizeText(f.size) + ")";
-    if (state.images.includes(f.type)) {
+    if (f.for) {  // an agent's conversation, attached to its question for the advisor only (A2)
+      a.append(el("span", "", "📄 Conversation, for the advisor"), el("span", "s", sizeText(f.size)));
+    } else if (state.images.includes(f.type)) {
       const img = el("img"); img.src = a.href; img.alt = f.name; img.loading = "lazy";
       a.classList.add("image"); a.append(img);
     } else {
@@ -13866,6 +17966,12 @@ function buildMessage(m) {
       more.append(el("summary", "", roleTitle(m.role)), el("span", "prompt", m.text));
       line.append(more);
     }
+    return line;
+  }
+  if (m.kind === "process") {  // a process note proposed, approved, declined or retired (L1)
+    const line = el("p", "sys");
+    line.append(m.from === "Owner" ? el("b", "", "You") : named("b", "", m.from),
+                document.createTextNode(" " + m.text.charAt(0).toLowerCase() + m.text.slice(1)));
     return line;
   }
   if (m.kind === "take") {
@@ -14023,6 +18129,40 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("online", () => { if (state.wake) state.wake(); });
 
 // A newer crewchat: say so until the owner dismisses it, then not again for that version.
+// Projects your other machines have and this one has not (roadmap M2): set one up here in a click (then connect its
+// folder), or say it is not for this machine.
+function showOffered(list) {
+  const box = $("offered"), key = JSON.stringify(list);
+  if (key === state.offeredKey) return;
+  state.offeredKey = key;
+  state.offered = list;
+  box.hidden = !list.length;
+  box.replaceChildren(...list.map(offerRow));
+  if (state.panel && state.panel.kind === "machines") { machChanged(); renderPanel(false); }
+}
+function offerRow(o) {
+  const row = el("div", "m-offer");
+  row.append(o.machines.join(", ") + (o.machines.length > 1 ? " have" : " has") + " the project ", el("b", "", o.name), ". ");
+  const acts = el("span", "acts");
+  actButton(acts, "Set up here", "Make " + o.name + " on this machine too, then connect its folder", async (b) => {
+    b.disabled = true; b.textContent = "Setting up…";
+    try {
+      const made = await postJSON("/api/machines", { op: "setup-project", name: o.name });
+      switchTo(made.id, made.name, "#connect-folder");
+    } catch (e) {
+      b.disabled = false; b.textContent = "Set up here";
+      row.append(el("span", "m-error", " " + e.message));
+    }
+  }).classList.add("m-setup");
+  actButton(acts, "Not on this machine", "Do not offer " + o.name + " here again", async () => {
+    try {
+      await postJSON("/api/machines", { op: "dismiss", name: o.name });
+      showOffered((state.offered || []).filter((x) => x.name !== o.name));
+    } catch (e) {}
+  });
+  row.append(acts);
+  return row;
+}
 function showUpdate(version, releases) {
   let dismissed = "";
   try { dismissed = localStorage.getItem("crewchat-update-dismissed") || ""; } catch (e) {}
@@ -14036,8 +18176,9 @@ $("update-close").addEventListener("click", () => {
 });
 
 // Needs you: blocked tasks (with the agent's question), reviews, unread messages to you, tasks given back.
-const NEED_LOOK = { permission: ["Asks permission", "var(--err)"], blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
-                    message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"] };
+const NEED_LOOK = { permission: ["Asks permission", "var(--err)"], browser: ["Browser", "var(--err)"], blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
+                    message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"],
+                    process: ["Process note", "var(--accent)"] };
 const needKey = (n) => n.kind + ":" + (n.task || n.id);
 function renderNeeds(needs) {
   const box = $("needs-list"), key = JSON.stringify(needs);
@@ -14051,6 +18192,8 @@ function renderNeeds(needs) {
   state.needsShown = new Set(needs.map(needKey));
   box.replaceChildren(...needs.map((n) => {
     if (n.kind === "permission") return permissionItem(n);
+    if (n.kind === "browser") return browserItem(n);
+    if (n.kind === "process") return processItem(n);
     const [label, tint] = NEED_LOOK[n.kind] || ["", ""];
     const b = el("button", "need");
     b.setAttribute("role", "listitem");
@@ -14083,22 +18226,74 @@ function renderNeeds(needs) {
 // A permission prompt of an agent's tool: what it asks to run or change, and Allow or Deny. With no answer
 // here in time, the agent asks in its terminal instead.
 function permissionItem(n) {
+  return askItem(n, "permission", n.tool, "pre", [["allow", "Allow"], ["deny", "Deny"]]);
+}
+// A process note only you may approve, or one the lead asks you about (L1): what it says, its commands exactly as
+// written, and Approve or Decline.
+function processItem(n) {
   const box = el("div", "need ask");
   box.setAttribute("role", "listitem");
-  box.style.setProperty("--need", NEED_LOOK.permission[1]);
-  box.append(el("span", "k", NEED_LOOK.permission[0] + " · " + n.agent), el("span", "t", n.tool));
-  if (n.text) box.append(el("pre", "cmd", n.text));
+  box.style.setProperty("--need", NEED_LOOK.process[1]);
+  box.append(el("span", "k", NEED_LOOK.process[0] + (n.agent ? " · " + n.agent : "")),
+             el("span", "t", n.id + " v" + n.version + (n.scope === "shared" ? " (all projects)" : "") + ": " + n.title));
+  if (n.text) box.append(el("span", "q", n.text));
+  const more = el("details"), steps = el("ol"), traps = el("ul");
+  for (const s of n.steps || []) steps.append(el("li", "", s));
+  for (const p of n.pitfalls || []) traps.append(el("li", "", p));
+  more.append(el("summary", "", "Steps and pitfalls"), steps, traps);
+  box.append(more);
+  if ((n.commands || []).length) box.append(el("pre", "cmd", n.commands.join("\n")));
+  if (n.body) {  // what the agents' skill will say, word for word: what an Approve approves
+    const all = el("details");
+    all.append(el("summary", "", "What agents will read"), el("pre", "cmd", n.body));
+    box.append(all);
+  }
   const acts = el("div", "acts"), said = el("span", "meta");
   said.setAttribute("role", "status");
-  for (const [answer, label] of [["allow", "Allow"], ["deny", "Deny"]]) {
-    const b = el("button", answer === "allow" ? "" : "ghost", label);
+  for (const [op, label] of [["approve", "Approve"], ["decline", "Decline"]]) {
+    const b = el("button", op === "approve" ? "" : "ghost", label);
     b.type = "button";
-    b.setAttribute("aria-label", label + " " + n.agent + ": " + n.tool);
+    b.setAttribute("aria-label", label + " the process note " + n.id);
     b.addEventListener("click", async () => {
       for (const x of acts.querySelectorAll("button")) x.disabled = true;
       try {
-        await postJSON("/api/permission", { id: n.id, answer });
-        said.textContent = answer === "allow" ? "Allowed" : "Denied";
+        await postJSON("/api/processes", { op, name: n.id, of: n.of });
+        said.textContent = op === "approve" ? "Approved" : "Declined";
+      } catch (e) {
+        said.textContent = e.message || "Not sent";
+        for (const x of acts.querySelectorAll("button")) x.disabled = false;
+      }
+    });
+    acts.append(b);
+  }
+  acts.append(said);
+  box.append(acts);
+  return box;
+}
+// An agent asks to open a new site, or to change something on a page (B1): the owner answers here, or it is
+// refused when the wait runs out.
+function browserItem(n) {
+  const allow = n.ask === "site" ? ["allow_site", "Allow the site"] : ["allow_task", "Allow for this task"];
+  return askItem(n, "browser", n.host || "a page", "p", [allow, ["deny", "Deny"]]);
+}
+// An ask in Needs you: what it is about, its text in a `tag`, and a button for each [answer, label].
+function askItem(n, kind, subject, tag, answers) {
+  const box = el("div", "need ask");
+  box.setAttribute("role", "listitem");
+  box.style.setProperty("--need", NEED_LOOK[kind][1]);
+  box.append(el("span", "k", NEED_LOOK[kind][0] + " · " + n.agent), el("span", "t", subject));
+  if (n.text) box.append(el(tag, "cmd", n.text));
+  const acts = el("div", "acts"), said = el("span", "meta");
+  said.setAttribute("role", "status");
+  for (const [answer, label] of answers) {
+    const b = el("button", answer === "deny" ? "ghost" : "", label);
+    b.type = "button";
+    b.setAttribute("aria-label", label + " " + n.agent + ": " + subject);
+    b.addEventListener("click", async () => {
+      for (const x of acts.querySelectorAll("button")) x.disabled = true;
+      try {
+        await postJSON("/api/permission", { id: n.id, answer, kind });  // which kind of ask: one gone says so
+        said.textContent = answer === "deny" ? "Denied" : "Allowed";
       } catch (e) {
         said.textContent = e.message || "Not sent";
         for (const x of acts.querySelectorAll("button")) x.disabled = false;
@@ -14233,7 +18428,7 @@ async function loadBoot() {
   const boot = await request("/api/boot");
   state.roles = boot.roles || []; state.statuses = boot.statuses || {};
   state.tools = boot.tools || {}; state.presets = boot.presets || {}; state.art = boot.art || {};
-  state.models = boot.models || {}; state.advisors = boot.advisors || {}; state.pictures = boot.pictures;
+  state.models = boot.models || {}; state.pictures = boot.pictures;
   state.agentNames = boot.names || []; state.images = boot.images || []; state.maxUpload = boot.max_upload || state.maxUpload;
   state.releases = boot.releases || "";
   state.boot = boot.tag;
@@ -14268,6 +18463,11 @@ async function loop() {
       for (const r of state.sheet) if (r.holder && r.status !== "done") state.held[r.holder] = r;
       state.many = new Set(state.agents.map((a) => a.device)).size > 1;
       showUpdate(data.update || "", state.releases);
+      showOffered(data.offered || []);
+      if (first && location.hash === "#connect-folder") {  // a project just set up from another machine's: its folder
+        history.replaceState(null, "", location.pathname + location.search);
+        openLaunch().then(() => browse("~")).catch(() => {});
+      }
       if (data.project && data.project + " · crewchat" !== state.title) {
         state.title = data.project + " · crewchat";
         state.project = data.project;
@@ -14278,6 +18478,7 @@ async function loop() {
       state.link = data.link;
       renderLink(data.link);
       renderSetup(data.rules, data.skills);
+      renderProcesses(data.processes);
       renderSheet(state.sheet);
       state.needs = data.needs || [];
       if (data.chat && data.chat !== state.chat) { state.chat = data.chat; showBell(); syncPush(); }
@@ -14706,6 +18907,7 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     card("ax-lanes", "The day, agent by agent", true);
     card("ax-tokens", "Tokens and cost");
     card("ax-heat", "Code heat map");
+    card("ax-learning", "What the crew has learned");
     card("ax-code", "The code, by who holds it", true);
     root.append(head, note, numbers, hero, grid);
     canvas.addEventListener("click", (e) => {
@@ -15141,6 +19343,35 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     }
     return grid;
   }
+  // L7: the process notes recorded, approved and used per week, the most used ones, and tasks that used a note
+  // against the others (an estimate: tasks differ).
+  function renderLearning() {
+    const box = $("ax-learning"), l = ax.report && ax.report.learning;
+    if (!box) return;
+    const weeks = (l && l.weeks) || [];
+    if (!weeks.length) {
+      box.replaceChildren(el("p", "ax-empty", "No process notes yet: agents record what they work out with hub_process."));
+      return;
+    }
+    const out = [el("p", "meta", (l.notes || 0) + " notes agents get now. Per week: recorded, approved, used")];
+    out.push(bars(weeks.map((w) => ["week of " + w.week.slice(5), w.recorded + w.approved + w.used,
+                                    w.recorded + " · " + w.approved + " · " + w.used])));
+    if ((l.top || []).length) {
+      out.push(el("p", "meta", "The most used notes"));
+      out.push(bars(l.top.map((t) => [t.name, t.used, count(t.used) + " use" + (t.used === 1 ? "" : "s")])));
+    }
+    const c = l.compare || {}, side = (s) => {
+      if (!s || !s.tasks) return "none yet";
+      const bits = [s.tasks + " task" + (s.tasks === 1 ? "" : "s")];
+      if (s.time) bits.push(dur(s.time));
+      if (s.tokens) bits.push(count(s.tokens) + " tokens");
+      if (s.turns) bits.push(s.turns + " turns");
+      return bits.join(", ");
+    };
+    out.push(el("p", "meta", "Done with a note: " + side(c.with) + ". Without: " + side(c.without) +
+                ". Medians, and an estimate: the tasks were not alike."));
+    box.replaceChildren(...out);
+  }
   function renderTokens() {
     const box = $("ax-tokens"), usage = ax.report && ax.report.usage;
     if (!box) return;
@@ -15469,7 +19700,13 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
     }).sort((p, q) => q.edits - p.edits);
     const report = { messages: stream.length + 2350, pairs: [...pairs].map(([k, n]) => k.split("\n").concat([n])),
       tasks: { posted: sheet.length, taken: 11, done: 6, in_review: 2, blocked_now: 1, time_to_take: 1260, cycle_time: 3.6 * 3600,
-               time_blocked: 2700, review_pass_rate: 0.83, done_today: 6 }, usage, timelines, stream, edits, built: now, agents: {} };
+               time_blocked: 2700, review_pass_rate: 0.83, done_today: 6 }, usage, timelines, stream, edits, built: now, agents: {},
+      learning: { notes: 4, weeks: [3, 2, 1, 0].map((w, i) => ({ week: new Date((now - w * 7 * DAY) * 1000).toISOString().slice(0, 10),
+                                                               recorded: [2, 3, 1, 2][i], approved: [1, 3, 1, 1][i], used: [0, 4, 7, 9][i] })),
+                  top: [{ name: "release-build", used: 9 }, { name: "fix-flaky-sync-test", used: 6 }, { name: "local-https-setup", used: 4 },
+                        { name: "db-migration", used: 1 }],
+                  compare: { with: { tasks: 5, time: 2.4 * 3600, tokens: 820000, turns: 14 },
+                             without: { tasks: 9, time: 3.9 * 3600, tokens: 1310000, turns: 23 }, estimate: true } } };
     ax.graph = sampleGraph(rand);
     return { agents, sheet, report, now, device: "studio", link: { via: "tailscale", machines: [{ name: "linux-box", online: true }] },
              roles: ["lead", "developer", "qa", "reviewer", "docs"].map((name) => ({ name })) };
@@ -15557,7 +19794,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       if (ax.replay === null) scrub.value = scrub.max;
       $("ax-meta").textContent = count(r.messages || 0) + " messages in all · updated " + clock(r.built);
     }
-    renderNumbers(); renderRiver(); renderLanes(); renderMachines(); renderTokens(); renderHeat(); renderCode(); renderCrewList();
+    renderNumbers(); renderRiver(); renderLanes(); renderMachines(); renderTokens(); renderHeat(); renderLearning(); renderCode();
+    renderCrewList();
     wake();
   }
   function loadGraph() {
@@ -15884,6 +20122,20 @@ def build_parser():
     p.add_argument("--to", help="add: for one agent only")
     p.set_defaults(fn=cmd_tasks)
 
+    p = sub.add_parser("processes", help="the process notes the crew wrote down: list, show, approve, retire, share")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "show", "approve", "decline", "retire", "share", "owner-only", "rule", "promote",
+                            "unpromote"])
+    p.add_argument("name", nargs="?", help="the note's name (rule: owner, default or lead)")
+    p.add_argument("value", nargs="?", help="owner-only: on or off; promote: its parameters, like VERSION,TARGET")
+    p.add_argument("--yes", action="store_true", help="promote: without asking")
+    p.set_defaults(fn=cmd_processes)
+
+    p = sub.add_parser("run", help="run a project command: a process note's commands the owner approved (in your shell)")
+    p.add_argument("name", help="the command, as its note is called")
+    p.add_argument("values", nargs="*", metavar="NAME=VALUE", help="its parameters")
+    p.set_defaults(fn=cmd_run)
+
     p = sub.add_parser("skills", help="skills shared with every agent of the project: list, add or remove")
     p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
     p.add_argument("path", nargs="?", help="add: a folder with SKILL.md, or a .md file; remove: the skill's name")
@@ -15932,6 +20184,13 @@ def build_parser():
     p.add_argument("--defs", action="store_true", help="the classes and functions it defines")
     p.set_defaults(fn=cmd_map)
 
+    p = sub.add_parser("accounts", help="this machine's Claude Code accounts, for agents started from the chat page; "
+                                        "or add or remove one")
+    p.add_argument("action", nargs="?", default="list", choices=["list", "add", "remove"])
+    p.add_argument("name", nargs="?", help="add, remove: the account's name, e.g. personal")
+    p.add_argument("folder", nargs="?", help="add: its Claude Code settings folder, e.g. ~/.claude-personal")
+    p.set_defaults(fn=cmd_accounts)
+
     p = sub.add_parser("usage", help="the tokens this project's agents used, and roughly what that would cost at "
                                      "API prices; or turn keeping them on or off")
     p.add_argument("mode", nargs="?", default="show", choices=["show", "on", "off"])
@@ -15947,7 +20206,7 @@ def build_parser():
     p.set_defaults(fn=cmd_projects)
 
     for name in ("start", "say", "agents", "agent", "places", "place", "invite", "ui", "role", "roles", "status",
-                 "rules", "skills", "tasks", "usage", "edits", "map"):
+                 "rules", "skills", "processes", "tasks", "usage", "edits", "map"):
         sub.choices[name].add_argument("--chat", metavar="PROJECT",
                                        help="the project (default: the one of the folder you are in)"
                                        if name != "start" else "put this folder in this project (a new one if "
@@ -15955,7 +20214,7 @@ def build_parser():
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=list(HOOK_CLIENTS))
-    p.add_argument("event", choices=["prompt", "stop", "tool", "permission"])
+    p.add_argument("event", choices=["prompt", "stop", "tool", "permission", "browser"])
     p.set_defaults(fn=cmd_hook)
     return parser
 

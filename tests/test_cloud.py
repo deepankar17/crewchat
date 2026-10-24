@@ -2,8 +2,10 @@
 
 Needs the `cryptography` library; skipped without it. Google's Firestore library is not needed.
 """
+import argparse
 import base64
 import contextlib
+import io
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from unittest import mock
 from pathlib import Path
 
@@ -194,6 +197,66 @@ class Sync(unittest.TestCase):
         for m in (self.a, self.b):
             m.stop()
 
+    def test_a_machine_waiting_for_approval_shows_with_its_fingerprint(self):
+        c = Machine(self.store, "laptop")
+        try:
+            row = wait_until(lambda: next((r for r in self.a.sync.machines_status() if r["name"] == "laptop"), None),
+                             message="the mac to see the new machine")
+            self.assertEqual((row["state"], row["fp"]), ("waiting", c.device.fp))
+            self.a.account.approve("laptop", expect_fp=c.device.fp)
+            wait_until(lambda: next(r for r in self.a.sync.machines_status() if r["name"] == "laptop")["state"] != "waiting",
+                       message="approved: no longer waiting")
+        finally:
+            c.stop()
+
+    def test_cloud_setup_and_approve_from_the_page(self):
+        # M1: the Machines panel's cloud steps, with the commands' own code.
+        root = Path(tempfile.mkdtemp(prefix="cloud-setup-", dir=TMP))
+        crewchat.save_config({"project": "Demo"}, root)
+        out = cloud.page_op(self.a.hub, root, "cloud-setup", {
+            "web": {"projectId": "my-proj", "apiKey": "AIza-key"},
+            "oauth": {"installed": {"client_id": "123.apps", "client_secret": "THE-SECRET"}}}, True)
+        self.assertEqual(out, {"project": "my-proj"})  # never the secret back to the page
+        saved = root / "cloud" / "firebase.json"
+        self.assertEqual(json.loads(saved.read_text())["oauth"]["client_secret"], "THE-SECRET")
+        if os.name != "nt":
+            self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        c = Machine(self.store, "laptop")
+        try:
+            with self.assertRaises(cloud.CloudError):
+                cloud.page_op(self.a.hub, self.a.root, "cloud-approve", {"name": "laptop", "fingerprint": "wrong"}, True)
+            self.assertFalse(c.device.ready)
+            cloud.page_op(self.a.hub, self.a.root, "cloud-approve", {"name": "laptop", "fingerprint": c.device.fp}, True)
+            wait_until(lambda: c.device.ready, message="the laptop's approval")
+            with self.assertRaises(cloud.CloudError):  # Google's sign-in only at the machine itself
+                cloud.page_op(self.a.hub, self.a.root, "cloud-login", {}, False)
+        finally:
+            c.stop()
+
+    def test_check_everything_over_cloud_sync(self):
+        checks = {c["id"]: c for c in crewchat.link_checks(self.a.projects, deep=True)}
+        self.assertIs(checks["cloud-approved"]["ok"], True)
+        self.assertIs(checks["cloud-reachable"]["ok"], True)
+        self.assertNotIn("tailscale-installed", checks)  # Tailscale's checks are for its own way only
+        self.a.link.online = False
+        try:
+            self.assertIs({c["id"]: c for c in crewchat.link_checks(self.a.projects, deep=True)}["cloud-reachable"]["ok"], False)
+        finally:
+            self.a.link.online = True
+
+    def test_sign_in_from_the_page_fails_at_once_when_no_browser_opens(self):
+        # Review: with no browser to open (a service with no display), the page waited five minutes for nothing.
+        root = Path(tempfile.mkdtemp(prefix="no-browser-", dir=TMP))
+        crewchat.save_config({"project": "Demo"}, root)
+        cloud.page_op(self.a.hub, root, "cloud-setup", {"web": {"projectId": "p", "apiKey": "k"},
+                                                         "oauth": {"client_id": "c", "client_secret": "s"}}, True)
+        with mock.patch.object(cloud.webbrowser, "open", return_value=False), mock.patch.object(cloud.time, "sleep"):
+            started = time.time()
+            with self.assertRaises(cloud.CloudError) as e:
+                cloud.page_op(self.a.hub, root, "cloud-login", {}, True)
+        self.assertLess(time.time() - started, 5)
+        self.assertIn("crewchat cloud login", str(e.exception))
+
     def test_shared_files_open_on_the_other_machine(self):
         # Roadmap Y4: a file up to 5 MB travels with its message, encrypted, in pieces under Firestore's limit.
         data = os.urandom(cloud.CLOUD_FILE_MAX)  # a 5 MB screenshot: ten pieces
@@ -251,6 +314,55 @@ class Sync(unittest.TestCase):
             self.a.sync.ttl = ttl
         self.assertFalse([k for k in self.store.docs if k.startswith("files/")])
         self.assertTrue(msg)
+
+    def test_the_advisors_mark_travels(self):
+        # A2: the asking agent's conversation goes with its question for the advisor only, on every machine.
+        config = Path(tempfile.mkdtemp(prefix="claude-config-", dir=TMP))
+        path = config / "projects" / "x" / "s.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}}]}}) + "\n")
+        asker, advisor, other = self.a.agent(), self.b.agent(), self.b.agent()
+        for m in (self.a, self.b):  # each tells the other what it is (machine_info, with the marks it keeps)
+            m.sync.info_source = (lambda m=m: crewchat.machine_info(m.projects))
+        self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
+        wait_until(lambda: advisor in self.a.hub._advisors(), message="the mac to know the advisor")
+        wait_until(lambda: not self.a.sync.older_machines(), message="the mac to hear the other keeps the mark")
+        with self.a.hub.lock:
+            self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
+            question, _ = self.a.hub.ask(asker, "Is npm test enough here?", to=advisor, wait=0)
+        fid = question["files"][0]["id"]
+        wait_until(lambda: self.b.has(question["text"]) and self.store.get("files/%s-0" % fid),
+                   message="the question and its file in the cloud")
+        with self.b.hub.lock:
+            got = next(m for m in self.b.hub.messages if m["id"] == question["id"])
+        self.assertEqual(got["files"][0]["for"], advisor)
+        self.assertIsNone(self.b.hub.file(fid)[0])  # not on the windows machine yet: from the cloud's pieces
+        with self.assertRaises(crewchat.HubError) as e:
+            crewchat.open_shared_file(self.b.hub, fid, other)
+        self.assertEqual(str(e.exception), "that file is for the advisor")
+        self.assertIn("tool Bash: npm test", crewchat.open_shared_file(self.b.hub, fid, advisor))
+        self.assertNotIn("conversation-", crewchat.fmt(got, other))
+
+    def test_with_an_older_machine_the_question_goes_without_it(self):
+        # Review of A2: a crewchat before it drops the mark, lists the file for every agent and relays its copy.
+        config = Path(tempfile.mkdtemp(prefix="claude-config-", dir=TMP))
+        path = config / "projects" / "x" / "s.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n")
+        asker, advisor = self.a.agent(), self.b.agent()
+        self.a.sync.info_source = lambda: crewchat.machine_info(self.a.projects)  # the windows machine says nothing
+        self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
+        wait_until(lambda: advisor in self.a.hub._advisors(), message="the mac to know the advisor")
+        self.assertEqual(self.a.sync.older_machines(), [self.b.device.id])
+        with self.a.hub.lock:
+            self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
+            question, _ = self.a.hub.ask(asker, "Older machine about?", to=advisor, wait=0)
+        self.assertNotIn("files", question)
+        self.assertIn("not available: a linked machine runs an older crewchat, which would show it to every agent.",
+                      question["text"])
 
     def test_on_a_paid_plan_the_owner_can_let_bigger_files_travel(self):
         for m in (self.a, self.b):
@@ -720,6 +832,24 @@ class SharedProjects(unittest.TestCase):
     def hub(self, machine, name):
         return machine.projects.get(crewchat.project_id(name)).hub
 
+    def test_machines_status_over_cloud_sync(self):
+        # M1/M2: version, OS and projects travel sealed in the first project's state: never a name in clear.
+        def row():
+            return next((r for r in self.b.sync.machines_status() if r["name"] == "mac"), {})
+        wait_until(lambda: row().get("version"), message="windows to have the mac's info")
+        mac = row()
+        self.assertEqual((mac["version"], mac["os"], mac["state"]), (crewchat.__version__, crewchat.os_name(), "online"))
+        self.assertTrue({("t3", False), ("solo", False)} <= {(p["name"], p["first"]) for p in mac["projects"]})
+        self.assertEqual(mac["fp"], self.a.device.fp)
+        self.assertNotIn("solo", json.dumps(self.store.docs, default=str))
+
+    def test_offered_over_cloud_sync(self):
+        crewchat.create_project("cloud-new", self.a.root)
+        self.a.projects.refresh()
+        offer = wait_until(lambda: next((o for o in crewchat.offered(self.b.projects) if o["name"] == "cloud-new"), None),
+                           message="windows to be offered cloud-new")
+        self.assertEqual(offer["machines"], ["mac"])
+
     def test_every_projects_page_names_the_coordinator(self):
         # Machines coordinate as a whole, through the machine's link: a project's page says who, as the first's does.
         self.a.sync.renew_lease()
@@ -814,6 +944,45 @@ class SharedProjectsReset(unittest.TestCase):
         a.stop()
         a.account.remove(a.device.id)
         self.assertEqual(list(store.docs), [])
+
+
+@unittest.skipUnless(HAVE_CRYPTO, "needs the cryptography library")
+class LogoutFromThePage(unittest.TestCase):
+    def test_signing_out_stops_the_link(self):
+        # Release review (E5): the running link went on sending under the removed machine's id, and filled the cloud
+        # again after the last machine's logout had emptied it.
+        store = cloud.MemoryStore()
+        a = Machine(store, "mac")
+        self.addCleanup(a.stop)
+        a.say("all", "before")
+        wait_until(lambda: any(p.startswith("messages/") for p in store.docs), message="the message in the cloud")
+        cloud.page_op(a.hub, a.root, "cloud-logout", {}, True)
+        self.assertIsNone(a.hub.sync)
+        self.assertTrue(a.sync.stopping())
+        self.assertEqual(list(store.docs), [])  # the last machine: the account is gone
+        a.say("all", "after")
+        time.sleep(1)
+        self.assertEqual(list(store.docs), [])
+
+
+class LogoutFromTheCommandLine(unittest.TestCase):
+    def test_the_running_server_signs_out(self):
+        # Release review (E5): `crewchat cloud logout` removed the machine while the running server went on syncing.
+        said = []
+        with mock.patch.object(crewchat, "post_json", side_effect=lambda url, token, body, **kw: said.append(body) or
+                               {"signed_out": True}), \
+                mock.patch.object(crewchat, "owner_token", return_value="owner"), \
+                mock.patch.object(crewchat, "local_url", return_value="http://127.0.0.1:9"), \
+                mock.patch.object(cloud, "logout", side_effect=AssertionError("signed out here, not by the server")), \
+                mock.patch("sys.stdout", io.StringIO()) as out:
+            cloud._cmd_cloud(argparse.Namespace(action="logout"))
+        self.assertEqual(said, [{"op": "cloud-logout"}])
+        self.assertIn("stopped syncing", out.getvalue())
+        with mock.patch.object(crewchat, "post_json", side_effect=urllib.error.URLError("refused")), \
+                mock.patch.object(crewchat, "owner_token", return_value="owner"), \
+                mock.patch.object(cloud, "logout") as here, mock.patch("sys.stdout", io.StringIO()):
+            cloud._cmd_cloud(argparse.Namespace(action="logout"))  # no server: signed out here, as before
+        here.assert_called_once()
 
 
 class FirestoreImport(unittest.TestCase):

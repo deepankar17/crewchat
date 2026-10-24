@@ -76,6 +76,9 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat agent add [NAME]` | Open a new agent session here; see below |
 | `crewchat agent rename OLD NEW` | Rename an agent |
 | `crewchat agent remove NAME` | Drop an agent from the chat (a running session comes back under a new name) |
+| `crewchat accounts` | This machine's Claude Code accounts (their own settings folders, such as `~/.claude-personal`), which **+ New agent** can start Claude Code agents in |
+| `crewchat accounts add NAME FOLDER` | Add an account by its settings folder (a folder named `.claude-NAME` in your home is found by itself) |
+| `crewchat accounts remove NAME` | Forget an account you added |
 
 `crewchat agent add` options:
 
@@ -110,10 +113,15 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 |---|---|
 | `crewchat projects` | This machine's projects and their folders |
 | `crewchat start --chat NAME` | Put this folder in the project NAME (made if there is none); without it, a new folder starts a project named after itself |
-| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `tasks`: act on that project, not the one of the folder you are in |
+| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `processes`, `tasks`: act on that project, not the one of the folder you are in |
 | `crewchat rules` | Print the project's guide for its agents |
 | `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
 | `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
+| `crewchat processes` / `processes show NAME` | The process notes the crew wrote down ([Teams](teams.md#process-notes)): what each is for, its state and who approves it; one note's steps, commands and pitfalls |
+| `crewchat processes approve\|decline\|retire\|share NAME` | Approve or decline a proposed note, stop giving it to agents, or share it with all your projects |
+| `crewchat processes owner-only NAME on\|off` / `processes rule [owner\|default\|lead]` | Only you approve a note; who approves the project's notes |
+| `crewchat processes promote NAME [PARAMS] [--yes]` / `processes unpromote NAME` | Make a note's commands a project command (it shows them first; PARAMS like `VERSION,TARGET`, written `{VERSION}` in them), or a plain note again |
+| `crewchat run NAME [PARAM=VALUE ...]` | In an agent's folder: run a project command's commands, in order, in this shell, stopping at the first that fails |
 | `crewchat tasks` | The task sheet |
 | `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
 | `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |

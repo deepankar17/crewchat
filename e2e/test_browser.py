@@ -403,6 +403,36 @@ class NewPage(Signed):
         c.until("$('edits-note').textContent.startsWith('Kept')", what="back to auto")
         self.assertEqual(c.errors, [])
 
+    def test_open_folder_for_the_projects_folders_and_an_agents_folder(self):
+        c = self.chrome
+        folder = json.loads(self.m.owner.post("/api/folders", {"op": "project"})[1])["folders"][0]["path"]
+        self.assertTrue(folder.endswith("notes-app"))
+        # The page's request is caught here: the server must not open a real file manager window during a test.
+        c.js("window.__opened = []; window.__fetch = window.__fetch || window.fetch;"
+             "window.fetch = (url, init) => String(url).includes('/api/open-folder')"
+             " ? (window.__opened.push(JSON.parse(init.body)), Promise.resolve(new Response('{\"ok\": true}', { status: 200 })))"
+             " : window.__fetch(url, init)")
+        try:
+            c.js("openPanel('project')")
+            c.until("[...document.querySelectorAll('#folders-list li')].some(li => li.innerText.includes(%s))" % json.dumps(folder),
+                    what="the project's folder")
+            c.js("document.querySelector('#folders-list button').click()")
+            c.until("window.__opened.length === 1", what="the request")
+            self.assertEqual(c.js("window.__opened"), [{"folder": folder}])
+            c.until("$('folders-note').textContent.startsWith('Opened ')", what="its note")
+            c.js("closePanel()")
+            # The agent's panel offers its own folder (the one it is joined from), not any other.
+            c.js(self.card() + ".click()")
+            c.until("!!document.querySelector('#agent-pane-body button[aria-label^=\"Open notes-app\"]')", what="the agent's folder")
+            self.assertIn(folder, c.js("$('agent-pane-body').innerText"))
+            c.js("document.querySelector('#agent-pane-body button[aria-label^=\"Open notes-app\"]').click()")
+            c.until("window.__opened.length === 2", what="the second request")
+            self.assertEqual(c.js("window.__opened[1]"), {"folder": folder})
+            c.until("$('agent-pane-body').querySelector('.panel-note').textContent.startsWith('Opened ')", what="its note")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("window.fetch = window.__fetch || window.fetch")
+
     def test_roles_in_the_panel(self):
         c = self.chrome
         c.js("openPanel('roles')")
@@ -678,6 +708,28 @@ class NewPage(Signed):
         self.assertEqual(self.shown_though_hidden(), [])
         self.assertEqual(c.errors, [])
 
+    def test_the_browser_panel_and_a_browser_ask_in_needs_you(self):
+        c = self.chrome
+        c.until("!!%s" % self.card(), what="the agent")
+        c.js("postJSON('/api/agent', {op: 'browser', agent: %s, mode: 'on'})" % json.dumps(self.agent.name))
+        out = {}
+        call = {"tool_name": "mcp__claude-in-chrome__navigate",
+                "tool_input": {"url": "https://jenkins.example.test/job/build"}}
+        t = threading.Thread(target=lambda: out.update(text=self.agent.hook("browser", extra=call)))
+        t.start()  # a new site: the agent's call waits on the owner
+        c.until("$('needs-list').innerText.includes('jenkins.example.test')", what="the browser ask in Needs you")
+        c.js("[...document.querySelectorAll('#needs-list .need.ask button')].find(b => b.textContent === 'Allow the site').click()")
+        t.join(30)
+        self.assertEqual(out["text"].strip(), "")  # allowed: the hook says nothing, the tool goes on
+        c.js("openPanel('browser')")
+        c.until("$('panel-body').innerText.includes('jenkins.example.test')", what="the site in the Browser panel")
+        self.assertIn(self.agent.name, c.js("$('panel-body').innerText"))  # it drives now
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Trust').click()")
+        c.until("$('panel-body').innerText.includes('trusted')", what="the site trusted")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Let go').click()")
+        c.until("$('panel-body').innerText.includes('No agent is using the browser')", what="the browser let go")
+        self.assertEqual(c.errors, [])
+
     def test_notifications_subscribe_to_push_and_a_push_shows_one(self):
         c = self.chrome
         self.addCleanup(c.js, "try { localStorage.removeItem(notifyKey()); } catch (e) {} showBell()")
@@ -792,11 +844,45 @@ class NewPage(Signed):
         c.click("#l-back")
         self.assertEqual(c.js(step), 2)
         c.js("$('l-tool').value = 'claude'; $('l-tool').dispatchEvent(new Event('change'))")
-        self.assertEqual(c.js("[...$('l-advisor').options].map(o => o.value)"), ["", "fable", "opus", "sonnet"])
-        self.assertTrue(c.js("$('l-advisor-note').hidden"))
-        c.js("$('l-advisor').value = 'opus'; $('l-advisor').dispatchEvent(new Event('change'))")
-        self.assertFalse(c.js("$('l-advisor-note').hidden"))  # what Claude Code's own advisor is
         self.assertEqual(self.shown_though_hidden(), [])
+        c.click("#l-cancel")
+        self.assertEqual(c.errors, [])
+
+    def test_use_the_browser_in_new_agent_is_sent(self):
+        # The checkbox shared its id with the folder browser (l-browser), which came first: it never reached the
+        # launch request or the readiness check.
+        c = self.chrome
+        c.click("#add-agent")
+        c.until("$('launch').open && $('l-folder').options.length > 0", what="the dialog and its folders")
+        c.js("""window.sent = []; window.realFetch = window.realFetch || window.fetch;
+                window.fetch = (url, opts) => { window.sent.push([String(url), opts && opts.body || ""]);
+                  if (String(url).includes('/api/launch') && opts && opts.method === 'POST')
+                    return Promise.resolve(new Response(JSON.stringify({error: 'stopped by the test'}), {status: 400}));
+                  return window.realFetch(url, opts); };""")
+        c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
+        c.click("#l-next")
+        c.js("$('l-tool').value = 'claude'; $('l-tool').dispatchEvent(new Event('change'))")
+        box = "[...document.querySelectorAll('#launch input[type=checkbox]')].find(i => i.closest('label') && " \
+              "i.closest('label').textContent.includes('Use the browser'))"
+        c.js(box + ".click()")
+        c.until("window.sent.some(([u]) => u.includes('/api/tool-check') && u.includes('browser=1'))",
+                what="the readiness check with the browser")
+        c.click("#l-next")
+        c.click("#l-start")
+        c.until("window.sent.some(([u, b]) => u.includes('/api/launch') && b.includes('\"browser\":true'))",
+                what="the launch request with the browser")
+        c.js("window.fetch = window.realFetch")
+        c.click("#l-cancel")
+
+    def test_the_new_agent_form_has_no_advisor_box(self):
+        c = self.chrome
+        c.click("#add-agent")
+        c.until("$('launch').open && $('l-folder').options.length > 0", what="the dialog and its folders")
+        c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
+        c.click("#l-next")
+        c.js("$('l-tool').value = 'claude'; $('l-tool').dispatchEvent(new Event('change'))")
+        self.assertEqual(c.js("[$('l-model'), $('l-advisor'), $('l-advisor-note')].map(e => e === null)"),
+                         [False, True, True])  # the model stays; Claude Code's own advisor is gone
         c.click("#l-cancel")
         self.assertEqual(c.errors, [])
 
@@ -1138,6 +1224,122 @@ class NewPage(Signed):
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class AdvisorOnThePage(Signed):
+    """A2, on a machine of its own (its agents would change the other page tests' counts)."""
+
+    def test_the_question_shows_the_conversation_for_the_advisor(self):
+        c = self.chrome
+        transcript = self.m.dir / "user-home" / ".claude" / "projects" / "notes-app" / "s.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text(json.dumps({"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "name": "Bash", "input": {"command": "npm test"}}]}}) + "\n")
+        self.agent.stop_hook(extra={"transcript_path": str(transcript)})  # its hook says where its conversation is
+        advisor = self.m.agent()
+        advisor.link()
+        self.m.owner.role(advisor.name, "advisor")
+        asked = {}
+        thread = threading.Thread(target=lambda: asked.update(text=self.agent.call(
+            "hub_ask", question="Is npm test enough here?", to=advisor.name)))
+        thread.start()
+        try:
+            c.until("[...document.querySelectorAll('#log .msg')].some(m => m.innerText.includes('Is npm test enough here?')"
+                    " && m.innerText.includes('Conversation, for the advisor'))", what="the question with its file")
+            href = c.js("[...document.querySelectorAll('#log a.file')].find(a => a.innerText.includes("
+                        "'Conversation, for the advisor')).getAttribute('href')")
+            self.assertIn("conversation-%s.txt" % self.agent.name, href)
+            opened = c.js("fetch(%s).then(r => r.status + ' ' + r.statusText).catch(e => String(e))" % json.dumps(href))
+            self.assertTrue(opened.startswith("200"), opened)
+            self.assertIn("tool Bash: npm test", c.js("fetch(%s).then(r => r.text())" % json.dumps(href)))
+            self.assertEqual(c.errors, [])
+        finally:
+            ask_id = eventually(lambda: next((m["id"] for m in self.m.owner.messages() if m["kind"] == "ask"), None),
+                                what="the question")
+            advisor.call("hub_answer", id=ask_id, text="Yes.")
+            thread.join(30)
+        self.assertIn("Yes.", asked.get("text", ""))
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class Machines(unittest.TestCase):
+    """M1: two machines linked from their chat pages alone, then one removed."""
+
+    def sign_in(self, m):
+        code = m.cli("ui", "--print").split(": ")[1].split()[0]
+        self.chrome.open(m.url + "/")
+        self.chrome.until("location.pathname === '/login'")
+        self.chrome.type_into("input[name=code]", code)
+        self.chrome.js("document.querySelector('form').submit()")
+        self.chrome.until("location.pathname === '/' && !!document.getElementById('log')", what="the chat page")
+        self.chrome.js("window.confirm = () => true")  # Remove and Unlink ask first
+
+    def open_panel(self):
+        self.chrome.click('[data-panel="machines"]')
+        self.chrome.until("!!document.querySelector('#panel:not([hidden]) .m-me')", what="the Machines panel")
+
+    def machine_states(self):
+        return self.chrome.js("[...document.querySelectorAll('.m-machine')].map(c => c.querySelector('.m-state').textContent)")
+
+    def test_link_two_machines_from_the_page(self):
+        a, b = H.Machine("panel-a"), H.Machine("panel-b")
+        self.chrome = Chrome()
+        try:
+            for m in (a, b):
+                m.start()
+                m.cli("url", m.url)  # its address for the other (in real use: tailscale serve's)
+            self.sign_in(a)
+            self.open_panel()
+            self.chrome.until("!!document.querySelector('#m-invite')", what="Invite on a machine not linked yet")
+            self.chrome.click("#m-invite")
+            command = self.chrome.until("(document.querySelector('#m-invite-command') || {}).textContent",
+                                        what="the join command")
+            self.assertTrue(command.startswith("crewchat peers join %s " % a.url), command)
+            self.sign_in(b)
+            self.open_panel()
+            self.chrome.type_into("#m-join-text", command)
+            self.chrome.click("#m-join")
+            self.chrome.until("document.querySelectorAll('.m-machine').length === 1 && "
+                              "document.querySelector('.m-machine .m-state').textContent === 'online'", timeout=30,
+                              what="b's panel to show a online")
+            self.sign_in(a)
+            self.open_panel()
+            self.chrome.until("document.querySelector('.m-machine .m-version') && "
+                              "document.querySelector('.m-machine .m-state').textContent === 'online'", timeout=30,
+                              what="a's panel to show b online, with its version")
+            self.chrome.click(".m-machine .m-remove")
+            self.chrome.until("document.querySelectorAll('.m-machine').length === 0", timeout=30, what="b removed")
+            self.assertEqual(self.chrome.errors, [])
+        finally:
+            self.chrome.close()
+            for m in (a, b):
+                m.stop()
+
+
+    def test_set_up_here_from_the_banner(self):
+        # M2: a project made on one machine shows on the other's page, which sets it up there in a click.
+        a, b = H.Machine("offer-a"), H.Machine("offer-b")
+        self.chrome = Chrome()
+        try:
+            for m in (a, b):
+                m.start()
+            b.link_to(a)
+            a.owner.post("/api/projects", {"op": "create", "name": "video-app", "pack": "software"})
+            self.sign_in(b)
+            self.chrome.until("!!document.querySelector('#offered:not([hidden]) .m-setup')", timeout=40,
+                              what="b's page to offer video-app")
+            self.assertIn("video-app", self.chrome.js("document.getElementById('offered').textContent"))
+            self.chrome.click("#offered .m-setup")
+            self.chrome.until("location.search.includes('chat=') && !!document.getElementById('log')", timeout=20,
+                              what="the new project's page")
+            self.chrome.until("document.getElementById('launch').open", what="the folder picker, to connect its folder")
+            self.assertIn("video-app", self.chrome.js("[...document.getElementById('projects').options].map(o => o.text).join(' ')"))
+            self.assertEqual(self.chrome.errors, [])
+        finally:
+            self.chrome.close()
+            for m in (a, b):
+                m.stop()
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
 class PublicDemo(unittest.TestCase):
     """Roadmap X3: crewchat.dev/demo, the analytics view on its sample data with no crewchat server, served with the
     headers firebase.json gives the site (a policy that allows no inline script or style)."""
@@ -1176,7 +1378,8 @@ class PublicDemo(unittest.TestCase):
         self.assertGreater(c.js("document.querySelectorAll('#ax-heat .ax-tile').length"), 5)
         code = c.js("crewAnalytics.code()")
         self.assertEqual((code["files"], code["folders"], code["held"] > 0), (28, 0, True))  # coloured by holder
-        self.assertTrue(c.js("[...document.querySelectorAll('#analytics .avatar img')].every((i) => i.complete && i.naturalWidth)"))
+        c.until("[...document.querySelectorAll('#analytics .avatar img')].every((i) => i.complete && i.naturalWidth)",
+                what="the avatars to load")  # they may still be loading when the view is ready
         sent = c.js("crewAnalytics.stats().sent")
         c.until("crewAnalytics.stats().sent > %d" % sent, what="the sample crew to talk")
         self.assertEqual(c.js("getComputedStyle(document.querySelector('.ax-card')).borderRadius"), "18px")  # styled

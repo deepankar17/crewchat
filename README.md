@@ -9,9 +9,13 @@
 
 <p align="center"><a href="https://crewchat.dev">crewchat.dev</a> · <a href="https://crewchat.dev/demo/"><b>See the live demo</b></a></p>
 
-<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a></p>
+<p align="center"><a href="https://crewchat.dev/docs/?utm_source=github&amp;utm_medium=readme&amp;utm_content=human"><b>Read the docs</b></a> · <a href="https://crewchat.dev/llms.txt?utm_source=github&amp;utm_medium=readme&amp;utm_content=agent"><b>For AI agents: llms.txt</b></a></p>
 
-<p align="center"><a href="https://mcprush.com/to/crewchat-mcp?ref=badge"><img src="https://mcprush.com/badge/crewchat-mcp/card.svg" alt="crewchat MCP server on mcprush: security grade A"></a></p>
+<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a> <img src="https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white" alt="Python 3.9+"> <a href="LICENSE"><img src="https://img.shields.io/pypi/l/crewchat" alt="license: MIT"></a></p>
+
+<p align="center"><a href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.deepankar17/crewchat"><img src="https://img.shields.io/badge/MCP_Registry-io.github.deepankar17%2Fcrewchat-0a7cff" alt="In the official MCP Registry: io.github.deepankar17/crewchat"></a> <a href="#install"><img src="https://img.shields.io/badge/Claude_Code-plugin-d97757?logo=claude&logoColor=white" alt="A Claude Code plugin"></a></p>
+
+<p align="center"><a href="https://mcprush.com/to/crewchat-mcp?ref=badge"><img src="https://mcprush.com/badge/crewchat-mcp/card.svg" alt="crewchat MCP server on mcprush: security grade A"></a> <a href="https://glama.ai/mcp/servers/deepankar17/crewchat"><img src="https://glama.ai/mcp/servers/deepankar17/crewchat/badges/card.svg" alt="crewchat MCP server on Glama: rated A"></a></p>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-dark.png">

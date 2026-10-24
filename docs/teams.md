@@ -96,9 +96,49 @@ before committing to an approach, when an error keeps coming back, and before sa
 done. An agent asks with `hub_ask` and waits for the answer; the advisor answers with
 `hub_answer`. Both are messages in the chat, so you see every question and answer.
 
-The advisor sees only what the asking agent sends it (the goal, what it tried, the error or the
-change), not that agent's session. With several advisors, a question goes to the one with the
-fewest waiting.
+With several advisors, a question goes to the one with the fewest waiting.
+
+**The advisor sees what the agent did.** When an agent asks, crewchat reads the agent's own
+conversation from the files its tool keeps, boils it down, and attaches it to the question as
+`conversation-NAME.txt`. The advisor opens it with `hub_file`. It holds what the agent said and
+what you said to it, and each tool call with a short form of what it was given (the command, the
+path). A tool's result is cut to its first and last 10 lines (2 KB at most). The agent's
+thinking is left out. It starts where the agent took the task it holds now (without a task, at the
+start of its conversation), and it is the part of it that fits in 40 KB (the oldest goes first, and
+the file says so). Text that looks like a secret (private keys, `sk-...`, `ghp_...`,
+`github_pat_...`, `AKIA...`, `xox...` and `Bearer ...` tokens) and crewchat's own tokens are
+replaced with `[secret left out]`; other text the agent saw is sent as it was, so see
+[Privacy](privacy.md#what-the-advisor-is-shown).
+
+Only the advisor the question is for and you can open that file. Another agent's `hub_file` is
+refused, its `hub_inbox` and `hub_history` do not list it, and on a linked machine the same holds.
+You open it from the question on the chat page (**Conversation, for the advisor**). The question's
+own text stays in the chat for everyone, as before.
+
+It works for all six tools, read where each keeps its sessions:
+
+| Tool | Read from | Not included |
+|---|---|---|
+| Claude Code | `~/.claude/projects/` (or the account's settings folder) | |
+| Codex CLI | `~/.codex/sessions/` | A compressed old session (`.jsonl.zst`) |
+| Gemini CLI | `~/.gemini/tmp/` | |
+| Qwen Code | `~/.qwen/projects/` | |
+| Cursor | `~/.cursor/projects/` | Tool results (its transcript has none), so it is at most the last 40 KB |
+| OpenCode | its database (`~/.local/share/opencode/opencode.db`, or `OPENCODE_DB`), read only | |
+
+crewchat knows where a conversation is from the agent's hooks, at its prompts, stops and tool
+calls, so an agent that has had none since the server started has none yet. A file outside the
+tool's own folder is never read, so an agent cannot have crewchat pass on another file.
+
+**When it is not attached.** The question goes as before, with a line for the advisor: "(Maya's
+conversation is not available: ... You have what Maya wrote.)" with the reason. It can be that no
+conversation of it is known on this machine (no hook from it yet), its file is missing or
+cannot be read, crewchat does not understand the tool's file (formats are the tools' own and can
+change), the agent's folder is joined to another machine's chat (the file is on the agent's
+machine, not the one that reads it), or, with [linked machines](multiple-machines.md), one of them
+runs an older crewchat. An older one would show the file to every agent, so while any linked
+machine is on a crewchat before 1.1.0, or has not been heard from since this server started
+(one that has been off the whole time, say), questions go without the conversation.
 
 Only you give the advisor role (an agent cannot take it itself), and only the advisor a question
 was sent to answers it, once. An advisor on another linked machine is asked too.
@@ -111,12 +151,11 @@ starts again (`in_progress`). The sheet shows `advisor: approved` or `changes ne
 You can always mark a task done yourself. `crewchat tasks advisor off` turns it off again; it is
 off unless you set it.
 
-Claude Code also has an advisor of its own ([`--advisor`](https://code.claude.com/docs/en/advisor)),
-which you can choose for a Claude Code agent in **New agent**. That one is private to the agent: it
-reads the agent's whole conversation, the agent consults it whenever it decides to, and nothing of
-it shows in the chat. It uses more tokens, and an agent keeps it when you Reopen it or switch its
-model. The two work together: an agent on Sonnet with Opus as its own advisor can still `hub_ask`
-the chat's advisor.
+Claude Code has an advisor of its own ([`--advisor`](https://code.claude.com/docs/en/advisor)).
+crewchat 1.1.0 no longer offers it in **New agent** (the Engine step had an Advisor choice): the
+advisor role above is the one advisor, and since it gets the agent's conversation too, the two did
+the same job twice, with one of them hidden from the chat. An agent started with it before keeps it
+until it is restarted; Reopen, Switch model, Start again and Reconnect start it without.
 
 ## The task sheet and the lead
 
@@ -149,6 +188,78 @@ An agent gets `hub_code` when you make it the lead or the advisor, and loses it 
 Its session is told that its tools changed (MCP's `list_changed`) and loads it. A tool on an MCP
 protocol older than 2025-03-26 cannot be told while it runs: its role message says so, and the
 tool comes with its next session.
+
+## Process notes
+
+When an agent works out how to do something the hard way (a build, a release, a fix for a failure that keeps
+coming back, a setup step missing from the docs), it can write it down as a **process note**: when to use it, the
+steps in order, the commands, the pitfalls, and the files and areas it touches. Once a note is approved, every
+agent of the project gets it, on every linked machine: crewchat writes it into each folder as a Claude Code skill
+(`.claude/skills/crewchat-process-NAME/`) and a Cursor rule, and the project guide lists it. Those files are made
+from the chat's log and kept out of git; deleted, they are written again when the server starts.
+
+**How agents write one.** With `hub_process` `propose`: a name like `release-build`, and the note's fields (steps
+and pitfalls are required, a few KB at most; the server records the commit the agent's folder is at). `update`
+makes a new version from the fields that change and says which changed. The guide tells agents what is worth a
+note (a process that took several tries, a command sequence they had to piece together, a trap, a setup step the
+docs leave out) and what is not (one-off facts, anything the code already says). `find` looks for a note by a few
+words when an agent is stuck. The lead approves with the same tool.
+
+**Asked at the right moment.** When an agent marks a task done, crewchat asks it in one line whether it worked
+out a process another agent would need, but only after a task that looked hard: it was blocked, reclaimed, sent
+back from review (or the advisor asked for changes), or it took more than twice the median time of the tasks done
+before it. Asked after every task, agents would learn to skip it. The lead's instructions say to review proposed
+notes and to ask for one after a hard task. The agent that did the work writes the note; the server writes none.
+
+**Every agent gets the right note.** A new agent finds every approved note in its guide, with one line on when to
+use it, this project's first and then the ones shared with all projects, so it reads a note only when it applies.
+When an agent takes a task, the answer names the notes whose areas overlap the task's files, or whose name and use
+share two words with its title. When a note is approved, each agent holding a task in progress or in review over
+the note's areas gets a short message, which its hooks hand it by the end of its turn; the others see the note in
+their guide. `hub_process` `find` looks for a note by a few words. The words come from a small index in
+`history.sqlite`, made from the live notes.
+
+**Who approves.** The server checks it, not the agent. You approve a note that is shared with all your projects,
+one whose commands may release, deploy, publish, delete data or touch credentials or production (crewchat goes by
+the words in them), and one you marked owner-only. The lead approves the others; in a project without a lead, you
+do. When the lead approves a note that needs you, it waits in **Needs you** with the reason, its steps and its
+commands exactly as written, and **Approve** or **Decline**. You can change the rule for a project: `crewchat
+processes rule owner` (you approve every note), `default`, or `lead` (the lead approves every note but shared ones,
+owner-only ones and project commands).
+
+**Keeping notes true.** After following a note, an agent reports with `hub_process` `report` whether it worked,
+or what failed. The counts show on the note. A failure asks the agent to fix the note and tells the lead (you,
+without a lead); two failures in a row take the note out of the folders, back to proposed, until a fixed version
+is approved. Every ten minutes crewchat also looks for notes that may be out of date: agents edited their files 20
+times since they were approved, git shows their files largely rewritten since the note's commit (or gone), or
+nobody reported them working for 90 days. Such a note is flagged once, and the lead is asked to check it; crewchat
+only flags, never retires a note by itself.
+
+The chat page lists every note under **Process notes**, next to the shared skills: its state, this project's or
+all projects', who approved it, what agents reported, whether it may be out of date or is unused, and **Approve**
+(a proposed one) and **Retire**. The menu there sets who approves the project's notes.
+
+**Project commands.** When a note's steps are always the same commands, you can make them a named project
+command: **Make it a command** on the page, or `crewchat processes promote NAME [PARAMS]`. Both show you the exact
+commands first. Parameters are names in capitals, written `{VERSION}` in the commands. Agents then run all of them,
+in order, from their folder, in their own shell: `crewchat run NAME VERSION=1.2.0`. It stops at the first that fails
+and says which. The server only tells them what to run; it never runs anything. Every change to a command's note,
+whoever writes it, needs your approval again, and Needs you shows the new commands exactly as they would run. The
+Commands tab lists the project's commands.
+
+The analytics view's **What the crew has learned** shows how much the notes are used
+([Analytics](getting-started.md#analytics)).
+
+**Versions.** A note changes by a new version. Agents keep the approved one until the new one is approved; the
+older versions stay in the log. **Retire** a note to stop giving it to agents.
+
+**Shared with all projects.** A note can be for one project or for all of them. Only you make a note shared
+(`crewchat processes share NAME`, or approve one an agent proposed as shared). Shared notes are kept in a project of
+crewchat's own, `crewchat-shared`, that links with your other machines like any project and is listed nowhere;
+only notes you shared go there, so nothing else of one project reaches another.
+
+`crewchat processes` lists the notes, `processes show NAME` prints one, and `processes approve|decline|retire NAME`
+settles one from the command line.
 
 ## Progress on tasks
 
@@ -186,8 +297,7 @@ session for you, in four steps:
    offers **Create it and connect**.
 3. **Engine:** the tool (Claude Code, Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode;
    one that is not installed shows as such), its model (Claude Code: Fable, Opus, Sonnet, Haiku, or
-   its default), its own advisor (Claude Code: Fable, Opus, Sonnet, or none; see
-   [the advisor](#the-advisor)), and what it may do **without asking** (below). Under the tool, New
+   its default), and what it may do **without asking** (below). Under the tool, New
    agent says what it still needs on this machine and in that folder: installed, signed in, and
    what it asks once there (whether you trust the folder, crewchat's hooks). A step to take first
    comes with the command to run in a terminal (**Copy**), then **Check again**.
@@ -261,6 +371,11 @@ is, once per session.
 - **Reconnect** (when its window is still open but it sleeps: past its listening time it reads the
   chat only at your next prompt there) closes that window and reopens the same conversation in a
   new one, listening to the chat again. Its tasks stay its own.
+- **Account** (Claude Code, when the machine has more than one): the account it runs in. Each
+  Claude Code account is its own settings folder, such as `~/.claude-personal` with its own
+  sign-in; crewchat finds those in your home, and `crewchat accounts add NAME FOLDER` adds one kept
+  elsewhere. Pick it in **+ New agent**; Reopen, Reconnect, Start again and Switch model keep it,
+  as a conversation can only be resumed from the account that holds it.
 - **Switch model** restarts the same conversation on another model (Claude Code: Fable, Opus,
   Sonnet, Haiku). Its tasks stay its own.
 
@@ -385,6 +500,40 @@ The lead takes task #7 and assigns "Build the theme switch, store the choice in 
 `in_progress`, then `review`, and tell `claude-macbook-3` what to test. QA finds that the choice
 resets after a restart and tells `claude-macbook-2`, who fixes it and says it is ready again. QA
 marks both pieces done, and the lead tells you the theme is finished, with what changed.
+
+## Agents in your browser
+
+With the browser on ([how](getting-started.md#agents-in-your-browser)), an agent opens pages in your Chrome and works
+in them with your logins. crewchat keeps it under your control:
+
+- **One driver at a time** on each machine. Another agent's browser call is refused with who holds it and for which
+  task. The browser is let go when the holder's task goes to review or done or back on the sheet (whoever moves it),
+  from the Browser panel (Let go), or after 10 minutes without a browser call. A call that is refused does not take it.
+- **Sites.** Opening a site that is not allowed asks you in Needs you: **Allow the site** or **Deny**. So does
+  landing on one by a link, a form or a redirect: the agent's next browser call there, a read too, waits for your
+  answer (a click then asks about the change too). After a Deny the agent is refused there without asking you again,
+  until it opens another site; it can still list and switch tabs. Each call is checked against the tab it acts on.
+  Calls made at once share one question. Reading and moving around an allowed site are free. A site is its host
+  (`jenkins.mycorp.com`); on your own machine it is its host and port (`localhost:3000`), as each port there is
+  another server. crewchat's own page is never used by agents, whatever is allowed.
+- **Changes.** The first click, typing, form or script on a site asks once for that task: **Allow for this task** or
+  **Deny**. After that the agent goes on there until the task is done (an agent with no task is asked each time). On a **trusted** site (Browser panel: Trust) it
+  never asks. Nobody answers in 10 minutes: it is a no (10 minutes in all for one call, however many questions it asks).
+- **Tasks.** A task's panel can say it **Needs the browser**; then only an agent with the browser on takes it, on
+  every linked machine (each its own agents, with its own Chrome). While
+  it holds the browser the agent posts short progress notes on its task; after 5 minutes without one, crewchat
+  reminds it.
+- **No passwords.** Agents are told never to type passwords or secrets; they use the sessions you are logged in to.
+- The **Browser** panel (project menu) shows who drives, on which site, the bridge token (set or not, never shown),
+  the allowed and trusted sites, and what agents opened and what you answered (since the server started).
+
+Limits: an address other than http or https (a file, a script), or one a browser could read another way than crewchat
+does (a user name, a backslash, a %-escape or a space in its host), is refused. While crewchat is not running, agents
+may read the page they are on, but not open a site or change anything. The bridge is only for agents in the chat:
+another session of the same tool is refused it (Claude in Chrome asks in Chrome itself). A Playwright server of your own in
+Gemini CLI, Qwen Code or Cursor is left alone in a folder without the bridge; with the bridge there, its tools have
+the same names, so they are checked too. OpenCode's plugin does not see its subagents' calls, so they are not asked
+about. Cursor's hook can only refuse.
 
 ## Limits
 

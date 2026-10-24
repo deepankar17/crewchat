@@ -265,6 +265,9 @@ class Agent:
     def _hook_command(self, event):
         if self.client == "claude":
             settings = json.loads((self.folder / ".claude" / "settings.local.json").read_text())
+            if event == "browser":  # the before-hook on browser calls (B1), beside other PreToolUse hooks
+                return next(h["hooks"][0]["command"] for h in settings["hooks"]["PreToolUse"]
+                            if "browser" in h.get("matcher", ""))
             key = {"prompt": "UserPromptSubmit", "stop": "Stop", "permission": "PermissionRequest"}[event]
             return settings["hooks"][key][0]["hooks"][0]["command"]
         hooks = json.loads((self.folder / ".cursor" / "hooks.json").read_text())

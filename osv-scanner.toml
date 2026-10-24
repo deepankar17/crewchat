@@ -1,0 +1,2 @@
+# Advisories scripts/security-scan.sh accepts for now. Each entry needs an id, a reason and an
+# expiry date (ignoreUntil); after that date the advisory fails the scan again. None so far.

@@ -820,6 +820,7 @@ class CloudSync(crewchat.ProjectLink):
         self.space = space_id(self._root(), chat) if chat is not None else None
         self.base = "spaces/%s/" % self.space if chat is not None else ""  # where its collections are
         self.marked = False  # spaces/{space} written, so that a reset finds this project's documents
+        self.waiting = {}  # the machine's link: devices on the account not approved yet -> {name, tag, fp}
         self.marks_sent = (None, 0)  # (synced_to, when) last written to the space's marks/
         self.outbox = queue.Queue()
         self.stop_event = threading.Event()
@@ -834,7 +835,6 @@ class CloudSync(crewchat.ProjectLink):
         self.marks = read_json(self.marks_file, {"published": 0, "synced_to": 0})
         self.clock = time.time  # the lease's clock (the tests move it)
         self.lease = {}  # meta/coordinator as last read
-        self.machine = self  # the machine's link, whose lease says who coordinates (a project's link: set by it)
         self.catching_up = threading.Lock()  # one catch-up at a time, served or read
 
     # The coordinator (roadmap Y1) --------------------------------------------------------------
@@ -957,13 +957,59 @@ class CloudSync(crewchat.ProjectLink):
                 pass
         if self.chat is None:
             for project in self._all()[1:]:
-                project.stop()
+                project.detach()  # each project's hub unlinked too, as the machine's link stops (a logout)
 
     def stopping(self):
         return self.stop_event.is_set()
 
     def link_status(self):
         return {"via": "cloud", "me": self.device.name, "online": self.online, "approved": self.device.ready}
+
+    def info_changed(self):
+        super().info_changed()
+        self.dirty.set()  # the state document goes out again, with the new info
+
+    def cloud_checks(self, deep=False):
+        """Cloud sync's checks for the Machines panel (M1): approved, online, the store reached now (deep)."""
+        check = crewchat.check_item
+        out = [check("cloud-approved", self.device.ready, "This machine is approved on the account",
+                     "fingerprint %s" % self.device.fp,
+                     "Approve it from a machine already set up: its Machines panel lists it as waiting"),
+               check("cloud-online", bool(self.online), "Cloud sync is online", "",
+                     "Check this machine's internet connection")]
+        if deep:
+            started = time.time()
+            try:
+                self.store.get("meta/coordinator")
+                out.append(check("cloud-reachable", True, "Firestore answers", "%d ms" % ((time.time() - started) * 1000)))
+            except Exception as e:  # offline, signed out, or a quota reached
+                out.append(check("cloud-reachable", False, "Firestore answers", str(e),
+                                 "Check the internet connection; if it says quota, the Firebase plan's daily limit was reached"))
+        return out
+
+    def machines_status(self):
+        now, rows = time.time(), []
+        try:
+            lease = self.coordinator()
+        except Exception:
+            lease = {}
+        for device_id, entry in self.device.trust.get("devices", {}).items():
+            if device_id == self.device_id:
+                continue
+            remote = self.hub.remote.get(device_id) or {}
+            seen = float(remote.get("updated") or 0)
+            rows.append(dict(self.info_of(device_id), id=device_id, name=entry.get("name") or device_id,
+                             tag=entry.get("tag", ""), state="online" if now - seen < 2 * HEARTBEAT + 60 else "offline",
+                             seen=seen, coordinator=bool(lease.get("name")) and lease.get("name") == entry.get("name"),
+                             fp=entry.get("fp", "")))
+        for device_id, doc in list(self.waiting.items()):
+            if not self.device.trusted(device_id):
+                rows.append(dict(self.info_of(device_id), id=device_id, name=doc["name"], tag=doc["tag"],
+                                 state="waiting", seen=0.0, coordinator=False, fp=doc["fp"]))
+        return sorted(rows, key=lambda r: r["name"].lower())
+
+    def linked_ids(self):
+        return [d for d in list(self.device.trust.get("devices", {})) if d != self.device_id]
 
     def _project_link(self, hub, name):
         link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name,
@@ -1071,15 +1117,19 @@ class CloudSync(crewchat.ProjectLink):
 
     def _send_state(self):
         rows = self.hub.local_state()
-        signature = json.dumps([{k: v for k, v in r.items() if k != "seen"} for r in rows], sort_keys=True)
+        info = self.my_info()  # the machine's link: its version, OS and projects (M1, M2), sealed like the rest
+        signature = json.dumps([[{k: v for k, v in r.items() if k != "seen"} for r in rows], info], sort_keys=True)
         now = time.time()
         changed = signature != self.state_sig
         seen_due = rows and self.shared and now - self.state_seen_at >= SEEN_EVERY  # read only by others
-        heartbeat_due = rows and now - self.state_sent_at >= HEARTBEAT
+        # The machine's link says it is alive even with no agents, so the Machines panel can tell it is on.
+        heartbeat_due = (rows or info is not None) and now - self.state_sent_at >= HEARTBEAT
         if not (changed or seen_due or heartbeat_due) or now - self.state_sent_at < STATE_DEBOUNCE:
             return changed  # try again later if something is pending
-        doc = self._seal("crewchat|%s|state|%s|%%s" % (self._scope(), self.device_id),
-                         {"device": self.device.name, "agents": rows})
+        payload = {"device": self.device.name, "agents": rows}
+        if self.chat is None:  # null while this machine's info is not known yet; an older crewchat sends none
+            payload["info"] = info
+        doc = self._seal("crewchat|%s|state|%s|%%s" % (self._scope(), self.device_id), payload)
         doc["updated"] = SERVER_TIME
         self.store.set(self.base + "state/" + self.device_id, doc)
         self.state_sig, self.state_sent_at, self.state_seen_at = signature, now, now
@@ -1355,6 +1405,8 @@ class CloudSync(crewchat.ProjectLink):
                 payload = self._open("crewchat|%s|state|%s|%%s" % (self._scope(), device_id), doc)
             except Exception:
                 continue
+            if self.chat is None and not ("info" in payload and payload["info"] is None):  # null: not known yet
+                self.keep_info(device_id, payload.get("info"))
             if device_id not in self.shared_with:
                 self.shared_with.add(device_id)
                 self.dirty.set()  # a machine just joined this project: tell it who is here now
@@ -1368,8 +1420,12 @@ class CloudSync(crewchat.ProjectLink):
                     self.account.accept_account(self.store.get("meta/account"))
                     self._after_keys()
             elif kind == "removed":
+                self.waiting.pop(device_id, None)
                 for sync in self._all():
                     sync._drop(device_id)
+            elif device_id != self.device_id and isinstance(doc, dict) and not self.device.trusted(device_id):
+                self.waiting[device_id] = {"name": str(doc.get("name") or device_id), "tag": str(doc.get("tag") or ""),
+                                           "fp": str(doc.get("fp") or "")}
 
     def _on_meta(self, changes):
         for kind, doc_id, doc in changes:
@@ -1454,7 +1510,7 @@ class Auth:
                 write_private(self.dir / "auth.json", json.dumps(self.data))
             return self.data["id_token"]
 
-    def login(self, timeout=300):
+    def login(self, timeout=300, need_browser=False):
         """Google sign-in in the browser (OAuth for desktop apps, with PKCE), then Firebase."""
         client = self.config.get("oauth") or {}
         if not client.get("client_id"):
@@ -1486,7 +1542,10 @@ class Auth:
             "scope": "openid email", "state": state, "code_challenge": challenge,
             "code_challenge_method": "S256", "prompt": "select_account"})
         print("Opening your browser to sign in with Google. If it does not open, visit:\n  %s" % url, flush=True)
-        webbrowser.open(url)
+        if not webbrowser.open(url) and need_browser:  # the Machines panel: nobody here to open the address by hand
+            server.server_close()
+            raise CloudError("no browser could be opened on this machine for Google's sign-in. Run `crewchat cloud "
+                             "login` in a terminal on it: it shows the address to open")
         deadline = time.time() + timeout
         server.timeout = 5
         while "code" not in got and time.time() < deadline:
@@ -1591,13 +1650,122 @@ def cmd_cloud(args):
         crewchat.die(str(e))
 
 
+PEERS_ON = ("this machine is linked over Tailscale (`crewchat peers status`); a machine syncs one way. Unlink it "
+            "first: Unlink in the Machines panel, or `crewchat peers leave`")
+
+
+def setup(root, web=None, oauth=None, project=None, api_key=None, client_id=None, client_secret=None):
+    """Keep the Firebase project's settings (the web config's projectId and apiKey, and a Desktop OAuth client),
+    for `crewchat cloud setup` and the Machines panel. Returns {"project"}; the client secret is never returned."""
+    if (Path(root) / "config.json").exists() and crewchat.load_config(root).get("peers"):
+        raise CloudError(PEERS_ON)
+    web = web if isinstance(web, dict) else {}
+    project = project or web.get("projectId")
+    api_key = api_key or web.get("apiKey")
+    data = oauth if isinstance(oauth, dict) else {}
+    data = data.get("installed") or data.get("web") or data
+    client = {"client_id": str(data.get("client_id") or ""), "client_secret": str(data.get("client_secret") or "")}
+    if client_id:
+        client = {"client_id": client_id, "client_secret": client_secret or ""}
+    if not (project and api_key and client["client_id"]):
+        raise CloudError("need the Firebase project id, its web API key and a Desktop OAuth client: see "
+                         "docs/firebase-setup.md")
+    write_private(cloud_dir(root) / "firebase.json", json.dumps(
+        {"projectId": project, "apiKey": api_key, "oauth": client}, indent=2))
+    return {"project": project}
+
+
+def login(root, device_name=None, again=False, need_browser=False):
+    """Sign in with Google (in the browser, on this machine), make this machine a device of the account and
+    register it. Returns {email, device, tag, fp, state: founded | ready | waiting}. The server starts syncing
+    after a restart."""
+    if crewchat.load_config(root).get("peers"):
+        raise CloudError(PEERS_ON)
+    need_crypto()
+    auth = Auth(root)
+    if not auth.signed_in or again:
+        auth.login(need_browser=need_browser)
+    store, auth = firestore_store(root)
+    device = Device(root)
+    if not device.exists:
+        names = {d.get("name") for _, d in store.list("devices")}
+        name = crewchat.place_label(device_name) if device_name else crewchat.machine_name()
+        base, number = name, 2
+        while name in names:
+            name, number = "%s-%d" % (base[:13], number), number + 1
+        device.create(name)
+    result = Account(store, device).register()
+    config = crewchat.load_config(root)
+    config["cloud"] = True
+    crewchat.save_config(config, root)
+    return {"email": auth.email, "device": device.name, "tag": device.tag, "fp": device.fp,
+            "state": result if result in ("founded", "ready") else "waiting"}
+
+
+def approve(account, name, fingerprint):
+    """Approve a machine waiting on the account, after the owner compared its fingerprint. Returns {"approved"}."""
+    account.refresh()
+    target_id, doc = account.find(name)
+    if account.device.trusted(target_id):
+        return {"approved": doc.get("name"), "already": True}
+    if not fingerprint:
+        raise CloudError("compare the fingerprint the new machine shows, and give it to approve it")
+    return {"approved": account.approve(target_id, expect_fp=fingerprint)}
+
+
+def remove(account, name):
+    account.refresh()
+    removed = account.remove(name)
+    return {"removed": removed, "last": not account.device.trust.get("devices")}
+
+
+def logout(root, account=None):
+    """Take this machine off the account and forget its cloud identity. The server stops syncing at a restart."""
+    device = Device(root)
+    if account is not None and device.ready:
+        try:
+            account.remove(device.id)
+        except CloudError:
+            pass
+    folder = cloud_dir(root)
+    for name in ("auth.json", "device.json", "device_key.pem", "keys.json", "trust.json", "sync.json"):
+        try:
+            (folder / name).unlink()
+        except OSError:
+            pass
+    config = crewchat.load_config(root)
+    config["cloud"] = False
+    crewchat.save_config(config, root)
+    return {"signed_out": True}
+
+
+def page_op(hub, root, op, data, local):
+    """The Machines panel's cloud operations (crewchat.Handler._machines)."""
+    account = hub.sync.account if isinstance(hub.sync, CloudSync) else None
+    if op == "cloud-setup":
+        return setup(root, data.get("web"), data.get("oauth"))
+    if op == "cloud-login":
+        if not local:
+            raise CloudError("sign in at the machine itself: Google's sign-in opens a browser there. Open the chat "
+                             "on that machine (its own page) and sign in from its Machines panel")
+        return login(root, data.get("device"), need_browser=True)
+    if op == "cloud-logout":
+        if isinstance(hub.sync, CloudSync):  # stopped first: it must not write under the removed machine again
+            hub.sync.detach()
+        return logout(root, account)
+    if account is None:
+        store, _ = firestore_store(root)
+        account = Account(store, Device(root))
+    if op == "cloud-approve":
+        return approve(account, str(data.get("name") or ""), str(data.get("fingerprint") or ""))
+    if op == "cloud-remove":
+        return remove(account, str(data.get("name") or ""))
+    raise CloudError("unknown operation %s" % op)
+
+
 def _cmd_cloud(args):
     root = crewchat.home()
-    folder = cloud_dir(root)
     action = args.action
-    if action in ("setup", "login") and (root / "config.json").exists() and crewchat.load_config(root).get("peers"):
-        raise CloudError("this machine is linked over Tailscale (`crewchat peers status`); a machine syncs one "
-                         "way. Leave first with `crewchat peers leave`")
     if action == "rules":
         print(RULES, end="")
         return
@@ -1605,55 +1773,42 @@ def _cmd_cloud(args):
         web = read_json(args.web_config) if args.web_config else {}
         if args.web_config and not web:
             raise CloudError("%s is not a readable JSON file" % args.web_config)
-        project = args.project_id or web.get("projectId")
-        api_key = args.api_key or web.get("apiKey")
-        oauth = {}
-        if args.oauth_client:
-            data = read_json(args.oauth_client)
-            if not data:
-                raise CloudError("%s is not a readable JSON file" % args.oauth_client)
-            data = data.get("installed") or data.get("web") or data
-            oauth = {"client_id": data.get("client_id", ""), "client_secret": data.get("client_secret", "")}
-        if args.client_id:
-            oauth = {"client_id": args.client_id, "client_secret": args.client_secret or ""}
-        if not (project and api_key and oauth.get("client_id")):
-            raise CloudError("need the Firebase project id, its web API key and a Desktop OAuth client: see "
-                             "docs/firebase-setup.md")
-        write_private(folder / "firebase.json", json.dumps(
-            {"projectId": project, "apiKey": api_key, "oauth": oauth}, indent=2))
-        print("Cloud sync is set up for Firebase project %s. Next: crewchat cloud login" % project)
+        oauth = read_json(args.oauth_client) if args.oauth_client else {}
+        if args.oauth_client and not oauth:
+            raise CloudError("%s is not a readable JSON file" % args.oauth_client)
+        out = setup(root, web, oauth, args.project_id, args.api_key, args.client_id, args.client_secret)
+        print("Cloud sync is set up for Firebase project %s. Next: crewchat cloud login" % out["project"])
         return
     if action == "login":
-        need_crypto()
-        auth = Auth(root)
-        if not auth.signed_in or args.again:
-            auth.login()
-        print("Signed in as %s." % auth.email)
-        store, auth = firestore_store(root)
-        device = Device(root)
-        if not device.exists:
-            names = {d.get("name") for _, d in store.list("devices")}
-            name = crewchat.place_label(args.device or crewchat.socket.gethostname())
-            base, number = name, 2
-            while name in names:
-                name, number = "%s-%d" % (base[:13], number), number + 1
-            device.create(name)
-        result = Account(store, device).register()
-        config = crewchat.load_config(root)
-        config["cloud"] = True
-        crewchat.save_config(config, root)
-        print("This machine is device \"%s\" (tag %s). Its fingerprint: %s" % (device.name, device.tag, device.fp))
-        if result == "founded":
+        out = login(root, args.device, args.again)
+        print("Signed in as %s." % out["email"])
+        print("This machine is device \"%s\" (tag %s). Its fingerprint: %s" % (out["device"], out["tag"], out["fp"]))
+        if out["state"] == "founded":
             print("It is the first device on this account, so it holds the account key.")
-        elif result == "ready":
+        elif out["state"] == "ready":
             print("It is approved and ready.")
         else:
             print()
             print("Before it can read or send anything, approve it from a machine that is already set up:")
-            print("  crewchat cloud approve %s" % device.name)
-            print("That command shows a fingerprint: it must be %s." % device.fp)
+            print("  crewchat cloud approve %s" % out["device"])
+            print("That command shows a fingerprint: it must be %s." % out["fp"])
         print()
         print("Restart the server so it starts syncing: crewchat service restart (or crewchat serve).")
+        return
+    if action == "logout":
+        try:  # the running server signs out: it stops its link first, so nothing more is sent under this machine
+            crewchat.post_json(crewchat.local_url() + "/api/machines", crewchat.owner_token(), {"op": "cloud-logout"})
+            print("Signed out and removed this machine's cloud identity. The server here has stopped syncing.")
+            return
+        except (urllib.error.URLError, OSError, ValueError, SystemExit):  # not running (or too old to know how)
+            pass
+        try:
+            store, _ = firestore_store(root)
+            account = Account(store, Device(root))
+        except Exception:  # signed out already, or offline: forget it here anyway
+            account = None
+        logout(root, account)
+        print("Signed out and removed this machine's cloud identity. Restart the server.")
         return
     store, auth = firestore_store(root)
     device = Device(root)
@@ -1706,30 +1861,14 @@ def _cmd_cloud(args):
         print("Approved %s. It receives the account key and starts syncing within a few seconds." % name)
         return
     if action == "remove":
-        account.refresh()
         if not args.name:
             raise CloudError("usage: crewchat cloud remove DEVICE")
-        name = account.remove(args.name)
-        if device.trust.get("devices"):
-            print("Removed %s and switched the others to a new account key it never sees." % name)
+        out = remove(account, args.name)
+        if not out["last"]:
+            print("Removed %s and switched the others to a new account key it never sees." % out["removed"])
         else:
-            print("Removed %s, the last machine on the account, and cleared the account's data from the cloud." % name)
-        return
-    if action == "logout":
-        if device.ready:
-            try:
-                account.remove(device.id)
-            except CloudError:
-                pass
-        for name in ("auth.json", "device.json", "device_key.pem", "keys.json", "trust.json", "sync.json"):
-            try:
-                (folder / name).unlink()
-            except OSError:
-                pass
-        config = crewchat.load_config(root)
-        config["cloud"] = False
-        crewchat.save_config(config, root)
-        print("Signed out and removed this machine's cloud identity. Restart the server.")
+            print("Removed %s, the last machine on the account, and cleared the account's data from the cloud."
+                  % out["removed"])
         return
     raise CloudError("unknown action %s" % action)
 

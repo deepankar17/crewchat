@@ -1,0 +1,15 @@
+# Secret scanning rules for scripts/security-scan.sh: gitleaks' default rules plus the allowed
+# values below. Add an entry here only for fake or public values, never to silence a real key.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Unit tests use made-up tokens and keys"
+paths = ['''^tests/''']
+
+[[allowlists]]
+description = "Cloudflare Web Analytics beacon token: public by design, it ships in every page"
+condition = "AND"
+paths = ['''^site/config\.json$''']
+regexTarget = "line"
+regexes = ['''"cf_beacon_token"''']
