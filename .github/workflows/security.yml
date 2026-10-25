@@ -7,11 +7,18 @@ on:  # main only (owner, 23 Oct 2026): pushes to it and pull requests into it, l
     branches: [main]
   workflow_dispatch:
 
+# A newer push to the same branch replaces a run that has not finished.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   scan:
+    # Merging a pull request already ran this scan.
+    if: ${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'Merge pull request') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
