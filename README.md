@@ -183,7 +183,7 @@ chat more permissions than you would give them alone. More in [SECURITY.md](http
 ## Status
 
 crewchat grew out of a setup its author runs daily with four agents across a Mac and a Windows
-laptop. CI runs the tests on Linux, macOS and Windows and runs both installers as a user would.
+laptop. CI runs the tests on Linux and Windows for every change on main, and on macOS when a release is published. It runs both installers as a user would.
 What has been tried for real and what has not: [Status](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md#status).
 
 ## Development

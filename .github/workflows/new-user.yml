@@ -8,7 +8,12 @@ on:
   release:
     types: [published]
   schedule:
-    - cron: "17 6 * * 1"  # weekly: each run downloads the release from 5 machines, and GitHub counts them
+    - cron: "17 6 * * 1"  # weekly, Linux only: Mac and Windows run when a release is published
+
+# A newer run for the same ref replaces one that has not finished.
+concurrency:
+  group: new-user-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   # release-assets.yml attaches the release's package just after it is published: wait for it.
@@ -29,7 +34,8 @@ jobs:
 
   windows:
     needs: package
-    if: ${{ !failure() && !cancelled() }}
+    # The Monday run is Linux only. Mac and Windows still run for a release or a manual run.
+    if: github.event_name != 'schedule' && !failure() && !cancelled()
     strategy:
       fail-fast: false
       matrix:
@@ -107,12 +113,9 @@ jobs:
 
   unix:
     needs: package
+    # Linux runs every time, including the Monday check.
     if: ${{ !failure() && !cancelled() }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.release.tag_name }}
     steps:
@@ -127,6 +130,43 @@ jobs:
           echo "PyPI here does not list ${TAG#v} after 10 minutes"; exit 1
       # The README pipes install.sh into sh. Here it is downloaded first and run only if it is
       # byte for byte the install.sh of the commit this run is for (the release's tag, or main).
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          path: source
+      - name: The README's command
+        run: |
+          curl -LsSf -o "$RUNNER_TEMP/install.sh" https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh
+          want=$(shasum -a 256 source/install.sh | cut -d' ' -f1)
+          echo "$want  $RUNNER_TEMP/install.sh" | shasum -a 256 -c -
+          sh "$RUNNER_TEMP/install.sh"
+      - name: A first chat
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          v=$(crewchat --version) && echo "$v"
+          if [ -n "$TAG" ] && [ "$v" != "crewchat ${TAG#v}" ]; then echo "expected $TAG"; exit 1; fi
+          mkdir "$RUNNER_TEMP/notes-app" && cd "$RUNNER_TEMP/notes-app" && git init -q
+          crewchat start --no-service --no-open
+          curl -sf http://127.0.0.1:8765/health
+          crewchat status
+
+  macos:
+    needs: package
+    # Not on Monday. A Mac minute costs the same as ten Linux minutes, so this runs for a release
+    # or when someone starts the workflow by hand.
+    if: ${{ github.event_name != 'schedule' && !failure() && !cancelled() }}
+    runs-on: macos-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - name: Wait for this runner's PyPI to list the release
+        if: github.event_name == 'release'
+        run: |
+          for i in $(seq 60); do
+            curl -sSf -H 'Accept: application/vnd.pypi.simple.v1+json, application/vnd.pypi.simple.v1+html;q=0.2, text/html;q=0.01' https://pypi.org/simple/crewchat/ |
+              grep -qF "\"${TAG#v}\"" && exit 0
+            sleep 10
+          done
+          echo "PyPI here does not list ${TAG#v} after 10 minutes"; exit 1
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
         with:
           path: source
