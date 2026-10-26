@@ -1,6 +1,6 @@
 # Changelog
 
-## Next: 1.1.0 (on the branch `m1-machines-panel`)
+## 1.1.0 (2026-10-26)
 
 - **Process notes: what one agent works out, every agent gets.** An agent that got something to work the hard way
   (a build, a release, a fix for a failure that keeps coming back, a setup step) records it with the new
@@ -50,6 +50,16 @@
 - **Real OS logos** on agents' pictures when the chat spans machines, instead of an apple and a window emoji.
 - **Fixed:** joining while the server still synced with cloud sync used the code and needed a restart; it is now
   refused before the code is used.
+- **Fixed:** a process note's approval or retire that arrives before the version it names is kept and applied when
+  that version arrives. A retire covers versions written at or before it, on every linked machine.
+- **Fixed:** a project-command parameter inside quotes the owner already wrote can no longer break out and run as
+  its own command. A commit value that is not a commit id is not passed to git.
+- **Fixed:** a linked machine that has never been heard from no longer turns the advisor's conversation excerpt off.
+  An older crewchat, one that reported nothing, still does.
+- **Fixed:** OpenCode's excerpt budget counts each text after it is cut, so one long line does not drop the older ones.
+- A local site an agent was allowed to open is asked again once per port. crewchat's own page is always refused.
+  While the server cannot be reached, the browser hook refuses navigations. Codex, Gemini, Qwen, Cursor and OpenCode
+  must be in the chat to use crewchat's Playwright bridge.
 
 ## 1.0.2 (2026-10-21)
 

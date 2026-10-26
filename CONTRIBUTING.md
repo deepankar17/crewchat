@@ -5,10 +5,14 @@ its core.
 
 ## Ground rules
 
-- **No dependencies in the core.** `crewchat.py`, `crewchat_peers.py` and `crewchat_map.py` use the standard library
-  only, and `crewchat.py` must keep working when copied on its own to another machine. Libraries
-  go in an optional extra, imported only when used: `cloud` for cloud sync (`crewchat_cloud.py`),
-  and `map` for the code map's accurate readers (tree-sitter and its grammars, in `crewchat_map.py`).
+- **No dependencies in the core.** `crewchat_peers.py`, `crewchat_map.py` and the source modules in
+  `crewchat_src/` use the standard library only. A new dependency goes in an optional extra, imported
+  lazily, the way `crewchat_cloud.py` is. Edit a source module, then rebuild with
+  `python3 tools/build/onefile.py`. Do not edit `crewchat.py` by hand. The rebuilt file is what a
+  release ships and what someone copies alone: it must run with none of `crewchat_src/` beside it.
+  `crewchat_peers.py`, `crewchat_map.py` and `crewchat_cloud.py` stay separate files. The extras
+  are `cloud` for cloud sync (`crewchat_cloud.py`) and `map` for the code map's accurate readers
+  (tree-sitter and its grammars, in `crewchat_map.py`).
 - **The server binds to 127.0.0.1.** Changes that make it listen elsewhere will not be merged;
   remote access goes through a private network.
 - **Storage follows [docs/storage.md](docs/storage.md).** `messages.jsonl` is the source of truth;
@@ -20,7 +24,8 @@ its core.
 
 | File | |
 |---|---|
-| `crewchat.py` | The server, the MCP tools, the chat page (and its analytics view, `ANALYTICS_JS`), hooks, and every command. It also writes the light hook script, `~/.crewchat/crewchat-hook.py`, from its own code (`hook_script`): edit the functions it copies, never the written file |
+| `crewchat_src/` | The source modules (base, config, conversation, analytics, notes, hub, tools, http, host, hooks, service, guides, page, cli). Edit one of these, then rebuild. They share the built file's namespace and are not installed |
+| `crewchat.py` | The built file: the server, the MCP tools, the chat page (and its analytics view, `ANALYTICS_JS`), hooks, and every command. Do not edit it by hand. It also writes the light hook script, `~/.crewchat/crewchat-hook.py`, from its own code (`hook_script`): edit the functions it copies, never the written file |
 | `crewchat_peers.py` | Linking machines over Tailscale |
 | `crewchat_cloud.py` | Linking machines with cloud sync (Firestore) |
 | `crewchat_map.py` | The code map: files, definitions and imports of the project's code (standard library) |

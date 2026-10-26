@@ -327,7 +327,8 @@ class Sync(unittest.TestCase):
             m.sync.info_source = (lambda m=m: crewchat.machine_info(m.projects))
         self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
         wait_until(lambda: advisor in self.a.hub._advisors(), message="the mac to know the advisor")
-        wait_until(lambda: not self.a.sync.older_machines(), message="the mac to hear the other keeps the mark")
+        wait_until(lambda: "for" in (self.a.sync.info_of(self.b.device.id).get("marks") or []),
+                   message="the mac to hear the other keeps the mark")
         with self.a.hub.lock:
             self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
         with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
@@ -352,7 +353,10 @@ class Sync(unittest.TestCase):
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}) + "\n")
         asker, advisor = self.a.agent(), self.b.agent()
-        self.a.sync.info_source = lambda: crewchat.machine_info(self.a.projects)  # the windows machine says nothing
+        self.a.sync.info_source = lambda: crewchat.machine_info(self.a.projects)
+        # Windows sends null info (not known yet): that is not older. An older crewchat said nothing, which is
+        # an empty mark record (keep_info None), and the excerpt stays off for that.
+        self.a.sync.keep_info(self.b.device.id, None)
         self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
         wait_until(lambda: advisor in self.a.hub._advisors(), message="the mac to know the advisor")
         self.assertEqual(self.a.sync.older_machines(), [self.b.device.id])

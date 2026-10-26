@@ -2153,8 +2153,11 @@ class BinaryOnWindows(unittest.TestCase):
 
 
 class RememberedMachines(unittest.TestCase):
-    """Owner's decision (23 Oct): a linked machine switched off since this server started was taken for one never heard
-    from, so it turned off the advisor's excerpt for every question (older_machines). Its last word is kept on disk."""
+    """Owner's decision (23 Oct): a linked machine that is off is judged by what it last said, kept on disk
+    (older_machines). If that included the `for` mark, it is not older. keep_info(id, None) stores an empty mark
+    record (back on an older crewchat, which says nothing) and that machine stays older. A damaged machines file
+    stays older, the safe side. A machine never heard from has no record and is not older, so it does not turn the
+    advisor excerpt off."""
 
     class Link(crewchat.ProjectLink):
         def __init__(self, root, chat=None):
@@ -2166,19 +2169,23 @@ class RememberedMachines(unittest.TestCase):
     def test_a_machine_that_is_off_is_judged_by_what_it_last_said(self):
         root = Path(tempfile.mkdtemp(prefix="remembered-", dir=TMP))
         link = self.Link(root)
-        self.assertEqual(link.older_machines(), ["laptop", "desktop"])  # never heard from: older, the safe side
+        self.assertEqual(link.older_machines(), [])  # nothing written yet: not older
         link.keep_info("laptop", {"version": "1.1.0", "marks": ["for"], "projects": [{"name": "web"}]})
-        self.assertEqual(link.older_machines(), ["desktop"])
+        self.assertEqual(link.older_machines(), [])  # desktop has no record; laptop keeps the mark
         again = self.Link(root)  # this server restarted; the laptop is off
-        self.assertEqual(again.older_machines(), ["desktop"])
+        self.assertEqual(again.older_machines(), [])
+        self.assertIn("for", again.info_of("laptop")["marks"])
         self.assertEqual((again.info_of("laptop")["version"], again.info_of("laptop")["projects"]), ("1.1.0", []))
         (root / crewchat.MACHINES_FILE).write_text('{"laptop": {"version": 3, "marks": 5}, "desktop": [1]}')
         self.assertEqual(self.Link(root).older_machines(), ["laptop", "desktop"])  # a damaged file: no crash, unknown
         self.Link(root).keep_info("laptop", {"version": "1.1.0", "marks": ["for"]})  # it reports again
         again = self.Link(root)
-        self.assertEqual(again.older_machines(), ["desktop"])
+        self.assertEqual(again.older_machines(), [])  # sound file again; desktop's bad entry was not kept
         again.keep_info("laptop", None)  # back on an older crewchat, which says nothing of itself
-        self.assertEqual(self.Link(root).older_machines(), ["laptop", "desktop"])
+        saved = json.loads((root / crewchat.MACHINES_FILE).read_text())
+        self.assertEqual(saved.get("laptop"), {"version": "", "marks": []})  # empty record, not a missing key
+        self.assertNotIn("desktop", saved)
+        self.assertEqual(self.Link(root).older_machines(), ["laptop"])
         self.Link(root, chat="other").keep_info("desktop", {"version": "1.1.0", "marks": ["for"]})
         many = self.Link(root)  # each peer's puller reports on its own thread
         ids = ["m%d" % i for i in range(40)]
@@ -2187,8 +2194,102 @@ class RememberedMachines(unittest.TestCase):
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(sorted(json.loads((root / crewchat.MACHINES_FILE).read_text())), sorted(ids))
-        self.assertFalse((root / crewchat.MACHINES_FILE).read_text().count("desktop"))  # only the machine's link keeps
+        saved = json.loads((root / crewchat.MACHINES_FILE).read_text())
+        self.assertEqual(sorted(saved), sorted(ids + ["laptop"]))
+        self.assertNotIn("desktop", saved)  # only the machine's link keeps them
+
+    def test_a_fresh_link_with_nothing_written_is_not_older(self):
+        """Two linked machines and no machines file: never heard from, so not older. A file that is not JSON, or
+        not an object, is damaged and both are older."""
+        root = Path(tempfile.mkdtemp(prefix="unheard-", dir=TMP))
+        self.assertFalse((root / crewchat.MACHINES_FILE).exists())
+        self.assertEqual(self.Link(root).older_machines(), [])
+        (root / crewchat.MACHINES_FILE).write_text("{")
+        self.assertEqual(self.Link(root).older_machines(), ["laptop", "desktop"])
+        (root / crewchat.MACHINES_FILE).write_text("[]")
+        self.assertEqual(self.Link(root).older_machines(), ["laptop", "desktop"])
+
+
+class HotPathCaches(unittest.TestCase):
+    """bridge_here / bridge_set_up and claude_accounts are read on hot paths. The answer stays until the file that
+    was read changes (mtime, inode, size), so a settings change or a new account is seen on the next call and an
+    unchanged file is not opened again."""
+
+    def _reads(self, path):
+        seen = []
+        real = Path.read_text
+
+        def counting(self, *args, **kwargs):
+            if Path(self) == Path(path):
+                seen.append(1)
+            return real(self, *args, **kwargs)
+
+        return seen, counting
+
+    def test_the_bridge_is_reread_when_its_settings_change(self):
+        folder = Path(tempfile.mkdtemp(prefix="bridge-cache-", dir=TMP))
+        rel, servers = crewchat.BRIDGE_FILES["cursor"]
+        path = folder / rel
+        path.parent.mkdir(parents=True)
+        bare = {servers: {}}
+        bridged = {servers: {"browser": {"command": "npx", "env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "t"}}}}
+        path.write_text(json.dumps(bare))
+        seen, counting = self._reads(path)
+        with mock.patch.object(Path, "read_text", counting):
+            self.assertFalse(crewchat.bridge_here(folder, "cursor", "browser_click"))
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(crewchat.bridge_here(folder, "cursor", "browser_click"))
+            self.assertEqual(len(seen), 1)  # unchanged: not opened again
+            path.write_text(json.dumps(bridged))
+            self.assertTrue(crewchat.bridge_here(folder, "cursor", "browser_click"))  # the gate must see it
+            self.assertEqual(len(seen), 2)
+            path.write_text(json.dumps(bare))
+            self.assertFalse(crewchat.bridge_here(folder, "cursor", "browser_click"))
+            self.assertEqual(len(seen), 3)
+
+    def test_codexs_bridge_is_reread_when_its_settings_change(self):
+        home = Path(tempfile.mkdtemp(prefix="codex-cache-", dir=TMP))
+        path = home / "config.toml"
+        path.write_text("# no bridge\n")
+        block = "\n%s\n%s\n%s\n" % (crewchat.CODEX_BEGIN, crewchat.CODEX_BRIDGE, crewchat.CODEX_END)
+        seen, counting = self._reads(path)
+        with mock.patch.object(crewchat, "codex_config", return_value=path), \
+                mock.patch.object(Path, "read_text", counting):
+            self.assertFalse(crewchat.bridge_set_up(None, "codex"))
+            self.assertEqual(len(seen), 1)
+            self.assertFalse(crewchat.bridge_here(None, "codex", "browser_click"))
+            self.assertEqual(len(seen), 1)
+            path.write_text(block)
+            self.assertTrue(crewchat.bridge_here(None, "codex", "browser_click"))
+            self.assertEqual(len(seen), 2)
+
+    def test_a_new_claude_account_is_seen_and_an_unchanged_home_is_not_listed_again(self):
+        home = Path(tempfile.mkdtemp(prefix="acct-cache-", dir=TMP))
+        listed = []
+        real = Path.iterdir
+
+        def counting(self):
+            if Path(self) == home:
+                listed.append(1)
+            return real(self)
+
+        with mock.patch.object(Path, "iterdir", counting):
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], [""])
+            self.assertEqual(len(listed), 1)
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], [""])
+            self.assertEqual(len(listed), 1)  # unchanged: the home is not listed again
+            work = home / ".claude-work"
+            work.mkdir()
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], [""])  # no sign-in yet
+            self.assertEqual(len(listed), 2)
+            (work / ".claude.json").write_text("{}")
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], ["", "work"])
+            self.assertEqual(len(listed), 3)
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], ["", "work"])
+            self.assertEqual(len(listed), 3)
+            added = crewchat.claude_accounts({"claude_accounts": {"extra": str(work)}}, home)
+            self.assertEqual([a["id"] for a in added], ["", "work", "extra"])  # config is applied without listing
+            self.assertEqual(len(listed), 3)
 
 
 class BrowserHooks(unittest.TestCase):
@@ -2512,8 +2613,13 @@ class PrivateChatData(unittest.TestCase):
 class NoFormattedSql(unittest.TestCase):
     def test_no_table_name_is_formatted_into_a_statement(self):
         # Argus scan: values always go in as ? parameters; table names are written out, never formatted in.
-        for name in ("crewchat.py", "crewchat_map.py", "crewchat_peers.py"):
-            lines = (Path(crewchat.__file__).parent / name).read_text(encoding="utf-8").splitlines()
+        root = Path(crewchat.__file__).parent
+        names = ["crewchat.py", "crewchat_map.py", "crewchat_peers.py"]
+        source = root / "crewchat_src"
+        if source.is_dir():  # a public checkout has the built file and not the modules
+            names.extend("crewchat_src/" + path.name for path in sorted(source.glob("*.py")))
+        for name in names:
+            lines = (root / name).read_text(encoding="utf-8").splitlines()
             for n, line in enumerate(lines, 1):
                 self.assertNotRegex(line, r"\b(FROM|INTO|UPDATE|JOIN|TABLE)\s+(%s|\{)", "%s:%d" % (name, n))
 
@@ -7730,6 +7836,61 @@ class ProcessNotes(unittest.TestCase):
         self.assertIn("written by claude-beta", eventually(lambda: self.skill().exists() and self.skill().read_text(),
                                                             what="the note from beta").lower())
 
+    def test_an_approval_that_arrives_first_still_approves_the_note(self):
+        # A linked machine can be handed the approval before the proposal. It used to drop the approval, and the
+        # note stayed proposed there after the proposal arrived.
+        now = time.time()
+        note = dict(crewchat.clean_note(self.NOTE), op="propose", version=1)
+        self.hub.ingest({"id": "B8", "ts": now + 1, "from": crewchat.OWNER, "to": "all", "text": "Approved",
+                         "kind": "process", "process": json.dumps({"op": "approve", "name": "release-build", "of": "B7"})})
+        self.assertEqual(self.hub.process_rows(), [])
+        self.stop()
+        self.start()  # the held approval is in state.json, and still applies after a restart
+        self.hub.ingest({"id": "B7", "ts": now, "from": "claude-beta", "to": "all", "text": "Proposed",
+                         "kind": "process", "process": json.dumps(note)})
+        row = self.hub.process_rows()[0]
+        self.assertEqual((row["state"], row["live"], row["approved_by"]), ("approved", 1, crewchat.OWNER))
+
+    def test_a_retire_that_arrives_first_covers_the_version_it_already_meant(self):
+        now = time.time()
+        self.hub.ingest({"id": "B9", "ts": now + 5, "from": crewchat.OWNER, "to": "all", "text": "Retired",
+                         "kind": "process", "process": json.dumps({"op": "retire", "name": "release-build"})})
+        note = dict(crewchat.clean_note(self.NOTE), op="propose", version=1)
+        self.hub.ingest({"id": "B7", "ts": now, "from": "claude-beta", "to": "all", "text": "Proposed",
+                         "kind": "process", "process": json.dumps(note)})
+        self.assertEqual(self.hub.process_rows()[0]["state"], "retired")
+        later = dict(note, version=2)
+        self.hub.ingest({"id": "B10", "ts": now + 10, "from": "claude-beta", "to": "all", "text": "Proposed again",
+                         "kind": "process", "process": json.dumps(later)})
+        self.assertEqual(self.hub.process_rows()[0]["state"], "proposed")  # written after the retire: a new version
+
+    def test_a_retire_leaves_every_machine_with_the_same_note(self):
+        # A version written after the retire stayed proposed where the retire arrived first, and was retired where
+        # the version was already stored. Guides are written from that state, so one machine kept the note live.
+        now = time.time()
+        propose = {"id": "B10", "ts": now + 10, "from": "claude-beta", "to": "all", "text": "Proposed again",
+                   "kind": "process", "process": json.dumps(dict(crewchat.clean_note(self.NOTE), op="propose", version=2))}
+        approve = {"id": "B11", "ts": now + 11, "from": crewchat.OWNER, "to": "all", "text": "Approved",
+                   "kind": "process", "process": json.dumps({"op": "approve", "name": "release-build", "of": "B10"})}
+        retire = {"id": "B9", "ts": now + 5, "from": crewchat.OWNER, "to": "all", "text": "Retired",
+                  "kind": "process", "process": json.dumps({"op": "retire", "name": "release-build"})}
+
+        def replay(messages):
+            with self.hub.lock:
+                self.hub.processes.clear()
+                for msg in messages:
+                    self.hub._process_effect(msg)
+            return self.hub.process_rows()[0]["state"]
+
+        self.assertEqual(replay([retire, propose, approve]), "approved")
+        self.assertEqual(replay([propose, approve, retire]), "approved")
+
+    def test_a_commit_that_is_not_a_commit_id_is_not_passed_to_git(self):
+        self.assertEqual(crewchat.note_from({"name": "release-build", "commit": "--ext-diff"})["commit"], "")
+        with mock.patch.object(crewchat.subprocess, "run") as run:
+            self.assertIsNone(crewchat.git_churn(self.folder, "--ext-diff", ["tools/build.py"]))
+            run.assert_not_called()
+
 
     def test_an_approval_that_comes_before_its_note_still_counts(self):
         # Release review: an approve (or report) from a linked machine that arrived before the version it names was
@@ -8023,6 +8184,27 @@ class ProjectCommands(Base):
         with self.assertRaises(crewchat.HubError):
             self.hub.process_command("no-such")
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": lead, "role": "none"})
+
+    def test_a_parameter_inside_quotes_cannot_become_its_own_command(self):
+        # The owner may write echo '{TARGET}'. Quoting the value and leaving those quotes closes them early,
+        # and the rest of the value runs as its own command.
+        folder = Path(tempfile.mkdtemp(prefix="quote-", dir=TMP))
+        marker = folder / "pwned"
+        value = "'; touch %s; echo '" % marker
+        line = crewchat.command_line("echo '{TARGET}'", {"TARGET": value})
+        subprocess.run(line, shell=True, cwd=str(folder), check=True, stdout=subprocess.DEVNULL)
+        self.assertFalse(marker.exists())
+        self.assertEqual(crewchat.command_line("echo packed {TARGET}", {"TARGET": "it's here"}),
+                         "echo packed " + shlex.quote("it's here"))
+        # The quotes may hold more than the parameter. Quoting the value again closes them early.
+        for template, value in (
+                ("echo 'build {TARGET}'", "x; touch %s; echo y" % marker),
+                ('echo "build {TARGET}"', 'x"; touch %s; echo "' % marker),
+                ('echo "build {TARGET}"', "$(touch %s)" % marker)):
+            marker.unlink(missing_ok=True)
+            line = crewchat.command_line(template, {"TARGET": value})
+            subprocess.run(line, shell=True, cwd=str(folder), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.assertFalse(marker.exists(), line)
 
 
 class LearningAnalytics(Base):

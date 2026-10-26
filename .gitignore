@@ -2,6 +2,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 build/
+# tools/build/onefile.py joins the source modules; the rule above would hide it
+!tools/build/
+!tools/build/onefile.py
 dist/
 .venv/
 venv/

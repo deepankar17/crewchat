@@ -42,6 +42,13 @@ def eventually(check, timeout=10.0, what="condition"):
     raise AssertionError("timed out waiting for " + what)
 
 
+def heard_the_mark(sync):
+    """Every linked machine has said it keeps `for`. An empty older list no longer means that: a machine never heard
+    from is not older."""
+    ids = sync.linked_ids()
+    return bool(ids) and all("for" in (sync.info_of(i).get("marks") or []) for i in ids)
+
+
 class Machine:
     count = 0
 
@@ -333,7 +340,7 @@ class Linked(unittest.TestCase):
         self.b.hub.set_role(crewchat.OWNER, advisor, "advisor")
         try:
             eventually(lambda: advisor in self.a.hub._advisors(), what="alpha to know beta's advisor")
-            eventually(lambda: not self.a.sync.older_machines(), what="alpha to hear the others keep the mark")
+            eventually(lambda: heard_the_mark(self.a.sync), what="alpha to hear the others keep the mark")
             with self.a.hub.lock:
                 self.a.hub.agents[asker]["conversation"] = {"tool": "claude", "place": path.resolve()}
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(config)}):
@@ -354,7 +361,7 @@ class Linked(unittest.TestCase):
         # Review of the owner's decisions: a 1.1 machine answers its first pulls before it knows its own info; that
         # "nothing yet" made the others forget what it said, as if it ran a crewchat before 1.1.
         self.tell_marks(*self.machines)
-        eventually(lambda: not self.a.sync.older_machines(), what="alpha to hear the others keep the mark")
+        eventually(lambda: heard_the_mark(self.a.sync), what="alpha to hear the others keep the mark")
         self.b.sync.info_source = None  # beta restarted: its info is not known yet
         msg = self.b.say("all", "back, but still starting up")
         eventually(lambda: self.a.has(msg["text"]), what="alpha to pull from beta again")

@@ -57,7 +57,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -1950,8 +1950,9 @@ def _opencode_entries(role, when, part):
 
 def _opencode_conversation(session_id, since, budget=4 * EXCERPT_BYTES, home=None):
     """An OpenCode session as entries, oldest first: its `message` rows (newest first, back to `since` or until
-    `budget` bytes of text are in hand) and their `part` rows, from the database opened read-only. Raises
-    ConversationUnavailable when the database is missing, locked (waited for 2 s) or damaged."""
+    `budget` bytes of text are in hand, counted after each text is cut to `budget`, as the file readers do) and
+    their `part` rows, from the database opened read-only. Raises ConversationUnavailable when the database is
+    missing, locked (waited for 2 s) or damaged."""
     if not isinstance(session_id, str) or conversation_place("opencode", {"session": session_id}) != session_id:
         raise ConversationUnavailable("crewchat does not know where this conversation is")
     try:
@@ -1964,41 +1965,40 @@ def _opencode_conversation(session_id, since, budget=4 * EXCERPT_BYTES, home=Non
             raise ConversationUnavailable("OpenCode's database is not a regular file")
     except OSError:
         raise ConversationUnavailable("OpenCode's database is missing")
-    newest_first, size = [], 0
     db = None
     try:
         db = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(str(path)), uri=True, timeout=2)
         db.text_factory = lambda raw: raw.decode("utf-8", "replace")
         messages = db.execute("SELECT id, time_created, data FROM message WHERE session_id = ? "
                               "ORDER BY time_created DESC, id DESC", (session_id,))
-        for message_id, created, data in messages:
-            when = _opencode_time(created)
-            if since is not None and when is not None and when < since:
-                break
-            try:
-                role = json.loads(data).get("role")
-            except (ValueError, RecursionError, AttributeError):
-                continue
-            entries = []
-            parts = db.execute("SELECT time_created, data FROM part WHERE message_id = ? ORDER BY time_created, id",
-                               (message_id,)).fetchall()
-            for part_created, part_data in parts:
+
+        def groups():  # one message's entries, newest message first; _newest_within stops the scan at the budget
+            for message_id, created, data in messages:
+                when = _opencode_time(created)
+                if since is not None and when is not None and when < since:
+                    return
                 try:
-                    part = json.loads(part_data)
-                    entries += _opencode_entries(role, _opencode_time(part_created) or when, part) if isinstance(part, dict) else []
-                except Exception:  # a part of a shape the reader did not expect is skipped
+                    role = json.loads(data).get("role")
+                except (ValueError, RecursionError, AttributeError):
                     continue
-            if entries:
-                newest_first.append([(w, who, text[:budget]) for w, who, text in entries])
-                size += sum(len(text.encode("utf-8", "replace")) for _, _, text in entries)
-                if size > budget:
-                    break
+                entries = []
+                parts = db.execute("SELECT time_created, data FROM part WHERE message_id = ? ORDER BY time_created, id",
+                                   (message_id,)).fetchall()
+                for part_created, part_data in parts:
+                    try:
+                        part = json.loads(part_data)
+                        entries += _opencode_entries(role, _opencode_time(part_created) or when, part) if isinstance(part, dict) else []
+                    except Exception:  # a part of a shape the reader did not expect is skipped
+                        continue
+                if entries:
+                    yield entries
+
+        return _newest_within(groups(), budget)
     except sqlite3.Error:
         raise ConversationUnavailable("OpenCode's database cannot be read (locked or damaged)")
     finally:
         if db is not None:
             db.close()
-    return [entry for entries in reversed(newest_first) for entry in entries]
 
 
 def _newest(paths):
@@ -2920,9 +2920,12 @@ def clean_note(fields):
 
 
 def note_from(data):
-    """A note's fields from a process message, unchecked beyond their types (it was checked where it was written)."""
+    """A note's fields from a process message, unchecked beyond their types (it was checked where it was written).
+    A commit that is not a commit id is dropped: it is later passed to git, and a value starting with - would be an option."""
+    commit = str(data.get("commit") or "").strip()
     note = {"name": str(data.get("name") or ""), "scope": "shared" if data.get("scope") == "shared" else "project",
-            "when": str(data.get("when") or ""), "commit": str(data.get("commit") or "")}
+            "when": str(data.get("when") or ""),
+            "commit": commit if re.match(r"^[0-9a-f]{4,40}$", commit) else ""}
     for key in PROCESS_LISTS:
         value = data.get(key)
         note[key] = [str(v) for v in value] if isinstance(value, list) else []
@@ -5551,7 +5554,9 @@ class Hub:
     def _process_effect(self, msg):
         """A process message on the notes it keeps. Returns whether they changed. Caller holds the lock. Every
         machine gets the same notes from the same messages, whatever order they come in: versions are kept in the
-        order of their numbers (then time and id), and an approval names the version it approves."""
+        order of their numbers (then time and id), an approval names the version it approves, and an op that
+        arrives before that version is held until the version does. A retire covers a version written at or before
+        it, whether the retire or the version arrives first."""
         try:
             data = json.loads(msg["process"])
         except ValueError:
@@ -5589,14 +5594,19 @@ class Hub:
                     del rec["pending"]
                 for m in sorted(waiting, key=lambda m: (m["ts"], m["id"])):
                     self._process_effect(m)
+            retired = rec.get("retired_ts")
+            if retired is not None and float(v.get("ts") or 0) <= float(retired):
+                v["state"] = "retired"  # a retire already seen, for a version written before it
             return True
         v = next((x for x in rec["versions"] if x["id"] == str(data.get("of") or "")), None)
         if v is None and op in ("approve", "report", "stale", "decline", "ask") and str(data.get("of") or ""):
             # Its version has not come yet (linked machines' messages arrive in any order): kept until it does.
+            # Saved, so a restart still applies it. The folders change only when a version goes live.
             if not any(m["id"] == msg["id"] for m in rec.get("pending", [])):
                 rec.setdefault("pending", []).append({"id": msg["id"], "ts": msg["ts"], "from": msg["from"],
                                                       "process": msg["process"], "of": str(data["of"])})
                 del rec["pending"][:-MAX_PENDING_PROCESS]
+                return True
             return False
         if op == "approve" and v is not None and v["state"] == "proposed":
             v["state"], v["approved_by"], v["approved_at"] = "approved", msg["from"], msg["ts"]
@@ -5623,8 +5633,10 @@ class Hub:
         elif op == "ask" and v is not None and v["state"] == "proposed":
             v["asked"] = {"by": msg["from"], "reason": str(data.get("reason") or "")[:300]}
         elif op == "retire":
-            for x in rec["versions"]:
-                x["state"] = "retired"
+            rec["retired_ts"] = max(float(rec.get("retired_ts") or 0), float(msg.get("ts") or 0))
+            for x in rec["versions"]:  # a version written after it stays, as when the retire arrived first
+                if float(x.get("ts") or 0) <= float(rec["retired_ts"]):
+                    x["state"] = "retired"
         elif op == "mark":
             rec["owner_only"] = bool(data.get("owner_only"))
         else:
@@ -9778,23 +9790,76 @@ TOOL_HINTS = {"claude": "Needs Claude Code: https://claude.com/claude-code",
               "opencode": "Needs OpenCode: curl -fsSL https://opencode.ai/install | bash"}
 
 
+def _file_stamp(path):
+    """(mtime in ns, inode, size) of a file, or None if it is not there. A cached read stays true while this
+    is unchanged: a rewrite moves the mtime or the size, and a file put in its place has a new inode."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_ino, st.st_size)
+
+
+def _cached_read(cache, key, path, read):
+    """read(path), kept under key until path's stamp changes. The stamp is taken again after the read, so a
+    change during it is not cached. An unchanged file is not opened again."""
+    stamp = _file_stamp(path)
+    found = cache.get(key)
+    if found is not None and found[0] == stamp:
+        return found[1]
+    result = read(path)
+    if _file_stamp(path) == stamp:
+        cache[key] = (stamp, result)
+    return result
+
+
 ACCOUNT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 CLAUDE_ACCOUNT_SIGNS = (".claude.json", ".credentials.json")  # in a Claude Code settings folder that was signed in
+_CLAUDE_ACCOUNT_CACHE = {}  # home path -> (stamp, accounts found on disk, .claude-* names that stamp covers)
+
+
+def _account_stamp(home, names):
+    """Stamp of the home directory and of each .claude-* folder already seen, including its sign-in files
+    (None where a file is not there yet). A new folder changes home; a sign-in file appearing changes its own."""
+    rows = []
+    for name in names:
+        folder = Path(home) / name
+        signs = tuple(_file_stamp(folder / sign) for sign in CLAUDE_ACCOUNT_SIGNS)
+        rows.append((name, _file_stamp(folder), signs))
+    return (_file_stamp(home), tuple(rows))
+
+
+def _claude_accounts_found(home):
+    """The default account and each ~/.claude-<name> that holds a sign-in. Listed again only when that stamp
+    changes, so a new account directory is seen on the next call and an unchanged home is not listed again."""
+    home = Path(home)
+    key = str(home)
+    cached = _CLAUDE_ACCOUNT_CACHE.get(key)
+    if cached is not None and _account_stamp(home, cached[2]) == cached[0]:
+        return cached[1]
+    try:
+        entries = sorted(home.iterdir())
+    except OSError:
+        entries = []
+    found = [{"id": "", "label": "default", "dir": ""}]
+    watched = []
+    for path in entries:
+        if not path.name.startswith(".claude-"):
+            continue
+        watched.append(path.name)
+        aid = path.name[len(".claude-"):].lower()
+        if ACCOUNT_RE.fullmatch(aid) and path.is_dir() and any((path / f).exists() for f in CLAUDE_ACCOUNT_SIGNS):
+            found.append({"id": aid, "label": aid, "dir": str(path)})
+    _CLAUDE_ACCOUNT_CACHE[key] = (_account_stamp(home, watched), found, tuple(watched))
+    return found
 
 
 def claude_accounts(config, home=None):
     """This machine's Claude Code accounts (1.1): the default one, each settings folder in the user's home named like
     .claude-personal that holds a sign-in (found), and the ones the owner added (`crewchat accounts add`, config.json's
-    claude_accounts), which win over a found one of the same name. [{id, label, dir}]; the default's id and dir are ""."""
-    out = [{"id": "", "label": "default", "dir": ""}]
-    try:
-        entries = sorted((home or user_home()).iterdir())
-    except OSError:
-        entries = []
-    for path in entries:
-        aid = path.name[len(".claude-"):].lower() if path.name.startswith(".claude-") else ""
-        if ACCOUNT_RE.fullmatch(aid) and path.is_dir() and any((path / f).exists() for f in CLAUDE_ACCOUNT_SIGNS):
-            out.append({"id": aid, "label": aid, "dir": str(path)})
+    claude_accounts), which win over a found one of the same name. [{id, label, dir}]; the default's id and dir are "".
+    The folders found on disk are cached by their stamp; the ones in config are applied on every call."""
+    out = [dict(account) for account in _claude_accounts_found(home or user_home())]
     for aid, folder in sorted((config.get("claude_accounts") or {}).items()):
         aid = str(aid).lower()
         if ACCOUNT_RE.fullmatch(aid) and isinstance(folder, str) and folder:
@@ -10543,6 +10608,33 @@ def _version_marks(info):
             "marks": [m[:20] for m in marks[:20] if isinstance(m, str)] if isinstance(marks, list) else []}
 
 
+def _read_machines(path):
+    """(records, damaged) from MACHINES_FILE. A missing file is ({}, False): nothing has been written, so no
+    machine has been heard from. Unreadable, not a JSON object, or an entry that is not {version, marks: [str]}
+    is damaged, ({}, True), and none of it is trusted. {"version": "", "marks": []} is sound: keep_info(id, None)
+    writes one, and a missing key does not."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, False
+    except OSError:
+        return {}, True
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}, True
+    if not isinstance(data, dict):
+        return {}, True
+    records = {}
+    for key, value in data.items():
+        marks = value.get("marks") if isinstance(value, dict) else None
+        if (not isinstance(value, dict) or not isinstance(marks, list)
+                or any(not isinstance(mark, str) for mark in marks)):
+            return {}, True
+        records[str(key)] = _version_marks(value)
+    return records, False
+
+
 INFO_EVERY = 60  # seconds this machine's info (ProjectLink.my_info) is kept before it is made again
 
 
@@ -10563,6 +10655,7 @@ class ProjectLink:
         self.info_source = None  # the machine's link only: () -> this machine's machine_info (share_projects sets it)
         self.info_made = None  # (info_source, when, what it made): my_info's last
         self.remembered = None  # the machine's link only: other machine's id -> its last version and marks (on disk)
+        self._machines_damaged_flag = False  # the machines file was there but could not be trusted
         self.remembered_lock = threading.Lock()  # each peer's puller thread reports
 
     def my_info(self):
@@ -10577,7 +10670,8 @@ class ProjectLink:
         return made[2]
 
     def keep_info(self, device_id, info):
-        """What another machine told of itself (machine_info), cleaned; none from a crewchat before 1.1."""
+        """What another machine told of itself (machine_info), cleaned; none from a crewchat before 1.1.
+        None is stored as an empty mark record. A missing record is a machine never heard from, not this."""
         if not isinstance(info, dict):
             self.infos.pop(device_id, None)
             self._remember(device_id, None)
@@ -10592,12 +10686,18 @@ class ProjectLink:
 
     def _remembered(self):
         """What each machine last said of its version and marks, kept on disk (MACHINES_FILE) so a machine switched
-        off since this server started is not taken for an unknown one (older_machines). Rebuilt as machines report."""
+        off since this server started is judged by that, not taken for one never heard from (older_machines).
+        Rebuilt as machines report. A missing file stays empty; a damaged one is untrusted."""
         with self.remembered_lock:
             if self.remembered is None:
-                self.remembered = {str(k): _version_marks(v) for k, v in
-                                   json_file(self.hub.roster.root / MACHINES_FILE).items() if isinstance(v, dict)}
+                self.remembered, self._machines_damaged_flag = _read_machines(
+                    self.hub.roster.root / MACHINES_FILE)
             return self.remembered
+
+    def _machines_damaged(self):
+        """The machines file was there but could not be trusted. A missing file is not damaged."""
+        self._remembered()
+        return self._machines_damaged_flag
 
     def _remember(self, device_id, info):
         if self.chat is not None:
@@ -10605,15 +10705,16 @@ class ProjectLink:
         known = self._remembered()
         with self.remembered_lock:
             before = known.get(device_id)
-            if info is None:
-                known.pop(device_id, None)
+            stored = {"version": "", "marks": []} if info is None else info  # empty, not deleted: it did report
+            if stored == before:  # written only when what it said changed
+                return
+            known[device_id] = stored
+            try:
+                write_json(self.hub.roster.root / MACHINES_FILE, known, private=True)
+            except OSError:
+                pass
             else:
-                known[device_id] = info
-            if info != before:  # written only when what it said changed
-                try:
-                    write_json(self.hub.roster.root / MACHINES_FILE, known, private=True)
-                except OSError:
-                    pass
+                self._machines_damaged_flag = False  # what is on disk now is these records, and they are sound
 
     def info_changed(self):
         """This machine's machine_info may have changed (a project made or removed): tell the others soon. A subclass
@@ -10634,10 +10735,27 @@ class ProjectLink:
         return []
 
     def older_machines(self):
-        """The machines linked here that have not said they keep a file's `for` mark (MARKS): a crewchat before A2,
-        or one never heard from. The machine's link knows what each said (keep_info), and remembers it across
-        restarts, so one that is off is judged by what it last said."""
-        return [d for d in self.linked_ids() if "for" not in (self.machine.info_of(d).get("marks") or [])]
+        """The machines linked here that have not said they keep a file's `for` mark (MARKS). One that is off is
+        judged by what it last said (keep_info, remembered across restarts). One never heard from (no record, and
+        the machines file is missing or sound) is not listed, so it does not turn the advisor excerpt off.
+        keep_info(id, None) stores an empty mark record: an older crewchat, which says nothing, and that machine
+        is listed. A damaged machines file is not trusted: every linked machine is listed, unless it has reported
+        the mark since this server started."""
+        link = self.machine
+        if link._machines_damaged():
+            return [d for d in self.linked_ids() if "for" not in ((link.infos.get(d) or {}).get("marks") or [])]
+        remembered = link._remembered()
+        older = []
+        for device_id in self.linked_ids():
+            if device_id in link.infos:
+                marks = link.infos[device_id].get("marks") or []
+            elif device_id in remembered:
+                marks = remembered[device_id].get("marks") or []
+            else:
+                continue
+            if "for" not in marks:
+                older.append(device_id)
+        return older
 
     def machines_status(self):
         """The other machines, for the Machines panel (M1): [{id, name, tag, state, seen, version, os, projects,
@@ -11233,7 +11351,13 @@ GIT_SAFE = ["-c", "core.fsmonitor=false"]
 
 def git_churn(folder, commit, paths):
     """(lines changed in these paths since commit, lines they have now) in a folder's repository, (0, 0) when none
-    changed, or None when it cannot say (not git, an unknown commit)."""
+    changed, or None when it cannot say (not git, an unknown commit). commit is a commit id only: it is placed where
+    git reads an option."""
+    if not re.match(r"^[0-9a-f]{4,40}$", str(commit or "")):
+        return None
+    paths = [p for p in paths if isinstance(p, str) and p and not p.startswith("-") and "\0" not in p]
+    if not paths:
+        return None
     try:
         diff = subprocess.run(["git"] + GIT_SAFE + ["-C", str(folder), "diff", "--numstat", commit, "HEAD", "--"] + paths,
                               capture_output=True, text=True, timeout=10, **HIDDEN)
@@ -11808,7 +11932,8 @@ def bridge_here(folder, client, tool):
     """Whether a browser tool call may be crewchat's bridge, so its before-hook checks it (B2). A tool named with its
     server (mcp__claude-in-chrome__..., mcp__browser__...) is. Gemini CLI, Qwen Code and Cursor name an MCP server's
     tools bare (browser_click), as a Playwright server of the user's own does: there it is the bridge only where this
-    tool runs the bridge in this folder; elsewhere it is the user's own browser, not the owner's Chrome."""
+    tool runs the bridge in this folder (bridge_set_up, reread when that settings file changes); elsewhere it is the
+    user's own browser, not the owner's Chrome."""
     if tool.startswith("mcp__"):
         return True
     if client != "codex" and client not in BRIDGE_FILES:
@@ -11816,19 +11941,34 @@ def bridge_here(folder, client, tool):
     return bridge_set_up(folder, client)
 
 
+_BRIDGE_CACHE = {}  # (client, settings path) -> (file stamp, whether crewchat's bridge is in it)
+
+
+def _codex_has_bridge(path):
+    try:
+        block = CODEX_BLOCK.search(path.read_text(encoding="utf-8"))
+    except OSError:
+        return False
+    return bool(block) and CODEX_BRIDGE in block.group(0)
+
+
 def bridge_set_up(folder, client):
-    """Is crewchat's bridge, with its token, in this tool's settings for this folder (Codex: for every folder)?"""
+    """Is crewchat's bridge, with its token, in this tool's settings for this folder (Codex: for every folder)?
+    Kept until that file's mtime, inode or size changes, so a settings change is seen on the next call and an
+    unchanged file is not opened again. A stale answer would skip the browser gate."""
     if client == "codex":
-        try:
-            block = CODEX_BLOCK.search(codex_config().read_text(encoding="utf-8"))
-        except OSError:
-            return False
-        return bool(block) and CODEX_BRIDGE in block.group(0)
+        path = codex_config()
+        return _cached_read(_BRIDGE_CACHE, ("codex", str(path)), path, _codex_has_bridge)
     if client not in BRIDGE_FILES or folder is None:
         return False
     rel, servers = BRIDGE_FILES[client]
-    table = json_file(Path(folder) / rel).get(servers)
-    return any(is_bridge(client, entry) for entry in (table.values() if isinstance(table, dict) else ()))
+    path = Path(folder) / rel
+
+    def read(settings_path):
+        table = json_file(settings_path).get(servers)
+        return any(is_bridge(client, entry) for entry in (table.values() if isinstance(table, dict) else ()))
+
+    return _cached_read(_BRIDGE_CACHE, (client, str(path)), path, read)
 
 
 def bridge_refusal(client, data, folder):
@@ -14733,15 +14873,54 @@ CMD_SPECIAL = re.compile(r'[&|<>^%!"()\r\n]')  # what cmd.exe acts on even in li
 
 
 def command_line(line, values):
-    """A project command's line with its parameters put in, each quoted for the shell it runs in (L6). On Windows a
-    value with a character cmd.exe acts on (& | < > ^ % ! " ( )) is refused: no quoting keeps it a value there."""
+    """A project command's line with its parameters put in, each quoted for the shell it runs in (L6). A value put
+    inside quotes the owner already wrote is escaped for those quotes, not wrapped in a second pair: that second pair
+    would close the first and the rest of the value would run as its own command. Outside quotes, the value is quoted
+    whole. On Windows a value with a character cmd.exe acts on (& | < > ^ % ! " ( )) is refused: no quoting keeps it
+    a value there."""
     if os.name == "nt":
         bad = next((k for k, v in values.items() if CMD_SPECIAL.search(str(v))), None)
         if bad:
             raise HubError("%s may not hold & | < > ^ %% ! \" ( ) on Windows: cmd.exe would run what follows" % bad)
-    quote = (lambda v: subprocess.list2cmdline([v])) if os.name == "nt" else shlex.quote
-    return re.sub(r"\{([A-Z][A-Z0-9_]{0,31})\}", lambda m: quote(values[m.group(1)]) if m.group(1) in values
-                  else m.group(0), line)
+    param = re.compile(r"\{([A-Z][A-Z0-9_]{0,31})\}")
+
+    def shell_quote(value):
+        return subprocess.list2cmdline([value]) if os.name == "nt" else shlex.quote(value)
+
+    def in_single(value):  # the quotes stay; a ' in the value ends and reopens them
+        return str(value).replace("'", "'\\''")
+
+    def in_double(value):  # $ ` " \ would otherwise be read by the shell inside the owner's quotes
+        return re.sub(r'(["\\$`])', r"\\\1", str(value))
+
+    out, quote, i = [], None, 0
+    while i < len(line):
+        ch = line[i]
+        if quote == '"' and ch == "\\" and i + 1 < len(line):  # the owner's own escape, kept as written
+            out.append(line[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"" and (quote is None or ch == quote):
+            quote = None if quote == ch else ch
+            out.append(ch)
+            i += 1
+            continue
+        found = param.match(line, i)
+        if found:
+            key = found.group(1)
+            if key not in values:
+                out.append(found.group(0))
+            elif quote == "'":
+                out.append(in_single(values[key]))
+            elif quote == '"':
+                out.append(values[key] if os.name == "nt" else in_double(values[key]))
+            else:
+                out.append(shell_quote(str(values[key])))
+            i = found.end()
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 RUN_TAIL = 15  # lines of a failed step's output `crewchat run` prints

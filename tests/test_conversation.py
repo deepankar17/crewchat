@@ -460,6 +460,16 @@ class OpenCode(Home):
         self.assertEqual(cut[-1], (at("10:03"), "result", "no such fi"))
         self.assertLess(len(cut), len(self.WANT))
 
+    def test_the_budget_counts_the_text_after_it_is_cut(self):
+        # The file readers count a message after cutting it to the budget, so one long line does not crowd out
+        # the older lines. OpenCode used to count the whole line and drop them.
+        db = self.make()
+        self.add(db, "msg_old", "user", "10:01", [{"type": "text", "text": "keep me"}])
+        self.add(db, "msg_new", "assistant", "10:02", [{"type": "text", "text": "x" * 100}])
+        db.close()
+        self.assertEqual(self.read("opencode", self.SES, budget=10),
+                         [(at("10:01"), "user", "keep me"), (at("10:02"), "agent", "x" * 10)])
+
     def test_the_database_named_by_the_variable_and_a_path_with_odd_characters(self):
         odd = self.home / "my data #1?" / "oc.db"
         db = self.make(odd)
