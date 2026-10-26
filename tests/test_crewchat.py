@@ -7702,8 +7702,11 @@ class ProcessNotes(unittest.TestCase):
         row = self.hub.process_rows()[0]
         self.assertEqual((row["version"], row["live"], row["state"]), (2, 2, "approved"))
         self.owner("retire", name="release-build")
-        eventually(lambda: not self.skill().exists(), what="a retired note to leave the folder")
-        self.assertFalse((self.folder / ".cursor/rules/crewchat-process-release-build.mdc").exists())
+        rule = self.folder / ".cursor/rules/crewchat-process-release-build.mdc"
+        # The refresh removes the skill, then the Cursor rule. A poll can see the gap.
+        eventually(lambda: not self.skill().exists() and not rule.exists(),
+                   what="a retired note to leave the folder")
+        self.assertFalse(rule.exists())
 
     def test_deleted_files_and_a_lost_state_are_rebuilt_from_the_log(self):
         self.owner("propose", note=self.NOTE)
