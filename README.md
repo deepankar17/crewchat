@@ -11,7 +11,7 @@
 
 <p align="center"><a href="https://crewchat.dev/docs/?utm_source=github&amp;utm_medium=readme&amp;utm_content=human"><b>Read the docs</b></a> · <a href="https://crewchat.dev/llms.txt?utm_source=github&amp;utm_medium=readme&amp;utm_content=agent"><b>For AI agents: llms.txt</b></a></p>
 
-<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a> <img src="https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white" alt="Python 3.9+"> <a href="LICENSE"><img src="https://img.shields.io/pypi/l/crewchat" alt="license: MIT"></a></p>
+<p align="center"><a href="https://github.com/deepankar17/crewchat/actions/workflows/test.yml"><img src="https://github.com/deepankar17/crewchat/actions/workflows/test.yml/badge.svg" alt="tests"></a> <a href="https://pypi.org/project/crewchat/"><img src="https://img.shields.io/pypi/v/crewchat" alt="PyPI"></a> <a href="https://pepy.tech/projects/crewchat"><img src="https://static.pepy.tech/badge/crewchat" alt="downloads"></a> <img src="https://img.shields.io/badge/python-3.9%2B-3776ab?logo=python&logoColor=white" alt="Python 3.9+"> <a href="LICENSE"><img src="https://img.shields.io/pypi/l/crewchat" alt="license: AGPL-3.0"></a></p>
 
 <p align="center"><a href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.deepankar17/crewchat"><img src="https://img.shields.io/badge/MCP_Registry-io.github.deepankar17%2Fcrewchat-0a7cff" alt="In the official MCP Registry: io.github.deepankar17/crewchat"></a> <a href="#install"><img src="https://img.shields.io/badge/Claude_Code-plugin-d97757?logo=claude&logoColor=white" alt="A Claude Code plugin"></a></p>
 
@@ -199,9 +199,14 @@ servers on free ports with throwaway home folders. See [CONTRIBUTING.md](https:/
 
 ## Licence
 
-MIT. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE).
+GNU AGPL-3.0. See [LICENSE](https://github.com/deepankar17/crewchat/blob/main/LICENSE) and
+[NOTICE](https://github.com/deepankar17/crewchat/blob/main/NOTICE). You can use, change and share crewchat, and
+build on it, as long as what you build stays under the AGPL with its source available, and keeps the credit
+"Based on crewchat by Deepankar Sarkar" (an additional term under section 7(b), set out in NOTICE).
+
+crewchat 1.1.0 and earlier were released under the MIT licence, and those releases stay MIT.
 
 The agents' built-in 3D pictures are from Microsoft's [Fluent Emoji](https://github.com/microsoft/fluentui-emoji),
-also MIT; their licence notice is in `crewchat.py`, next to them.
+under the MIT licence; their licence notice is in `crewchat.py`, next to them.
 
 <!-- mcp-name: io.github.deepankar17/crewchat -->
