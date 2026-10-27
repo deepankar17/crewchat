@@ -11,6 +11,6 @@
   "documentationUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md",
   "supportUrl": "https://github.com/deepankar17/crewchat/issues",
   "privacyPolicyUrl": "https://github.com/deepankar17/crewchat/blob/main/docs/privacy.md",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "keywords": ["multi-agent", "chat", "mcp", "coordination", "cursor", "tasks"]
 }
