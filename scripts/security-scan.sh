@@ -105,7 +105,16 @@ secrets() {
 
 dependencies() {
   echo "== security: dependencies (osv-scanner)"
-  "$TOOLS/bin/osv-scanner" scan source --recursive --config osv-scanner.toml .
+  local out rc
+  out=$("$TOOLS/bin/osv-scanner" scan source --recursive --config osv-scanner.toml . 2>&1)
+  rc=$?
+  printf '%s\n' "$out"
+  # A tree with no lockfile (the public repository) has nothing to check; osv-scanner says so and exits non-zero.
+  if [ $rc -ne 0 ] && grep -q "No package sources found" <<<"$out"; then
+    echo "   no lockfiles: nothing to check"
+    return 0
+  fi
+  return $rc
 }
 
 code() {

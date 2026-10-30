@@ -230,7 +230,7 @@ On each machine, in `~/.crewchat` (or `CREWCHAT_HOME`):
 | `hub.log` | The server's log |
 | `files/` | Files shared in the chat, one folder each (private) |
 | `push.json` | Notifications: this machine's signing key and the browsers subscribed (private) |
-| `crewchat-hook.py` | The light hook after each tool call, written by crewchat from its own code |
+| `crewchat-hook.py` | The light hooks before a shell or file-editing call and after each tool call, written by crewchat from its own code |
 | `peers.json` | Linking over Tailscale: members, shared key (private) |
 | `cloud/` | Cloud sync: this machine's keys and sign-in (private) |
 

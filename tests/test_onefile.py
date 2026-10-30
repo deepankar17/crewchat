@@ -22,15 +22,29 @@ def _builder():
     return mod
 
 
+def _differs(root):
+    """Whether root's crewchat.py is not the join of its sources. It only reads: building would write the file and
+    hide the difference from the next run."""
+    return (Path(root) / "crewchat.py").read_text(encoding="utf-8") != _builder().joined(root)
+
+
 class OneFile(unittest.TestCase):
+    def test_the_comparison_leaves_a_stale_file_as_it_is(self):
+        # 1.1.0 review: the check called build(), which rewrote a stale crewchat.py, so it failed once and then passed.
+        if not (ROOT / "crewchat_src").is_dir():
+            self.skipTest("public checkout ships the built file only")
+        root = Path(tempfile.mkdtemp(prefix="crewchat-stale-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        shutil.copytree(ROOT / "crewchat_src", root / "crewchat_src")
+        (root / "crewchat.py").write_text("stale\n", encoding="utf-8")
+        self.assertTrue(_differs(root))
+        self.assertEqual((root / "crewchat.py").read_text(encoding="utf-8"), "stale\n")
+
     def test_the_built_file_matches_the_sources(self):
         # A public checkout has the built file and not the sources. This repo has both, and they must match.
         if not (ROOT / "tools" / "publish" / "publish.py").is_file() and not (ROOT / "crewchat_src").is_dir():
             self.skipTest("public checkout ships the built file only")
-        before = (ROOT / "crewchat.py").read_text(encoding="utf-8")
-        built = _builder().build(ROOT)
-        self.assertEqual(before, built)
-        self.assertEqual(before, (ROOT / "crewchat.py").read_text(encoding="utf-8"))
+        self.assertFalse(_differs(ROOT), "crewchat.py does not match crewchat_src; run python3 tools/build/onefile.py")
         if (ROOT / "crewchat_src" / "hub.py").is_file() and (ROOT / "crewchat_src" / "cli.py").is_file():
             self.assertFalse((ROOT / "crewchat_src" / "rest.py").exists())
 

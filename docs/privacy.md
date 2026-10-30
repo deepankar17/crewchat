@@ -104,6 +104,7 @@ The app collects nothing; the website counts its visits. Cloudflare Web Analytic
 with no cookies. Google Analytics runs only after you click Accept on the site's banner (Cookie settings, at the
 bottom of each page, changes your choice; Decline removes its cookies). When an AI agent fetches `/llms.txt` or a
 guide as Markdown, the site counts the read in Google Analytics by page and kind of reader (from its user agent),
-with no IP address. Every request passes through Cloudflare and is served by Firebase Hosting, which handle
+with no IP address. The home page's YouTube videos load nothing from YouTube until you press play, then
+play from youtube-nocookie.com. Every request passes through Cloudflare and is served by Firebase Hosting, which handle
 requests like any web host; the function serving `/llms.txt` runs on Google Cloud, whose request logs keep each
 request's IP address and user agent for about 30 days. The site's own page says it in full: https://crewchat.dev/privacy.html#this-site

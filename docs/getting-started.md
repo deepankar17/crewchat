@@ -171,11 +171,12 @@ its user next types), its task and last message, the tokens it used today and in
 would cost at API prices (an estimate; Claude Code agents only, `crewchat usage` for the whole crew),
 its role and listening setting, and **Message**, **Stop** or **Reopen**, and **Remove**. Click its
 picture to change it. Its name is a field: click it, type, Enter. ✕ or Esc closes it. The side
-panel on the right is for the project: its rules, skills and machines, its roles (**⋯**), its
-tasks, and **Commands**.
+panel on the right is for the project: **Project settings** (rules, skills, process notes, folders, machines), its
+**Roles**, **Machines**, **Browser** and **Commands** (all in **⋯**),
+and its tasks. **Chat**, **Tasks** and **Analytics**, at the top of the rail, switch the middle of the page.
 
 **Open folder**, next to the agent's folder in its settings and next to each of the project's
-folders in the side panel (**⋯**, Rules, skills and machines), opens that folder in Finder, File
+folders in the side panel (**⋯**, Project settings), opens that folder in Finder, File
 Explorer or your Linux file manager, on the machine that hosts the page (not the phone or laptop
 you are browsing from). Only the project's connected folders on that machine can be opened, and
 only by you; an agent on another machine has no button. On macOS a folder named as a package
@@ -246,12 +247,13 @@ With a lead, the lead takes your tasks and hands out the work instead: see
 ## Needs you
 
 When something waits on you, it shows at the top of the list of agents, under **Needs you**, and
-the project's tab turns red (on any project, so you see it from the others too):
+the project's tab turns red (on any project, so you see it from the others too). On a phone, a red
+count in the bar at the top opens the list:
 
 - a **permission prompt** of a Claude Code agent, with what it wants to run or change, and
   **Allow** and **Deny** ([below](#permission-prompts));
 - a task an agent marked **blocked**, with its question;
-- a task **ready for review**;
+- a task **in review**;
 - a **message to you** you have not seen yet (it counts as seen while the page is in front);
 - a task **given back** or **reclaimed** that nobody has taken again.
 
@@ -401,15 +403,16 @@ nobody else is in its files, and it suits its machine), says it started, works, 
 they find (a bug, a follow-up) they add to the sheet. With a lead, the lead hands tasks out.
 
 On the chat page, **Tasks** (above the list of agents) shows it in place of the conversation, as a
-board: **To do**, **Doing**, **Blocked**, **Review** and **Done**. Each card has its number, title,
-the agent that holds it, what it waits for, its files and its machine; click one to open it in the
+board: **To do**, **In progress**, **Blocked**, **In review** and **Done**. Each card has its number, title,
+the agent that holds it, what it waits for, its files and its machine; a piece the lead handed out says
+which task it is part of, and that task how many pieces are still open. Click a card to open it in the
 side panel, with its history and the owner's actions.
 
-<img src="images/task-board.png" width="760" alt="The task board: To do with two tasks, Doing with two tasks and the agents that hold them, Blocked, Review and Done, with a filter by agent and by role, and a form to add a task.">
+<img src="images/task-board.png" width="760" alt="The task board: To do with two tasks, In progress with two tasks and the agents that hold them, Blocked, In review and Done, with a filter by agent and by role, and a form to add a task.">
 
 - **Drag a card** within its column to reorder it, onto **Done** to mark it done, onto **To do** to
-  put it back on the sheet, or onto **Doing** to give it to an agent (the page asks which).
-  **Blocked** and **Review** are set by the agents.
+  put it back on the sheet, or onto **In progress** to give it to an agent (the page asks which).
+  **Blocked** and **In review** are set by the agents.
 - **Filters** show one agent's, one role's or one machine's tasks. **Done** shows 20 tasks, and
   **Show more** the rest. On the board you open a card to act on it with the keyboard, or use **List**.
 - **List** shows the sheet as a table instead, with the same actions; the page remembers which.
@@ -457,7 +460,7 @@ machine: an older one does not know reclaims and keeps showing the old holder.
 
 ## Analytics
 
-**Analytics**, next to Tasks and Commands, shows the crew at a glance, live:
+**Analytics**, next to Chat and Tasks, shows the crew at a glance, live:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/analytics-dark.png">

@@ -34,6 +34,7 @@ import datetime
 import functools
 import gzip
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -57,7 +58,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -131,6 +132,9 @@ REMOTE_SEEN_SLACK = 300  # other machines publish "last seen" at most this often
 RECLAIM_MINUTES = (10, 7 * 24 * 60)  # a task's holder may be silent this long before it is reclaimed: least, most
 RECLAIM_EVERY = 60  # seconds between the server's checks for silent holders
 RECLAIM_DEFAULT = 60  # minutes, until the owner sets the project's own (or off)
+WRITE_REFUSED = " crewchat held this call back. If it is for other work, run it again in a moment."  # writes after a reclaim
+HOLD_WRITES = 15  # seconds a hook refuses writes after a reclaim: what the agent queued, not what it runs once it knows
+HOLD_UNREAD = 3600  # the same for a tool with no way into the turn: until its next write, the refusal being how it hears
 ALIVE_EVERY = 60  # an agent's tool-call hook tells the server it is alive at most this often (seconds)
 DOING_EVERY = 4  # ... and what it is doing, when that changed, at most this often (seconds)
 DOING_FRESH = 120  # seconds the page shows what an agent was doing
@@ -142,7 +146,7 @@ SESSION_NAME_NOTE = " If your app lets you name this session (the Claude app doe
 MAX_CHAIN_LIMIT = 50
 SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".config/gcloud", "Library/Keychains")
 SECRET_FILES = (".netrc", ".git-credentials", ".pgpass")  # never shared by an agent, even from a project folder
-EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed", "settled", "browser", "process")  # optional message fields, kept when messages travel between machines
+EXTRA_FIELDS = ("task", "role", "status", "depends", "areas", "where", "order", "history", "reclaim", "reclaimed", "answers", "verdict", "advisor", "suggested", "changed", "settled", "browser", "process", "re")  # optional message fields, kept when messages travel between machines
 VERDICTS = {"approve": "approved", "changes": "changes needed"}  # an advisor's verdict on a task before done
 STATUSES = {"in_progress": "in progress", "blocked": "blocked", "review": "ready for review", "done": "done",
             "todo": "given back"}
@@ -958,6 +962,18 @@ ROLE_FIELDS = ("label", "description", "picture", "colour", "tool")
 MAX_IMPORT_ROLES = 50
 NEEDS_LOOKBACK = 2000  # messages scanned for an agent's newest word on a task
 NEEDS_MESSAGES = 20  # unread messages to the owner shown in Needs you
+def reply_to(text):
+    """The task an owner's "Re #12: ..." answers, or "" (how Needs you knew a reply before the `re` field, R8)."""
+    found = re.match(r"Re #([A-Za-z]*\d+): ", text or "")
+    return found.group(1) if found else ""
+
+
+# Every kind of item in Needs you (R8), the one list of them: its place in the list, how the page and a push name
+# it, its colour on the page, and how the owner answers it (buttons, a reply, or opening what it points at).
+NEED_KINDS = {"permission": (-1, "Asks permission", "--err", "buttons"), "browser": (-1, "Browser", "--err", "buttons"),
+              "blocked": (0, "Needs you", "--err", "reply"), "review": (1, "In review", "--warn", "reply"),
+              "process": (2, "Process note", "--accent", "buttons"), "message": (2, "Message", "--accent", "open"),
+              "reclaimed": (3, "Reclaimed", "--off", "open"), "given_back": (3, "Given back", "--off", "open")}
 MAX_PROJECT_NAME = 60
 ROLES_LOCK = threading.Lock()  # one change to a config.json's roles at a time
 
@@ -1598,6 +1614,74 @@ def transcript_usage(path, offset=0, last_id=""):
 def usage_tokens(by_model):
     """All the tokens in {model: counts}."""
     return sum(sum(counts) for counts in by_model.values())
+
+
+# Asks that wait on the owner (R8) -------------------------------------------------------------
+# A permission prompt, or a browser call (B2), waits in Needs you for the owner's answer while the hook that asked
+# keeps its HTTP request open. Kept in memory only: after a restart there is no one left waiting for the answer, and
+# the hook falls back (Claude Code's own prompt; the browser gate refuses). Each machine shows its own agents' asks.
+class Asks:
+    def __init__(self, lock, changed):
+        self.lock = lock  # the Hub's Condition: every method but answer() is called with it held
+        self.changed = changed
+        self._asks = {}  # id -> {id, kind, agent, text, ts, answer, ...the kind's own fields}
+
+    def wait(self, kind, agent, text, deadline, same=None, **fields):
+        """Ask the owner, and wait until the answer or the deadline (a time.time()). Calls made at once that ask the
+        same thing (an equal `same`, not None, from the same agent) wait on one ask: the owner answers once. Returns
+        the answer, or "" when time ran out or the ask was dropped."""
+        if deadline <= time.time():
+            return ""
+        ask = next((a for a in self._asks.values() if same is not None and not a["answer"] and
+                    (a["kind"], a["agent"], a.get("_same")) == (kind, agent, same)), None)
+        mine = ask is None
+        if mine:
+            ask = dict(fields, id=secrets.token_hex(6), kind=kind, agent=agent, text=text, ts=time.time(), answer="",
+                       _same=same)
+            self._asks[ask["id"]] = ask
+            self.changed()
+        try:
+            self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self._asks,
+                               timeout=max(0, deadline - time.time()))
+        finally:
+            if mine and self._asks.pop(ask["id"], None) is not None:
+                self.changed()
+        return ask["answer"]
+
+    def answer(self, ask_id, answer, allowed, wrong, gone):
+        """The owner's answer: one of `allowed` (else HubError `wrong`), to an ask still waiting (else HubError
+        `gone`)."""
+        if answer not in allowed:
+            raise HubError(wrong)
+        with self.lock:
+            ask = self._asks.get(ask_id) if isinstance(ask_id, str) else None
+            if ask is None or ask["answer"]:
+                raise HubError(gone)
+            ask["answer"] = answer
+            self.lock.notify_all()
+            self.changed()
+        return {"agent": ask["agent"], "answer": answer}
+
+    def drop(self, agent):
+        """The agent's turn began or ended: what it asked was answered elsewhere, and its waits end with ""."""
+        dropped = [i for i, a in self._asks.items() if a["agent"] == agent and not a["answer"]]
+        for ask_id in dropped:
+            del self._asks[ask_id]
+        if dropped:
+            self.lock.notify_all()
+        return bool(dropped)
+
+    def waiting(self, kind=None):
+        """Copies of the asks not yet answered (of `kind`), oldest first."""
+        return [self._public(a) for a in self._asks.values() if not a["answer"] and kind in (None, a["kind"])]
+
+    def get(self, ask_id):
+        ask = self._asks.get(ask_id) if isinstance(ask_id, str) else None
+        return self._public(ask) if ask else None
+
+    @staticmethod
+    def _public(ask):
+        return {k: v for k, v in ask.items() if k != "_same"}
 
 
 # --- The agent's conversation, read from its tool's own files (A2) ---------------------------------------------------
@@ -2900,7 +2984,7 @@ def clean_note(fields):
     if not note["pitfalls"]:
         raise HubError("a note needs its pitfalls: what went wrong or is easy to get wrong (one line is enough)")
     commit = str(fields.get("commit") or "").strip()
-    if commit and not re.match(r"^[0-9a-f]{4,40}$", commit):
+    if commit and not re.fullmatch(r"[0-9a-fA-F]{4,64}", commit):
         raise HubError("commit is a git commit id")
     note["commit"] = commit
     command = fields.get("command")
@@ -2925,7 +3009,7 @@ def note_from(data):
     commit = str(data.get("commit") or "").strip()
     note = {"name": str(data.get("name") or ""), "scope": "shared" if data.get("scope") == "shared" else "project",
             "when": str(data.get("when") or ""),
-            "commit": commit if re.match(r"^[0-9a-f]{4,40}$", commit) else ""}
+            "commit": commit if re.fullmatch(r"[0-9a-fA-F]{4,64}", commit) else ""}
     for key in PROCESS_LISTS:
         value = data.get(key)
         note[key] = [str(v) for v in value] if isinstance(value, list) else []
@@ -3027,8 +3111,9 @@ class Hub:
         self.device = ""  # this machine's device name when cloud sync is on
         self.waiting = {}  # agent name -> its hook calls waiting for messages right now (memory only)
         self.activity = {}  # agent name -> (working|listening|idle, since) (memory only)
-        self.permissions = {}  # id -> an agent's permission prompt waiting for Allow or Deny (memory only)
-        self.browser_asks = {}  # id -> a browser call waiting for the owner (B2): a new site, or a change (memory only)
+        self.asks = Asks(self.lock, self._changed)  # permission prompts and browser calls waiting on the owner (R8)
+        self.proxies = {}  # id -> {place, client, folder, pids}: a browser proxy (R8), memory only
+        self.hook_pids = {}  # agent -> the processes above its hooks, nearest first: which proxy is whose (R8)
         self.browser_site = {}  # agent -> the site its browser was last taken to (B2), or None when it cannot be told
         self.browser_tabs = {}  # agent -> {Claude in Chrome tab id: its site, or None}: each call names its tab (B2)
         self.browser_ok = set()  # (agent, task, site): changes the owner allowed there for that task (B2)
@@ -3846,13 +3931,14 @@ class Hub:
 
         with self.lock:
             last_word = {}  # task -> its newest update from an agent
-            answered = {}  # (task, agent) -> the newest answer the owner sent it ("Re #12: ...", as Needs you sends one)
+            answered = {}  # (task, agent) -> the newest answer the owner sent it: its `re`, or "Re #12: ..." (before R8)
             for m in reversed(self.messages[-NEEDS_LOOKBACK:]):
                 if m["kind"] == "update" and m.get("task") and m["from"] not in (OWNER, SERVER_NAME) and m["task"] not in last_word:
                     last_word[m["task"]] = m
-                reply = m["from"] == OWNER and m["kind"] == "msg" and re.match(r"Re #([A-Za-z]*\d+): ", m["text"])
-                if reply:
-                    answered.setdefault((reply.group(1), m["to"]), m["seq"])
+                if m["from"] == OWNER and m["kind"] == "msg":
+                    reply = m.get("re") or reply_to(m["text"])
+                    if reply:
+                        answered.setdefault((reply, m["to"]), m["seq"])
             given = {mid for mid, p in self.progress.items() if p.get("status") == "todo" and p.get("by") not in (OWNER, SERVER_NAME)}
             unread = [m for m in self._unread(OWNER) if m["to"] == OWNER and m["kind"] in ("msg", "ask", "answer")]
         items = []
@@ -3874,13 +3960,12 @@ class Hub:
                               "text": said.get("text", "") if fits else "",
                               "ts": said.get("ts", r.get("ts", 0)), "blocking": len(blocking(r["id"]))})
         with self.lock:
-            for ask in self.permissions.values():
-                if not ask["answer"]:
-                    items.append({"kind": "permission", "id": ask["id"], "agent": ask["agent"], "tool": ask["tool"],
-                                  "text": ask["text"], "ts": ask["ts"], "blocking": 0})
-            for ask in self.browser_asks.values():
-                if not ask["answer"]:
-                    items.append(dict(ask, kind="browser", blocking=0))
+            for ask in self.asks.waiting("permission"):
+                items.append({"kind": "permission", "id": ask["id"], "agent": ask["agent"], "tool": ask["tool"],
+                              "text": ask["text"], "ts": ask["ts"], "blocking": 0,
+                              "machine": self.device or machine_name()})  # where it would run: asks stay on their machine
+            for ask in self.asks.waiting("browser"):
+                items.append(dict(ask, blocking=0))
             for rec in self.processes.values():  # notes only the owner may approve, or that the lead asks about (L1)
                 v = self._latest(rec)
                 if v is None or v["state"] != "proposed":
@@ -3898,9 +3983,17 @@ class Hub:
         for m in unread[-NEEDS_MESSAGES:]:
             items.append({"kind": "message", "id": m["id"], "seq": m["seq"], "agent": m["from"], "text": m["text"][:300],
                           "task": m.get("task", ""), "ts": m["ts"], "blocking": 0})
-        order = {"permission": -1, "browser": -1, "blocked": 0, "review": 1, "process": 2, "message": 2, "reclaimed": 3,
-                 "given_back": 3}
-        items.sort(key=lambda i: (order[i["kind"]], -i["blocking"], -i["ts"]))
+        for i in items:  # one shape (R8): the page, push and the answer route all go by "key"
+            i["ref"] = i["task"] if i["kind"] in ("blocked", "review", "reclaimed", "given_back") else i["id"]
+            i["key"] = "%s:%s" % (i["kind"], i["ref"])
+            i["answer"] = NEED_KINDS[i["kind"]][3]
+            if i["kind"] == "permission":
+                i["choices"] = ["allow", "deny"]
+            elif i["kind"] == "browser":
+                i["choices"] = ["allow_task", "deny"] if i["ask"] == "change" else ["allow_site", "allow_task", "deny"]
+            elif i["kind"] == "process":
+                i["choices"] = ["approve", "decline"]
+        items.sort(key=lambda i: (NEED_KINDS[i["kind"]][0], -i["blocking"], -i["ts"]))
         self._needs = (version, items)
         return items
 
@@ -3917,35 +4010,20 @@ class Hub:
             agent = self.agents.get(name) if name else None
             if agent is None or agent["place"] != place or self.machine_config().get("permissions") == "terminal":
                 return ""
-            ask = {"id": secrets.token_hex(6), "agent": name, "tool": clean_doing(tool)[:60] or "a tool",
-                   "text": str(text or "")[:MAX_PERMISSION_TEXT], "ts": time.time(), "answer": ""}
-            self.permissions[ask["id"]] = ask
             self.touch(name, active=True)
-            self._changed()
-            try:
-                self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self.permissions, timeout=wait)
-            finally:
-                self.permissions.pop(ask["id"], None)
-                self._changed()
-        return ask["answer"] if ask["answer"] in ("allow", "deny") else ""
+            answer = self.asks.wait("permission", name, str(text or "")[:MAX_PERMISSION_TEXT], time.time() + wait,
+                                    tool=clean_doing(tool)[:60] or "a tool")
+        return answer if answer in ("allow", "deny") else ""
 
     def answer_permission(self, pid, answer):
         """The owner's Allow or Deny for a permission prompt in Needs you."""
-        return self._answer_ask(self.permissions, pid, answer, ("allow", "deny"), "answer is allow or deny",
-                                "that permission prompt is not waiting any more")
-
-    def _answer_ask(self, asks, aid, answer, answers, wrong, gone):
-        """The owner's answer to one of `asks` in Needs you: one of `answers` (else HubError `wrong`), to an ask
-        still waiting (else HubError `gone`)."""
-        if answer not in answers:
-            raise HubError(wrong)
         with self.lock:
-            ask = asks.get(aid) if isinstance(aid, str) else None
-            if ask is None or ask["answer"]:
-                raise HubError(gone)
-            ask["answer"] = answer
-            self._changed()
-        return {"agent": ask["agent"], "answer": answer}
+            ask = self.asks.get(pid)
+            if ask and ask["kind"] != "permission":
+                ask = None
+            pid = ask["id"] if ask else None
+        return self.asks.answer(pid, answer, ("allow", "deny"), "answer is allow or deny",
+                                "that permission prompt is not waiting any more")
 
     # The browser (B1-B2) --------------------------------------------------------------------------
     def browser_sites(self):
@@ -3981,6 +4059,34 @@ class Hub:
             self._append(OWNER, "all", "", "plan", task=mid, browser="on" if on else "off")
             self._changed()
         return {"id": mid, "browser": bool(on)}
+
+    def _reclaimed_from(self, name, mid, row):
+        """Was this open task reclaimed from the agent, and does it not have it back? Caller holds the lock."""
+        return row.get("reclaimed") == name and self.taken.get(mid) != name and self._row_status(mid) not in ("done", "removed")
+
+    def _reclaimed_remind(self, name, agent):
+        """What to tell an agent back from a silence about the tasks reclaimed from it, at its first tool call after
+        each change of holder, so a write it had queued for one stops before it goes out. Caller holds the lock."""
+        told, lines = agent.get("reclaim_told") or {}, []
+        for mid, row in self.sheet.items():
+            if not self._reclaimed_from(name, mid, row):
+                told.pop(mid, None)
+                continue
+            now = self.taken.get(mid) or ""
+            if told.get(mid) == now:
+                continue
+            told[mid] = now
+            lines.append("crewchat: task #%s was reclaimed from you while you were silent; %s. Stop your work on it now: "
+                         "no commits, pushes or writes for it%s." % (
+                             mid, "%s holds it now" % now if now else "it is back on the sheet",
+                             "" if now else " until you hub_task take it again"))
+        if told:
+            agent["reclaim_told"] = told
+        else:
+            agent.pop("reclaim_told", None)
+        if lines:
+            self._save_soon()
+        return " ".join(lines)
 
     def _browser_remind(self, name, now):
         """What to remind the agent driving the browser of, when it has posted no progress note for a while (B3)."""
@@ -4029,7 +4135,7 @@ class Hub:
                     status != "todo" or self.taken.get(mid) != holder["agent"]):
                 del BROWSER["holder"]
 
-    def browser_check(self, place, key, tool, args, wait=PERMISSION_WAIT):
+    def browser_check(self, place, key, tool, args, wait=PERMISSION_WAIT, record=True):
         """A browser call an agent's before-hook asks about (B2): {"decision": "allow" | "deny", "reason"}. One agent
         drives this machine's browser at a time; a site not allowed asks the owner, whether the agent opens it or a link
         takes it there (then before any call on it, reads too); the first change on a site that is not trusted asks
@@ -4066,15 +4172,16 @@ class Hub:
             # the call is checked (so nobody else drives while the owner is asked), and given back if it is refused.
             mine = BROWSER["holder"] = dict(holder or {"since": now}, hub=id(self), agent=name, task=task, last=now,
                                             project=self.roster.project)
-        out = self._browser_gate(name, task, kind, url, tool, args, now + wait)
+        out = self._browser_gate(name, task, kind, url, tool, args, now + wait, record)
         if out["decision"] == "deny" and holder is None:
             with BROWSER_LOCK:
                 if BROWSER.get("holder") is mine:
                     del BROWSER["holder"]
         return out
 
-    def _browser_gate(self, name, task, kind, url, tool, args, deadline):
-        """browser_check's questions for one call of an agent that may drive the browser."""
+    def _browser_gate(self, name, task, kind, url, tool, args, deadline, record=True):
+        """browser_check's questions for one call of an agent that may drive the browser. record: an open sets the
+        agent's site before it runs (the hooks); the browser proxy (R8) says where the browser is after it instead."""
         allow = {"decision": "allow", "reason": ""}
         left = lambda: deadline - time.time()  # noqa: E731  (what is left of the call's wait for the owner)
         sites = self.browser_sites()
@@ -4095,6 +4202,8 @@ class Hub:
                     return denied
             else:
                 browser_log(self.roster.project, name, "open %s" % (url or "the previous page")[:200], "allowed")
+            if not record:
+                return allow
             with self.lock:
                 self.browser_site[name] = host or None
                 tab = browser_tab(tool, args)
@@ -4197,6 +4306,84 @@ class Hub:
             host = None
         self.browser_site[name] = host
 
+    # The browser proxy (R8) ----------------------------------------------------------------------------------
+    # The bridge runs behind `crewchat browser-proxy`, which asks here before each call and says after it which page
+    # the browser is on. A proxy has no session of its own: it is matched to the agent whose hooks share its nearest
+    # parent process (the agent tool started both), or else to the only agent of its tool in its folder.
+    def note_pids(self, place, key, pids):
+        """An agent's hook says which processes it runs under, nearest first."""
+        with self.lock:
+            name = self.links.get(key) if isinstance(key, str) else None
+            if name and (self.agents.get(name) or {}).get("place") == place:
+                self.hook_pids[name] = [int(p) for p in (pids or [])[:8] if isinstance(p, int) and p > 1]
+                return True
+            return False  # not linked (yet): the hook tells again
+
+    def register_proxy(self, place, client, folder, pids):
+        pid_list = [int(p) for p in (pids or [])[:8] if isinstance(p, int) and p > 1]
+        with self.lock:
+            proxy = secrets.token_hex(6)
+            self.proxies[proxy] = {"place": place, "client": str(client or "")[:20], "folder": str(folder or ""),
+                                   "pids": pid_list}
+            return proxy
+
+    def _proxy(self, proxy, place):
+        """A proxy registered here, by the same place's token (None for any place: the server's own calls)."""
+        rec = self.proxies.get(proxy) if isinstance(proxy, str) else None
+        return rec if rec is not None and place in (None, rec["place"]) else None
+
+    def proxy_agent(self, proxy, place=None):
+        """The agent in the chat a proxy serves, or None when crewchat cannot tell."""
+        with self.lock:
+            rec = self._proxy(proxy, place)
+            if rec is None:
+                return None
+            linked = set(self.links.values())
+            mine = [n for n in linked if (self.agents.get(n) or {}).get("place") == rec["place"]
+                    and (self.agents.get(n) or {}).get("client") == rec["client"]]
+            # The agent tool itself: the nearest process above the proxy, and above that agent's hooks. Only the
+            # nearest: two agents in two tabs of one terminal share every process further up (final review).
+            if rec["pids"]:
+                found = [n for n in mine if self.hook_pids.get(n, [None])[0] == rec["pids"][0]]
+                if len(found) == 1:
+                    return found[0]
+            here = [n for n in mine if ((self.agents[n].get("session") or {}).get("folder") or "") == rec["folder"]]
+            return here[0] if len(here) == 1 else None
+
+    def proxy_call(self, proxy, tool, args, wait=PERMISSION_WAIT, place=None):
+        """A call the proxy is about to make: the browser gate's answer, as for the hooks, without taking an open as
+        done before it runs."""
+        with self.lock:
+            if self._proxy(proxy, place) is None:
+                return {"decision": "deny", "reason": PROXY_GONE}
+        name = self.proxy_agent(proxy, place)
+        if name is None:
+            return {"decision": "deny", "reason": PROXY_WHO}
+        with self.lock:
+            key = next(k for k, n in self.links.items() if n == name)
+            place = self.agents[name]["place"]
+        # Everything behind the proxy is the browser: a tool by another name is checked as a browser call (a change,
+        # unless crewchat knows it as a read), never let through as "not a browser's" (final review).
+        tool = tool if browser_tool_name(tool) else "browser_" + tool
+        return self.browser_check(place, key, tool, args, wait, record=False)
+
+    def proxy_seen(self, proxy, tabs, place=None):
+        """Where the browser is after a call, as it says itself (sure, unlike tool output). Returns a note for the
+        agent when the call took it to a site not allowed, or None."""
+        name = self.proxy_agent(proxy, place)
+        if name is None:
+            return None
+        current = next((t.get("url") for t in (tabs or []) if isinstance(t, dict) and t.get("current")), "")
+        host = site_of(str(current or "")) or None
+        with self.lock:
+            self.browser_site[name] = host
+            if host:  # a page's dialog can stop the browser saying: a site denied is not forgotten for that
+                self.browser_refused = {r for r in self.browser_refused if r[0] != name or r[1] == host}
+        if host and host not in self.browser_sites() and not self.own_page(host):
+            return ("this call took the browser to %s, which is not an allowed site: your next call there asks the "
+                    "owner" % host)
+        return None
+
     def _browser_denied(self, answer, what):
         return {"decision": "deny", "reason": ("the owner denied this: do not %s" % what) if answer == "deny" else
                 ("the owner did not answer in time; ask in the chat before you %s" % what)}
@@ -4226,42 +4413,26 @@ class Hub:
                                                      " for #%s: %s" % (task, title) if task else ""))
         with self.lock:
             # Calls made at once (a screenshot and a page's text) wait on the same question: the owner answers once.
-            ask = next((a for a in self.browser_asks.values() if host and not a["answer"] and
-                        (a["agent"], a["ask"], a["host"], a["task"]) == (name, kind, host, task)), None)
-            mine = ask is None
-            if mine:
-                ask = {"id": secrets.token_hex(6), "agent": name, "ask": kind, "host": host, "task": task,
-                       "text": text, "ts": time.time(), "answer": ""}
-                self.browser_asks[ask["id"]] = ask
-                self._changed()
-            try:
-                self.lock.wait_for(lambda: ask["answer"] or ask["id"] not in self.browser_asks, timeout=wait)
-            finally:
-                if mine:
-                    self.browser_asks.pop(ask["id"], None)
-                    self._changed()
-        return ask["answer"]
+            return self.asks.wait("browser", name, text, time.time() + wait, same=(kind, host, task) if host else None,
+                                  ask=kind, host=host, task=task)
 
     def answer_browser(self, aid, answer):
         """The owner's answer to a browser ask in Needs you: allow_site (a new site), allow_task (changes there for
         this task) or deny."""
         with self.lock:
-            ask = self.browser_asks.get(aid) if isinstance(aid, str) else None
+            ask = self.asks.get(aid)
+            if ask and ask["kind"] != "browser":
+                ask = None
             if ask and ask["ask"] == "change" and answer == "allow_site":
                 raise HubError("changes are allowed for the task: answer is allow_task or deny")
-        return self._answer_ask(self.browser_asks, aid, answer, ("allow_site", "allow_task", "deny"),
+            aid = ask["id"] if ask else None
+        return self.asks.answer(aid, answer, ("allow_site", "allow_task", "deny"),
                                 "answer is allow_site, allow_task or deny", "that is not waiting any more")
 
     def _drop_permissions(self, name):
         """A turn of the agent began or ended: what it asked was answered elsewhere (in its terminal).
         Caller holds the lock."""
-        for ask in list(self.permissions.values()):
-            if ask["agent"] == name and not ask["answer"]:
-                del self.permissions[ask["id"]]
-        dropped = [a for a in self.browser_asks.values() if a["agent"] == name and not a["answer"]]
-        for ask in dropped:  # its browser call is gone with the turn: its hook waits no more (_browser_ask_owner)
-            del self.browser_asks[ask["id"]]
-        if dropped:
+        if self.asks.drop(name):  # its calls are gone with the turn: their hooks wait no more
             self._changed()
 
     # Edit events (C0) ---------------------------------------------------------------------------
@@ -4475,11 +4646,14 @@ class Hub:
             and not m.get("history")  # from before the chat was linked: on the page and the sheet, never news
         ]
 
-    def send(self, sender, to, text, kind="msg", files=None):
+    def send(self, sender, to, text, kind="msg", files=None, re=None):
+        """`re`: the task an owner's reply answers (R8), so Needs you knows it without reading the text; kept only
+        when it names a task."""
         with self.lock:
             to = self._named(to)
             self._check_recipient(to, everyone=True)
-            msg = self._append(sender, to, text, kind, files=files or None)
+            re = re if isinstance(re, str) and re in self.sheet else None
+            msg = self._append(sender, to, text, kind, files=files or None, re=re)
             self._changed()
             return msg
 
@@ -6174,27 +6348,43 @@ class Hub:
         waiting = [d for d in row["depends"] if d in self.sheet and self._row_status(d) != "done"]
         if waiting:
             return "it waits for %s" % ", ".join("#" + d for d in waiting)
-        linked = self._maps.linked if self._maps is not None else None  # the code map (C1), once built
-        for other, holder in self.taken.items():
-            if other == mid or holder == agent or other not in self.sheet:
-                continue
-            if self._row_status(other) not in ("doing", "review"):
-                continue
-            if areas_overlap(row["areas"], self.sheet[other]["areas"]):
-                return "its files overlap #%s, which %s is working on" % (other, holder)
-            if linked is not None and areas_overlap(row["areas"], self.sheet[other]["areas"], linked):
-                return "its files import, or are imported by, those of #%s, which %s is working on" % (other, holder)
+        held = self._held_back(mid, agent)
+        if held:
+            return held
         if not self._row_machine_ok(agent, row):
             return "it needs the machine %s" % row["where"]
         if row.get("browser") and not (self.agents.get(agent) or {}).get("browser"):
             return "it needs the browser, which is not on for %s (the owner turns it on)" % agent
         return ""
 
+    def _in_progress(self):
+        """The tasks being worked on now, as (id, holder, areas). Caller holds the lock."""
+        return [(mid, holder, self.sheet[mid]["areas"]) for mid, holder in self.taken.items()
+                if mid in self.sheet and self._row_status(mid) in ("doing", "review")]
+
+    def _held_back(self, mid, agent=None, working=None):
+        """Which other agent's work in progress keeps a row from being taken now, or '': its files overlap that task's,
+        or import them (the code map, C1). agent: who asks, whose own tasks hold nothing back; None for the sheet
+        itself, what the lead reads before giving the row to anyone. working: _in_progress, when already read for
+        other rows. Caller holds the lock."""
+        areas = self.sheet[mid]["areas"]
+        if not areas:
+            return ""
+        linked = self._maps.linked if self._maps is not None else None  # the code map (C1), once built
+        for other, holder, theirs in self._in_progress() if working is None else working:
+            if other == mid or holder == agent:
+                continue
+            if areas_overlap(areas, theirs):
+                return "its files overlap #%s, which %s is working on" % (other, holder)
+            if linked is not None and areas_overlap(areas, theirs, linked):
+                return "its files import, or are imported by, those of #%s, which %s is working on" % (other, holder)
+        return ""
+
     def sheet_rows(self, agent=None, view="all"):
         """The sheet, in order: dicts with id, title, status, holder, ... For view "next", only the
         rows agent may take now; "mine", the ones it holds."""
         with self.lock:
-            rows = []
+            rows, working = [], self._in_progress()
             for mid, row in sorted(self.sheet.items(), key=lambda kv: kv[1]["order"]):
                 status = self._row_status(mid)
                 if status == "removed":
@@ -6209,7 +6399,8 @@ class Hub:
                     status = "waiting"  # shown so: it cannot start before what it waits for is done
                 rows.append(dict(row, id=mid, status=status, holder=self.taken.get(mid) or "",
                                  note=(self.progress.get(mid) or {}).get("by", ""), reclaimed=row.get("reclaimed", ""),
-                                 browser=bool(row.get("browser"))))
+                                 browser=bool(row.get("browser")),
+                                 blocker=self._held_back(mid, agent, working) if status == "todo" else ""))
             return rows
 
     def add_row(self, sender, title, depends="", areas="", where="", to="all"):
@@ -6471,7 +6662,9 @@ class Hub:
         data = {"roles": roles, "statuses": STATUSES, "tools": TOOLS_INFO, "presets": PICTURE_PRESETS,
                 "art": ART_PICTURES, "pictures": {"types": PICTURE_TYPES, "max": MAX_PICTURE},
                 "models": {tool: tool_models(tool) for tool in LAUNCH_TOOLS},
-                "names": AGENT_NAMES, "images": INLINE_IMAGES, "max_upload": MAX_UPLOAD, "releases": RELEASES}
+                "names": AGENT_NAMES, "images": INLINE_IMAGES, "max_upload": MAX_UPLOAD, "releases": RELEASES,
+                "need_kinds": {kind: dict(zip(("order", "label", "colour", "answer"), look))
+                               for kind, look in NEED_KINDS.items()}}
         data["tag"] = sha(__version__ + json.dumps(data, sort_keys=True))[:12]
         self._boot = (roles, data)
         return data
@@ -6479,8 +6672,9 @@ class Hub:
     def hook(self, place, key, ack, wait_seconds, event="stop", owner_only=False, session=None, doing="", path=None,
              conversation=None, browser=None):
         """What an agent's hook asks: are there messages for the session with this link key?
-        event is "prompt" (its user typed), "stop" (it finished a turn) or "tool" (it used a tool:
-        only a sign of life, or the session report it was asked for). `conversation` is where the agent's
+        event is "prompt" (its user typed), "stop" (it finished a turn), "tool" (it used a tool:
+        only a sign of life, or the session report it was asked for) or "write" (it is about to run a shell or
+        file-editing call, after a silence: "refuse" says why it should not). `conversation` is where the agent's
         conversation is ({"tool", "path" or "session"}, from its hook): kept in memory when conversation_place
         accepts it (A2), else ignored. `browser` is a browser call's {"tool", "action", "url"} after it ran: the page
         it left the agent on (browser_seen)."""
@@ -6501,6 +6695,12 @@ class Hub:
                 return {"link": True}
             if kept:
                 agent["conversation"] = kept  # (memory only: _save leaves it out)
+            if event == "held":  # may the hold on a tool with no way into the turn stay? (write_hook)
+                return {"reclaimed": any(self._reclaimed_from(name, mid, row) for mid, row in self.sheet.items())}
+            if event == "write":
+                self.touch(name, active=True)
+                said = self._reclaimed_remind(name, agent)
+                return {"refuse": said + WRITE_REFUSED} if said else {}
             if event == "tool":  # a tool call: a sign of life (for reclaiming tasks), nothing to hand over
                 self.touch(name, active=True)
                 doing = clean_doing(doing)
@@ -6520,12 +6720,17 @@ class Hub:
                     self._edited(name, clean)
                 if isinstance(browser, dict):
                     self._browser_seen(name, browser)
-                remind = self._browser_remind(name, time.time())
+                # Not on a session report: nothing reads its answer, and the notice would be gone (hook_check).
+                said = "" if session else self._reclaimed_remind(name, agent)
+                remind = " ".join(x for x in (said, self._browser_remind(name, time.time())) if x)
                 if remind and agent["client"] not in CONTEXT_EVENTS:  # no way into its turn: the chat says it
                     self._append(SERVER_NAME, name, remind, "msg")
                     self._changed()
                     remind = ""
-                return dict({"edits": tracking}, **({"remind": remind} if remind else {}))  # edits: send paths while true
+                out = dict({"edits": tracking}, **({"remind": remind} if remind else {}))  # edits: send paths while true
+                if session and name not in self.hook_pids:  # a new process: its report comes before the pids (R8)
+                    out["pids"] = "want"
+                return dict(out, hold=said + WRITE_REFUSED) if said else out
             if agent.pop("doing", None):  # a turn began or ended: what it last did is old news
                 self._changed()
             self._drop_permissions(name)
@@ -6545,6 +6750,7 @@ class Hub:
             if session:
                 self._keep_session(name, session)
             want = not session and self._wants_session(name, table)
+            want_pids = name not in self.hook_pids  # which processes it runs under (R8): new here, or a restart
             listen = self._listen_override(name) if event == "stop" else None
             if listen == 0:  # the owner turned its listening off on the chat page: answer at once
                 wait_seconds = 0
@@ -6580,6 +6786,8 @@ class Hub:
             out["listen"] = listen  # the hook waits this long in all, whatever its folder says
         if want:
             out["session"] = "want"  # report the session again: it was reopened, or its process is gone
+        if want_pids:
+            out["pids"] = "want"
         return out
 
     def _free_tasks(self, name, why):
@@ -6792,6 +7000,8 @@ class Hub:
         except (KeyError, TypeError, ValueError):
             return
         if SESSION_RE.fullmatch(kept["id"]) and kept["pid"] > 1 and self.agent_folders(name):
+            if (self.agents[name].get("session") or {}).get("pid") != kept["pid"]:
+                self.hook_pids.pop(name, None)  # another process (a Reopen): which proxy is whose, asked again
             self.agents[name]["session"] = kept
             self._save_soon()
 
@@ -7412,6 +7622,8 @@ def sheet_line(row):
         extra.append("never reclaimed" if row["reclaim"] == "off" else "reclaimed after %s min of silence" % row["reclaim"])
     if row["depends"]:
         extra.append("waits for " + ", ".join("#" + d for d in row["depends"]))
+    if row.get("blocker"):
+        extra.append("held back: " + row["blocker"])
     if row["areas"]:
         extra.append("files " + ", ".join(row["areas"]))
     if row.get("suggested"):
@@ -8096,7 +8308,7 @@ def link_info(hub, shared=True):
     return dict(hub.sync.link_status(), shared=shared, coordinator=coordinator)
 
 
-POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/permission", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map", "/api/coordinator", "/api/machines", "/api/open-folder", "/api/browser", "/api/processes", "/api/process-command")
+POST_PATHS = ("/mcp", "/login", "/api/send", "/api/role", "/api/roles", "/api/projects", "/api/read", "/api/agent", "/api/launch", "/api/folders", "/api/upload", "/api/rules", "/api/skills", "/api/task", "/api/login-code", "/api/invite", "/api/join", "/api/hook", "/api/admin", "/api/run", "/api/needs", "/api/push", "/api/usage", "/api/analytics", "/api/edits", "/api/map", "/api/coordinator", "/api/machines", "/api/open-folder", "/api/browser", "/api/processes", "/api/process-command")
 PEER_PATHS = ("/peer/join", "/peer/pull", "/peer/claim", "/peer/rekey", "/peer/leave", "/peer/file", "/peer/relay")  # crewchat_peers
 
 # The chat page installs as an app on phones and desktops ("Add to Home Screen"). The manifest
@@ -8688,7 +8900,8 @@ class Handler(BaseHTTPRequestHandler):
         to = data.get("to")
         kind = "task" if data.get("kind") == "task" else "msg"
         files = self.hub.attach(data.get("files") or [])
-        return {"id": self.hub.send(OWNER, to, clean_text(to, data.get("text"), OWNER, files), kind, files)["id"]}
+        text = clean_text(to, data.get("text"), OWNER, files)
+        return {"id": self.hub.send(OWNER, to, text, kind, files, re=data.get("re") or reply_to(text) or None)["id"]}
 
     def _task_op(self, data):
         """The owner on the task sheet: add, assign, move, settle (todo, done, blocked) or remove a task,
@@ -8922,13 +9135,50 @@ class Handler(BaseHTTPRequestHandler):
         return {"holder": holder, "sites": self.hub.browser_sites(), "token": bool(browser_token()), "log": log,
                 "idle": BROWSER_IDLE}
 
-    def _permission(self, data):
-        """The owner's answer in Needs you: to a browser ask (the page says so; its answers are a browser ask's own),
-        or to a permission prompt. By kind, not by what still waits, so an ask that is gone says so."""
-        answer = data.get("answer")
-        if data.get("kind") == "browser" or answer in ("allow_site", "allow_task"):
-            return self.hub.answer_browser(data.get("id"), answer)
-        return self.hub.answer_permission(data.get("id"), answer)
+    def _proxy_event(self, place, data):
+        event = data.get("event")
+        if event == "pids":
+            return {"recorded": self.hub.note_pids(place, data.get("key"), data.get("pids"))}
+        if event == "proxy":
+            return {"proxy": self.hub.register_proxy(place, data.get("client"), data.get("folder"), data.get("pids"))}
+        if event == "proxy_call":
+            args = data.get("args") if isinstance(data.get("args"), dict) else {}
+            return self.hub.proxy_call(data.get("proxy"), str(data.get("tool") or ""), args, place=place)
+        tabs = data.get("tabs") if isinstance(data.get("tabs"), list) else []
+        return {"note": self.hub.proxy_seen(data.get("proxy"), tabs[:50], place=place)}
+
+    def _needs(self, data):
+        """The owner's answer to an item in Needs you, by its key (R8): Allow or Deny for a permission prompt or a
+        browser call, Approve or Decline for a process note, a reply to a blocked task or a review, or Done for a
+        review. By the key's kind, not by what still waits, so an item that is gone says so."""
+        key, answer = data.get("key"), data.get("answer")
+        kind, _, ref = key.partition(":") if isinstance(key, str) else ("", "", "")
+        if not ref or kind not in NEED_KINDS:
+            raise HubError("bad key")
+        if kind == "permission":
+            return self.hub.answer_permission(ref, answer)
+        if kind == "browser":
+            return self.hub.answer_browser(ref, answer)
+        if kind == "process":
+            if answer == "approve":
+                return {"said": self.hub.approve_process(OWNER, ref, data.get("of") or "")}
+            if answer == "decline":
+                self.hub.decline_process(OWNER, ref, data.get("of") or "")
+                return {"ok": True}
+            raise HubError("answer is approve or decline")
+        if kind not in ("blocked", "review"):
+            raise HubError("nothing to answer for %s" % kind)
+        item = next((n for n in self.hub.needs_you() if n["key"] == key), None)
+        if item is None:
+            raise HubError("that is not waiting any more")
+        if answer == "done" and kind == "review":
+            self.hub.owner_status(ref, "done")
+            return {"ok": True}
+        text = str(data.get("text") or "").strip()
+        if answer != "reply" or not text:
+            raise HubError("answer is a reply with its text" + (", or done" if kind == "review" else ""))
+        # With its Re # as well as `re`, so a linked machine still on 1.1 (which drops `re`) sees the answer too.
+        return {"id": self.hub.send(OWNER, item["agent"] or item["holder"], "Re #%s: %s" % (ref, text), re=ref)["id"]}
 
     def _local_page(self):
         """Is the page asking served to this machine itself (not a phone or another machine over the tailnet)? By the
@@ -9279,7 +9529,7 @@ class Handler(BaseHTTPRequestHandler):
                          "/api/read": self._read, "/api/folders": self._folders,
                          "/api/rules": self._rules, "/api/skills": self._skills, "/api/task": self._task_op,
                          "/api/processes": self._processes,
-                         "/api/permission": self._permission,
+                         "/api/needs": self._needs,
                          "/api/push": self._push, "/api/usage": self._usage,
                          "/api/analytics": self._analytics, "/api/edits": self._edits,
                          "/api/map": self._map,
@@ -9322,6 +9572,12 @@ class Handler(BaseHTTPRequestHandler):
                 except HubError:
                     self._json(400, {"error": "bad request"})
                 return
+            if data.get("event") in ("pids", "proxy", "proxy_call", "proxy_seen"):  # the browser proxy (R8)
+                try:
+                    self._json(200, self._proxy_event(who[1], data))
+                except HubError:
+                    self._json(400, {"error": "bad request"})
+                return
             if data.get("event") == "permission":
                 try:
                     self._json(200, {"answer": self.hub.ask_permission(who[1], data.get("key"), str(data.get("tool") or ""),
@@ -9332,7 +9588,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 ack = max(0, int(data.get("ack") or 0))
                 wait = max(0, min(MAX_WAIT, int(data.get("wait") or 0)))
-                event = data.get("event") if data.get("event") in ("prompt", "tool") else "stop"
+                event = data.get("event") if data.get("event") in ("prompt", "tool", "write", "held") else "stop"
                 session = data.get("session") if isinstance(data.get("session"), dict) else None
                 # After the owner's limit of chat-driven turns in a row, only the owner wakes the agent.
                 capped = int(data.get("chain") or 0) >= self.roster.max_chain
@@ -9815,7 +10071,9 @@ def _cached_read(cache, key, path, read):
 
 ACCOUNT_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 CLAUDE_ACCOUNT_SIGNS = (".claude.json", ".credentials.json")  # in a Claude Code settings folder that was signed in
-_CLAUDE_ACCOUNT_CACHE = {}  # home path -> (stamp, accounts found on disk, .claude-* names that stamp covers)
+_CLAUDE_ACCOUNT_CACHE = {}  # home path -> (stamp, accounts found, .claude-* names that stamp covers, when listed)
+HOME_STAMP_MOVES = os.name != "nt"  # on Windows a folder's stamp stays put when a folder is made in it
+ACCOUNT_LIST_TTL = 5.0  # seconds a home listing is kept where its stamp cannot say a folder was added
 
 
 def _account_stamp(home, names):
@@ -9831,11 +10089,13 @@ def _account_stamp(home, names):
 
 def _claude_accounts_found(home):
     """The default account and each ~/.claude-<name> that holds a sign-in. Listed again only when that stamp
-    changes, so a new account directory is seen on the next call and an unchanged home is not listed again."""
+    changes, so a new account directory is seen on the next call and an unchanged home is not listed again. On
+    Windows, where the home's stamp does not move, the listing is also kept ACCOUNT_LIST_TTL seconds at most."""
     home = Path(home)
     key = str(home)
     cached = _CLAUDE_ACCOUNT_CACHE.get(key)
-    if cached is not None and _account_stamp(home, cached[2]) == cached[0]:
+    if cached is not None and _account_stamp(home, cached[2]) == cached[0] and (
+            HOME_STAMP_MOVES or time.monotonic() - cached[3] < ACCOUNT_LIST_TTL):
         return cached[1]
     try:
         entries = sorted(home.iterdir())
@@ -9850,7 +10110,7 @@ def _claude_accounts_found(home):
         aid = path.name[len(".claude-"):].lower()
         if ACCOUNT_RE.fullmatch(aid) and path.is_dir() and any((path / f).exists() for f in CLAUDE_ACCOUNT_SIGNS):
             found.append({"id": aid, "label": aid, "dir": str(path)})
-    _CLAUDE_ACCOUNT_CACHE[key] = (_account_stamp(home, watched), found, tuple(watched))
+    _CLAUDE_ACCOUNT_CACHE[key] = (_account_stamp(home, watched), found, tuple(watched), time.monotonic())
     return found
 
 
@@ -10371,9 +10631,15 @@ def loopback_port(site):
 
 
 BROWSER_MATCHER = "mcp__claude-in-chrome__.*|mcp__browser__.*|browser_.*"  # the tools a browser before-hook watches
+# The calls that can change something, in each tool's names: the hook before them refuses the first after a reclaim.
+WRITE_MATCHER = ("^(Bash|Edit|MultiEdit|Write|NotebookEdit|run_shell_command|write_file|replace|edit|bash|write|patch|"
+                 "shell|exec_command|local_shell|apply_patch)$")
+BEFORE_MATCHERS = {"browser": BROWSER_MATCHER, "write": WRITE_MATCHER}  # the before-hooks, and the calls each watches
 BROWSER_DOWN = "crewchat is not running here: start it (crewchat start), then try again"
 BRIDGE_ONLY = ("only an agent in the chat, with the browser on, may use crewchat's browser bridge: link to the chat "
                "(hub_link) and ask the owner to turn your browser on")
+PROXY_GONE = "crewchat does not know this browser proxy: start the agent again"  # R8: a server started again
+PROXY_WHO = "crewchat cannot tell which agent this browser belongs to; start the agent from the chat"  # R8
 OWN_PAGE = ("that is crewchat's own page, which agents never use: the owner answers the browser's questions there. "
             "Open another site")
 
@@ -11353,7 +11619,7 @@ def git_churn(folder, commit, paths):
     """(lines changed in these paths since commit, lines they have now) in a folder's repository, (0, 0) when none
     changed, or None when it cannot say (not git, an unknown commit). commit is a commit id only: it is placed where
     git reads an option."""
-    if not re.match(r"^[0-9a-f]{4,40}$", str(commit or "")):
+    if not re.fullmatch(r"[0-9a-fA-F]{4,64}", str(commit or "")):  # fullmatch: "$" would take a "\n"
         return None
     paths = [p for p in paths if isinstance(p, str) and p and not p.startswith("-") and "\0" not in p]
     if not paths:
@@ -11425,15 +11691,15 @@ def git_exclude(project, paths):
 def hook_command(client, event):
     # Forward slashes and no quotes unless a path has a space: that form runs unchanged in sh,
     # cmd and PowerShell, whichever shell the agent's tool uses for hooks. run_command: an
-    # installed crewchat runs by its own launcher. After each tool call: Python runs the light hook
-    # script instead, which loads in a fraction of the time.
+    # installed crewchat runs by its own launcher. Before a write and after each tool call: Python runs the
+    # light hook script instead, which loads in a fraction of the time.
     return "%s %s %s" % (" ".join(p if " " not in p else '"%s"' % p for p in hook_program(event)), client, event)
 
 
 def hook_program(event):
-    """What a hook runs, before its tool's name and the event: the light hook script for the tool event (if
-    it can be written), else crewchat's `hook` command."""
-    script = write_hook_script() if event == "tool" else None
+    """What a hook runs, before its tool's name and the event: the light hook script for the tool and write
+    events (if it can be written), else crewchat's `hook` command."""
+    script = write_hook_script() if event in ("tool", "write") else None
     return [console_python().as_posix(), script.as_posix()] if script else run_command() + ["hook"]
 
 
@@ -11459,9 +11725,9 @@ PROMPT_EVENT = {"codex": "UserPromptSubmit", "gemini": "BeforeAgent", "qwen": "U
 # each event, the hook it runs, and its timeout in seconds.
 SETTINGS_HOOKS = {
     "gemini": (("BeforeAgent", "prompt", 30), ("AfterAgent", "stop", MAX_LISTEN + 100), ("AfterTool", "tool", 10),
-               ("BeforeTool", "browser", PERMISSION_WAIT + 30)),
+               ("BeforeTool", "write", 10), ("BeforeTool", "browser", PERMISSION_WAIT + 30)),
     "qwen": (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100), ("PostToolUse", "tool", 10),
-             ("PreToolUse", "browser", PERMISSION_WAIT + 30))}
+             ("PreToolUse", "write", 10), ("PreToolUse", "browser", PERMISSION_WAIT + 30))}
 
 
 def is_our_hook(command):
@@ -11644,27 +11910,34 @@ def disallow_rule(data, prefix, names=(SERVER_NAME,)):
             del data["permissions"]
 
 
+def user_groups(hooks, event):
+    """A hook event's groups without crewchat's own."""
+    return [g for g in hooks.get(event, []) if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
+
+
 def set_claude_hooks(settings, names=(SERVER_NAME,)):
     """crewchat's hooks in Claude Code settings, replacing its own older ones and keeping the user's,
     and its tools allowed without asking under each of its names (an agent stuck on a permission
     prompt misses the chat)."""
     allow_rule(settings, CLAUDE_ALLOW, names)
     hooks = settings.setdefault("hooks", {})
+    mine = {}  # each event's groups, the user's first, with crewchat's own taken out once
     for event, name, extra in (("UserPromptSubmit", "prompt", {"timeout": 30}),
                                ("Stop", "stop", {"timeout": MAX_LISTEN + 100,
                                                  "statusMessage": "Waiting for crewchat messages"}),
                                ("PostToolUse", "tool", {"timeout": 10}),  # a sign of life
                                ("PermissionRequest", "permission", {"timeout": PERMISSION_WAIT + 30,
                                                                     "statusMessage": "Asking on the crewchat page"}),
+                               ("PreToolUse", "write", {"timeout": 10}),  # refused once after a reclaim
                                ("PreToolUse", "browser", {"timeout": PERMISSION_WAIT + 30,
                                                           "statusMessage": "Checking with crewchat"})):
-        groups = [g for g in hooks.get(event, [])
-                  if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
+        if event not in mine:
+            mine[event] = user_groups(hooks, event)
         group = {"hooks": [dict({"type": "command", "command": hook_command("claude", name)}, **extra)]}
-        if name == "browser":
-            group["matcher"] = BROWSER_MATCHER
-        groups.append(group)
-        hooks[event] = groups
+        if name in BEFORE_MATCHERS:
+            group["matcher"] = BEFORE_MATCHERS[name]
+        mine[event].append(group)
+    hooks.update(mine)
 
 
 def set_settings_hooks(settings, client):
@@ -11672,16 +11945,18 @@ def set_settings_hooks(settings, client):
     replacing its own older ones and keeping the user's. Each tool asks once to trust them. Timeouts in
     milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds."""
     hooks = settings.setdefault("hooks", {})
+    mine = {}  # each event's groups, the user's first, with crewchat's own taken out once
     for event, name, timeout in SETTINGS_HOOKS[client]:
-        groups = [g for g in hooks.get(event, [])
-                  if not any(is_our_hook(h.get("command", "")) for h in g.get("hooks", []))]
+        if event not in mine:
+            mine[event] = user_groups(hooks, event)
         group = {"hooks": [{"type": "command", "name": "crewchat-" + name, "command": hook_command(client, name),
                             "timeout": timeout * 1000}]}
-        if name == "browser":
-            group["matcher"] = BROWSER_MATCHER
+        if name in BEFORE_MATCHERS:
+            group["matcher"] = BEFORE_MATCHERS[name]
         elif name == "tool":
             group["matcher"] = ".*"
-        hooks[event] = groups + [group]
+        mine[event].append(group)
+    hooks.update(mine)
 
 
 def install_cursor(project, url, token):
@@ -11715,7 +11990,7 @@ const REOPEN_PROMPT = %(reopen)s;
 
 async function hook(event, data, directory) {
   try {
-    const run = Bun.spawn([...(event === "tool" ? TOOL_HOOK : HOOK), event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
+    const run = Bun.spawn([...(event === "tool" || event === "write" ? TOOL_HOOK : HOOK), event], {cwd: directory, stdin: "pipe", stdout: "pipe", stderr: "ignore",
                                              env: {...process.env, CREWCHAT_PROJECT: directory}});
     run.stdin.write(JSON.stringify(data));
     run.stdin.end();
@@ -11758,9 +12033,10 @@ export const CrewchatPlugin = async ({client, directory}) => {
     if (part) part.text += "\n\n" + text;
   },
   "tool.execute.before": async (input, output) => {
-    if (!/^(browser_|mcp__browser__)/.test(input.tool)) return;
-    const refused = await hook("browser", {session_id: input.sessionID, tool_name: input.tool, tool_input: output.args || {}},
-                               directory);
+    const write = /^(bash|edit|write|patch|apply_patch)$/.test(input.tool);
+    if (!write && !/^(browser_|mcp__browser__)/.test(input.tool)) return;
+    const call = {session_id: input.sessionID, tool_name: input.tool, tool_input: output.args || {}};
+    const refused = await (write ? hook("write", call, directory) : hook("browser", call, directory));
     if (refused) throw new Error(refused);
   },
   "tool.execute.after": async (input, output) => {
@@ -11849,19 +12125,21 @@ def install_codex():
     outside = CODEX_BLOCK.sub("\n", text)
     # Its hooks too (messages at the end of each turn), unless the user's own hooks are written in a
     # way a table of ours can't join (hooks = {...}, Stop = [...]). Codex asks once to review them.
-    # A PreToolUse of the user's own written so leaves out only the browser's hook (B2).
+    # A PreToolUse of the user's own written so leaves out only crewchat's before-hooks (B2).
     their_pre = re.search(r"^\s*PreToolUse\s*=", outside, re.M)
     hooks = "" if re.search(r"^\s*hooks\s*=|^\s*(Stop|UserPromptSubmit|PostToolUse)\s*=", outside,
                             re.M) else "".join(
         "[[hooks.%s]]\n%s[[hooks.%s.hooks]]\ntype = \"command\"\ncommand = %s\ntimeout = %d\n" % (
-            event, "matcher = %s\n" % string(BROWSER_MATCHER) if name == "browser" else "", event,
+            event, "matcher = %s\n" % string(BEFORE_MATCHERS[name]) if name in BEFORE_MATCHERS else "", event,
             string(hook_command("codex", name)), timeout)
         for event, name, timeout in (("UserPromptSubmit", "prompt", 30), ("Stop", "stop", MAX_LISTEN + 100),
-                                     ("PostToolUse", "tool", 10), ("PreToolUse", "browser", PERMISSION_WAIT + 30))
+                                     ("PostToolUse", "tool", 10), ("PreToolUse", "write", 10),
+                                     ("PreToolUse", "browser", PERMISSION_WAIT + 30))
         if not (event == "PreToolUse" and their_pre))
     bridge = browser_token()  # the browser for agents (B1): the Playwright MCP Bridge, with its token
-    browser = "\n" + CODEX_BRIDGE + "\ncommand = \"npx\"\nargs = [%s]\nenv = { PLAYWRIGHT_MCP_EXTENSION_TOKEN = %s }\n" % (
-        ", ".join(string(a) for a in BROWSER_BRIDGE), string(bridge)) if bridge and not CODEX_THEIR_BROWSER.search(outside) else ""
+    proxy = bridge_command("codex")
+    browser = "\n" + CODEX_BRIDGE + "\ncommand = %s\nargs = [%s]\ntool_timeout_sec = %d\nenv = { PLAYWRIGHT_MCP_EXTENSION_TOKEN = %s }\n" % (
+        string(proxy[0]), ", ".join(string(a) for a in proxy[1:]), BRIDGE_TIMEOUT, string(bridge)) if bridge and not CODEX_THEIR_BROWSER.search(outside) else ""
     block = "%s\n[mcp_servers.%s]\ncommand = %s\nargs = [%s]\n%s%s%s\n" % (
         CODEX_BEGIN, SERVER_NAME, string(command[0]),
         ", ".join(string(a) for a in command[1:] + ["stdio", "--local-only"]), browser, hooks, CODEX_END)
@@ -11910,7 +12188,18 @@ def refresh_codex():
         pass
 
 
-BROWSER_BRIDGE = ["@playwright/mcp@latest", "--extension"]  # the Playwright MCP Bridge, run with npx (B1)
+# The Playwright MCP Bridge (B1), run with npx by crewchat's browser proxy (R8). Pinned: the proxy reads the exact
+# text of its browser_run_code_unsafe result (BrowserProxy._tabs), so a new version is tried, then this bumped by hand.
+PLAYWRIGHT_MCP = "@playwright/mcp@0.0.83"
+BROWSER_BRIDGE = [PLAYWRIGHT_MCP, "--extension"]
+
+
+BRIDGE_TIMEOUT = PERMISSION_WAIT + 30  # seconds a bridge call may take: the owner may be asked inside it (R8)
+
+
+def bridge_command(client):
+    """How an agent tool runs crewchat's bridge: `crewchat browser-proxy CLIENT`, which runs Playwright MCP (R8)."""
+    return run_command() + ["browser-proxy", client]
 BRIDGE_STORE = "https://chromewebstore.google.com/search/Playwright%20MCP%20Bridge"
 
 
@@ -11934,11 +12223,14 @@ def bridge_here(folder, client, tool):
     tools bare (browser_click), as a Playwright server of the user's own does: there it is the bridge only where this
     tool runs the bridge in this folder (bridge_set_up, reread when that settings file changes); elsewhere it is the
     user's own browser, not the owner's Chrome."""
-    if tool.startswith("mcp__"):
+    if tool.startswith("mcp__") and not tool.startswith("mcp__browser__"):
         return True
     if client != "codex" and client not in BRIDGE_FILES:
         return True  # a tool crewchat does not set the bridge up for: checked, the safe side
-    return bridge_set_up(folder, client)
+    set_up = bridge_set_up(folder, client)
+    if set_up == "proxy":
+        return False  # crewchat's browser proxy gates its calls itself (R8)
+    return True if tool.startswith("mcp__browser__") else bool(set_up)
 
 
 _BRIDGE_CACHE = {}  # (client, settings path) -> (file stamp, whether crewchat's bridge is in it)
@@ -11949,12 +12241,15 @@ def _codex_has_bridge(path):
         block = CODEX_BLOCK.search(path.read_text(encoding="utf-8"))
     except OSError:
         return False
-    return bool(block) and CODEX_BRIDGE in block.group(0)
+    if not block or CODEX_BRIDGE not in block.group(0):
+        return False
+    return "proxy" if '"browser-proxy"' in block.group(0) else "npx"  # the argument itself, not a path with it
 
 
 def bridge_set_up(folder, client):
     """Is crewchat's bridge, with its token, in this tool's settings for this folder (Codex: for every folder)?
-    Kept until that file's mtime, inode or size changes, so a settings change is seen on the next call and an
+    "proxy" when it runs through crewchat's browser proxy (R8), which gates its calls itself; "npx" when written
+    before the proxy (the hooks gate it); False when it is not there. Kept until that file's mtime, inode or size changes, so a settings change is seen on the next call and an
     unchanged file is not opened again. A stale answer would skip the browser gate."""
     if client == "codex":
         path = codex_config()
@@ -11966,7 +12261,12 @@ def bridge_set_up(folder, client):
 
     def read(settings_path):
         table = json_file(settings_path).get(servers)
-        return any(is_bridge(client, entry) for entry in (table.values() if isinstance(table, dict) else ()))
+        found = [e for e in (table.values() if isinstance(table, dict) else ()) if is_bridge(client, e)]
+        if not found:
+            return False
+        # The argument itself, in a list: not a path with it, and not a value of the wrong kind.
+        return "proxy" if any(isinstance(v, list) and "browser-proxy" in v
+                              for e in found for v in (e.get("args"), e.get("command"))) else "npx"
 
     return _cached_read(_BRIDGE_CACHE, (client, str(path)), path, read)
 
@@ -11977,7 +12277,7 @@ def bridge_refusal(client, data, folder):
     tool = str(data.get("tool_name") or data.get("tool") or "")
     if tool.startswith("mcp__claude-in-chrome__") or browser_action(tool, {})[0] == "other":
         return ""
-    return browser_deny(client, BRIDGE_ONLY) if bridge_set_up(folder, client) else ""
+    return browser_deny(client, BRIDGE_ONLY) if bridge_set_up(folder, client) == "npx" else ""  # the proxy refuses
 
 
 def sync_browser_server(folder, token=None, kept=None):
@@ -11998,8 +12298,10 @@ def sync_browser_server(folder, token=None, kept=None):
         table = data.setdefault(servers, {})
         env = {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": token}
         want = None if not token else (
-            {"type": "local", "command": ["npx"] + BROWSER_BRIDGE, "environment": env, "enabled": True}
-            if client == "opencode" else {"command": "npx", "args": BROWSER_BRIDGE, "env": env})
+            {"type": "local", "command": bridge_command(client), "environment": env, "enabled": True,
+             "timeout": BRIDGE_TIMEOUT * 1000}
+            if client == "opencode" else dict({"command": bridge_command(client)[0], "args": bridge_command(client)[1:],
+                                               "env": env}, **({} if client == "cursor" else {"timeout": BRIDGE_TIMEOUT * 1000})))
         mine = table.get("browser")
         if mine is not None and not is_bridge(client, mine):
             continue  # a "browser" server of the user's own: not crewchat's to change
@@ -12060,7 +12362,7 @@ def set_cursor_hooks(hooks):
     hooks.setdefault("version", 1)
     for event, name, timeout in (("stop", "stop", MAX_LISTEN + 100), ("afterShellExecution", "tool", 10),
                                  ("afterFileEdit", "tool", 10), ("afterMCPExecution", "tool", 10),
-                                 ("beforeMCPExecution", "browser", PERMISSION_WAIT + 30)):
+                                 ("beforeShellExecution", "write", 10), ("beforeMCPExecution", "browser", PERMISSION_WAIT + 30)):
         kept = [h for h in hooks.setdefault("hooks", {}).get(event, []) if not is_our_hook(h.get("command", ""))]
         kept.append({"command": hook_command("cursor", name), "timeout": timeout})
         hooks["hooks"][event] = kept
@@ -12303,7 +12605,7 @@ def conversation_place(tool, ref, home=None, config=None):
     return None
 
 
-def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None, conversation=None):
+def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=None, conversation=None, pids=None):
     """Ask the server for this session's messages without marking them read.
 
     Returns (kind, text, last id, whether the owner wrote any of it, capped). kind is "link" if
@@ -12314,6 +12616,7 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
     answers "capped", and only a message from the owner ends the wait. `report` makes the
     session report (session_report) when the server asks for one: a new session, or after a Reopen.
     `conversation` says where the agent's conversation is (conversation_ref, with the tool); it goes with each ask.
+    `pids` gives the processes the hook runs under (ancestor_pids), sent only when the server has none (R8).
     """
     begun = time.time()
     deadline = begun + wait_total
@@ -12331,7 +12634,15 @@ def hook_check(base, token, key, wait_total, ack, event="stop", chain=0, report=
             if out.get("session") == "want" and report:
                 found, report = report(), None
                 if found:  # a quick call of its own, so a long wait above is not held up
-                    post_json(base + "/api/hook", token, {"key": key, "event": "tool", "session": found}, timeout=10)
+                    answer = post_json(base + "/api/hook", token, {"key": key, "event": "tool", "session": found}, timeout=10)
+                    if answer.get("pids") == "want":  # another process (a Reopen): the server only knows it from here
+                        out = dict(out, pids="want")
+            if out.get("pids") == "want" and pids:
+                found, pids = pids(), None
+                try:
+                    post_json(base + "/api/hook", token, {"key": key, "event": "pids", "pids": found}, timeout=5)
+                except (OSError, ValueError):
+                    pass  # asked for again at its next hook
         except urllib.error.HTTPError:
             raise
         except (urllib.error.URLError, OSError):
@@ -12623,13 +12934,18 @@ def remind_output(client, text):
     return json.dumps({"hookSpecificOutput": {"hookEventName": CONTEXT_EVENTS[client], "additionalContext": text}})
 
 
+def hook_state_file(client, session):
+    """Where a session's hooks keep what they know: the same file for every hook of that session."""
+    return Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
+
+
 def tool_hook(client, data):
     """The hook after each tool call: a sign of life for the server (at most every ALIVE_EVERY seconds, so a
     long turn without a crewchat tool does not look silent), with what the call was when that changed (at
     most every DOING_EVERY). Never waits or delivers. It runs in the light hook script (hook_script), with
     only the standard library and what hook_script copies there: keep it to those."""
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
-    state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
+    state_file = hook_state_file(client, session)
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
@@ -12676,6 +12992,11 @@ def tool_hook(client, data):
     if browser:
         body["browser"] = browser
     answer = hook_post(config[0] + "/api/hook", config[1], body)
+    if answer.get("hold"):  # a task was reclaimed: the writes that follow are refused (write_hook), for long if
+        # the reminder has no way into this turn, so that the refusal is how the agent hears
+        state["hold"] = str(answer["hold"])
+        state["hold_until"] = now + (HOLD_WRITES if client in CONTEXT_EVENTS else HOLD_UNREAD)
+        save_hook_state(state_file, state)
     if answer.get("remind"):  # at the browser without a progress note for a while (B3): into this turn
         out = remind_output(client, str(answer["remind"]))
         if out:
@@ -12683,6 +13004,50 @@ def tool_hook(client, data):
     if bool(answer.get("edits")) != bool(state.get("edits")):  # the owner turned edit tracking on or off
         state["edits"] = bool(answer.get("edits"))
         save_hook_state(state_file, state)
+
+
+def write_hook(client, data):
+    """The hook before a shell or file-editing call: those just after a task was reclaimed from this agent are refused
+    for HOLD_WRITES, so what it had queued (a commit and a push, in one response) does not go out before it hears of
+    it. A reclaim takes a silence, so a session that told the server of itself under ALIVE_EVERY ago asks nothing. A
+    server that cannot be reached stops nothing. Runs in the light hook script, as tool_hook does: keep it to what
+    hook_script copies there."""
+    session = str(data.get("session_id") or data.get("conversation_id") or "default")
+    state_file = hook_state_file(client, session)
+    try:
+        state = json.loads(state_file.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or not state.get("key"):
+        return
+    now = time.time()
+    until = float(state.get("hold_until") or 0)
+    if now >= until and now - float(state.get("alive") or 0) < ALIVE_EVERY:
+        return
+    project = find_project(client)
+    config = client_config(project, client) if project else None
+    if config is None or hooks_off(project):
+        return
+
+    def ask(event):
+        return hook_post(config[0] + "/api/hook", config[1], {"key": state["key"], "event": event})
+    try:
+        if now < until:
+            if until - now > HOLD_WRITES and ask("held").get("reclaimed") is False:  # a long hold: it took the task back
+                state["hold_until"] = 0
+                save_hook_state(state_file, state)
+                return
+            state["hold_until"] = min(until, now + HOLD_WRITES)  # it reads this one: a short while more, from here
+            save_hook_state(state_file, state)
+            print(browser_deny(client, str(state.get("hold") or "")))
+            return
+        answer = ask("write")
+    except (OSError, ValueError):
+        return
+    if answer.get("refuse"):
+        state["hold"], state["hold_until"] = str(answer["refuse"]), now + HOLD_WRITES
+        save_hook_state(state_file, state)
+        print(browser_deny(client, state["hold"]))
 
 
 def browser_seen(data):
@@ -12768,6 +13133,29 @@ def edited_path(client, data, project):
     return relative.as_posix()[:300] if relative.parts else ""
 
 
+PS_TREE = os.name != "nt"  # whether `ps` can walk up the processes (Windows: only the parent is known)
+SHELLS = {"sh", "bash", "zsh", "dash", "fish", "cmd.exe", "powershell", "pwsh"}
+
+
+def ancestor_pids(limit=4):
+    """The processes this one runs under, nearest first, without the shells between (a tool may start its hooks and
+    its MCP servers through `sh -c`): how the browser proxy and an agent's hooks find they belong to the same agent
+    tool (R8). Stops at the first process of the system (pid 1)."""
+    pid, out = os.getppid(), []
+    if not PS_TREE:
+        return [pid]
+    while pid > 1 and len(out) < limit:
+        try:
+            ps = subprocess.run(["ps", "-o", "ppid=,comm=", "-p", str(pid)], capture_output=True, text=True, timeout=2)
+            parent, comm = ps.stdout.split(None, 1)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            break
+        if os.path.basename(comm.strip()).lstrip("-") not in SHELLS:
+            out.append(pid)
+        pid = int(parent)
+    return out
+
+
 def hook_post(url, token, body, timeout=5):
     """POST body as JSON to a chat server, from a hook. This machine's server over a plain socket: importing
     urllib alone takes longer than the rest of the light hook. Another machine's (perhaps https) through
@@ -12804,20 +13192,21 @@ OUR_SCRIPT_RE = re.compile(r"[/\\]%s(?:\\?\")? (?:%s) " % (re.escape(HOOK_SCRIPT
 
 
 def hook_script():
-    """The light hook script: crewchat's tool-call hook (tool_hook) and what it needs, copied out of this
-    file, so a hook after every tool call loads a few hundred lines of Python instead of all of crewchat."""
+    """The light hook script: crewchat's tool-call hooks (tool_hook, write_hook) and what they need, copied out of this
+    file, so a hook around every tool call loads a few hundred lines of Python instead of all of crewchat."""
     import inspect
 
     def value(v):  # sets in a fixed order, so the same crewchat writes the same file
         return "frozenset(%r)" % sorted(v) if isinstance(v, (set, frozenset)) else repr(v)
     names = ("SERVER_NAME", "KEY_RE", "EDIT_TOOLS", "CLIENT_FILES", "MCP_FILES", "HOOK_MARKERS", "ALIVE_EVERY", "DOING_EVERY",
+             "HOLD_WRITES", "HOLD_UNREAD",
              "OTHER_TOOL_NAMES", "HUB_TOOL_NAMES", "TOOL_WORDS", "SUBCOMMAND_TOOLS", "COMMAND_WRAPPERS",
              "CONVERSATION_PATH_TOOLS", "CONVERSATION_ID_TOOLS", "MAX_CONVERSATION_PATH", "BROWSER_MATCHER",
              "CONTEXT_EVENTS", "O_BINARY")
     functions = (sha, find_project, connection_entry, client_config, hooks_off, claim_launch_key, tool_summary,
                  browser_seen, edited_path, conversation_ref, conversation_where, hook_post, open_private,
-                 save_hook_state, remind_output, tool_hook)
-    return ('"""crewchat %s\'s hook after each tool call, written by crewchat from its own code (`crewchat hooks\n'
+                 save_hook_state, remind_output, hook_state_file, tool_hook, browser_deny, write_hook)
+    return ('"""crewchat %s\'s hooks before a write and after each tool call, written by crewchat from its own code (`crewchat hooks\n'
             'refresh` writes it again). Edits are not kept."""\n'
             "import hashlib\nimport json\nimport os\nimport re\nimport shlex\nimport socket\nimport sys\n"
             "import tempfile\nimport time\nfrom pathlib import Path\n\n"
@@ -12827,7 +13216,7 @@ def hook_script():
               "    try:  # a hook must never break the agent's turn\n"
               '        data = json.loads(sys.stdin.read() or "{}")\n'
               "        if isinstance(data, dict) and len(sys.argv) > 1 and sys.argv[1] in HOOK_MARKERS:\n"
-              "            tool_hook(sys.argv[1], data)\n"
+              '            (write_hook if sys.argv[2:3] == ["write"] else tool_hook)(sys.argv[1], data)\n'
               "    except Exception:\n"
               "        pass\n")
 
@@ -12855,13 +13244,13 @@ def run_hook(client, event):
         data = {}
     if not isinstance(data, dict):
         data = {}
-    if event == "tool":
-        tool_hook(client, data)  # the same as the light hook script runs (HOOK_SCRIPT_FILE)
+    if event in ("tool", "write"):  # the same as the light hook script runs (HOOK_SCRIPT_FILE)
+        (tool_hook if event == "tool" else write_hook)(client, data)
         return
     if event == "browser" and browser_action(data.get("tool_name") or data.get("tool"), {})[0] == "other":
         return  # not a browser call (Cursor's hook runs before every MCP call): nothing to read or ask
     session = str(data.get("session_id") or data.get("conversation_id") or "default")
-    state_file = Path(tempfile.gettempdir()) / "crewchat-hooks" / ("%s-%s" % (client, sha(session)[:16]))
+    state_file = hook_state_file(client, session)
     try:
         state = json.loads(state_file.read_text())
     except (OSError, ValueError):
@@ -12929,7 +13318,8 @@ def run_hook(client, event):
         # The user is back: hook-driven turns may chain again, and they see what arrived. Nothing
         # is confirmed here: only the end of a turn (the stop hook) proves the agent saw a message,
         # so one handed over just before an interrupted turn is shown again.
-        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", report=report, conversation=where)
+        kind, text, last, _, _ = hook_check(base, token, key, 0, 0, "prompt", report=report, conversation=where,
+                                             pids=ancestor_pids)
         if kind != "ok":
             if ignored >= MAX_LINK_PROMPTS:
                 # Asked at several prompts and never linked: this session is not joining (or has no
@@ -12954,7 +13344,8 @@ def run_hook(client, event):
             return
         chain = int(data.get("loop_count") or 0)
     kind, text, last, from_owner, capped = hook_check(base, token, key, listen_seconds(project, client),
-                                                      pending, chain=chain, report=report, conversation=where)
+                                                      pending, chain=chain, report=report, conversation=where,
+                                                      pids=ancestor_pids)
     if kind != "ok":
         # Asking here makes the agent take one more turn, which costs a whole turn's tokens. Claude
         # Code is asked at its user's prompt instead; here only a session that was linked and must
@@ -13269,6 +13660,232 @@ def cmd_listen(args):
         else:
             print("Listening is on by default: Claude Code agents wait up to %d minutes for messages "
                   "after each turn; Cursor agents check once." % (DEFAULT_LISTEN // 60))
+
+
+# crewchat's browser bridge behind a proxy (R8) --------------------------------------------------------------------
+# An agent tool runs `crewchat browser-proxy CLIENT` as its "browser" MCP server, and the proxy runs Playwright MCP as
+# its child. Each tools/call is gated before it reaches the browser (the server's browser gate), one at a time, and
+# after it the proxy asks Playwright which page the browser is on (page.url()), instead of reading tool output a page
+# can write into. Everything else passes through as it is.
+class BrowserProxy:
+    def __init__(self, client, child_cmd, server, stdin, stdout, env=None):
+        self.client, self.child_cmd, self.server, self.env = client, child_cmd, server, env
+        self.stdin, self.stdout = stdin, stdout
+        self.write_lock = threading.Lock()  # one line at a time to the agent
+        self.call_lock = threading.Lock()  # one tools/call at a time: each is gated on what the last one left
+        self.child = None
+        self.hello = []  # initialize and notifications/initialized, sent again to a new child
+        self.waiting = {}  # request id -> [threading.Event, response]: a call to the child whose answer we wait for
+        self.cancelled = set()  # calls the agent gave up on while they waited their turn or for the owner
+        self.start_error = ""  # why the child could not be started, when it could not
+        self.mine = 0
+        self.prefix = "crewchat-%s-" % secrets.token_hex(4)  # the proxy's own request ids: never an agent's
+        self.child_lock = threading.Lock()  # one child started however many calls find it gone at once
+
+    def run(self):
+        for line in self.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, list):  # a batch would take its tools/calls past the gate (MCP no longer has them)
+                self._to_agent({"jsonrpc": "2.0", "id": None, "error": {
+                    "code": -32600, "message": "crewchat's browser bridge takes one request at a time, not a batch"}})
+                continue
+            if isinstance(msg, dict) and msg.get("method") == "notifications/cancelled":
+                params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+                self.cancelled.add(params.get("requestId"))
+            if isinstance(msg, dict) and msg.get("method") == "tools/call" and "id" in msg:
+                threading.Thread(target=self._call, args=(msg,), daemon=True).start()
+                continue
+            if isinstance(msg, dict) and msg.get("method") in ("initialize", "notifications/initialized"):
+                self.hello.append(msg)
+            self._to_child(msg)
+        if self.child is not None:
+            self.child.terminate()
+            self.child.wait()
+            for pipe in (self.child.stdin, self.child.stdout):
+                pipe.close()
+        self.stdout.close()
+        return 0
+
+    # The child -------------------------------------------------------------------------------------------------
+    def _start(self):
+        """Start the child; False (and why, in start_error) when it cannot be started."""
+        try:
+            self.child = subprocess.Popen(self.child_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                                          encoding="utf-8", bufsize=1, env=self.env, **HIDDEN)
+        except OSError as e:
+            self.child, self.start_error = None, str(e)
+            return False
+        threading.Thread(target=self._read_child, args=(self.child,), daemon=True).start()
+        return True
+
+    def _to_child(self, msg, wait=False, timeout=None):
+        """Send msg to the child (started, or started again with the agent's own hello, when it is not running).
+        wait: return its response, or None when the child died first."""
+        with self.child_lock:
+            if self.child is None or self.child.poll() is not None:
+                if not self._start():
+                    if not wait and isinstance(msg, dict) and "id" in msg:  # initialize, tools/list: answered
+                        self._to_agent({"jsonrpc": "2.0", "id": msg["id"], "error": {
+                            "code": -32603, "message": "the browser could not start: %s" % self.start_error}})
+                    return None
+                for hello in self.hello if msg not in self.hello else ():
+                    self._send(dict(hello, id=self.prefix + "hello") if "id" in hello else hello)
+        slot = None
+        if wait:
+            slot = self.waiting[msg["id"]] = [threading.Event(), None]
+        self._send(msg)
+        if wait:
+            if not slot[0].wait(timeout):
+                self.waiting.pop(msg["id"], None)  # no answer in time: taken as none
+                return None
+            return slot[1]
+        return None
+
+    def _send(self, msg):
+        try:
+            self.child.stdin.write(json.dumps(msg) + "\n")
+            self.child.stdin.flush()
+        except (OSError, ValueError):
+            pass  # it died: whoever waits hears so from _read_child
+
+    def _read_child(self, child):
+        for line in child.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            slot = self.waiting.pop(msg.get("id"), None) if isinstance(msg, dict) and "id" in msg else None
+            if slot is not None:
+                slot[1] = msg
+                slot[0].set()
+            elif not (isinstance(msg, dict) and str(msg.get("id", "")).startswith(self.prefix)):
+                self._to_agent(msg)
+        child.wait()
+        for mid in [m for m in self.waiting]:  # the child is gone: nothing it was asked will be answered
+            slot = self.waiting.pop(mid, None)
+            if slot is not None:
+                slot[0].set()
+
+    def _to_agent(self, msg):
+        with self.write_lock:
+            self.stdout.write(json.dumps(msg) + "\n")
+            self.stdout.flush()
+
+    # A call ------------------------------------------------------------------------------------------------------
+    def _call(self, msg):
+        try:
+            self._gated_call(msg)
+        except Exception as e:  # whatever went wrong, the agent hears of it: a call left unanswered hangs it
+            self._to_agent(self._error(msg["id"], "crewchat's browser bridge failed on this call: %s" % e))
+
+    def _gated_call(self, msg):
+        params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
+        tool, args = str(params.get("name") or ""), params.get("arguments") or {}
+        with self.call_lock:
+            try:
+                said, up = self.server.call(tool, args), True
+            except OSError:  # crewchat is not running: reads go on, nothing changes a page (as the hooks do)
+                said, up = ({"decision": "allow"} if browser_action(tool, args)[0] == "read" else
+                            {"decision": "deny", "reason": BROWSER_DOWN}), False
+            if said.get("decision") != "allow":
+                return self._to_agent(self._error(msg["id"], said.get("reason") or "crewchat refused this call"))
+            if msg["id"] in self.cancelled:  # the agent gave up on it while it waited: it is not run late
+                self.cancelled.discard(msg["id"])
+                return None
+            answer = self._to_child(msg, wait=True)
+            if answer is None:
+                return self._to_agent(self._error(msg["id"], "the browser could not start: %s" % self.start_error
+                                                  if self.child is None else
+                                                  "the browser stopped while it ran this call; try again"))
+            if up:
+                try:
+                    note = self.server.seen(self._tabs())
+                except OSError:
+                    note = None
+                if note and isinstance(answer.get("result"), dict):  # the call took the page somewhere not allowed
+                    answer["result"].setdefault("content", []).append({"type": "text", "text": note})
+            self._to_agent(answer)
+
+    def _tabs(self):
+        """Where the browser is, [{url, current: True}], as Playwright itself says; [] when it cannot say (then nothing
+        is known: a page's open dialog stops it). Against Playwright MCP 0.0.83 neither tool that looks easier will do.
+        browser_tabs' "[title](url)" list is not escaped, so a page's title or address can read as another site.
+        browser_evaluate runs in the page, whose own eval and Promise answer it, so a page can say any address.
+        browser_run_code_unsafe runs in Playwright's process, and page.url() comes from the browser's navigation events."""
+        self.mine += 1
+        answer = self._to_child({"jsonrpc": "2.0", "id": "%s%d" % (self.prefix, self.mine), "method": "tools/call",
+                                 "params": {"name": "browser_run_code_unsafe",
+                                            "arguments": {"code": "async (page) => page.url()"}}},
+                                wait=True, timeout=15)
+        result = (answer or {}).get("result") or {}
+        text = "".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+        found = re.match(r"### Result\n(\".*\")\n", text)
+        try:
+            url = json.loads(found.group(1)) if found and not result.get("isError") else None
+        except ValueError:
+            url = None
+        return [{"url": url, "current": True}] if isinstance(url, str) and url else []
+
+    @staticmethod
+    def _error(mid, text):
+        return {"jsonrpc": "2.0", "id": mid, "result": {"content": [{"type": "text", "text": text}], "isError": True}}
+
+
+class ProxyServer:
+    """The browser proxy's side of the server: /api/hook events, with this folder's place token, as the hooks use."""
+
+    def __init__(self, base, token, client, folder):
+        self.base, self.token, self.client, self.folder = base, token, client, folder
+        self.proxy = None
+
+    def _post(self, body, timeout=10):
+        return post_json(self.base + "/api/hook", self.token, body, timeout=timeout)
+
+    def _register(self):
+        self.proxy = self._post({"event": "proxy", "client": self.client, "folder": self.folder,
+                                 "pids": ancestor_pids()})["proxy"]
+
+    def call(self, tool, args):
+        for again in (False, True):
+            if self.proxy is None or again:
+                self._register()
+            said = self._post({"event": "proxy_call", "proxy": self.proxy, "tool": tool, "args": args},
+                              timeout=PERMISSION_WAIT + 20)
+            if said.get("reason") != PROXY_GONE or again:  # a server started again forgot this proxy: once more
+                return said
+        return said
+
+    def seen(self, tabs):
+        return self._post({"event": "proxy_seen", "proxy": self.proxy, "tabs": tabs}).get("note")
+
+
+class NoChat:
+    """A proxy in a folder connected to no crewchat: the bridge is only for the chat's agents (S2)."""
+
+    def call(self, tool, args):
+        return {"decision": "deny", "reason": BRIDGE_ONLY}
+
+    def seen(self, tabs):
+        return None
+
+
+def proxy_main(client):
+    """`crewchat browser-proxy CLIENT`: the bridge for an agent tool, on stdin and stdout."""
+    project = find_project(client)
+    config = client_config(project, client) if project else None
+    server = ProxyServer(config[0], config[1], client, str(project)) if config else NoChat()
+    # npx by its full path (on Windows it is npx.cmd, which Popen does not find by name); the agent tool's messages
+    # in UTF-8 whatever this machine's locale is.
+    stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8", errors="replace")
+    stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", line_buffering=True)
+    return BrowserProxy(client, [shutil.which("npx") or "npx", "-y"] + BROWSER_BRIDGE, server, stdin, stdout).run()
+
+
+def cmd_browser_proxy(args):
+    sys.exit(proxy_main(args.client))
 
 
 # --------------------------------------------------------------------------------------------
@@ -13623,8 +14240,6 @@ PUSH_PAGE_GONE = 45  # seconds since a page last polled a project: none of its p
 PUSH_EVERY = 3  # how often the server looks for something new to push (seconds)
 MAX_PUSH_SUBS = 20
 MAX_PUSH_NOTICES = 10  # kept per browser until its service worker fetches them
-NEED_LABELS = {"permission": "Asks permission", "blocked": "Needs you", "review": "Ready for review", "message": "Message",
-               "given_back": "Given back", "reclaimed": "Reclaimed", "process": "Process note"}  # as the page says them (NEED_LOOK)
 
 # P-256 (NIST, FIPS 186-4): enough of it to make a key and sign, in plain Python. Only this machine's own
 # key is used, on what it sends; nothing received is ever verified with it.
@@ -13804,7 +14419,7 @@ def send_push(store, endpoint):
 
 def push_notice(project, item):
     """A Needs you item as a notification, worded as the page words its own."""
-    label = NEED_LABELS.get(item["kind"], "Needs you")
+    label = NEED_KINDS[item["kind"]][1] if item["kind"] in NEED_KINDS else "Needs you"  # as the page says it
     if item.get("task"):
         body = "#%s %s" % (item["task"], item.get("title") or "") + ("\n" + item["text"] if item.get("text") else "")
     elif item["kind"] == "permission":
@@ -13812,7 +14427,7 @@ def push_notice(project, item):
     else:
         body = item.get("text", "")
     return {"title": "%s: %s" % (project.name, label) + (" · " + item["agent"] if item.get("agent") else ""),
-            "body": body[:400], "tag": "%s:%s:%s" % (project.id, item["kind"], item.get("task") or item.get("id") or ""),
+            "body": body[:400], "tag": "%s:%s" % (project.id, item.get("key") or item["kind"]),
             "url": "/" if project.primary else "/?chat=" + urllib.parse.quote(project.id)}
 
 
@@ -13822,7 +14437,7 @@ def push_round(projects, store, seen, send=send_push):
     project's Needs you had; a project seen for the first time pushes nothing (a restart is not news)."""
     for project in projects.all():
         items = project.hub.needs_you()
-        keys = {"%s:%s" % (i["kind"], i.get("task") or i.get("id")): i for i in items}
+        keys = {i["key"]: i for i in items}
         before, seen[project.id] = seen.get(project.id), set(keys)
         if before is None or time.time() - project.hub.page_seen < PUSH_PAGE_GONE:
             continue
@@ -14327,7 +14942,9 @@ This project's AI agents and the owner share a chat (crewchat). If your tool lis
     task (the lead, else whoever posted it; the owner for the owner's own) and shows on the task.
 - **The task sheet.** With nothing to do, `hub_task` view and take the top task. A task whose
   holder shows no sign of life (no tool call, no hook) for the project's reclaim time (view says
-  it) goes back on the sheet; waiting on someone's answer, mark it `blocked`.
+  it) goes back on the sheet; waiting on someone's answer, mark it `blocked`. Told at a tool call
+  that a task was reclaimed from you (the shell or edit calls right after are refused), stop work on it (no commits,
+  no pushes) until you take it again.
 - **The advisor.** If an agent has the advisor role (`hub_agents` shows it), ask it with `hub_ask`
   before you commit to an approach, when an error keeps coming back, and before you say a task is
   done. When crewchat can read your conversation, it goes with your question as a file only the
@@ -14876,16 +15493,19 @@ def command_line(line, values):
     """A project command's line with its parameters put in, each quoted for the shell it runs in (L6). A value put
     inside quotes the owner already wrote is escaped for those quotes, not wrapped in a second pair: that second pair
     would close the first and the rest of the value would run as its own command. Outside quotes, the value is quoted
-    whole. On Windows a value with a character cmd.exe acts on (& | < > ^ % ! " ( )) is refused: no quoting keeps it
-    a value there."""
-    if os.name == "nt":
+    whole. After a $(, `, ${, $[ or $' a parameter is refused: inside those the shell reads the value afresh and no
+    escaping for the quotes around them keeps it a value. On Windows a value with a character cmd.exe acts on
+    (& | < > ^ % ! " ( )) is refused: no quoting keeps it a value there, and only double quotes are quotes."""
+    nt = os.name == "nt"
+    if nt:
         bad = next((k for k, v in values.items() if CMD_SPECIAL.search(str(v))), None)
         if bad:
             raise HubError("%s may not hold & | < > ^ %% ! \" ( ) on Windows: cmd.exe would run what follows" % bad)
     param = re.compile(r"\{([A-Z][A-Z0-9_]{0,31})\}")
+    plain_var = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")  # ${HOME}: nothing inside it is read again
 
     def shell_quote(value):
-        return subprocess.list2cmdline([value]) if os.name == "nt" else shlex.quote(value)
+        return subprocess.list2cmdline([value]) if nt else shlex.quote(value)
 
     def in_single(value):  # the quotes stay; a ' in the value ends and reopens them
         return str(value).replace("'", "'\\''")
@@ -14896,15 +15516,6 @@ def command_line(line, values):
     out, quote, i = [], None, 0
     while i < len(line):
         ch = line[i]
-        if quote == '"' and ch == "\\" and i + 1 < len(line):  # the owner's own escape, kept as written
-            out.append(line[i:i + 2])
-            i += 2
-            continue
-        if ch in "'\"" and (quote is None or ch == quote):
-            quote = None if quote == ch else ch
-            out.append(ch)
-            i += 1
-            continue
         found = param.match(line, i)
         if found:
             key = found.group(1)
@@ -14913,13 +15524,36 @@ def command_line(line, values):
             elif quote == "'":
                 out.append(in_single(values[key]))
             elif quote == '"':
-                out.append(values[key] if os.name == "nt" else in_double(values[key]))
+                out.append(values[key] if nt else in_double(values[key]))
             else:
                 out.append(shell_quote(str(values[key])))
             i = found.end()
             continue
-        out.append(ch)
-        i += 1
+        step = 1
+        if nt:
+            if ch == '"':
+                quote = None if quote else ch
+        elif quote == "'":
+            if ch == "'":
+                quote = None
+        elif ch == "\\":  # the owner's own escape, kept as written: \' is not a quote
+            step = 2
+        elif plain_var.match(line, i) and line[i + 2:plain_var.match(line, i).end() - 1] not in values:
+            step = plain_var.match(line, i).end() - i
+        elif ch == "`" or line[i:i + 2] in ("$(", "${", "$[", "$'"):
+            rest = [m.group(1) for m in param.finditer(line, i) if m.group(1) in values]
+            if rest:
+                raise HubError("%s comes after %s in a command line: the shell would read its value as commands. "
+                               "Put the parameter before it" % (rest[0], "`" if ch == "`" else line[i:i + 2]))
+            out.append(line[i:])
+            break
+        elif ch == "#" and quote is None and (i == 0 or line[i - 1].isspace()):  # a comment, to the end of the line
+            end = line.find("\n", i)
+            step = (end if end >= 0 else len(line)) - i
+        elif ch in "'\"" and (quote is None or ch == quote):
+            quote = None if quote == ch else ch
+        out.append(line[i:i + step])
+        i += step
     return "".join(out)
 
 
@@ -15143,12 +15777,17 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .agent .name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent .holds .badge { display: inline-block; vertical-align: 1px; max-width: 110px; }
 .agent .holds { grid-column: 2 / 4; font-size: 12.5px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.agent .count { font-size: 11px; font-weight: 700; background: var(--accent); color: var(--on-accent); border-radius: 99px; padding: 0 7px; }
+/* What an agent has not read yet: its backlog, so muted and outlined, never like the owner's own counts (U10). */
+.agent .count { font-size: 11px; font-weight: 600; background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 99px; padding: 0 6px; font-variant-numeric: tabular-nums; }
 .badge { font-size: 11px; font-weight: 650; border-radius: 99px; padding: 0 8px; background: var(--tint); color: var(--deep); white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
 @media (prefers-color-scheme: dark) { .badge { color: var(--accent-2); } }
-.dot { width: 9px; height: 9px; border-radius: 50%; background: var(--off); flex: none; display: inline-block; }
-.dot.on { background: var(--ok); } .dot.recent { background: var(--warn); }
+/* A state by shape as well as colour (U1, WCAG 1.4.1): filled when here now, a ring when seen lately, a faint ring
+   when away. */
+.dot { width: 9px; height: 9px; border-radius: 50%; background: transparent; box-shadow: inset 0 0 0 1.5px var(--off);
+  flex: none; display: inline-block; }
+.dot.on { background: var(--ok); box-shadow: none; } .dot.recent { box-shadow: inset 0 0 0 2.5px var(--warn); }
 .none { font-size: 13px; color: var(--muted); margin: 4px 8px; }
 .add-agent { margin-top: 6px; background: transparent; color: var(--accent); border: 1.5px dashed var(--line); }
 .add-agent:hover { background: var(--tint); }
@@ -15170,6 +15809,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #needs-list { max-height: 45vh; overflow-y: auto; }
 #needs-count { background: var(--err); color: var(--err-ink); border-radius: 99px; padding: 0 7px; font-size: 11px; letter-spacing: 0; }
 #needs-count:empty { display: none; }
+#needs-open { display: none; }  /* a phone's: Needs you, a tap away (U3) */
 .card.needs-card { border-left: 4px solid var(--err); }
 .needs-card textarea { width: 100%; min-height: 70px; resize: vertical; margin-top: 6px; }
 #bell > summary { padding: 4px 10px; border-radius: 99px; font-size: 16px; line-height: 1.2; }
@@ -15178,16 +15818,17 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #bell.off #bell-icon { filter: grayscale(1); opacity: 0.55; }
 
 /* Live: who is working, and on what. */
-.dot.working { background: var(--ok); animation: pulse 1.6s ease-in-out infinite; }
+.dot.working { background: var(--ok); box-shadow: none; animation: pulse 1.6s ease-in-out infinite; }
 @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(31, 138, 82, 0.45); } 60% { box-shadow: 0 0 0 5px rgba(31, 138, 82, 0); } }
 .agent .holds .doing { color: var(--ok-strong); font-weight: 600; }
 @media (prefers-color-scheme: dark) { .agent .holds .doing { color: var(--ok); } }
 #working { margin: 0; padding: 2px max(18px, calc((100% - 860px) / 2)); font-size: 12.5px; color: var(--muted); flex: none; }
 #working .dots::after { content: "…"; display: inline-block; animation: blink 1.2s steps(3) infinite; width: 1.2em; overflow: hidden; vertical-align: bottom; }
 @keyframes blink { 0% { width: 0.3em; } 100% { width: 1.2em; } }
-.msg, .sys { animation: rise 0.18s ease-out; }
+/* Only a message that just arrived rises in; the history shows at once when the page opens (U11). */
+.msg.fresh, .sys.fresh { animation: rise 0.18s ease-out; }
 @keyframes rise { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
-@media (prefers-reduced-motion: reduce) { .dot.working, .msg, .sys, #working .dots::after { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .dot.working, .msg.fresh, .sys.fresh, #working .dots::after { animation: none; } }
 .welcome { max-width: 520px; margin: 10vh auto 0; text-align: center; color: var(--muted); }
 .welcome img { width: 96px; height: 96px; }
 .welcome h2 { color: var(--ink); font-size: 20px; margin: 8px 0 4px; }
@@ -15201,7 +15842,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .avatar .initials { color: var(--av-ink); font-size: 12.5px; font-weight: 700; letter-spacing: 0.02em; }
 .avatar .emoji { font-size: 18px; line-height: 1; }
 .avatar .mark, .avatar .os { position: absolute; bottom: -3px; height: 14px; min-width: 14px; padding: 0 3px; border-radius: 7px;
-  font-size: 8px; line-height: 14px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
+  font-size: 10px; line-height: 14px; text-align: center; box-shadow: 0 0 0 2px var(--bg); }
 .avatar .mark { right: -4px; background: var(--mk); color: var(--mk-ink, #fff); font-weight: 700; box-shadow: 0 0 0 2px var(--bg), 0 0 0 3px var(--off); }
 .avatar .os { left: -4px; background: var(--panel); }
 .avatar.big { width: 56px; height: 56px; } .avatar.big .initials { font-size: 20px; } .avatar.big .emoji { font-size: 28px; }
@@ -15301,7 +15942,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .mentions [role=option] { cursor: pointer; display: flex; align-items: center; gap: 8px; background: none; color: var(--text); text-align: left;
   border-radius: 10px; padding: 5px 8px; font-weight: 500; font-size: 13.5px; }
 .mentions [role=option][aria-selected="true"], .mentions [role=option]:hover { background: var(--tint); }
-.mentions .avatar { width: 24px; height: 24px; } .mentions .avatar .initials { font-size: 9.5px; }
+.mentions .avatar { width: 24px; height: 24px; } .mentions .avatar .initials { font-size: 10px; }
 .mentions .avatar .mark, .mentions .avatar .os { display: none; }
 .mentions .r { margin-left: auto; font-size: 11.5px; color: var(--muted); }
 #plus > summary { width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
@@ -15343,6 +15984,7 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #sheet .acts { justify-content: flex-start; flex-wrap: nowrap; }
 .acts button, .acts select { font-size: 12.5px; padding: 3px 10px; background: transparent; color: var(--text); border: 1px solid var(--line); }
 .acts button.danger { color: var(--err); }
+.acts button.apart { margin-left: auto; }
 #cmd-filter { width: 100%; font-size: 14px; margin-bottom: 12px; }
 .cmd-group h3 { font-size: 13px; color: var(--muted); margin: 18px 0 6px; font-weight: 650; }
 .cmd { border: 1px solid var(--line); border-radius: 14px; background: var(--soft); padding: 9px 12px; margin-bottom: 6px; }
@@ -15363,6 +16005,10 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .seg button[aria-pressed="true"] { background: var(--panel); color: var(--ink); box-shadow: var(--shadow); }
 .board-bar select { font-size: 13px; }
 #board { display: grid; grid-template-columns: repeat(5, minmax(168px, 1fr)); gap: 12px; align-items: start; overflow-x: auto; padding-bottom: 8px; }
+/* More columns past an edge (a narrow window, the side panel open): that edge fades, so none is silently cut off (U5). */
+#board.more-right { -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 56px), transparent); mask-image: linear-gradient(to right, #000 calc(100% - 56px), transparent); }
+#board.more-left { -webkit-mask-image: linear-gradient(to left, #000 calc(100% - 56px), transparent); mask-image: linear-gradient(to left, #000 calc(100% - 56px), transparent); }
+#board.more-left.more-right { -webkit-mask-image: linear-gradient(to right, transparent, #000 56px, #000 calc(100% - 56px), transparent); mask-image: linear-gradient(to right, transparent, #000 56px, #000 calc(100% - 56px), transparent); }
 .col { background: var(--soft); border-radius: var(--radius); padding: 10px; min-height: 140px; display: flex; flex-direction: column; gap: 8px;
   border: 2px solid transparent; transition: border-color 0.12s, background 0.12s; }
 .col.over { border-color: var(--accent-2); background: var(--tint); }
@@ -15379,9 +16025,10 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 .tcard .ttl { margin: 2px 0 6px; font-size: 13.5px; line-height: 1.35; overflow-wrap: anywhere;
   display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .tcard .tmeta { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
-.tcard .avatar { width: 22px; height: 22px; } .tcard .avatar .initials { font-size: 9px; } .tcard .avatar .emoji { font-size: 13px; }
+.tcard .avatar { width: 22px; height: 22px; } .tcard .avatar .initials { font-size: 10px; } .tcard .avatar .emoji { font-size: 13px; }
 .tcard .avatar .mark, .tcard .avatar .os { display: none; }
 .tchip { font-size: 11px; background: var(--soft); border-radius: 99px; padding: 1px 8px; color: var(--muted); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.tchip.piece { color: var(--deep); font-weight: 600; }
 .tcard .who { font-size: 12px; color: var(--muted); margin-right: auto; }
 .more { background: transparent; color: var(--accent); font-size: 12.5px; padding: 4px; }
 .give { display: flex; gap: 8px; align-items: center; background: var(--panel); box-shadow: var(--shadow); border-radius: 16px; padding: 10px 12px; margin: 10px 0; }
@@ -15448,6 +16095,9 @@ body.switching #space { opacity: 0.45; pointer-events: none; transition: opacity
 #process-list .meta { flex: 1 1 auto; }
 #process-list .warn { color: var(--warn); }
 #process-rule { font-size: 12px; max-width: 60%; }
+/* Help under the settings, not a card among them (U9). */
+#pane-project .help { margin: 4px 4px 12px; font-size: 13px; }
+#pane-project .help summary { cursor: pointer; color: var(--muted); }
 #folders-list button { white-space: nowrap; }
 
 /* Dialogs: New agent (four steps), New project, Project rules. */
@@ -15477,6 +16127,11 @@ dialog fieldset { border: 0; padding: 0; margin: 0; }
 .steps li::before { content: counter(step) ". "; }
 .steps li.on { background: var(--accent); color: var(--on-accent); font-weight: 650; }
 .steps li.done { background: var(--tint); color: var(--ink); }
+.steps li small { font-size: 10.5px; font-weight: 400; }
+/* The dialog keeps the height of its tallest step (U8): steps sit in one cell, the others hidden from view and focus. */
+#launch .step-body { display: grid; }
+#launch .step-body > .step { grid-area: 1 / 1; }
+#launch .step-body > .step[hidden] { display: block !important; visibility: hidden; }
 .inline { display: flex; gap: 10px; align-items: center; }
 .swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; flex: none; background: var(--sw, var(--off)); }
 #l-perms-note.warn { color: var(--err); }
@@ -15608,9 +16263,17 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
   body, body.panel-open { grid-template-areas: "top" "space"; grid-template-columns: minmax(0, 1fr); }
   .phone-only { display: inline-flex !important; }
   .wide-only { display: none !important; }
-  #topbar { align-items: center; padding: 6px 10px; }
+  /* One header on a phone (U3): the project's name is the switcher; the bar above shows only while switching. */
+  #topbar { align-items: center; padding: 6px 10px; display: none; }
+  body.switching #topbar { display: flex; }
   #tabs, #tab-add { display: none; }
-  #projects { flex: 1; min-width: 0; }
+  #space-head .titles { min-width: 0; flex: 1; }
+  #projects { display: block !important; max-width: 100%; font-weight: 650; font-size: 16px; color: var(--ink);
+    background: transparent; border: 0; padding: 0; margin: 0; }
+  #project { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  #needs-open:not([hidden]) { display: inline-flex; align-items: center; gap: 3px; flex: none; min-width: 40px; height: 32px;
+    padding: 0 10px; justify-content: center; border-radius: 99px; background: var(--err); color: var(--err-ink); border: 0;
+    font-size: 14px; font-weight: 750; }
   #space { border-radius: 0; box-shadow: none; }
   #space-head { padding: 8px 10px; gap: 8px; }
   #space-avatar { display: none; }
@@ -15668,16 +16331,15 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
       <button type="button" id="new-project">New project…</button>
     </div>
   </details>
-  <select id="projects" class="phone-only" aria-label="Project"></select>
   <p id="switching" role="status" hidden></p>
 </header>
 <aside id="rail" aria-label="The crew">
   <div class="rail-tools">
+    <button type="button" class="icon on" id="view-chat" aria-pressed="true" title="The conversation">Chat</button>
     <button type="button" class="icon" id="view-tasks" aria-pressed="false" title="The task board">Tasks <span id="tasks-count"></span></button>
-    <button type="button" class="icon" id="view-commands" aria-pressed="false" title="Every crewchat command">Commands</button>
     <button type="button" class="icon" id="view-analytics" aria-pressed="false" title="The crew at a glance">Analytics</button>
   </div>
-  <section id="needs-you" hidden aria-label="Needs you">
+  <section id="needs-you" hidden aria-label="Needs you" tabindex="-1">
     <h2 class="rail-head">Needs you <span id="needs-count"></span></h2>
     <div id="needs-list" role="list"></div>
     <p id="needs-said" class="sr" role="status"></p>
@@ -15698,7 +16360,8 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
   <header id="space-head">
     <button type="button" class="icon phone-only" id="rail-open" aria-label="The crew and the task board" aria-expanded="false" aria-controls="rail">☰</button>
     <span id="space-avatar" class="pav" aria-hidden="true">c</span>
-    <div class="titles"><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
+    <div class="titles"><select id="projects" class="phone-only" aria-label="Project"></select><h1 id="project">crewchat</h1><p id="space-meta"></p></div>
+    <button type="button" class="icon" id="needs-open" hidden aria-label="Needs you" title="What needs you"><span aria-hidden="true">!</span><span id="needs-open-count"></span></button>
     <input id="search" type="search" placeholder="Search" aria-label="Search this chat" autocomplete="off">
     <details id="bell" class="menu">
       <summary title="Notifications" aria-label="Notifications"><span id="bell-icon">🔔</span></summary>
@@ -15711,12 +16374,14 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
       </div>
     </details>
     <details id="space-menu" class="menu">
-      <summary title="Rules, skills, roles" aria-label="Project menu">⋯</summary>
+      <summary title="Project settings, roles, machines, commands" aria-label="Project menu">⋯</summary>
       <div class="menu-list">
+        <button type="button" data-panel="project">Project settings</button>
+        <button type="button" data-panel="roles">Roles</button>
         <button type="button" data-panel="machines">Machines</button>
         <button type="button" data-panel="browser">Browser</button>
-        <button type="button" data-panel="project">Rules, skills and machines</button>
-        <button type="button" data-panel="roles">Roles</button>
+        <hr>
+        <button type="button" data-panel="commands">Commands</button>
       </div>
     </details>
   </header>
@@ -15801,9 +16466,10 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
       <ul id="skills-list"></ul>
       <h3 style="margin-top:12px">Process notes
         <select id="process-rule" aria-label="Who approves this project's process notes">
-          <option value="default">The lead approves; you, the ones that need you</option>
-          <option value="owner">You approve every note</option>
-          <option value="lead">The lead approves all but shared and owner-only</option></select></h3>
+          <option value="default">Lead, and you when needed</option>
+          <option value="owner">You, every note</option>
+          <option value="lead">Lead, nearly all</option></select></h3>
+      <p class="meta" id="process-rule-note"></p>
       <ul id="process-list"></ul>
     </section>
     <section class="card" id="folders-card"><h3>Folders on this machine</h3>
@@ -15815,29 +16481,19 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
         <option value="on">On</option><option value="off">Off</option></select>
       <ul id="edits-files" class="meta"></ul>
     </section>
-    <section class="card"><h3>How it works</h3>
+    <details class="help"><summary>How it works</summary>
       <p class="meta"><b>Post as task</b> asks the agents to settle who takes it: each replies with a bid and exactly one takes it. If one agent is the lead, it takes your tasks and hands out the work instead.</p>
       <p class="meta">Agents appear by themselves when a session starts in a connected folder, and drop off after a day of silence. One <b>waiting for messages</b> answers right away; an <b>idle</b> one sees them when its user next types.</p>
-    </section>
+    </details>
   </div>
 </aside>
 <dialog id="launch" aria-labelledby="launch-title">
   <form id="launch-form" method="dialog">
     <h2 id="launch-title">New agent</h2>
     <p>Opens a new agent session in a terminal window on the machine that hosts this page. It joins the chat as you set it up here.</p>
-    <ol class="steps" id="l-steps"><li>Identity</li><li>Workspace</li><li>Engine</li><li>Briefing</li></ol>
-    <div>
+    <ol class="steps" id="l-steps"><li>Workspace</li><li>Engine</li><li>Identity <small>(optional)</small></li><li>Briefing <small>(optional)</small></li></ol>
+    <div class="step-body">
       <fieldset class="step">
-        <label for="l-template">From a template</label><select id="l-template"></select>
-        <label for="l-name">Name (optional)</label>
-        <div class="inline"><input type="text" id="l-name" maxlength="32" placeholder="a first name of its own if empty" autocomplete="off">
-          <button type="button" class="secondary" id="l-dice" title="A random name nobody here has" aria-label="A random name">🎲</button></div>
-        <label for="l-role">Role</label><select id="l-role"></select>
-        <label for="l-picture">Picture</label><select id="l-picture"></select>
-        <label for="l-colour">Colour</label>
-        <div class="inline"><input type="color" id="l-colour" value="#2f5fd6"><label class="check"><input type="checkbox" id="l-colour-tool" checked> The tool's own colour</label></div>
-      </fieldset>
-      <fieldset class="step" hidden>
         <label for="l-folder" id="l-folder-label">Project folder</label><select id="l-folder"></select>
         <label for="l-path">Or connect one</label>
         <div class="inline"><input type="text" id="l-path" placeholder="~/code/my-app" autocomplete="off" spellcheck="false">
@@ -15857,6 +16513,16 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
         <p class="meta" id="l-perms-note"></p>
       </fieldset>
       <fieldset class="step" hidden>
+        <label for="l-template">From a template</label><select id="l-template"></select>
+        <label for="l-name">Name (optional)</label>
+        <div class="inline"><input type="text" id="l-name" maxlength="32" placeholder="a first name of its own if empty" autocomplete="off">
+          <button type="button" class="secondary" id="l-dice" title="A random name nobody here has" aria-label="A random name">🎲</button></div>
+        <label for="l-role">Role</label><select id="l-role"></select>
+        <label for="l-picture">Picture</label><select id="l-picture"></select>
+        <label for="l-colour">Colour</label>
+        <div class="inline"><input type="color" id="l-colour" value="#2f5fd6"><label class="check"><input type="checkbox" id="l-colour-tool" checked> The tool's own colour</label></div>
+      </fieldset>
+      <fieldset class="step" hidden>
         <label for="l-task">First task (optional)</label><textarea id="l-task" maxlength="4000" placeholder="for example: Write a user guide for the settings screen"></textarea>
         <label for="l-instructions">Extra instructions (optional)</label><textarea id="l-instructions" maxlength="4000" placeholder="for example: Ask before changing anything under api/"></textarea>
       </fieldset>
@@ -15865,7 +16531,7 @@ dialog::backdrop { background: rgba(11, 31, 85, 0.28); -webkit-backdrop-filter: 
     <div class="buttons">
       <button type="button" class="secondary" id="l-cancel">Cancel</button>
       <button type="button" class="secondary" id="l-back">Back</button>
-      <button type="button" id="l-next">Next</button>
+      <button type="button" class="secondary" id="l-next">Next</button>
       <button type="submit" id="l-start">Start</button>
     </div>
   </form>
@@ -15998,7 +16664,7 @@ function renderProjects(list, current) {
   const menu = $("projects");
   if (menu !== document.activeElement) {
     menu.replaceChildren(...list.map((p) => {
-      const option = new Option(p.name + (p.linked ? " (shared)" : "") + (p.needs ? "  • needs you" : p.fresh ? "  • new" : ""), p.id);
+      const option = new Option(p.name + (p.linked ? " (shared)" : "") + (p.needs && p.id !== current ? " (" + p.needs + ")" : p.fresh ? "  • new" : ""), p.id);
       option.selected = p.id === current;
       return option;
     }));
@@ -16048,8 +16714,8 @@ function atBottom() {
   return log.scrollHeight - log.scrollTop - log.clientHeight < 80;
 }
 
-// The space shows the chat or the task board (the commands open in the side panel); the rail's Tasks
-// button and the back arrow switch.
+// The space shows the chat, the task board or the analytics: the rail's Chat, Tasks and Analytics switch, and so do
+// the views' back arrows (U2). The commands open in the side panel, from the project menu.
 // A hidden chat can't scroll, so whether it was at its newest message is kept, and on the way back it
 // shows what came in meanwhile.
 function showView(view) {
@@ -16058,7 +16724,7 @@ function showView(view) {
   log.hidden = view !== "chat"; $("form").hidden = view !== "chat";
   $("tasks").hidden = view !== "tasks";
   $("analytics").hidden = view !== "analytics";
-  for (const [id, on] of [["view-tasks", view === "tasks"], ["view-analytics", view === "analytics"]]) {
+  for (const [id, on] of [["view-chat", view === "chat"], ["view-tasks", view === "tasks"], ["view-analytics", view === "analytics"]]) {
     $(id).classList.toggle("on", on);
     $(id).setAttribute("aria-pressed", String(on));
   }
@@ -16071,8 +16737,7 @@ function showView(view) {
   document.body.classList.remove("rail-open");
   try { sessionStorage.setItem("crewchat-view", view); } catch (e) {}
 }
-$("view-tasks").addEventListener("click", () => showView($("tasks").hidden ? "tasks" : "chat"));
-$("view-analytics").addEventListener("click", () => showView($("analytics").hidden ? "analytics" : "chat"));
+for (const view of ["chat", "tasks", "analytics"]) $("view-" + view).addEventListener("click", () => showView(view));
 
 // The analytics view (X2) is a script of its own, fetched the first time it opens (the browser keeps it, and
 // asks whether it changed), then run as one of the page's.
@@ -16091,16 +16756,17 @@ function openAnalytics() {
     $("analytics").replaceChildren(el("p", "meta", "Could not open the analytics: " + e.message + ". Try again."));
   });
 }
-$("view-commands").addEventListener("click", () => (state.panel && state.panel.kind === "commands" ? closePanel() : openPanel("commands")));
 for (const b of document.querySelectorAll(".back")) b.addEventListener("click", () => showView("chat"));
 
 // A phone: the rail is a drawer.
-function setDrawer(open) {
+function setDrawer(open, focus) {
   document.body.classList.toggle("rail-open", open);
   $("rail-open").setAttribute("aria-expanded", String(open));
-  if (open) $("view-tasks").focus();
+  if (open && focus) { focus.scrollIntoView({ block: "start" }); focus.focus({ preventScroll: true }); }
+  else if (open) $("view-chat").focus();
 }
 $("rail-open").addEventListener("click", () => setDrawer(true));
+$("needs-open").addEventListener("click", () => setDrawer(true, $("needs-you")));
 $("scrim").addEventListener("click", () => setDrawer(false));
 
 // Menus (details elements) close when something else is clicked, or on Escape.
@@ -16233,10 +16899,12 @@ function showError(text) {
 }
 // The owner's actions on a task, as buttons (and a "Give to…" menu) in parent.
 // Always in this order, from the left (the list lines them up): move, settle, give, take off.
-function taskActions(r, parent) {
+// A task's actions: in a row of the list, compact; in the task's panel (roomy), every one in words, and Remove set apart
+// from the others (U7).
+function taskActions(r, parent, roomy) {
   const button = (label, title, body, cls) => { const b = actButton(parent, label, title, () => taskOp(body)); if (cls) b.classList.add(cls); };
-  button("↑", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
-  button("↓", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
+  button(roomy ? "↑ Up" : "↑", "Move task " + r.id + " up", { op: "move", task: r.id, where: "up" });
+  button(roomy ? "↓ Down" : "↓", "Move task " + r.id + " down", { op: "move", task: r.id, where: "down" });
   if (r.status !== "done") button("Done", "Mark task " + r.id + " done", { op: "status", task: r.id, status: "done" });
   if (r.status === "blocked" || r.status === "doing" || r.status === "review" || r.status === "done")
     button("To do", "Put task " + r.id + " back on the sheet", { op: "status", task: r.id, status: "todo" });
@@ -16247,16 +16915,26 @@ function taskActions(r, parent) {
     pick.addEventListener("change", () => pick.value && taskOp({ op: "assign", task: r.id, agent: pick.value }));
     parent.append(pick);
   }
-  const off = actButton(parent, "×", "Take task " + r.id + " off the sheet", () => {
+  const off = actButton(parent, roomy ? "Remove…" : "×", "Take task " + r.id + " off the sheet", () => {
     // As every other action that cannot be undone here: asked first.
     if (confirm("Take task #" + r.id + " off the sheet? Nobody works on it any more; its messages stay in the chat."))
       taskOp({ op: "remove", task: r.id });
   });
   off.classList.add("danger");
+  if (roomy) off.classList.add("apart");
+}
+// A lead's split work (U6): a piece names the task it is part of; that task says how many pieces are still open.
+function openPieces(r) {
+  return (state.sheet || []).filter((x) => x.parent === r.id && x.status !== "done" && x.status !== "removed").length;
+}
+function pieceWords(r) {
+  const n = openPieces(r);
+  return [r.parent ? "part of #" + r.parent : "", n ? "coordinating " + n + " piece" + (n === 1 ? "" : "s") : ""].filter(Boolean);
 }
 function taskMeta(r) {
-  const meta = [];
+  const meta = pieceWords(r);
   if (r.depends.length) meta.push("waits for " + r.depends.map((d) => "#" + d).join(", "));
+  if (r.blocker) meta.push("held back: " + r.blocker);
   if (r.areas.length) meta.push("files " + r.areas.join(", "));
   if (r.where) meta.push("on " + r.where);
   if (r.to !== "all") meta.push("for " + r.to);
@@ -16287,18 +16965,24 @@ function renderSheet(all) {
     title.addEventListener("click", () => openPanel("task", r.id));
     what.append(title, el("div", "meta", taskMeta(r)));
     tr.append(what);
-    const st = el("td"); st.append(el("span", "st " + r.status, r.status)); tr.append(st);
+    const st = el("td"); st.append(el("span", "st " + r.status, sheetWord(r.status))); tr.append(st);
     tr.append(el("td", "meta", r.holder || ""));
     const acts = el("td"); const box = el("div", "acts"); taskActions(r, box); acts.append(box);
     tr.append(acts);
     return tr;
   }));
 }
-// The board: To do, Doing, Blocked, Review, Done. A card opens the task; dragging one moves it, as the
-// owner may: reorder in a column, Done, back to To do, or Doing (to an agent, asked for). Blocked and
-// Review are for agents to set.
-const COLUMNS = [["todo", "To do", "var(--off)"], ["doing", "Doing", "var(--accent)"], ["blocked", "Blocked", "var(--err)"],
-                 ["review", "Review", "var(--warn)"], ["done", "Done", "var(--ok)"]];
+// The board: To do, In progress, Blocked, In review, Done. A card opens the task; dragging one moves it, as the
+// owner may: reorder in a column, Done, back to To do, or In progress (to an agent, asked for). Blocked and
+// In review are for agents to set.
+// One word for each status wherever the owner reads one (U4): the board, the list, a task's panel, the chat, Needs you.
+const COLUMNS = [["todo", "To do", "var(--off)"], ["doing", "In progress", "var(--accent)"], ["blocked", "Blocked", "var(--err)"],
+                 ["review", "In review", "var(--warn)"], ["done", "Done", "var(--ok)"]];
+const SHEET_WORDS = { todo: "to do", waiting: "to do · waiting", doing: "in progress", blocked: "blocked", review: "in review",
+                      done: "done", removed: "off the sheet" };
+const sheetWord = (status) => SHEET_WORDS[status] || status;
+// An update's status as the owner reads it: agents are told "ready for review"; the page says "in review" like the board.
+const updateWord = (status) => (status === "review" ? "in review" : state.statuses[status] || status);
 const column = (r) => (r.status === "waiting" ? "todo" : r.status);
 const DONE_SHOWN = 20;
 let boardDrag = null;
@@ -16333,8 +17017,10 @@ function taskCard(r) {
   b.style.setProperty("--edge", (COLUMNS.find((c) => c[0] === column(r)) || [])[2] || "");
   b.append(el("div", "tid", "#" + r.id + (r.status === "waiting" ? " · waiting" : "")), el("div", "ttl", r.title));
   const meta = el("div", "tmeta");
+  for (const words of pieceWords(r)) meta.append(el("span", "tchip piece", words));
   if (r.holder) { meta.append(avatar(agentRow(r.holder))); meta.append(el("span", "who", r.holder)); }
   for (const d of r.depends) meta.append(el("span", "tchip", "waits for #" + d));
+  if (r.blocker) { const chip = el("span", "tchip", "held back: " + r.blocker); chip.title = r.blocker; meta.append(chip); }
   for (const f of r.areas) meta.append(el("span", "tchip", f));
   if (r.where) meta.append(el("span", "tchip", "on " + r.where));
   if (meta.childNodes.length) b.append(meta);
@@ -16354,7 +17040,7 @@ function taskCard(r) {
 }
 // What dropping r on a column (before a card, or at its end) does; null when nothing.
 // What dropping r does: before the card `before` in a column (or at its end, with before ""), as the
-// owner may. null: nothing (its own place; Blocked and Review are the agents'; only a task to do can be
+// owner may. null: nothing (its own place; Blocked and In review are the agents'; only a task to do can be
 // given to an agent).
 function dropAction(r, col, before) {
   const from = column(r);
@@ -16395,10 +17081,19 @@ $("give-ok").addEventListener("click", async () => {
 });
 $("give-cancel").addEventListener("click", closeGive);
 $("give").addEventListener("keydown", (e) => { if (e.key === "Escape") { e.stopPropagation(); closeGive(); } });
+// Whether the board has columns past its left or right edge, for the faded edges (U5).
+function boardEdges() {
+  const board = $("board");
+  board.classList.toggle("more-left", board.scrollLeft > 2);
+  board.classList.toggle("more-right", board.scrollLeft + board.clientWidth < board.scrollWidth - 2);
+}
+$("board").addEventListener("scroll", boardEdges, { passive: true });
+if (window.ResizeObserver) new ResizeObserver(boardEdges).observe($("board"));
 function renderBoard(shown, all) {
   const board = $("board");
   if (boardDrag || board.hidden) return;
-  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.suggested, r.where]), state.showAllDone,
+  const key = JSON.stringify([shown.map((r) => [r.id, r.status, r.title, r.holder, r.depends, r.areas, r.suggested, r.where, r.parent, r.blocker,
+                                                openPieces(r)]), state.showAllDone,
                               state.agents.map((a) => [a.agent, a.picture, a.colour, a.client])]);
   if (key === state.boardKey) return;
   state.boardKey = key;
@@ -16437,6 +17132,7 @@ function renderBoard(shown, all) {
     return col;
   }));
   if (focused) board.querySelector('[data-task="' + CSS.escape(focused) + '"]')?.focus();
+  boardEdges();
 }
 function showBoard(on) {
   $("board").hidden = !on; $("sheet").hidden = on; $("give").hidden = true;
@@ -16542,6 +17238,7 @@ function renderProcesses(p) {
   if (key === state.processesKey) return;
   state.processesKey = key;
   $("process-rule").value = p.rule || "default";
+  $("process-rule-note").textContent = PROCESS_RULE_WORDS[$("process-rule").value] || "";
   const rows = (p.notes || []).map((n) => [n, false]).concat((p.shared || []).map((n) => [n, true]));
   $("process-list").replaceChildren(...rows.map(([n, shared]) => {
     const item = el("li");
@@ -16592,7 +17289,13 @@ function renderProcesses(p) {
   }));
   if (!rows.length) $("process-list").append(el("li", "", "None yet: agents propose them with hub_process when they work something out."));
 }
+// Who approves the project's notes, in full under the menu's short choices (U12).
+const PROCESS_RULE_WORDS = {
+  default: "The lead approves notes; you approve shared ones, owner-only ones, and ones whose commands may release, deploy, publish, delete data or touch credentials.",
+  owner: "You approve every note.",
+  lead: "The lead approves every note but shared ones, owner-only ones and project commands." };
 $("process-rule").addEventListener("change", async () => {
+  $("process-rule-note").textContent = PROCESS_RULE_WORDS[$("process-rule").value] || "";
   try { await postJSON("/api/processes", { op: "rule", rule: $("process-rule").value }); } catch (e) { alert(e.message); }
 });
 $("rules-edit").addEventListener("click", () => {
@@ -16630,8 +17333,9 @@ function launchOptions() {
   return request("/api/launch");
 }
 
-// New agent, in four steps: identity, workspace, engine, briefing. "From a template" starts from a role
-// (its picture, colour and tool) and goes straight to the workspace.
+// New agent, in four steps: what is required first, workspace and engine, then identity and briefing, both optional
+// (U8). Start works from any step once a folder and a ready tool are set; Enter in a field goes on to the next step.
+// "From a template" (in Identity) starts from a role: its picture, colour and tool.
 let launchTools = [], launchStep = 0;
 function showStep(n) {
   launchStep = n;
@@ -16642,8 +17346,7 @@ function showStep(n) {
   });
   $("l-back").hidden = n === 0;
   $("l-next").hidden = n === 3;
-  $("l-start").hidden = n !== 3;
-  if (n === 2) checkTool();  // the tool, for the folder just chosen
+  if (n === 1) checkTool();  // the tool, for the folder just chosen
   const first = document.querySelectorAll("#launch .step")[n].querySelector("select, input, textarea");
   if (first && $("launch").open) first.focus();
 }
@@ -16691,7 +17394,7 @@ async function openLaunch(role) {
     if (firstReady) $("l-tool").value = firstReady.id;
     if ($("l-role").value) applyRole($("l-role").value); else showTool();  // a role picked meanwhile
     showFolders(opts.folders);
-    if (role) { $("l-template").value = role; $("l-role").value = role; applyRole(role); showStep(1); }
+    if (role) { $("l-template").value = role; $("l-role").value = role; applyRole(role); }
     launchNote(opts.folders);
   } catch (err) {
     note.textContent = "Could not load the options: " + err.message;
@@ -16846,7 +17549,7 @@ function showTool() {
   const models = own(state.models, $("l-tool").value) || [];
   $("l-model").replaceChildren(new Option("Its default", ""), ...models.map(([id, label]) => new Option(label, id)));
   $("l-model").disabled = !models.length;
-  if (launchStep === 2) checkTool();
+  if (launchStep === 1) checkTool();
   if (!$("l-colour-tool").checked) return showPermissions();
   if (info) $("l-colour").value = info.colour;
   showPermissions();
@@ -16868,7 +17571,6 @@ function showPermissions(event) {
 }
 async function startAgent(event) {
   event.preventDefault();
-  if (launchStep < 3) { showStep(launchStep + 1); return; }  // Enter in a field: on to the next step
   const note = $("launch-note");
   $("l-start").disabled = true;
   note.textContent = "Starting…";
@@ -16889,13 +17591,19 @@ async function startAgent(event) {
 $("add-agent").addEventListener("click", () => openLaunch());
 $("plus-agent").addEventListener("click", () => openLaunch());
 $("launch-form").addEventListener("submit", startAgent);
+// Enter in a one-line field goes on to the next step; Start starts, from any step (U8).
+$("launch-form").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" || e.isComposing || launchStep >= 3 || e.defaultPrevented) return;
+  if (!(e.target instanceof HTMLInputElement || e.target instanceof HTMLSelectElement)) return;
+  e.preventDefault(); showStep(launchStep + 1);
+});
 $("l-cancel").addEventListener("click", () => $("launch").close());
 $("l-back").addEventListener("click", () => showStep(Math.max(0, launchStep - 1)));
 $("l-next").addEventListener("click", () => showStep(Math.min(3, launchStep + 1)));
 $("l-template").addEventListener("change", () => {
   const role = $("l-template").value;
   if (!role) return;
-  $("l-role").value = role; applyRole(role); showStep(1);
+  $("l-role").value = role; applyRole(role);
 });
 $("l-role").addEventListener("change", () => applyRole($("l-role").value));
 // A random first name nobody in the chat has yet (the server gives one anyway when the field is empty).
@@ -16911,8 +17619,8 @@ $("l-path").addEventListener("keydown", (e) => { if (e.key === "Enter" && !e.isC
 $("l-colour").addEventListener("input", () => { $("l-colour-tool").checked = false; });
 $("l-colour-tool").addEventListener("change", showTool);
 $("l-tool").addEventListener("change", showTool);
-$("l-account").addEventListener("change", () => { if (launchStep === 2) checkTool(true); });
-$("l-use-browser").addEventListener("change", () => { if (launchStep === 2) checkTool(true); });
+$("l-account").addEventListener("change", () => { if (launchStep === 1) checkTool(true); });
+$("l-use-browser").addEventListener("change", () => { if (launchStep === 1) checkTool(true); });
 $("l-perms").addEventListener("change", showPermissions);
 
 function roleTitle(name) {
@@ -17038,9 +17746,6 @@ function doing(a) {
 // The rail: each agent's picture, name, role, how it is, and the task it holds. One opens in the panel.
 // The agent open in the panel is marked in the rail, without drawing the rail again.
 function markOpen() {
-  const commands = !!state.panel && state.panel.kind === "commands";
-  $("view-commands").classList.toggle("on", commands);
-  $("view-commands").setAttribute("aria-pressed", String(commands));
   for (const card of $("agents").querySelectorAll(".agent")) {
     const on = state.agentPane === card.dataset.agent;
     card.classList.toggle("on", on);
@@ -17069,7 +17774,7 @@ function renderAgents(force) {
     const right = el("span", "inline");
     if (a.unread) {
       // Messages the agent has not read yet (not the owner's): said on hover, and to a screen reader.
-      const n = el("span", "count", String(a.unread));
+      const n = el("span", "count", a.unread + " unread");
       n.title = a.unread + " message" + (a.unread === 1 ? "" : "s") + " " + a.agent + " has not read yet";
       right.append(n, el("span", "sr", " messages it has not read"));
     }
@@ -17336,7 +18041,7 @@ function renderPanel(force) {
   $("pane-project").hidden = p.kind !== "project";
   $("commands").hidden = p.kind !== "commands";
   const draw = { task: panelTask, roles: panelRoles, role: panelRole,
-                 project: () => { loadEdits(); loadFolders(true); return ["Rules, skills and machines"]; },
+                 project: () => { loadEdits(); loadFolders(true); return ["Project settings"]; },
                  commands: () => ["Commands"], machines: panelMachines, browser: panelBrowser }[p.kind];
   const [title, ...cards] = draw(p.id);
   $("panel-title").textContent = title;
@@ -17707,7 +18412,7 @@ function panelAgent(name) {
 
   const now = [];
   now.push(field("Status", a.status || "No status set"));
-  now.push(field("Doing", (a.doing && isWorking(a) ? a.doing : doing(a)) + " · " + ago(a.seen, state.now)));
+  now.push(field("Activity", (a.doing && isWorking(a) ? a.doing : doing(a)) + " · " + ago(a.seen, state.now)));
   if (a.session) now.push(field("Session", sessionLine(a)));
   const task = heldTask(a.agent);
   if (task) {
@@ -17828,30 +18533,46 @@ function nameField(a, agentOp) {
 function panelTask(id) {
   const r = state.sheet.find((x) => x.id === id);
   if (!r) return ["Task #" + id, card("", el("p", "meta", "Task #" + id + " is no longer on the sheet."))];
-  const what = [el("p", "", r.title), field("Status", el("span", "st " + r.status, r.status))];
+  const what = [el("p", "", r.title), field("Status", el("span", "st " + r.status, sheetWord(r.status)))];
   if (r.holder) {
     const who = el("button", "link", r.holder);
     who.type = "button"; who.addEventListener("click", () => openPanel("agent", r.holder));
     what.push(field("Holder", who));
   }
   if (r.depends.length) what.push(field("Waits for", r.depends.map((d) => "#" + d).join(", ")));
+  if (r.blocker) what.push(field("Held back", r.blocker));
   if (r.areas.length) what.push(field("Files", r.areas.join(", ")));
   if (r.suggested && r.suggested.length) what.push(field("Suggested files", r.suggested.join(", ")));
   if (r.where) what.push(field("Machine", r.where));
   if (r.browser) what.push(field("Browser", "Needs the browser: only an agent with it on takes it"));
   what.push(field("From", r.from === "Owner" ? "you" : r.from));
+  if (r.parent) {
+    const up = el("button", "link", "#" + r.parent + " " + ((state.sheet.find((x) => x.id === r.parent) || {}).title || ""));
+    up.type = "button"; up.addEventListener("click", () => openPanel("task", r.parent));
+    what.push(field("Part of", up));
+  }
+  const pieces = (state.sheet || []).filter((x) => x.parent === r.id);
+  if (pieces.length) {
+    const list = el("span");
+    for (const x of pieces) {
+      const b = el("button", "link", "#" + x.id + " " + sheetWord(x.status));
+      b.type = "button"; b.title = x.title; b.addEventListener("click", () => openPanel("task", x.id));
+      list.append(b, " ");
+    }
+    what.push(field("Pieces", list));
+  }
   if (r.reclaimed) what.push(field("Reclaimed", "from " + r.reclaimed));
   const history = (state.byTask[r.id] || []).map((m) => {
     const line = el("p", "meta");
     line.textContent = hhmm(m.ts) + " · " + (m.from === "Owner" ? "You" : m.from) + ": " +
-      (m.kind === "update" ? (state.statuses[m.status] || m.status) + (m.text ? " — " + m.text : "") : m.text).slice(0, 200);
+      (m.kind === "update" ? updateWord(m.status) + (m.text ? " — " + m.text : "") : m.text).slice(0, 200);
     return line;
   });
   const acts = el("div", "acts");
   if (r.suggested && r.suggested.length)  // what its holder changed outside its areas: add them, so overlaps show
     actButton(acts, "Accept files", "Add the suggested files to task " + r.id + "'s",
               () => taskOp({ op: "areas", task: r.id, accept: true }));
-  taskActions(r, acts);
+  taskActions(r, acts, true);
   actButton(acts, r.browser ? "Does not need the browser" : "Needs the browser", "Whether task " + r.id + " needs the browser",
             () => taskOp({ op: "browser", task: r.id, value: !r.browser }));
   const need = state.needs.find((n) => n.task === r.id && n.kind !== "browser");  // a browser ask has its own card
@@ -17876,13 +18597,13 @@ function needsCard(n, r) {
     const acts = el("div", "acts");
     actButton(acts, "Send", "Send your answer to " + to, async (b) => {
       if (!answer.value.trim()) { answer.focus(); return panelNote("Write your answer first."); }
-      if (await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) {
+      if (await postAction("/api/needs", { key: n.key, answer: "reply", text: answer.value.trim() }, "Not sent", b)) {
         answer.value = ""; panelNote("Sent to " + to + ".");
       }
     });
     if (n.kind === "review") actButton(acts, "Mark done", "Mark task " + r.id + " done", async (b) => {
       if (answer.value.trim()) {  // what was typed goes too, first
-        if (!await postAction("/api/send", { to, text: "Re #" + r.id + ": " + answer.value.trim(), kind: "msg", files: [] }, "Not sent", b)) return;
+        if (!await postAction("/api/needs", { key: n.key, answer: "reply", text: answer.value.trim() }, "Not sent", b)) return;
         answer.value = "";
       }
       postAction("/api/task", { op: "status", task: r.id, status: "done" }, "Not marked done", b);
@@ -18175,7 +18896,7 @@ function buildMessage(m) {
     body.append(label);
   }
   if (m.kind === "update") {
-    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + (state.statuses[m.status] || m.status)));
+    meta.append(el("span", "pill " + m.status, "#" + m.task + " " + updateWord(m.status)));
   }
   if (m.kind === "ask") meta.append(el("span", "pill", "question" + (m.task ? " · done check #" + m.task : "")));
   if (m.kind === "answer") {
@@ -18212,7 +18933,7 @@ function refreshDynamic() {
       const st = node.querySelector(".state");
       const off = state.removed && state.removed.has(m.id);  // the owner took it off the sheet
       st.textContent = off ? "Off the sheet" : (who ? (m.status === "assigned" ? "For " : "Taken by ") + who : "Open")
-        + (p ? " · " + (state.statuses[p.status] || p.status) : "");
+        + (p ? " · " + updateWord(p.status) : "");
       st.className = "state" + (off ? " off" : who ? " " + colour(who) : "");
     }
   }
@@ -18223,8 +18944,8 @@ function remember(m) {
   if (m.text && m.from !== "Owner" && m.kind !== "event") state.lastSaid[m.from] = m;
   // A task's own messages; and the owner's answers from its panel ("Re #12: ...", as the server reads them too), so
   // its history shows them.
-  const re = m.from === "Owner" && !m.task && /^Re #([A-Za-z]*\d+): /.exec(m.text || "");
-  const task = m.task || (m.kind === "task" ? m.id : "") || (re ? re[1] : "");
+  const re = m.from === "Owner" && !m.task && (m.re || (/^Re #([A-Za-z]*\d+): /.exec(m.text || "") || [])[1]);
+  const task = m.task || (m.kind === "task" ? m.id : "") || re || "";
   if (task) state.byTask[task] = (state.byTask[task] || []).concat([m]).slice(-12);
 }
 
@@ -18277,10 +18998,12 @@ function groupWith(m, prev) {
     m.to === prev.to && m.ts - prev.ts < 300;
 }
 
+const FRESH_MAX = 20;  // messages in one poll that still rise in, one by one
 function addMessages(list, first) {
   if (!list.length) return;
   const log = $("log");
   $("empty")?.remove();
+  const fresh = !first && list.length <= FRESH_MAX;  // not the history a page opens on, nor a long catch-up
   for (const m of list) {
     if (m.kind === "plan") { state.after = m.seq; continue; }  // the task sheet's own bookkeeping
     const day = new Date(m.ts * 1000).toLocaleDateString([], { weekday: "long", day: "numeric", month: "long" });
@@ -18288,6 +19011,7 @@ function addMessages(list, first) {
     if (day !== state.lastDay) { const d = el("p", "day", day); d.hidden = !!searchWant(); log.append(d); state.lastDay = day; }
     const node = buildMessage(m);
     if (groupWith(m, state.lastShown) && sameDay) node.classList.add("cont");
+    if (fresh) node.classList.add("fresh");
     state.lastShown = m;
     node.hidden = !matches(node, searchWant());
     log.append(node);
@@ -18355,14 +19079,17 @@ $("update-close").addEventListener("click", () => {
 });
 
 // Needs you: blocked tasks (with the agent's question), reviews, unread messages to you, tasks given back.
-const NEED_LOOK = { permission: ["Asks permission", "var(--err)"], browser: ["Browser", "var(--err)"], blocked: ["Needs you", "var(--err)"], review: ["Ready for review", "var(--warn)"],
-                    message: ["Message", "var(--accent)"], given_back: ["Given back", "var(--off)"], reclaimed: ["Reclaimed", "var(--off)"],
-                    process: ["Process note", "var(--accent)"] };
-const needKey = (n) => n.kind + ":" + (n.task || n.id);
+// Each kind's label and colour come from the server's one list of kinds (/api/boot), and each item's key from the
+// server too (R8), so the page, push notices and the answer route never disagree.
+let NEED_LOOK = {};
+const needKey = (n) => n.key;
 function renderNeeds(needs) {
   const box = $("needs-list"), key = JSON.stringify(needs);
   $("needs-you").hidden = !needs.length;
   $("needs-count").textContent = needs.length ? String(needs.length) : "";
+  $("needs-open").hidden = !needs.length;
+  $("needs-open-count").textContent = String(needs.length);
+  $("needs-open").setAttribute("aria-label", "Needs you: " + needs.length + (needs.length === 1 ? " item" : " items"));
   if (key === state.needsKey) return;
   state.needsKey = key;
   const known = state.needsShown || new Set(), added = needs.filter((n) => !known.has(needKey(n)));
@@ -18402,10 +19129,10 @@ function renderNeeds(needs) {
     return b;
   }));
 }
-// A permission prompt of an agent's tool: what it asks to run or change, and Allow or Deny. With no answer
+// A permission prompt of an agent's tool: what it asks to run or change, on which machine, and Allow or Deny. With no answer
 // here in time, the agent asks in its terminal instead.
 function permissionItem(n) {
-  return askItem(n, "permission", n.tool, "pre", [["allow", "Allow"], ["deny", "Deny"]]);
+  return askItem(n, "permission", n.tool + (n.machine ? " on " + n.machine : ""), "pre", [["allow", "Allow"], ["deny", "Deny"]]);
 }
 // A process note only you may approve, or one the lead asks you about (L1): what it says, its commands exactly as
 // written, and Approve or Decline.
@@ -18436,7 +19163,7 @@ function processItem(n) {
     b.addEventListener("click", async () => {
       for (const x of acts.querySelectorAll("button")) x.disabled = true;
       try {
-        await postJSON("/api/processes", { op, name: n.id, of: n.of });
+        await postJSON("/api/needs", { key: n.key, answer: op, of: n.of });
         said.textContent = op === "approve" ? "Approved" : "Declined";
       } catch (e) {
         said.textContent = e.message || "Not sent";
@@ -18471,7 +19198,7 @@ function askItem(n, kind, subject, tag, answers) {
     b.addEventListener("click", async () => {
       for (const x of acts.querySelectorAll("button")) x.disabled = true;
       try {
-        await postJSON("/api/permission", { id: n.id, answer, kind });  // which kind of ask: one gone says so
+        await postJSON("/api/needs", { key: n.key, answer });  // the item's own key: one gone says so
         said.textContent = answer === "deny" ? "Denied" : "Allowed";
       } catch (e) {
         said.textContent = e.message || "Not sent";
@@ -18606,6 +19333,7 @@ function renderHeader() {
 async function loadBoot() {
   const boot = await request("/api/boot");
   state.roles = boot.roles || []; state.statuses = boot.statuses || {};
+  NEED_LOOK = Object.fromEntries(Object.entries(boot.need_kinds || {}).map(([k, v]) => [k, [v.label, "var(" + v.colour + ")"]]));
   state.tools = boot.tools || {}; state.presets = boot.presets || {}; state.art = boot.art || {};
   state.models = boot.models || {}; state.pictures = boot.pictures;
   state.agentNames = boot.names || []; state.images = boot.images || []; state.maxUpload = boot.max_upload || state.maxUpload;
@@ -18921,10 +19649,10 @@ ANALYTICS_JS = r"""// crewchat's analytics view (roadmap X2): the crew working, 
 .ax-machine b { color: var(--ink); font-size: 13.5px; }
 .ax-machine .meta { margin: 2px 0 6px; }
 .ax-chip { display: flex; align-items: center; gap: 6px; font-size: 12.5px; margin: 3px 0; min-width: 0; }
-.ax-chip .avatar { width: 22px; height: 22px; flex: 0 0 22px; font-size: 9px; }
+.ax-chip .avatar { width: 22px; height: 22px; flex: 0 0 22px; font-size: 10px; }
 .ax-chip span.n { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ax-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; background: var(--off); }
-.ax-dot.on { background: var(--ok); } .ax-dot.listen { background: var(--accent); }
+.ax-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; background: transparent; box-shadow: inset 0 0 0 1.5px var(--off); }
+.ax-dot.on { background: var(--ok); box-shadow: none; } .ax-dot.listen { box-shadow: inset 0 0 0 2.5px var(--accent); }
 .ax-heat { display: flex; flex-direction: column; gap: 8px; }
 .ax-group h4 { margin: 0 0 4px; font-size: 12px; color: var(--muted); font-weight: 600; }
 .ax-tiles { display: flex; flex-wrap: wrap; gap: 4px; }
@@ -18969,8 +19697,8 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
   const DAY = 86400;
   const reduce = matchMedia("(prefers-reduced-motion: reduce)");
   const dark = matchMedia("(prefers-color-scheme: dark)");
-  const STAGES = [["todo", "To do", "off"], ["doing", "Doing", "accent"], ["blocked", "Blocked", "err"],
-                  ["review", "Review", "warn"], ["done", "Done", "ok"]];
+  const STAGES = [["todo", "To do", "off"], ["doing", "In progress", "accent"], ["blocked", "Blocked", "err"],
+                  ["review", "In review", "warn"], ["done", "Done", "ok"]];
   const LANES = [["working", "Working", "accent"], ["listening", "Waiting for messages", "ok"], ["idle", "Idle", "line"]];
   const ax = { root: null, report: null, fetched: 0, fetching: null, shown: false, nodes: [], byName: new Map(),
                edges: new Map(), live: new Map(), particles: [], flashes: [], raf: 0, size: { w: 0, h: 0 }, imgs: new Map(),
@@ -19081,9 +19809,10 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       grid.append(c);
       return body;
     };
-    card("ax-river", "Tasks, from posted to done");
-    card("ax-machines", "Machines");
+    // The river spans the grid, so it is never drawn squeezed and its labels stay readable beside the panel (U12).
+    card("ax-river", "Tasks, from posted to done", true);
     card("ax-lanes", "The day, agent by agent", true);
+    card("ax-machines", "Machines");
     card("ax-tokens", "Tokens and cost");
     card("ax-heat", "Code heat map");
     card("ax-learning", "What the crew has learned");
@@ -19532,9 +20261,9 @@ body.ax-present .ax-replay, body.ax-present #analytics .back { display: none; }
       box.replaceChildren(el("p", "ax-empty", "No process notes yet: agents record what they work out with hub_process."));
       return;
     }
-    const out = [el("p", "meta", (l.notes || 0) + " notes agents get now. Per week: recorded, approved, used")];
+    const out = [el("p", "meta", "Notes agents get now: " + (l.notes || 0) + ". Each week:")];
     out.push(bars(weeks.map((w) => ["week of " + w.week.slice(5), w.recorded + w.approved + w.used,
-                                    w.recorded + " · " + w.approved + " · " + w.used])));
+                                    w.recorded + " recorded · " + w.approved + " approved · " + w.used + " used"])));
     if ((l.top || []).length) {
       out.push(el("p", "meta", "The most used notes"));
       out.push(bars(l.top.map((t) => [t.name, t.used, count(t.used) + " use" + (t.used === 1 ? "" : "s")])));
@@ -20393,8 +21122,11 @@ def build_parser():
 
     p = sub.add_parser("hook")  # run by the agents' hooks, not by hand
     p.add_argument("client", choices=list(HOOK_CLIENTS))
-    p.add_argument("event", choices=["prompt", "stop", "tool", "permission", "browser"])
+    p.add_argument("event", choices=["prompt", "stop", "tool", "write", "permission", "browser"])
     p.set_defaults(fn=cmd_hook)
+    p = sub.add_parser("browser-proxy")  # crewchat's browser bridge, run by an agent tool as its MCP server (R8)
+    p.add_argument("client", choices=sorted(set(BRIDGE_FILES) | {"codex"}))
+    p.set_defaults(fn=cmd_browser_proxy)
     return parser
 
 

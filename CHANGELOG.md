@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.2.0 (2026-10-31)
+
+- **A reclaimed agent stops before it writes.** An agent back from a silence is told at its next tool call that its
+  task was reclaimed, and the shell and file-editing calls right after are refused, so a commit and a push it had
+  queued do not go out. The agent may then carry on with other work. Cursor's refusal covers shell calls only.
+  `crewchat hooks refresh` adds the new hook to a connected folder.
+- **The sheet shows what holds a task back.** A task whose files overlap, or import, another task in progress says
+  so on its card, in its panel and in `hub_task view` with `show=all`, so the lead sees it before assigning. The lead
+  can still assign it.
+- **The permission card names its machine.** Allow or Deny shows where the command would run.
+- **Needs you answers in one place.** Every item has one key, from one list of kinds the page and notifications
+  share, and every answer (Allow, Deny, Approve, Decline, a reply, Done) goes to one route, `/api/needs`. A reply to a
+  blocked task or a review names the task it answers, so it clears the item however it was written (a reply that did
+  not start with `Re #` stayed in Needs you); `/api/permission` is gone.
+- **The browser bridge runs through crewchat.** Codex, Gemini CLI, Qwen Code, Cursor and OpenCode run the bridge as
+  `crewchat browser-proxy`, which checks each call before it reaches Chrome and asks the browser which page it is on
+  after it (Playwright's own `page.url()`), instead of reading tool output a page can write into. A link or redirect that leaves an allowed site is
+  caught at the next call. Playwright MCP is pinned (0.0.83). `crewchat hooks refresh` moves an existing bridge over.
+
 ## 1.1.0 (2026-10-26)
 
 - **Process notes: what one agent works out, every agent gets.** An agent that got something to work the hard way

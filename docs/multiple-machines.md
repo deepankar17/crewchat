@@ -173,7 +173,7 @@ server only listens on its own machine, so this also needs a private network suc
    ```
 
 The chat page says how a machine is linked, under the project's name: **Linked over Tailscale**
-with a dot for each other machine (green when it answers now), or **Linked with cloud sync
+with a dot for each other machine (filled green when it answers now, a ring when not), or **Linked with cloud sync
 (Firestore)** with online or offline, and whether the machine still waits for approval.
 
 ## Projects and linked machines

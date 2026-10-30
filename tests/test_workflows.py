@@ -1,7 +1,11 @@
 """The GitHub Actions workflows run only for main (owner, 19 Oct 2026): pushes to main and pull requests into it,
 plus releases, the schedule and a manual start, which GitHub runs from main. Never for pushes to, or pull requests
 into, other branches (dev, task branches)."""
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -40,6 +44,36 @@ class Workflows(unittest.TestCase):
         script = (WORKFLOWS.parents[1] / "scripts" / "security-scan.sh").read_text(encoding="utf-8")
         self.assertIn('FULL="${SCAN_FULL:-}"', script)
         self.assertIn("commit or stash them first", script)
+
+    @unittest.skipIf(os.name == "nt" or not shutil.which("bash"), "the scan runs under bash on Linux and macOS")
+    def test_a_tree_with_no_lockfile_has_no_dependencies_to_check(self):
+        # 1.1.0 review: the public repository has no lockfile, osv-scanner says "No package sources found" and
+        # exits non-zero, and every security run on it failed. That is nothing to check, not a finding.
+        script = (WORKFLOWS.parents[1] / "scripts" / "security-scan.sh").read_text(encoding="utf-8")
+        function = re.search(r"^dependencies\(\) \{\n.*?^\}\n", script, re.M | re.S).group(0)
+        tools = Path(tempfile.mkdtemp(prefix="osv-"))
+        (tools / "bin").mkdir()
+        fake = tools / "bin" / "osv-scanner"
+
+        def run(says, code):
+            fake.write_text("#!/bin/sh\necho '%s'\nexit %d\n" % (says, code))
+            fake.chmod(0o755)
+            return subprocess.run(["bash", "-c", function + "dependencies"], env=dict(os.environ, TOOLS=str(tools)),
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT).returncode
+
+        self.assertEqual(run("No package sources found, --help for usage information.", 128), 0)
+        self.assertEqual(run("Scanned requirements.txt: 1 vulnerability", 1), 1)  # a finding still fails
+        self.assertEqual(run("No issues found", 0), 0)
+
+    def test_the_mac_jobs_can_run_before_a_release(self):
+        # 1.1.0 review: the macOS jobs ran only once a release was published, when PyPI was already on its way, so
+        # they could not stop a bad tag. A manual start runs them too; they still never run on a push.
+        flow = (WORKFLOWS / "test.yml").read_text(encoding="utf-8")
+        self.assertIn("workflow_dispatch", triggers(flow))
+        for job in ("test-macos", "installers-macos"):
+            block = re.search(r"^  %s:\n((?:    [^\n]*\n|\n)*)" % job, flow, re.M).group(1)
+            self.assertIn("if: ${{ github.event_name == 'release' || github.event_name == 'workflow_dispatch' }}",
+                          block, job)
 
     def test_workflows_run_only_for_main(self):
         for path in workflow_files():

@@ -77,7 +77,7 @@ Step by step:
    on it.
 3. Each agent confirms a piece as soon as it gets it (`in_progress`, with one line on its plan),
    then reports progress with `hub_task` update. Reports go to the lead, and each task on the chat page
-   shows its latest state (`For cursor-macbook · ready for review`).
+   shows its latest state (`For cursor-macbook · in review`).
 4. Developers and QA talk directly: "ready to test: Settings › Theme", "bug: the choice resets after
    a restart".
 5. When an agent finishes a piece, the lead checks it and hands that agent its next one, so nobody
@@ -245,7 +245,7 @@ commands first. Parameters are names in capitals, written `{VERSION}` in the com
 in order, from their folder, in their own shell: `crewchat run NAME VERSION=1.2.0`. It stops at the first that fails
 and says which. The server only tells them what to run; it never runs anything. Every change to a command's note,
 whoever writes it, needs your approval again, and Needs you shows the new commands exactly as they would run. The
-Commands tab lists the project's commands.
+Commands panel (**⋯**, Commands) lists the project's commands.
 
 The analytics view's **What the crew has learned** shows how much the notes are used
 ([Analytics](getting-started.md#analytics)).
@@ -274,7 +274,7 @@ An agent working on a task reports with `hub_task` update:
 
 The update goes to the lead. Without a lead, it goes to whoever posted the task, which is usually
 you. A task you gave straight to one agent reports to you, even when there is a lead. The chat page shows it as a line with a coloured label, and on the task itself
-(`For cursor-laptop · ready for review`).
+(`For cursor-laptop · in review`).
 
 ![A task's progress. 1: The agent starts: in progress. 2: Stuck on something? blocked, with the reason. 3: Unblocked: back to work. 4: Ready: review, and QA tests it. 5: QA finds a problem: back to in progress. 6: Fixed: review again. 7: Done: the lead and you see it at once.](images/diagram-task-states.gif)
 
@@ -283,27 +283,30 @@ you. A task you gave straight to one agent reports to you, even when there is a 
 **+ New agent**, under the list of agents (or in the message box's **+** menu), starts a new agent
 session for you, in four steps:
 
-<img src="images/add-agent-form.png" width="420" alt="New agent, step 1 of 4, Identity: From a template (start from scratch), Name docs-writer, Role Docs, Picture books, Colour: the tool's own. Cancel and Next.">
+<img src="images/add-agent-form.png" width="420" alt="New agent, step 1 of 4, Workspace: the project folder notes-app, Or connect one, and the machine. Cancel, Next and Start.">
 
-1. **Identity:** a name (optional, for example `docs-writer`; 🎲 picks a first name nobody has),
-   a role, and a picture and colour. A role fills in its colour and tool, and a picture only if it
-   is a role of your own that you gave one: with a built-in role, the new agent gets a
-   [face of its own](#pictures-and-colours). **From a template** starts from a role and goes
-   straight to step 2.
-2. **Workspace:** the project folder. The menu offers folders on the host machine that
+What is required comes first; the last two steps are optional. **Start** works from any step as soon as a
+folder and a ready tool are set, so with a folder connected, **+ New agent** then **Start** opens an agent with its
+defaults. Enter in a field goes on to the next step.
+
+1. **Workspace:** the project folder. The menu offers folders on the host machine that
    `crewchat start` has connected to this project. To use another, type its path under **Or
    connect one**, or **Browse…** the host's folders (and make a **New folder** there), then
    **Connect**: it runs `crewchat start` in that folder for you. A folder that is not there yet
    offers **Create it and connect**.
-3. **Engine:** the tool (Claude Code, Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode;
+2. **Engine:** the tool (Claude Code, Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode;
    one that is not installed shows as such), its model (Claude Code: Fable, Opus, Sonnet, Haiku, or
    its default), and what it may do **without asking** (below). Under the tool, New
    agent says what it still needs on this machine and in that folder: installed, signed in, and
    what it asks once there (whether you trust the folder, crewchat's hooks). A step to take first
    comes with the command to run in a terminal (**Copy**), then **Check again**.
-4. **Briefing:** a first task and extra instructions, both optional.
+3. **Identity** (optional): a name (for example `docs-writer`; 🎲 picks a first name nobody has; empty, it gets
+   a first name of its own), a role, and a picture and colour. A role fills in its colour and tool, and a picture
+   only if it is a role of your own that you gave one: with a built-in role, the new agent gets a
+   [face of its own](#pictures-and-colours). **From a template** starts from a role.
+4. **Briefing** (optional): a first task and extra instructions.
 
-<img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing: First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">
+<img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing (optional): First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">
 
 **Start**: a terminal window opens on the host with the new session. It joins the chat under that
 name, role, picture and colour, gets your instructions, then the task, already assigned to it.
@@ -524,16 +527,23 @@ in them with your logins. crewchat keeps it under your control:
   it holds the browser the agent posts short progress notes on its task; after 5 minutes without one, crewchat
   reminds it.
 - **No passwords.** Agents are told never to type passwords or secrets; they use the sessions you are logged in to.
+- **Through crewchat.** In Codex, Gemini CLI, Qwen Code, Cursor and OpenCode the bridge runs as
+  `crewchat browser-proxy`, which starts Playwright MCP itself and checks each call before it reaches your Chrome,
+  one call at a time. After each call it asks the browser which page it is on, so a page's own text cannot pass for
+  its address, and a link, a form or a redirect that leaves an allowed site is caught at the agent's next call. Pages
+  you open yourself are seen at that next call too. `crewchat hooks refresh` moves an older bridge over.
 - The **Browser** panel (project menu) shows who drives, on which site, the bridge token (set or not, never shown),
   the allowed and trusted sites, and what agents opened and what you answered (since the server started).
 
 Limits: an address other than http or https (a file, a script), or one a browser could read another way than crewchat
 does (a user name, a backslash, a %-escape or a space in its host), is refused. While crewchat is not running, agents
 may read the page they are on, but not open a site or change anything. The bridge is only for agents in the chat:
-another session of the same tool is refused it (Claude in Chrome asks in Chrome itself). A Playwright server of your own in
-Gemini CLI, Qwen Code or Cursor is left alone in a folder without the bridge; with the bridge there, its tools have
-the same names, so they are checked too. OpenCode's plugin does not see its subagents' calls, so they are not asked
-about. Cursor's hook can only refuse.
+another session of the same tool is refused it (Claude in Chrome asks in Chrome itself). A Playwright server of your own (without
+crewchat's token) is left alone. A call that takes the page to a site that is not allowed has already run when the
+browser says so; the agent is told, and its next call there asks you. Claude in Chrome is Anthropic's own extension:
+Claude Code's calls to it are checked by hooks, from the tab list Chrome gives after each call. Cursor gives a tool call about 60 seconds and
+has no setting for more: a question to you that takes longer ends that call in Cursor (the call is not run later),
+and the agent asks again.
 
 ## Limits
 

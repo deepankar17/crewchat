@@ -6,6 +6,7 @@ The "Add an agent" form is only opened and closed: starting it would open a real
 """
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -123,8 +124,8 @@ class Signed(unittest.TestCase):
 
     def shown_though_hidden(self):
         """Elements marked hidden that the page's styles show anyway."""
-        return self.chrome.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none')"
-                              ".map(e => e.id || e.className)")
+        return self.chrome.js("[...document.querySelectorAll('[hidden]')].filter(e => getComputedStyle(e).display !== 'none'"
+                              " && getComputedStyle(e).visibility !== 'hidden').map(e => e.id || e.className)")
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
@@ -276,15 +277,16 @@ class NewPage(Signed):
         c.until("!!%s" % self.card(), what="the agent")
         c.js(self.card() + ".click()")
         c.until("!$('agent-pane').hidden", what="the agent's settings")
-        c.click("#view-commands")
+        c.js("$('space-menu').open = true")  # Commands is in the project menu (U2)
+        c.click("#space-menu [data-panel=commands]")
         c.until("!$('panel').hidden && $('panel-title').textContent === 'Commands' && !$('commands').hidden",
                 what="the commands in the side panel")
         c.until("document.querySelectorAll('#panel #cmd-list .cmd').length > 40", what="the commands")
         self.assertFalse(c.js("$('agent-pane').hidden"))  # both at once: the agent on the left, the commands on the right
-        self.assertEqual(c.js("$('view-commands').getAttribute('aria-pressed')"), "true")
         self.assertFalse(c.js("$('log').hidden"))  # the chat stays in the middle
-        c.click("#view-commands")
-        c.until("$('panel').hidden && $('view-commands').getAttribute('aria-pressed') === 'false'", what="Commands to close")
+        self.assertEqual(c.js("$('view-chat').getAttribute('aria-pressed')"), "true")
+        c.click("#panel-close")
+        c.until("$('panel').hidden", what="Commands to close")
         self.assertEqual(c.errors, [])
 
     def test_new_agent_browses_makes_and_connects_a_folder(self):
@@ -292,7 +294,7 @@ class NewPage(Signed):
         top = H.TMP / "browse-here"
         (top / "apps" / "web").mkdir(parents=True, exist_ok=True)
         try:
-            c.js("openLaunch(); showStep(1)")
+            c.js("openLaunch(); showStep(0)")  # the workspace is the first step (U8)
             c.js("$('l-path').value = %s" % json.dumps(str(top)))
             c.click("#l-browse")
             c.until("[...document.querySelectorAll('#l-browser .dirs button')].some(b => b.textContent.includes('apps'))",
@@ -315,6 +317,70 @@ class NewPage(Signed):
             self.assertEqual(c.errors, [])
         finally:
             c.js("$('launch').close()")
+
+    def test_the_chat_tab_comes_back_from_any_view(self):
+        c = self.chrome
+        for view in ("tasks", "analytics"):  # U2
+            c.click("#view-" + view)
+            c.until("!$('%s').hidden && $('log').hidden" % view, what="the %s view" % view)
+            c.click("#view-chat")
+            c.until("!$('log').hidden && $('view-chat').getAttribute('aria-pressed') === 'true'", what="the chat again")
+        self.assertEqual(c.errors, [])
+
+    def test_the_board_fades_an_edge_with_more_columns_past_it(self):
+        c = self.chrome
+        mid = self.m.owner.task("all", "A task to open beside the board")
+        try:
+            c.size(1100, 800)
+            c.js("showView('tasks'); $('as-board').click()")
+            c.until("!$('board').hidden && $('board').querySelectorAll('.col').length === 5", what="the board")
+            c.js("openPanel('task', %s)" % json.dumps(mid))  # the panel takes room: the board scrolls (U5)
+            c.until("$('board').scrollWidth > $('board').clientWidth + 2 && $('board').classList.contains('more-right')",
+                    what="a faded right edge")
+            c.js("$('board').scrollLeft = $('board').scrollWidth")
+            c.until("$('board').classList.contains('more-left') && !$('board').classList.contains('more-right')",
+                    what="the fade on the left at the end")
+            self.assertEqual(c.errors, [])
+        finally:
+            c.js("closePanel(); showView('chat')")
+            c.size(1280, 900)
+
+    def test_a_leads_pieces_name_the_task_they_are_part_of(self):
+        c = self.chrome
+        self.m.owner.role(self.agent.name, "lead")
+        self.addCleanup(self.m.owner.role, self.agent.name, "none")
+        parent = self.m.owner.task("all", "Offline mode for notes")
+        dev = self.m.agent()
+        dev.link()
+        self.addCleanup(self.m.owner.post, "/api/agent", {"op": "remove", "agent": dev.name})
+        said = self.agent.call("hub_task", action="assign", to=dev.name, title="Queue edits made offline", parent=parent)
+        piece = re.search(r"#(\w+)", said).group(1)
+        for mid in (parent, piece):  # off the sheet before the agent goes (cleanups run last first)
+            self.addCleanup(self.m.owner.post, "/api/task", {"op": "remove", "task": mid})
+        c.js("showView('tasks'); $('as-board').click()")  # U6: the piece says whose part it is; the parent counts them
+        c.until("[...$('board').querySelectorAll('.tcard')].some(b => b.dataset.task === %s && "
+                "b.textContent.includes('part of #%s'))" % (json.dumps(piece), parent), what="the piece's chip")
+        c.until("[...$('board').querySelectorAll('.tcard')].some(b => b.dataset.task === %s && "
+                "b.textContent.includes('coordinating 1 piece'))" % json.dumps(parent), what="the parent's count")
+        c.js("openPanel('task', %s)" % json.dumps(piece))
+        c.until("$('panel-body').textContent.includes('Part of') && $('panel-body').textContent.includes('Offline mode')",
+                what="Part of in the piece's panel")
+        c.js("closePanel(); showView('chat')")
+        self.assertEqual(c.errors, [])
+
+    def test_a_tasks_panel_names_every_action_and_sets_remove_apart(self):
+        c = self.chrome
+        mid = self.m.owner.task("all", "A task whose actions are read")
+        self.addCleanup(self.m.owner.post, "/api/task", {"op": "remove", "task": mid})
+        c.js("openPanel('task', %s)" % json.dumps(mid))
+        c.until("[...$('panel-body').querySelectorAll('.acts button')].length >= 3", what="the task's actions")
+        labels = c.js("[...$('panel-body').querySelectorAll('.acts button')].map(b => b.textContent)")
+        self.assertTrue(all(any(ch.isalpha() for ch in label) for label in labels), labels)  # U7: no bare symbol
+        self.assertIn("Remove…", labels)
+        self.assertEqual(c.js("[...$('panel-body').querySelectorAll('.acts button')].find(b => b.textContent === "
+                              "'Remove…').classList.contains('apart')"), True)
+        c.js("closePanel()")
+        self.assertEqual(c.errors, [])
 
     def test_errors_on_the_task_board_are_shown_there_and_keep_the_task(self):
         c = self.chrome
@@ -515,6 +581,19 @@ class NewPage(Signed):
         c.js("[...document.querySelectorAll('#panel .needs-card button')].find(b => b.textContent === 'Send').click()")
         c.until("$('panel-body').innerText.includes('You: Re #%s: Follow the system setting.')" % mid,
                 what="the answer in the task's history")
+        c.until("!state.needs.some(n => n.key === 'blocked:' + %s)" % json.dumps(mid),
+                what="the answered task to leave Needs you")  # R8: answered by the reply's re field
+        self.assertEqual(c.errors, [])
+
+    def test_review_answered_from_the_chat_box_leaves_needs_you(self):
+        c = self.chrome
+        mid = self.m.owner.task("all", "Write the upgrade notes")
+        self.agent.call("hub_task", action="take", id=mid)
+        self.agent.call("hub_task", action="update", id=mid, status="review", note="Ready for a look")
+        c.until("state.needs.some(n => n.key === 'review:' + %s)" % json.dumps(mid), what="the review in Needs you")
+        c.js("postJSON('/api/send', { to: %s, text: 'Re #' + %s + ': looks fine, go ahead', kind: 'msg', files: [] })"
+             % (json.dumps(self.agent.name), json.dumps(mid)))  # as the chat box sends what the owner typed
+        c.until("!state.needs.some(n => n.key === 'review:' + %s)" % json.dumps(mid), what="the review to leave Needs you")
         self.assertEqual(c.errors, [])
 
     def test_the_agent_settings_have_room_and_its_count_says_what_it_is(self):
@@ -829,18 +908,24 @@ class NewPage(Signed):
         c.until("$('launch').open && $('l-folder').options.length > 0", what="the dialog and its folders")
         self.assertIn("notes-app", c.js("$('l-folder').innerText"))
         step = "[...document.querySelectorAll('#launch .step')].findIndex(f => !f.hidden)"
-        self.assertEqual(c.js(step), 0)
-        self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, True])
+        self.assertEqual(c.js(step), 0)  # the workspace first (U8)
+        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Workspace")
+        self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, False])
+        self.assertFalse(c.js("$('l-start').disabled"))  # a folder and a tool: it can start from here
         c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
-        self.assertEqual(c.js(step), 1)  # a template skips to the workspace
+        self.assertEqual(c.js(step), 0)  # a template fills in the identity, wherever it is picked
         # A built-in role keeps its picture to itself: the new agent gets a face of its own ("").
         self.assertEqual(c.js("[$('l-role').value, $('l-picture').value]"), ["qa", ""])
         self.assertEqual(c.js("$('l-picture').selectedOptions[0].text"), "A new face, made for it")
         c.click("#l-next")
         c.click("#l-next")
+        c.click("#l-next")
         self.assertEqual(c.js(step), 3)
         self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [False, True, False])
-        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Briefing")
+        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Briefing (optional)")
+        heights = c.js("[0, 1, 2, 3].map(n => (showStep(n), $('launch').getBoundingClientRect().height))")
+        self.assertEqual(len(set(heights)), 1, heights)  # one height, whatever the step
+        c.js("showStep(3)")
         c.click("#l-back")
         self.assertEqual(c.js(step), 2)
         c.js("$('l-tool').value = 'claude'; $('l-tool').dispatchEvent(new Event('change'))")
@@ -1050,7 +1135,7 @@ class NewPage(Signed):
             self.assertNotEqual(c.js("$('ax-canvas').getAttribute('aria-label')"), sample)
             self.assertTrue(c.js("$('ax-demo-note').hidden"))
             c.click("#ax-sample")  # left on, then the view closed: off again when it reopens
-            c.click("#view-analytics")
+            c.click("#view-chat")
             c.click("#view-analytics")
             c.until("crewAnalytics.stats().shown && !crewAnalytics.stats().demo", what="the view without the sample")
             self.assertEqual(c.errors, [])
@@ -1186,6 +1271,10 @@ class NewPage(Signed):
             self.assertNotEqual(c.js("getComputedStyle(document.body).backgroundColor"), "rgb(255, 255, 255)")
             self.assertEqual(c.js("getComputedStyle($('tabs')).display"), "none")  # a picker instead
             self.assertNotEqual(c.js("getComputedStyle($('projects')).display"), "none")
+            # One header (U3): the project's name is the picker, in the bar with search, the bell and the menu.
+            self.assertEqual(c.js("getComputedStyle($('topbar')).display"), "none")
+            self.assertTrue(c.js("$('space-head').contains($('projects'))"))
+            self.assertLessEqual(c.js("$('space-head').getBoundingClientRect().height"), 64)
             # The sign-in page fits a phone too (its card once ran off the right edge).
             c.call("Network.clearBrowserCookies")
             try:
@@ -1197,6 +1286,18 @@ class NewPage(Signed):
                 code = self.m.cli("ui", "--print").split(": ")[1].split()[0]
                 c.open(self.m.url + "/login?code=" + code.replace("-", ""))
                 c.until("location.pathname === '/' && !!%s" % self.card(), what="signed in again")
+            # Something that needs the owner: a tap on the header's count opens the drawer at Needs you (U3).
+            stuck = self.m.owner.task("all", "Pick the default theme")
+            self.agent.call("hub_task", action="take", id=stuck)
+            self.agent.call("hub_task", action="update", id=stuck, status="blocked", note="Follow the system setting?")
+            c.until("!$('needs-open').hidden && getComputedStyle($('needs-open')).display !== 'none'", what="the count")
+            self.assertIn("Needs you:", c.js("$('needs-open').getAttribute('aria-label')"))
+            c.click("#needs-open")
+            c.until("$('rail').getBoundingClientRect().left >= 0 && document.activeElement === $('needs-you')",
+                    what="the drawer open at Needs you")
+            self.assertIn("Pick the default theme", c.js("$('needs-list').textContent"))
+            self.agent.call("hub_task", action="update", id=stuck, status="done", note="Follows the system")
+            c.js("setDrawer(false)")
             c.click("#rail-open")
             c.until("$('rail').getBoundingClientRect().left >= 0", what="the drawer to open")
             c.js(self.card() + ".click()")
@@ -1211,8 +1312,8 @@ class NewPage(Signed):
                     "$('sheet').querySelectorAll('tbody button').length > 0" % json.dumps(mid), what="the task list")
             right = c.js("Math.max(...[...$('sheet').querySelectorAll('button, select')].map(b => b.getBoundingClientRect().right))")
             self.assertLessEqual(right, 375)
-            c.js("$('as-board').click(); showView('chat')")
-            c.click("#view-commands")
+            c.js("$('as-board').click(); showView('chat'); $('space-menu').open = true")
+            c.click("#space-menu [data-panel=commands]")
             c.until("!$('panel').hidden", what="the panel")
             self.assertEqual(c.js("[$('panel').getBoundingClientRect().width, document.body.classList.contains('rail-open')]"),
                              [375, False])  # a full-screen sheet; the drawer closed

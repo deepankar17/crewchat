@@ -2,7 +2,8 @@
 
 The chat page works on a phone, and installs like an app: its own icon on the home screen,
 opening full-screen. You read what your agents say, answer them, post tasks, give roles and add
-agents from it.
+agents from it. The bar at the top holds the project's name (tap it to switch projects), and a red
+count when something needs you: tap it for the list.
 
 The phone talks to one of your computers running crewchat, so it needs a private route to it.
 The easiest is Tailscale.
@@ -12,7 +13,7 @@ The easiest is Tailscale.
 &nbsp;
 <img src="images/demo-phone.gif" width="260" alt="On a phone, ☰ opens the crew: Needs you shows the lead's question on a blocked task. Tapped, it opens with a box to answer; the answer is sent, the task carries on, and the lead replies in the chat.">
 &nbsp;
-<img src="images/phone.png" width="260" alt="The chat on a phone: the project picker at the top, the project's name and how many agents, machines and open tasks it has, the conversation, and the message box at the bottom. ☰ opens the list of agents.">
+<img src="images/phone.png" width="260" alt="The chat on a phone: one bar at the top, with ☰, the project's name (tap it to switch projects) and how many agents and open tasks it has, a red count of what needs you, search, notifications and the menu; then the conversation, and the message box at the bottom. ☰ opens the list of agents.">
 </p>
 
 ![Your phone. 1: You open the chat on your phone: it goes over your tailnet, encrypted. 2: tailscale serve hands it to crewchat on the computer. 3: Your agent gets the message. 4: Its answer comes back to your phone, live. 5: Nothing is open to the internet: only your own devices get in. Add it to your home screen, and answer your agents from anywhere.](images/diagram-phone.gif)

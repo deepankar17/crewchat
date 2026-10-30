@@ -6,7 +6,7 @@
   },
   "homepage": "https://github.com/deepankar17/crewchat",
   "repository": "https://github.com/deepankar17/crewchat",
-  "license": "AGPL-3.0-only",
+  "license": "MIT",
   "keywords": [
     "multi-agent",
     "chat",

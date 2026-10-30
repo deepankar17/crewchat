@@ -118,6 +118,10 @@ to do does not see it among the tasks it may take, and `hub_task` take says why:
 
 > its files import, or are imported by, those of #A12, which Maya is working on
 
+The sheet says so too, so you and the lead see it before giving the task to anyone: the task's card
+and panel on the chat page and `hub_task view` with `show=all` say what holds it back. It is a warning there: the
+lead can still assign the task, and the agent is told who to agree any change with.
+
 Only links the map is sure of hold a task back. Once the other task is done or given back, the
 waiting one can be taken.
 

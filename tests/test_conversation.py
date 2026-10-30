@@ -117,6 +117,7 @@ class ClaudeCode(Home):
         with self.assertRaises(crewchat.ConversationUnavailable):
             self.read("claude", place)
 
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "no fifos here")
     def test_a_fifo_is_refused_not_waited_on(self):
         fifo = self.path()
         fifo.parent.mkdir(parents=True)
@@ -471,7 +472,7 @@ class OpenCode(Home):
                          [(at("10:01"), "user", "keep me"), (at("10:02"), "agent", "x" * 10)])
 
     def test_the_database_named_by_the_variable_and_a_path_with_odd_characters(self):
-        odd = self.home / "my data #1?" / "oc.db"
+        odd = self.home / ("my data #1" + ("" if os.name == "nt" else "?")) / "oc.db"  # Windows refuses a ?
         db = self.make(odd)
         self.fill(db)
         db.close()
@@ -642,7 +643,8 @@ class Robustness(Home):
         # The reasons go into the question every agent reads: they name no file (its name is a session's id).
         outside = write_lines(self.home / "elsewhere.jsonl", [{"type": "user", "message": {"content": "x"}}])
         reasons = []
-        for swap in ("link", "unreadable"):
+        swaps = ("link",) if os.name == "nt" else ("link", "unreadable")  # chmod 0 does not stop a read on Windows
+        for swap in swaps:
             if missing.is_symlink() or missing.exists():
                 missing.unlink()
             if swap == "link":
@@ -655,7 +657,7 @@ class Robustness(Home):
                 self.read("claude", place)
             reasons.append(caught.exception.reason)
         self.assertEqual(reasons, ["its conversation file is not where claude keeps its conversations",
-                                   "its conversation file cannot be read"])
+                                   "its conversation file cannot be read"][:len(swaps)])
         with self.assertRaises(crewchat.ConversationUnavailable) as caught:
             self.read("codex", UUID)
         reasons.append(caught.exception.reason)

@@ -26,6 +26,16 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def old_bridge(folder, client):
+    """The bridge as crewchat wrote it before the browser proxy (R8): npx @playwright/mcp, gated by the hooks."""
+    rel, servers = crewchat.BRIDGE_FILES[client]
+    path = Path(folder) / rel
+    data = json.loads(path.read_text())
+    data[servers]["browser"] = {"command": "npx", "args": ["@playwright/mcp@latest", "--extension"],
+                                "env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "bridge-secret-123"}}
+    path.write_text(json.dumps(data))
 sys.path.insert(0, str(ROOT))
 
 TMP = tempfile.mkdtemp(prefix="crewchat-test-")
@@ -1126,20 +1136,21 @@ class BrowserPanel(Base):
                 break
             time.sleep(0.02)
         self.assertIn("new.example.com", ask["text"])
-        crewchat.post_json(self.base + "/api/permission", self.owner, {"id": ask["id"], "answer": "allow_site"})
+        crewchat.post_json(self.base + "/api/needs", self.owner, {"key": ask["key"], "answer": "allow_site"})
         t.join(5)
         self.assertEqual(got, ["allow_site"])
-        with self.assertRaises(urllib.error.HTTPError) as e:  # an id that is not a string: a bad request, not a crash
-            crewchat.post_json(self.base + "/api/permission", self.owner, {"id": [1], "answer": "deny"})
-        self.assertEqual(e.exception.code, 400)
+        for bad in ([1], "browser:", "browser:%s" % ask["id"]):  # not a string, no id, answered: a bad request, not a crash
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                crewchat.post_json(self.base + "/api/needs", self.owner, {"key": bad, "answer": "deny"})
+            self.assertEqual(e.exception.code, 400)
 
     def test_an_answer_to_an_ask_that_is_gone_says_so(self):
         # Release review (C5): an answer was taken for a browser ask only while the ask waited, so one that had expired
         # got "answer is allow or deny"; and Allow the site answered an ask about a change.
         for answer in ("allow_site", "allow_task", "deny"):
             with self.assertRaises(urllib.error.HTTPError) as e:
-                crewchat.post_json(self.base + "/api/permission", self.owner,
-                                   {"id": "0123456789ab", "answer": answer, "kind": "browser"})
+                crewchat.post_json(self.base + "/api/needs", self.owner,
+                                   {"key": "browser:0123456789ab", "answer": answer})
             self.assertIn("not waiting any more", crewchat.http_error_reason(e.exception), answer)
         name = self.hub.agent_for(self.hub.open_session("mac", "claude"))
         got = []
@@ -1152,14 +1163,16 @@ class BrowserPanel(Base):
                 break
             time.sleep(0.02)
         with self.assertRaises(urllib.error.HTTPError) as e:
-            crewchat.post_json(self.base + "/api/permission", self.owner,
-                               {"id": ask["id"], "answer": "allow_site", "kind": "browser"})
+            crewchat.post_json(self.base + "/api/needs", self.owner, {"key": ask["key"], "answer": "allow_site"})
         self.assertIn("allow_task or deny", crewchat.http_error_reason(e.exception))
-        crewchat.post_json(self.base + "/api/permission", self.owner, {"id": ask["id"], "answer": "allow_task",
-                                                                       "kind": "browser"})
+        crewchat.post_json(self.base + "/api/needs", self.owner, {"key": ask["key"], "answer": "allow_task"})
         t.join(5)
         self.assertEqual(got, ["allow_task"])
-        self.assertIn('postJSON("/api/permission", { id: n.id, answer, kind })', crewchat.CHAT_PAGE)  # it says which
+        self.assertIn('postJSON("/api/needs", { key: n.key, answer })', crewchat.CHAT_PAGE)  # the item's own key
+        self.assertNotIn('"/api/permission"', crewchat.CHAT_PAGE)
+        with self.assertRaises(urllib.error.HTTPError) as e:  # R8: one answer route; the old one is gone
+            crewchat.post_json(self.base + "/api/permission", self.owner, {"id": ask["id"], "answer": "deny"})
+        self.assertEqual(e.exception.code, 404)
 
     def test_a_token_left_in_a_file_git_tracks_is_reported(self):
         # Release review: removing the token skipped a settings file git tracks, and said nothing of it.
@@ -1462,6 +1475,254 @@ class ConfigWrites(unittest.TestCase):
             threading.Thread(target=lambda: projects.listed() and done.set(), daemon=True).start()
             self.assertFalse(done.wait(0.3))
         self.assertTrue(done.wait(5))
+
+
+class ReclaimedHolderTold(unittest.TestCase):
+    """An agent back from a silence is told at its first tool call that its task was reclaimed, before a write it
+    had queued (a push, an API call) goes further, not only when it next reports on the task."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="reclaimed-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        self.hub = crewchat.Hub(crewchat.Roster(root))
+        self.addCleanup(self.hub.events.close)
+
+    def agent(self, client="claude"):
+        name = self.hub.agent_for(self.hub.open_session("mac", client))
+        key = crewchat.secrets.token_urlsafe(12)
+        with self.hub.lock:
+            self.hub.links[key] = name
+        return name, key
+
+    def tool(self, key, name):
+        return self.hub.hook(self.hub.agents[name]["place"], key, 0, 0, "tool").get("remind", "")
+
+    def test_the_first_tool_call_after_a_reclaim_says_so_once(self):
+        hub = self.hub
+        a, a_key = self.agent()
+        b, _ = self.agent()
+        task = hub.add_row(crewchat.OWNER, "Push the release notes")["id"]
+        hub.take(a, task)
+        self.assertEqual(self.tool(a_key, a), "")  # its own task: nothing to say
+        then = time.time() + 61 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            hub.reclaim_silent()
+            remind = self.tool(a_key, a)
+            self.assertIn("#%s was reclaimed from you" % task, remind)
+            self.assertIn("back on the sheet", remind)
+            self.assertIn("Stop", remind)
+            self.assertEqual(self.tool(a_key, a), "")  # once, not at every call
+            hub.take(b, task)
+            self.assertIn("%s holds it now" % b, self.tool(a_key, a))  # a new holder: told again, with its name
+            self.assertEqual(self.tool(a_key, a), "")
+            hub.update(b, task, "todo", "over to you")
+            hub.take(a, task)  # it has the task again: nothing to warn of
+            self.assertEqual(self.tool(a_key, a), "")
+
+
+class ReclaimedHolderRefused(unittest.TestCase):
+    """The first shell or file-editing call after a reclaim is refused, once: a write it had queued does not go out
+    before it hears of the reclaim. The hook runs before the call, and needs the server only after a silence."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="refused-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, self.root)
+        self.hub = crewchat.Hub(crewchat.Roster(self.root))
+        self.addCleanup(self.hub.events.close)
+
+    def agent(self, client="claude"):
+        name = self.hub.agent_for(self.hub.open_session("mac", client))
+        key = crewchat.secrets.token_urlsafe(12)
+        with self.hub.lock:
+            self.hub.links[key] = name
+        return name, key
+
+    def before(self, key, name):
+        return self.hub.hook(self.hub.agents[name]["place"], key, 0, 0, "write").get("refuse", "")
+
+    def test_the_first_write_after_a_reclaim_is_refused_once(self):
+        hub = self.hub
+        a, key = self.agent()
+        task = hub.add_row(crewchat.OWNER, "Push the release notes")["id"]
+        hub.take(a, task)
+        self.assertEqual(self.before(key, a), "")  # its own task: the call goes on
+        then = time.time() + 61 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            hub.reclaim_silent()
+            refused = self.before(key, a)
+            self.assertIn("#%s was reclaimed from you" % task, refused)
+            self.assertIn("run it again", refused)  # work on another task is not stopped for good
+            self.assertEqual(self.before(key, a), "")  # once
+            self.assertEqual(hub.hook(hub.agents[a]["place"], key, 0, 0, "tool").get("remind", ""), "")  # told already
+
+    def test_a_write_counts_as_a_sign_of_life(self):
+        hub = self.hub
+        a, key = self.agent()
+        hub.take(a, hub.add_row(crewchat.OWNER, "Long task")["id"])
+        then = time.time() + 59 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            self.assertEqual(self.before(key, a), "")
+        with mock.patch.object(crewchat.time, "time", lambda: then + 2 * 60):
+            hub.reclaim_silent()
+        self.assertIn(a, hub.taken.values())  # still working: not silent
+
+    def state_of(self, client, state):
+        session = "s" + crewchat.secrets.token_hex(4)
+        path = crewchat.hook_state_file(client, session)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(state))
+        self.addCleanup(path.unlink)
+        return session, path
+
+    def run_hook(self, client, state, post):
+        return self.run_session(client, self.state_of(client, state)[0], post)
+
+    def run_session(self, client, session, post):
+        out = io.StringIO()
+        with mock.patch.object(crewchat, "find_project", return_value=self.root), \
+                mock.patch.object(crewchat, "client_config", return_value=("http://127.0.0.1:9", "tok")), \
+                mock.patch.object(crewchat, "hook_post", post), contextlib.redirect_stdout(out):
+            crewchat.write_hook(client, {"session_id": session})
+        return out.getvalue()
+
+    def test_the_hook_prints_the_refusal_in_the_tools_own_format(self):
+        said = []
+        post = lambda url, token, body, timeout=5: said.append(body) or {"refuse": "stop"}  # noqa: E731
+        out = self.run_hook("claude", {"key": "k" * 12}, post)
+        self.assertEqual(said, [{"key": "k" * 12, "event": "write"}])
+        self.assertEqual(json.loads(out), json.loads(crewchat.browser_deny("claude", "stop")))
+        self.assertEqual(json.loads(self.run_hook("gemini", {"key": "k" * 12}, post))["decision"], "deny")
+
+    def test_the_hook_asks_the_server_only_after_a_silence(self):
+        said = []
+        post = lambda url, token, body, timeout=5: said.append(body) or {"refuse": "stop"}  # noqa: E731
+        self.assertEqual(self.run_hook("claude", {"key": "k" * 12, "alive": time.time() - 5}, post), "")
+        self.assertEqual(self.run_hook("claude", {}, post), "")  # not linked: nothing to ask
+        self.assertEqual(said, [])
+
+    def test_a_server_that_cannot_be_reached_stops_nothing(self):
+        def post(url, token, body, timeout=5):
+            raise OSError("refused")
+        self.assertEqual(self.run_hook("claude", {"key": "k" * 12}, post), "")
+
+    def test_every_tool_gets_the_hook_on_its_write_calls(self):
+        settings = {"hooks": {"PreToolUse": [{"matcher": "Task", "hooks": [{"type": "command", "command": "mine"}]}]}}
+        crewchat.set_claude_hooks(settings)
+        crewchat.set_claude_hooks(settings)  # again: its own two replaced, the user's kept
+        groups = settings["hooks"]["PreToolUse"]
+        self.assertEqual([g["matcher"] for g in groups], ["Task", crewchat.WRITE_MATCHER, crewchat.BROWSER_MATCHER])
+        self.assertEqual(groups[1]["hooks"][0]["command"], crewchat.hook_command("claude", "write"))
+        for tool in ("Bash", "Edit", "Write", "run_shell_command", "write_file", "bash"):
+            self.assertTrue(re.search(crewchat.WRITE_MATCHER, tool), tool)
+        for tool in ("Read", "TodoWrite", "Grep", "mcp__crewchat__hub_task", "read_file"):
+            self.assertFalse(re.search(crewchat.WRITE_MATCHER, tool), tool)
+        for client, event in (("gemini", "BeforeTool"), ("qwen", "PreToolUse")):
+            settings = {}
+            crewchat.set_settings_hooks(settings, client)
+            self.assertEqual([g["matcher"] for g in settings["hooks"][event]],
+                             [crewchat.WRITE_MATCHER, crewchat.BROWSER_MATCHER])
+        hooks = {}
+        crewchat.set_cursor_hooks(hooks)
+        self.assertEqual(hooks["hooks"]["beforeShellExecution"][-1]["command"], crewchat.hook_command("cursor", "write"))
+
+    def reclaimed_from(self, client="claude"):
+        a, key = self.agent(client)
+        task = self.hub.add_row(crewchat.OWNER, "Push the release notes")["id"]
+        self.hub.take(a, task)
+        self.hub.update(a, task, "in_progress", "on it")
+        return a, key, task
+
+    def test_a_task_finished_or_removed_since_says_nothing(self):
+        hub = self.hub
+        a, key, task = self.reclaimed_from()
+        gone = hub.add_row(crewchat.OWNER, "Dropped")["id"]
+        hub.take(a, gone)
+        b, _ = self.agent()
+        then = time.time() + 61 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            hub.reclaim_silent()
+            hub.plan_change(gone, status="removed")
+            hub.take(b, task)
+            hub.update(b, task, "done", "finished")
+            self.assertEqual(self.before(key, a), "")
+
+    def test_the_writes_queued_with_the_first_are_refused_too(self):
+        # A commit and a push in one response: the agent reads the refusal only after both.
+        calls, stop = [], {"refuse": "stop"}
+        post = lambda url, token, body, timeout=5: calls.append(body) or stop  # noqa: E731
+        session, path = self.state_of("claude", {"key": "k" * 12})
+        self.assertIn("stop", self.run_session("claude", session, post))
+        stop.clear()
+        self.assertIn("stop", self.run_session("claude", session, post))  # the push, right after it
+        self.assertEqual(len(calls), 1)
+        state = json.loads(path.read_text())
+        state["hold_until"] = time.time() - 1
+        path.write_text(json.dumps(state))
+        self.assertEqual(self.run_session("claude", session, post), "")  # and then it may run it again
+
+    def after_tool(self, client, hold):
+        session, path = self.state_of(client, {"key": "k" * 12})
+        with mock.patch.object(crewchat, "find_project", return_value=self.root), \
+                mock.patch.object(crewchat, "client_config", return_value=("http://127.0.0.1:9", "tok")), \
+                mock.patch.object(crewchat, "hook_post", lambda url, token, body, timeout=5: {"hold": hold}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            crewchat.tool_hook(client, {"session_id": session, "tool_name": "Read", "tool_input": {"file_path": "a"}})
+        return session, path
+
+    def test_a_write_right_after_the_tool_call_that_said_so_is_refused(self):
+        session, _ = self.after_tool("claude", "stop")
+        said = []
+        post = lambda url, token, body, timeout=5: said.append(body) or {}  # noqa: E731
+        self.assertIn("stop", self.run_session("claude", session, post))
+        self.assertEqual(said, [])
+
+    def test_a_tool_with_no_way_into_the_turn_is_refused_at_its_next_write_however_late(self):
+        session, path = self.after_tool("opencode", "stop")
+        post = lambda url, token, body, timeout=5: {}  # noqa: E731
+        later = time.time() + 20 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: later):
+            self.assertIn("stop", self.run_session("opencode", session, post))
+        self.assertLessEqual(json.loads(path.read_text())["hold_until"], later + crewchat.HOLD_WRITES)
+
+    def test_a_long_hold_ends_when_the_agent_has_the_task_again(self):
+        hub = self.hub
+        a, key, task = self.reclaimed_from("opencode")
+        self.assertIs(hub.hook(hub.agents[a]["place"], key, 0, 0, "held")["reclaimed"], False)
+        then = time.time() + 61 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            hub.reclaim_silent()
+            self.assertIs(hub.hook(hub.agents[a]["place"], key, 0, 0, "held")["reclaimed"], True)
+        session, path = self.after_tool("opencode", "stop")
+        post = lambda url, token, body, timeout=5: {"reclaimed": False}  # noqa: E731
+        self.assertEqual(self.run_session("opencode", session, post), "")  # it took the task back: it may work on it
+        self.assertEqual(json.loads(path.read_text()).get("hold_until", 0), 0)
+
+    def test_the_server_says_so_after_a_tool_call_too(self):
+        hub = self.hub
+        a, key, task = self.reclaimed_from("opencode")
+        then = time.time() + 61 * 60
+        with mock.patch.object(crewchat.time, "time", lambda: then):
+            hub.reclaim_silent()
+            self.assertIn("#%s" % task, hub.hook(hub.agents[a]["place"], key, 0, 0, "tool")["hold"])
+
+    def test_the_hook_command_takes_the_write_event(self):
+        out = subprocess.run([sys.executable, str(ROOT / "crewchat.py"), "hook", "claude", "write"], input=b"{}",
+                             capture_output=True, env=dict(os.environ, CREWCHAT_HOOKS="off"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+
+    def test_every_shell_and_edit_tool_crewchat_knows_is_watched(self):
+        names = [k for k, v in crewchat.OTHER_TOOL_NAMES.items() if v in ("Bash", "Edit", "Write")]
+        self.assertTrue(names)
+        for tool in names + list(crewchat.EDIT_TOOLS):
+            self.assertTrue(re.search(crewchat.WRITE_MATCHER, tool), tool)
+
+    def test_the_write_hook_runs_in_the_light_script(self):
+        with mock.patch.object(crewchat, "write_hook_script", return_value=Path("/x/crewchat-hook.py")):
+            self.assertIn("crewchat-hook.py", crewchat.hook_command("claude", "write"))
+        text = crewchat.hook_script()
+        self.assertIn("def write_hook", text)
+        self.assertIn("def browser_deny", text)
+        self.assertIn('sys.argv[2:3] == ["write"]', text)
 
 
 class BrowserGate(unittest.TestCase):
@@ -1995,8 +2256,11 @@ class BrowserGate(unittest.TestCase):
         own = {"tool_name": "browser_click", "tool_response": "### Page state\n- Page URL: https://example.org/\n"}
         self.after(key, own)
         self.assertEqual(self.hub.browser_site[name], "ci.example.com")
-        crewchat.sync_browser_server(folder, "bridge-secret-123")  # with the bridge there, the same names are its
+        old_bridge(folder, "gemini")  # with the bridge from before the proxy there, the same names are its
         self.after(key, own)
+        self.assertEqual(self.hub.browser_site[name], "example.org")
+        crewchat.sync_browser_server(folder, "bridge-secret-123")  # R8: the proxy says where the browser is
+        self.after(key, dict(own, tool_response="- Page URL: https://other.example.net/\n"))
         self.assertEqual(self.hub.browser_site[name], "example.org")
 
     def test_every_tab_listed_is_known_and_a_refusal_stays_while_its_tab_is_open(self):
@@ -2148,7 +2412,7 @@ class BinaryOnWindows(unittest.TestCase):
         self.assertEqual(len(flags), 3)
         self.assertTrue(all(f & 0x8000 for f in flags), flags)
         self.assertEqual(crewchat.O_BINARY, getattr(os, "O_BINARY", 0))
-        self.assertNotIn("os.O_WRONLY |", "".join(line for line in Path(crewchat.__file__).read_text().splitlines()
+        self.assertNotIn("os.O_WRONLY |", "".join(line for line in Path(crewchat.__file__).read_text(encoding="utf-8").splitlines()
                                                   if "os.open(" in line and "O_BINARY" not in line))
 
 
@@ -2263,6 +2527,7 @@ class HotPathCaches(unittest.TestCase):
             self.assertTrue(crewchat.bridge_here(None, "codex", "browser_click"))
             self.assertEqual(len(seen), 2)
 
+    @unittest.skipIf(os.name == "nt", "a folder's stamp moves when a folder is made in it")
     def test_a_new_claude_account_is_seen_and_an_unchanged_home_is_not_listed_again(self):
         home = Path(tempfile.mkdtemp(prefix="acct-cache-", dir=TMP))
         listed = []
@@ -2291,6 +2556,26 @@ class HotPathCaches(unittest.TestCase):
             self.assertEqual([a["id"] for a in added], ["", "work", "extra"])  # config is applied without listing
             self.assertEqual(len(listed), 3)
 
+    def test_on_windows_a_new_claude_account_is_seen_within_seconds(self):
+        # 1.1.0 review: on Windows a folder's stamp does not move when a folder is made in it, so the home listing
+        # was kept for good and a new ~/.claude-work was never seen. There the listing lasts a few seconds.
+        home = Path(tempfile.mkdtemp(prefix="acct-win-", dir=TMP))
+        real_stamp, now = crewchat._file_stamp, [1000.0]
+
+        def windows_stamp(path):  # what Windows reports: the home's stamp never changes
+            return ("home",) if Path(path) == home else real_stamp(path)
+
+        with mock.patch.object(crewchat, "_file_stamp", windows_stamp), \
+                mock.patch.object(crewchat, "HOME_STAMP_MOVES", False), \
+                mock.patch.object(crewchat.time, "monotonic", lambda: now[0]):
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], [""])
+            work = home / ".claude-work"
+            work.mkdir()
+            (work / ".claude.json").write_text("{}")
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], [""])  # the listing still holds
+            now[0] += crewchat.ACCOUNT_LIST_TTL + 0.1
+            self.assertEqual([a["id"] for a in crewchat.claude_accounts({}, home)], ["", "work"])
+
 
 class BrowserHooks(unittest.TestCase):
     """B2: a before-hook for browser calls in every tool, printing a deny in that tool's own format."""
@@ -2316,7 +2601,7 @@ class BrowserHooks(unittest.TestCase):
         with mock.patch.object(crewchat, "codex_config", return_value=home / "config.toml"):
             crewchat.install_codex()
             text = (home / "config.toml").read_text()
-        self.assertEqual(text.count("[[hooks.PreToolUse]]"), 1)
+        self.assertEqual(text.count("[[hooks.PreToolUse]]"), 2)  # write calls, and the browser's
         self.assertIn(crewchat.hook_command("codex", "browser").split()[-1], text)
         plugin = crewchat.OPENCODE_PLUGIN % {"hook": "[]", "tool_hook": "[]", "reopen": '""'}
         self.assertIn('"tool.execute.before"', plugin)
@@ -2336,9 +2621,11 @@ class BrowserHooks(unittest.TestCase):
             folder = Path(tempfile.mkdtemp(prefix="own-browser-%s-" % client, dir=TMP)).resolve()
             crewchat.install_client(client, folder, "http://127.0.0.1:9", "tok")
             self.assertEqual(crewchat.browser_hook(client, call, "http://127.0.0.1:9", "tok", "k" * 12, folder), "", client)
-            crewchat.sync_browser_server(folder, "bridge-secret-123")
+            old_bridge(folder, client)  # the bridge from before the proxy: the same names are its, checked
             out = crewchat.browser_hook(client, call, "http://127.0.0.1:9", "tok", "k" * 12, folder)
             self.assertIn("crewchat is not running here", out, client)
+            crewchat.sync_browser_server(folder, "bridge-secret-123")  # R8: through the proxy, which checks it
+            self.assertEqual(crewchat.browser_hook(client, call, "http://127.0.0.1:9", "tok", "k" * 12, folder), "")
         folder = Path(tempfile.mkdtemp(prefix="own-browser-claude-", dir=TMP)).resolve()
         out = crewchat.browser_hook("claude", {"tool_name": "mcp__claude-in-chrome__computer",
                                                "tool_input": {"action": "left_click"}}, "http://127.0.0.1:9", "tok",
@@ -2407,12 +2694,15 @@ class BrowserHooks(unittest.TestCase):
         crewchat.install_client("gemini", folder, "http://127.0.0.1:9", "tok")
         click = {"tool_name": "browser_click", "tool_input": {"ref": "e1"}}
         self.assertEqual(hook("gemini", click, folder), "")  # no bridge here: the user's own browser
-        crewchat.sync_browser_server(folder, "bridge-secret-123")
+        old_bridge(folder, "gemini")  # a bridge from before the proxy: the hook refuses it
         self.assertIn("only an agent in the chat", json.loads(hook("gemini", click, folder))["reason"])
+        crewchat.sync_browser_server(folder, "bridge-secret-123")  # R8: the proxy refuses it instead
+        self.assertEqual(hook("gemini", click, folder), "")
         home = Path(tempfile.mkdtemp(prefix="codex-unlinked-", dir=TMP))
+        (home / "config.toml").write_text('%s\n%s\ncommand = "npx"\nargs = ["@playwright/mcp@latest"]\n%s\n' % (
+            crewchat.CODEX_BEGIN, crewchat.CODEX_BRIDGE, crewchat.CODEX_END))
         with mock.patch.object(crewchat, "codex_config", return_value=home / "config.toml"), \
                 mock.patch.object(crewchat, "browser_token", return_value="bridge-secret-123"):
-            crewchat.install_codex()
             out = hook("codex", {"tool_name": "mcp__browser__browser_navigate", "tool_input": {"url": "https://x.example/"}},
                        None)  # a Codex session in a folder with no chat at all
         self.assertIn("only an agent in the chat",
@@ -2444,7 +2734,7 @@ class BrowserServers(unittest.TestCase):
             self.assertNotIn("browser", json.loads((folder / rel).read_text())[servers], client)
             self.assertTrue(crewchat.sync_browser_server(folder, token))
             entry = json.loads((folder / rel).read_text())[servers]["browser"]
-            self.assertIn("@playwright/mcp@latest", json.dumps(entry), client)
+            self.assertIn('"browser-proxy", "%s"' % client, json.dumps(entry), client)  # R8: through crewchat's proxy
             self.assertIn(token, json.dumps(entry), client)
             self.assertIn(crewchat.SERVER_NAME, json.loads((folder / rel).read_text())[servers])  # crewchat's stays
             self.assertFalse(crewchat.sync_browser_server(folder, token))  # up to date
@@ -2457,6 +2747,61 @@ class BrowserServers(unittest.TestCase):
             text = (home / "config.toml").read_text()
         self.assertIn("[mcp_servers.browser]", text)
         self.assertIn(token, text)
+        self.assertIn('"browser-proxy", "codex"', text)
+
+    def test_refresh_moves_an_old_npx_bridge_to_the_proxy(self):
+        # R8: a bridge written before the proxy (npx @playwright/mcp@latest, with the token) is rewritten.
+        folder = self.folder("gemini")
+        path = folder / ".gemini/settings.json"
+        data = json.loads(path.read_text())
+        data["mcpServers"]["browser"] = {"command": "npx", "args": ["@playwright/mcp@latest", "--extension"],
+                                         "env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "tok-1"}}
+        path.write_text(json.dumps(data))
+        self.assertEqual(crewchat.bridge_set_up(folder, "gemini"), "npx")
+        self.assertTrue(crewchat.sync_browser_server(folder, "tok-1"))
+        entry = json.loads(path.read_text())["mcpServers"]["browser"]
+        self.assertEqual(entry["args"][-2:], ["browser-proxy", "gemini"])
+        self.assertEqual(crewchat.bridge_set_up(folder, "gemini"), "proxy")
+
+    def test_the_bridge_waits_as_long_as_the_owner_may_take(self):
+        # Final review: the owner's answer can take PERMISSION_WAIT inside the call; a client giving up first retried.
+        for client, rel, servers in (("gemini", ".gemini/settings.json", "mcpServers"), ("qwen", ".qwen/settings.json", "mcpServers"),
+                                     ("opencode", "opencode.json", "mcp")):
+            folder = self.folder(client)
+            crewchat.sync_browser_server(folder, "tok-3")
+            entry = json.loads((folder / rel).read_text())[servers]["browser"]
+            self.assertGreaterEqual(entry["timeout"], (crewchat.PERMISSION_WAIT + 30) * 1000, client)
+        home = Path(tempfile.mkdtemp(prefix="codex-timeout-", dir=TMP))
+        with mock.patch.object(crewchat, "codex_config", return_value=home / "config.toml"), \
+                mock.patch.object(crewchat, "browser_token", return_value="tok-3"):
+            crewchat.install_codex()
+        self.assertIn("tool_timeout_sec = %d" % (crewchat.PERMISSION_WAIT + 30), (home / "config.toml").read_text())
+
+    def test_only_the_proxy_command_counts_as_the_proxy(self):
+        folder = self.folder("gemini")
+        path = folder / ".gemini/settings.json"
+        data = json.loads(path.read_text())
+        data["mcpServers"]["browser"] = {"command": "node", "args": ["/srv/browser-proxy/server.js"],
+                                         "env": {"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "tok-9"}}
+        path.write_text(json.dumps(data))
+        self.assertEqual(crewchat.bridge_set_up(folder, "gemini"), "npx")  # a token'd bridge of its own: the hooks gate it
+
+    def test_the_playwright_version_is_pinned(self):
+        self.assertEqual(crewchat.PLAYWRIGHT_MCP, "@playwright/mcp@0.0.83")
+        self.assertNotIn("@latest", " ".join(crewchat.BROWSER_BRIDGE))
+        self.assertEqual(crewchat.BROWSER_BRIDGE, ["@playwright/mcp@0.0.83", "--extension"])
+
+    def test_bare_tools_skip_the_hook_where_the_proxy_runs(self):
+        folder = self.folder("gemini")
+        crewchat.sync_browser_server(folder, "tok-2")
+        self.assertFalse(crewchat.bridge_here(folder, "gemini", "browser_click"))  # the proxy gates it
+        self.assertFalse(crewchat.bridge_here(folder, "gemini", "mcp__browser__browser_click"))
+        self.assertTrue(crewchat.bridge_here(folder, "claude", "mcp__claude-in-chrome__navigate"))
+        # A session in no chat, in that folder: the proxy refuses it, not the hook.
+        self.assertEqual(crewchat.bridge_refusal("gemini", {"tool_name": "browser_click"}, folder), "")
+
+    def test_the_docs_name_the_proxy(self):
+        self.assertIn("crewchat browser-proxy", (ROOT / "docs" / "teams.md").read_text(encoding="utf-8"))
 
     def test_a_browser_server_of_the_users_own_is_left_alone(self):
         # Release review: a "browser" MCP server the user set up was taken for the bridge, removed with no token and
@@ -3212,6 +3557,42 @@ class TaskAreas(Base):
                       b.text("hub_task", action="take", id=second))
         a.text("hub_task", action="update", id=first, status="done", note="done")
         self.assertIn(second, free())  # the parser is done: the app task may start
+        self.assertEqual(self.row(second).get("blocker"), "")  # and the sheet no longer says it is held back
+
+    def row(self, mid):
+        return next(r for r in self.hub.sheet_rows() if r["id"] == mid)
+
+    def test_the_sheet_shows_what_holds_a_task_back_before_anyone_assigns_it(self):
+        # The lead reads why on the sheet, not only from the agent it gave the task to (a question on X, 30 Oct).
+        code = Path(tempfile.mkdtemp(prefix="blocker-", dir=TMP)).resolve()
+        for rel, text in {"shopapp/main.py": "from shoplib.parse import read\n", "shoplib/__init__.py": "",
+                          "shoplib/parse.py": "def read():\n    pass\n", "shoptools/run.py": "import json\n"}.items():
+            (code / rel).parent.mkdir(parents=True, exist_ok=True)
+            (code / rel).write_text(text)
+        (a, a_name), (b, b_name) = self.crew
+        first, second, third = self.task("Change the parser", "shoplib/"), self.task("Change the app", "shopapp/"), \
+            self.task("Change the tools", "shoptools/")
+        same = self.task("Change the parser's tests", "shoplib/parse.py")
+        a.call("hub_task", action="take", id=first)
+        import crewchat_map
+        maps = crewchat_map.Maps(Path(tempfile.mkdtemp(prefix="blocker-maps-", dir=TMP)))
+        self.addCleanup(maps.close)
+        maps.check([code])
+        self.hub._maps = maps
+        why = "its files import, or are imported by, those of #%s, which %s is working on" % (first, a_name)
+        self.assertEqual(self.row(second)["blocker"], why)
+        self.assertEqual(self.row(same)["blocker"], "its files overlap #%s, which %s is working on" % (first, a_name))
+        self.assertEqual(self.row(third)["blocker"], "")
+        own = self.task("Change the parser's docs", "shoplib/parse.py")
+        self.assertIn(own, [r["id"] for r in self.hub.sheet_rows(a_name, "next")])  # its own work holds nothing back
+        self.assertEqual(next(r for r in self.hub.sheet_rows(a_name) if r["id"] == own)["blocker"], "")
+        self.assertEqual(self.row(first)["blocker"], "")  # it has a holder: nothing holds it back
+        self.assertIn("held back: " + why, b.text("hub_task", action="view", show="all"))
+        self.assertIn(first, [r["id"] for r in self.hub.sheet_rows(a_name, "mine")])
+
+    def test_the_page_shows_the_blocker(self):
+        for shown in ('"held back: " + r.blocker', 'field("Held back", r.blocker)', "r.parent, r.blocker,"):
+            self.assertIn(shown, crewchat.CHAT_PAGE)
 
 
 class LeadTools(Base):
@@ -3289,6 +3670,8 @@ class LeadTools(Base):
         self.assertIn("heads up: engine.py changed its retry loop", out)  # named in a message
         self.assertIn("edited 5 times", lead.text("hub_code", action="history", path="history/"))  # a folder
         self.assertIn("no edits recorded", lead.text("hub_code", action="history", path="nowhere/x.py"))
+        if os.name == "nt":
+            return  # another thread's connection still holds the file open, and Windows will not delete it
         self.hub.chat_index.close()
         (self.hub.home / crewchat.HISTORY_FILE).unlink()  # derived: deleted, it is built again
         self.assertIn("[REVIEW] engine.py retries now", lead.text("hub_code", action="history", path="history/engine.py"))
@@ -3632,7 +4015,7 @@ class Roles(Base):
         opener, _ = self.owner_browser()
         boot = json.loads(self.raw("/api/boot", opener=opener)[1])
         moved = {"roles", "statuses", "tools", "presets", "art", "pictures", "models", "names", "images",
-                 "max_upload", "releases"}
+                 "max_upload", "releases", "need_kinds"}
         self.assertEqual(set(boot), moved | {"tag"})
         poll = json.loads(self.raw("/api/poll?after=-1&v=-1&wait=0", opener=opener)[1])
         self.assertFalse(set(poll) & moved)
@@ -3709,7 +4092,8 @@ class Roles(Base):
                 crewchat.command_line("git tag {V}", {"V": "1.0&del /q *"})
             self.assertIn("cmd.exe", str(e.exception))
             self.assertEqual(crewchat.command_line("git tag {V}", {"V": "1.0.2"}), "git tag 1.0.2")
-        self.assertEqual(crewchat.command_line("git tag {V}", {"V": "1.0&x"}), "git tag '1.0&x'")
+        if os.name != "nt":
+            self.assertEqual(crewchat.command_line("git tag {V}", {"V": "1.0&x"}), "git tag '1.0&x'")
 
     def test_the_command_line_without_a_server(self):
         with mock.patch.object(crewchat, "local_url", lambda config=None: "http://127.0.0.1:9"):  # nothing listens
@@ -3893,6 +4277,129 @@ class NeedsYou(Base):
         self.assertIn("given_back", left)
         b.text("hub_task", action="take", id=back)
         self.assertEqual(self.hub.needs_you(), [])
+
+    def test_every_need_has_a_key_and_a_known_kind(self):
+        # R8: one item shape, keyed on the server, from one table of kinds the page and push share.
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        blocked, review, back = self.add("Design the API"), self.add("Write the changelog"), self.add("Clean the logs")
+        a.text("hub_task", action="take", id=blocked)
+        a.text("hub_task", action="update", id=blocked, status="blocked", note="Tokens or cookies?")
+        b.text("hub_task", action="take", id=review)
+        b.text("hub_task", action="update", id=review, status="review", note="Ready")
+        b.text("hub_task", action="take", id=back)
+        b.text("hub_task", action="update", id=back, status="todo", note="No time")
+        a.text("hub_send", to="Owner", text="A question for you")
+        waiters = []
+        for kind, fields in (("permission", {"tool": "Bash"}), ("browser", {"ask": "change", "host": "a.com", "task": ""}),
+                             ("browser", {"ask": "site", "host": "b.com", "task": ""})):
+            def run(kind=kind, fields=fields):
+                with self.hub.lock:
+                    self.hub.asks.wait(kind, a_name, "t", time.time() + 30, **fields)
+            waiters.append(threading.Thread(target=run))
+            waiters[-1].start()
+        eventually(lambda: len(self.hub.asks.waiting()) == 3, what="three asks")
+        needs = self.hub.needs_you()
+        self.assertEqual({n["kind"] for n in needs}, {"blocked", "review", "given_back", "message", "permission", "browser"})
+        for n in needs:
+            self.assertEqual(n["key"], n["kind"] + ":" + n["ref"])
+            self.assertIn(n["kind"], crewchat.NEED_KINDS)
+            self.assertEqual(n["answer"], crewchat.NEED_KINDS[n["kind"]][3])
+        by_key = {n["key"]: n for n in needs}
+        self.assertEqual(by_key["review:" + review]["ref"], review)
+        self.assertEqual(sorted(n["choices"] for n in needs if n["kind"] == "browser"),
+                         [["allow_site", "allow_task", "deny"], ["allow_task", "deny"]])
+        self.assertEqual(next(n for n in needs if n["kind"] == "permission")["choices"], ["allow", "deny"])
+        self.assertNotIn("choices", by_key["review:" + review])
+        self.assertEqual([crewchat.NEED_KINDS[n["kind"]][0] for n in needs],
+                         sorted(crewchat.NEED_KINDS[n["kind"]][0] for n in needs))  # in the table's order
+        with self.hub.lock:
+            self.hub.asks.drop(a_name)
+        for t in waiters:
+            t.join(5)
+        for t in (blocked, review, back):
+            crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": t, "status": "done"})
+        crewchat.post_json(self.base + "/api/read", self.owner, {"seq": by_key[next(k for k in by_key if k.startswith("message:"))]["seq"]})
+
+    def test_boot_gives_the_kinds_and_the_page_keeps_none_of_its_own(self):
+        kinds = self.hub.boot()["need_kinds"]
+        self.assertEqual(set(kinds), set(crewchat.NEED_KINDS))
+        self.assertEqual(kinds["review"], {"order": 1, "label": "In review", "colour": "--warn", "answer": "reply"})
+        self.assertNotIn("const NEED_LOOK = {", crewchat.CHAT_PAGE)
+        self.assertNotIn('n.kind + ":"', crewchat.CHAT_PAGE)
+        self.assertFalse(hasattr(crewchat, "NEED_LABELS"))
+
+    def test_a_reply_with_re_answers_the_review(self):
+        # R8 (the 1.0 bug "a reply does not answer the review item"): the reply names the task in a field.
+        a, a_name = self.agent()
+        mid = self.add("Polish the docs")
+        a.text("hub_task", action="take", id=mid)
+        a.text("hub_task", action="update", id=mid, status="review", note="Have a look")
+        self.assertIn("review:" + mid, [n["key"] for n in self.hub.needs_you()])
+        self.hub.send(crewchat.OWNER, a_name, "looks fine, go ahead", re=mid)
+        self.assertNotIn("review:" + mid, [n["key"] for n in self.hub.needs_you()])
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "done"})
+
+    def test_a_reply_by_its_prefix_still_answers_and_carries_re(self):
+        a, a_name = self.agent()
+        mid = self.add("Pick a colour")
+        a.text("hub_task", action="take", id=mid)
+        a.text("hub_task", action="update", id=mid, status="blocked", note="Blue or green?")
+        sent = crewchat.post_json(self.base + "/api/send", self.owner, {"to": a_name, "text": "Re #%s: blue" % mid})
+        self.assertEqual(self.hub.by_id[sent["id"]].get("re"), mid)
+        self.assertNotIn("blocked:" + mid, [n["key"] for n in self.hub.needs_you()])
+        sent = crewchat.post_json(self.base + "/api/send", self.owner, {"to": a_name, "text": "either", "re": mid})
+        self.assertEqual(self.hub.by_id[sent["id"]].get("re"), mid)  # the task panel says it in the field
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "done"})
+
+    def test_re_to_another_agent_or_no_task_does_not_answer(self):
+        a, a_name = self.agent()
+        b, b_name = self.agent()
+        mid = self.add("Name the release")
+        a.text("hub_task", action="take", id=mid)
+        a.text("hub_task", action="update", id=mid, status="review", note="Ready")
+        self.hub.send(crewchat.OWNER, b_name, "fine", re=mid)  # to another agent: not an answer to this one
+        self.assertIn("review:" + mid, [n["key"] for n in self.hub.needs_you()])
+        msg = self.hub.send(crewchat.OWNER, a_name, "about something else", re="Z999")
+        self.assertNotIn("re", msg)  # names no task: not kept
+        self.assertIn("re", crewchat.EXTRA_FIELDS)  # travels between machines
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "status", "task": mid, "status": "done"})
+
+    def test_needs_route_replies_to_a_review_and_marks_it_done(self):
+        a, a_name = self.agent()
+        mid = self.add("Tidy the README")
+        a.text("hub_task", action="take", id=mid)
+        a.text("hub_task", action="update", id=mid, status="review", note="Ready")
+        key = "review:" + mid
+        post = lambda body: crewchat.post_json(self.base + "/api/needs", self.owner, body)  # noqa: E731
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            post({"key": key, "answer": "reply", "text": "  "})  # nothing written
+        self.assertEqual(e.exception.code, 400)
+        sent = post({"key": key, "answer": "reply", "text": "one more test, please"})
+        msg = self.hub.by_id[sent["id"]]
+        # With its Re # too, so a linked machine still on 1.1 (no `re`) also sees the answer (final review).
+        self.assertEqual((msg["to"], msg.get("re"), msg["text"]), (a_name, mid, "Re #%s: one more test, please" % mid))
+        # The task panel answers through the same route (R8: one route for every answer).
+        self.assertIn('postAction("/api/needs", { key: n.key, answer: "reply", text: answer.value.trim() }', crewchat.CHAT_PAGE)
+        self.assertNotIn('text: "Re #" + r.id', crewchat.CHAT_PAGE)
+        self.assertNotIn(key, [n["key"] for n in self.hub.needs_you()])  # answered: the agent's turn
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            post({"key": key, "answer": "reply", "text": "again"})  # not waiting any more
+        self.assertIn("not waiting any more", crewchat.http_error_reason(e.exception))
+        a.text("hub_task", action="update", id=mid, status="review", note="Test added")
+        post({"key": key, "answer": "done"})
+        self.assertEqual(self.hub.progress[mid]["status"], "done")
+
+    def test_needs_route_refuses_what_has_nothing_to_answer(self):
+        a, a_name = self.agent()
+        a.text("hub_send", to="Owner", text="hello")
+        item = next(n for n in self.hub.needs_you() if n["kind"] == "message")
+        for body in ({"key": item["key"], "answer": "reply"}, {"key": "nope", "answer": "x"}, {"key": "permission:feedfeedfeed", "answer": "allow"},
+                     {"key": 5, "answer": "allow"}, {"key": "blocked:" + item["key"], "answer": "done"}):
+            with self.assertRaises(urllib.error.HTTPError, msg=body) as e:
+                crewchat.post_json(self.base + "/api/needs", self.owner, body)
+            self.assertEqual(e.exception.code, 400, body)
+        crewchat.post_json(self.base + "/api/read", self.owner, {"seq": item["seq"]})
 
     def test_an_answered_question_waits_on_the_agent_not_the_owner(self):
         a, a_name = self.agent()
@@ -4835,20 +5342,35 @@ class Launching(Base):
             settings = json.loads((folder / rel).read_text())
             self.assertEqual({e: [h["name"] for h in hs] for e, hs in ours(settings).items()},
                              {prompt: ["crewchat-prompt"], stop: ["crewchat-stop"], tool: ["crewchat-tool"],
-                              before: ["crewchat-browser"]}, client)
+                              before: ["crewchat-write", "crewchat-browser"]}, client)
             self.assertIn(" hook %s stop" % client, ours(settings)[stop][0]["command"])
             # Milliseconds: Gemini CLI's always are, and Qwen Code reads 1000 or more as milliseconds.
             self.assertEqual(ours(settings)[stop][0]["timeout"], (crewchat.MAX_LISTEN + 100) * 1000)
             self.assertGreaterEqual(min(h["timeout"] for hs in ours(settings).values() for h in hs), 1000)
             self.assertEqual(settings["hooks"][tool][0], mine)
             crewchat.set_settings_hooks(settings, client)  # again: replaced, not added
-            self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 4)
+            self.assertEqual(sum(len(hs) for hs in ours(settings).values()), 5)
             del settings["hooks"][stop]  # a folder connected before crewchat had them: hooks refresh adds them
             (folder / rel).write_text(json.dumps(settings))
             self.assertIn(rel, crewchat.update_hooks(folder))
             self.assertIn(stop, json.loads((folder / rel).read_text())["hooks"])
             crewchat.disconnect_folder(folder)
             self.assertEqual(json.loads((folder / rel).read_text()), {"hooks": {tool: [mine]}})
+
+    def test_the_light_hook_script_refuses_a_held_write_when_it_really_runs(self):
+        # The script's own except hides a name hook_script forgot to copy, so run it.
+        folder = Path(tempfile.mkdtemp(prefix="light-write-", dir=TMP)).resolve()
+        cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo", "--client", "claude")
+        session = "light" + crewchat.secrets.token_hex(4)
+        path = crewchat.hook_state_file("claude", session)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"key": "k" * 12, "hold": "stop", "hold_until": time.time() + 10}))
+        self.addCleanup(path.unlink)
+        script = folder / "light.py"
+        script.write_text(crewchat.hook_script())
+        out = subprocess.run([sys.executable, str(script), "claude", "write"], cwd=str(folder), capture_output=True,
+                             input=json.dumps({"session_id": session}).encode())
+        self.assertEqual(json.loads(out.stdout), json.loads(crewchat.browser_deny("claude", "stop")), out.stderr)
 
     def test_opencode_gets_crewchats_plugin(self):
         folder = Path(tempfile.mkdtemp(prefix="opencode-plugin-", dir=TMP)).resolve()
@@ -5216,7 +5738,8 @@ class Linking(Base):
         name = session.me
         self.assertIn("Linked. You are %s, in the project Demo." % name, note)
         self.assertIn("%s (you)" % name, note)
-        self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0, "owner": False})
+        self.assertEqual(self.hook("key-first-0001"), {"agent": name, "text": "", "last": 0, "owner": False,
+                                                       "pids": "want"})  # a new agent: which processes it runs under
         number = self.say(name, "through the hook")
         answer = self.hook("key-first-0001")
         self.assertIn("Owner -> you: through the hook", answer["text"])
@@ -5505,6 +6028,139 @@ class Profiles(Base):
         self.assertTrue(session.call("hub_profile", colour="blue")["isError"])
 
 
+class PageAccessibility(unittest.TestCase):
+    """Roadmap U1: no text on the chat page or its analytics view under 10px, and an agent's or a machine's state told
+    by shape as well as colour."""
+
+    def test_no_text_is_set_under_ten_pixels(self):
+        small = []
+        for name, text in (("CHAT_PAGE", crewchat.CHAT_PAGE), ("ANALYTICS_JS", crewchat.ANALYTICS_JS)):
+            for m in re.finditer(r"font-size:\s*([\d.]+)px|font:\s*(?:\d+\s+)?([\d.]+)px|\"(?:\d+ )?([\d.]+)px ", text):
+                size = float(next(g for g in m.groups() if g))
+                if size < 10:
+                    small.append("%s: %s" % (name, text[max(0, m.start() - 60):m.end()].split("\n")[-1]))
+        self.assertEqual(small, [])
+
+    def test_states_differ_by_shape_not_only_colour(self):
+        css = crewchat.CHAT_PAGE + crewchat.ANALYTICS_JS
+        rules = {sel: body for sel, body in re.findall(r"(?:^|(?<=\} ))(\.(?:ax-)?dot(?:\.[a-z]+)?) \{([^}]*)\}", css, re.M)}
+        for away, here, lately in ((".dot", ".dot.on", ".dot.recent"), (".ax-dot", ".ax-dot.on", ".ax-dot.listen")):
+            self.assertIn("background: transparent", rules[away])  # a faint ring
+            self.assertIn("box-shadow: none", rules[here])  # filled
+            self.assertRegex(rules[lately], r"inset 0 0 0 2\.5px")  # a thick ring
+            self.assertNotIn("background", rules[lately])
+
+
+class PageNavigation(unittest.TestCase):
+    """Roadmap U2: the chat has a tab of its own beside Tasks and Analytics; Commands, a reference, is in the
+    project menu."""
+
+    def test_the_views_are_chat_tasks_and_analytics_and_commands_is_in_the_menu(self):
+        page = crewchat.CHAT_PAGE
+        tools = page[page.index('<div class="rail-tools">'):]
+        tools = tools[:tools.index("</div>")]
+        self.assertEqual(re.findall(r'id="(view-[a-z]+)"', tools), ["view-chat", "view-tasks", "view-analytics"])
+        self.assertNotIn("view-commands", page)
+        menu = page[page.index('<details id="space-menu"'):]
+        self.assertIn('data-panel="commands">Commands</button>', menu[:menu.index("</details>")])
+        self.assertIn('["view-chat", view === "chat"]', page)  # showView marks the current tab
+
+
+class PhoneHeader(unittest.TestCase):
+    """Roadmap U3: on a phone, one header bar, whose project name is the picker, and a count that opens Needs you."""
+
+    def test_the_picker_is_in_the_header_and_needs_you_has_a_button(self):
+        page = crewchat.CHAT_PAGE
+        head = page[page.index('<header id="space-head">'):]
+        head = head[:head.index("</header>")]
+        self.assertIn('<select id="projects"', head)
+        self.assertIn('id="needs-open"', head)
+        top = page[page.index('<header id="topbar">'):]
+        self.assertNotIn('id="projects"', top[:top.index("</header>")])
+        self.assertIn('$("needs-open").addEventListener("click", () => setDrawer(true, $("needs-you")));', page)
+        self.assertNotIn("needs you\" :", page)  # the picker counts, it does not say "needs you"
+
+
+class StatusWords(unittest.TestCase):
+    """Roadmap U4: the owner reads one word for each status: To do, In progress, Blocked, In review, Done."""
+
+    def test_the_board_the_analytics_and_needs_you_say_the_same(self):
+        page, ax = crewchat.CHAT_PAGE, crewchat.ANALYTICS_JS
+        for words in (re.findall(r'\["(?:todo|doing|blocked|review|done)", "([^"]+)"', page),
+                      re.findall(r'\["(?:todo|doing|blocked|review|done)", "([^"]+)"', ax)):
+            self.assertEqual(words[:5], ["To do", "In progress", "Blocked", "In review", "Done"])  # COLUMNS, STAGES
+        self.assertEqual(crewchat.NEED_KINDS["review"][1], "In review")
+        self.assertIn('const updateWord = (status) => (status === "review" ? "in review"', page)
+        self.assertNotIn('"pill " + m.status, "#" + m.task + " " + (state.statuses', page)  # the chat uses updateWord
+        self.assertEqual(crewchat.STATUSES["review"], "ready for review")  # agents keep their words
+
+
+class NewAgentOrder(unittest.TestCase):
+    """Roadmap U8: New agent asks for what is required first (workspace, engine), then the optional identity and
+    briefing; Start is on every step."""
+
+    def test_the_steps_put_what_is_required_first(self):
+        page = crewchat.CHAT_PAGE
+        steps = page[page.index('<ol class="steps" id="l-steps">'):]
+        self.assertEqual(re.findall(r"<li>([A-Za-z]+)", steps[:steps.index("</ol>")]),
+                         ["Workspace", "Engine", "Identity", "Briefing"])
+        body = page[page.index('<div class="step-body">'):page.index('<div id="launch-note"')]
+        order = [body.index(i) for i in ('id="l-folder"', 'id="l-tool"', 'id="l-name"', 'id="l-task"')]
+        self.assertEqual(order, sorted(order))
+        self.assertNotIn('$("l-start").hidden', page)  # Start shows on every step
+
+
+class ProjectSettingsMenu(unittest.TestCase):
+    """Roadmap U9: each project setting is reached one way: Project settings, Roles, Machines, Browser, then Commands."""
+
+    def test_the_menu_names_each_panel_once(self):
+        page = crewchat.CHAT_PAGE
+        menu = page[page.index('<details id="space-menu"'):]
+        menu = menu[:menu.index("</details>")]
+        self.assertEqual(re.findall(r'data-panel="([a-z]+)">([^<]+)<', menu),
+                         [("project", "Project settings"), ("roles", "Roles"), ("machines", "Machines"),
+                          ("browser", "Browser"), ("commands", "Commands")])
+        self.assertNotIn("Rules, skills and machines", page)
+        self.assertIn('<details class="help"><summary>How it works</summary>', page)  # help, not a settings card
+
+
+class AgentBacklog(unittest.TestCase):
+    """Roadmap U10: the count on an agent is what it has not read, muted, and never styled like the owner's counts."""
+
+    def test_an_agents_count_is_muted_and_says_unread(self):
+        page = crewchat.CHAT_PAGE
+        rule = re.search(r"\.agent \.count \{([^}]*)\}", page).group(1)
+        self.assertIn("background: transparent", rule)
+        self.assertIn("color: var(--muted)", rule)
+        self.assertIn('el("span", "count", a.unread + " unread")', page)
+        self.assertIn('" has not read yet"', page)  # its tooltip
+
+
+class FreshMessages(unittest.TestCase):
+    """Roadmap U11: only messages that arrive while the page is open rise in; the history shows at once."""
+
+    def test_the_animation_is_for_fresh_messages_only(self):
+        page = crewchat.CHAT_PAGE
+        self.assertNotIn(".msg, .sys { animation: rise", page)
+        self.assertIn(".msg.fresh, .sys.fresh { animation: rise", page)
+        self.assertIn("const fresh = !first && list.length <= FRESH_MAX;", page)
+        self.assertIn(".msg.fresh, .sys.fresh, #working .dots::after { animation: none; }", page)  # reduced motion still wins
+
+
+class AnalyticsAndNotesPolish(unittest.TestCase):
+    """Roadmap U12: the task river spans the grid, the Learning panel labels its numbers, and the process notes' rule
+    menu has short choices with the full rule written under it."""
+
+    def test_labels_and_the_rivers_width(self):
+        ax, page = crewchat.ANALYTICS_JS, crewchat.CHAT_PAGE
+        self.assertIn('card("ax-river", "Tasks, from posted to done", true);', ax)
+        self.assertIn('w.recorded + " recorded · " + w.approved + " approved · " + w.used + " used"', ax)
+        options = re.findall(r'<option value="(?:default|owner|lead)">([^<]+)</option>', page)
+        self.assertEqual(len(options), 3)
+        self.assertTrue(all(len(o) <= 26 for o in options), options)  # short enough not to be cut off
+        self.assertIn('id="process-rule-note"', page)
+
+
 class ChatPage(Base):
     def test_pages_need_the_owner(self):
         status, _, headers = self.raw("/")
@@ -5782,6 +6438,22 @@ class WebPush(Base):
         crewchat.push_round(self.projects(), store, seen, send)
         self.assertEqual(sent, [self.ENDPOINT])  # messages only: a blocked task is not pushed
 
+    def test_push_keys_on_the_items_key(self):
+        # R8: push and the page share the server's key, so an item seen once is not pushed again.
+        store, seen, sent = self.store(), {}, []
+        store.set_mode(self.ENDPOINT, self.projects().primary.id, "all")
+        send = lambda st, endpoint: sent.append(endpoint)  # noqa: E731
+        self.hub.page_seen = 0
+        item = {"kind": "message", "ref": "m1", "key": "message:m1", "id": "other-id", "agent": "luca", "text": "hi", "ts": 1}
+        with mock.patch.object(type(self.hub), "needs_you", lambda hub: [item]):
+            crewchat.push_round(self.projects(), store, seen, send)
+            item = dict(item, id="changed-id", ts=2)  # the same item, its other fields moved on
+            crewchat.push_round(self.projects(), store, seen, send)
+        self.assertEqual(sent, [])
+        self.assertEqual(seen[self.projects().primary.id], {"message:m1"})
+        notice = crewchat.push_notice(self.projects().primary, dict(item, kind="review", task="", text="x"))
+        self.assertIn("In review", notice["title"])
+
     def test_a_subscription_the_service_dropped_is_forgotten(self):
         store = self.store()
         store.set_mode(self.ENDPOINT, "demo", "all")
@@ -5882,7 +6554,7 @@ class CommandsTab(Base):
         sub = next(a for a in crewchat.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
         missing = []
         for name, parser in sub.choices.items():
-            if name == "hook":  # run by the hooks themselves
+            if name in ("hook", "browser-proxy"):  # run by the hooks, and by agent tools as their browser
                 continue
             mine = [words(u) for u in usages if u.split()[0] == name]
             if not mine:
@@ -6505,8 +7177,9 @@ class Hooks(Base):
 
         t, out, item = ask()
         self.assertEqual((item["agent"], item["tool"], item["text"]), (name, "Bash", "rm -rf build\n(Clean the build)"))
+        self.assertEqual(item["machine"], crewchat.machine_name())  # which machine it would run on, named on the card
         self.assertEqual(self.hub.needs_you()[0]["kind"], "permission")  # before anything else
-        answer = lambda pid, a: crewchat.post_json(self.base + "/api/permission", self.owner, {"id": pid, "answer": a})  # noqa: E731
+        answer = lambda pid, a: crewchat.post_json(self.base + "/api/needs", self.owner, {"key": "permission:" + pid, "answer": a})  # noqa: E731
         with self.assertRaises(urllib.error.HTTPError):
             answer(item["id"], "maybe")
         self.assertEqual(answer(item["id"], "allow"), {"agent": name, "answer": "allow"})
@@ -6552,7 +7225,7 @@ class Hooks(Base):
         place = self.hub.agents[name]["place"]
         key = next(k for k, n in self.hub.links.items() if n == name)
         self.assertEqual(self.hub.ask_permission(place, key, "Write", "notes.md", wait=0.3), "")  # its own prompt shows
-        self.assertFalse(self.hub.permissions)
+        self.assertFalse(self.hub.asks.waiting())
         self.assertEqual(self.hub.ask_permission(place, "unknownkey123", "Write", "x", wait=5), "")  # not linked
         with self.assertRaises(crewchat.HubError):
             self.hub.ask_permission(place, "bad key!", "Write", "x")
@@ -6849,8 +7522,10 @@ class Hooks(Base):
         session, name = self.linked("timeline-turn")
         self.hook("claude", "prompt", {"session_id": "timeline-turn"})
         self.hook("claude", "stop", {"session_id": "timeline-turn"}, listen="0")
-        states = [s for ts, s in [(r[0], r[2]) for r in self.hub.events._conn().execute(
-            "SELECT ts, agent, state FROM activity WHERE agent = ? ORDER BY ts", (name,))]]
+        self.hub.events.flush()
+        with self.hub.events.lock:  # the writer's thread opens the database too
+            states = [r[2] for r in self.hub.events._conn().execute(
+                "SELECT ts, agent, state FROM activity WHERE agent = ? ORDER BY ts", (name,))]
         self.assertEqual(states[-2:], ["working", "idle"])
         line = self.hub.analytics.report(self.hub, 1)["timelines"][name]
         self.assertEqual([piece[2] for piece in line][-2:], ["working", "idle"])
@@ -6861,7 +7536,9 @@ class Hooks(Base):
         try:
             before = len(states)
             self.hook("claude", "prompt", {"session_id": "timeline-turn"})
-            count = self.hub.events._conn().execute("SELECT COUNT(*) FROM activity WHERE agent = ?", (name,)).fetchone()[0]
+            self.hub.events.flush()
+            with self.hub.events.lock:
+                count = self.hub.events._conn().execute("SELECT COUNT(*) FROM activity WHERE agent = ?", (name,)).fetchone()[0]
             self.assertEqual(count, before)
         finally:
             config.pop("activity")
@@ -7089,6 +7766,7 @@ class Hooks(Base):
         self.assertTrue(tool[1].endswith("/%s claude tool" % crewchat.HOOK_SCRIPT_FILE))  # the light hook script
         cursor = json.loads((folder / ".cursor" / "hooks.json").read_text())["hooks"]
         self.assertEqual(sorted(cursor), ["afterFileEdit", "afterMCPExecution", "afterShellExecution", "beforeMCPExecution",
+                                         "beforeShellExecution",
                                           "stop"])
         self.assertEqual(crewchat.update_hooks(folder), [])  # up to date: nothing written
         other = Path(tempfile.mkdtemp(prefix="not-ours-", dir=TMP))
@@ -7670,6 +8348,20 @@ class ProcessNotes(unittest.TestCase):
         eventually(self.skill().exists, what="the approved note's skill")
         self.assertFalse(any(n["kind"] == "process" for n in self.hub.needs_you()))
 
+    def test_needs_route_approves_and_declines_a_note(self):
+        dev = self.agent()
+        token = crewchat.read_token(crewchat.OWNER, self.root)
+        self.hub.propose_process(dev, self.NOTE)
+        item = next(n for n in self.hub.needs_you() if n["kind"] == "process")
+        self.assertEqual((item["key"], item["choices"]), ("process:release-build", ["approve", "decline"]))
+        said = crewchat.post_json(self.base + "/api/needs", token, {"key": item["key"], "answer": "approve"})["said"]
+        self.assertIn("Approved", said)
+        self.assertFalse(any(n["kind"] == "process" for n in self.hub.needs_you()))
+        self.hub.propose_process(dev, dict(self.NOTE, name="release-check"))
+        item = next(n for n in self.hub.needs_you() if n["kind"] == "process")
+        crewchat.post_json(self.base + "/api/needs", token, {"key": item["key"], "answer": "decline"})
+        self.assertFalse(any(n["kind"] == "process" for n in self.hub.needs_you()))
+
     def test_without_a_lead_or_by_the_rule_the_owner_approves(self):
         dev = self.agent()
         self.assertEqual(self.hub.propose_process(dev, self.NOTE)[1:], ("owner", "the project has no lead"))
@@ -7892,7 +8584,12 @@ class ProcessNotes(unittest.TestCase):
         self.assertEqual(crewchat.note_from({"name": "release-build", "commit": "--ext-diff"})["commit"], "")
         with mock.patch.object(crewchat.subprocess, "run") as run:
             self.assertIsNone(crewchat.git_churn(self.folder, "--ext-diff", ["tools/build.py"]))
+            self.assertIsNone(crewchat.git_churn(self.folder, "abcd123\n", ["tools/build.py"]))  # "$" takes a "\n"
             run.assert_not_called()
+        # 1.1.0 review: a SHA-256 repository's ids are 64 long, and an id may be written in capitals.
+        for commit in ("ABCDEF1", "a" * 64):
+            self.assertEqual(crewchat.note_from({"name": "release-build", "commit": commit})["commit"], commit)
+        self.assertEqual(crewchat.note_from({"name": "release-build", "commit": "a" * 65})["commit"], "")
 
 
     def test_an_approval_that_comes_before_its_note_still_counts(self):
@@ -8143,7 +8840,9 @@ class ProjectCommands(Base):
     def test_a_promoted_command_runs_the_notes_steps_from_a_connected_folder(self):
         folder = Path(tempfile.mkdtemp(prefix="run-", dir=TMP)).resolve()
         cli("start", str(folder), "--no-open", "--no-service", "--chat", "demo")
-        self.note("pack-it", ["echo packed {TARGET} > out.txt", 'python3 -c "print(42)"'])
+        # python prints its argument the same way under sh and cmd.exe, so this runs on Windows too
+        self.note("pack-it", ['python3 -c "import sys; print(\'packed\', sys.argv[1])" {TARGET} > out.txt',
+                              'python3 -c "print(42)"'])
         with self.assertRaises(urllib.error.HTTPError):
             self.processes("promote", name="pack-it", params="VERSION")  # not in the commands
         self.processes("promote", name="pack-it", params="TARGET")
@@ -8188,6 +8887,7 @@ class ProjectCommands(Base):
             self.hub.process_command("no-such")
         crewchat.post_json(self.base + "/api/role", self.owner, {"agent": lead, "role": "none"})
 
+    @unittest.skipIf(os.name == "nt", "a POSIX shell")
     def test_a_parameter_inside_quotes_cannot_become_its_own_command(self):
         # The owner may write echo '{TARGET}'. Quoting the value and leaving those quotes closes them early,
         # and the rest of the value runs as its own command.
@@ -8208,6 +8908,45 @@ class ProjectCommands(Base):
             line = crewchat.command_line(template, {"TARGET": value})
             subprocess.run(line, shell=True, cwd=str(folder), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self.assertFalse(marker.exists(), line)
+
+    @unittest.skipIf(os.name == "nt", "a POSIX shell")
+    def test_a_parameter_inside_a_substitution_or_an_escape_cannot_run_a_command(self):
+        # 1.1.0 review: inside the owner's "...", a $(...), `...` or ${...} starts a new shell context where the
+        # double quotes' escaping does nothing, and \' or $'...' are not the quotes they look like.
+        folder = Path(tempfile.mkdtemp(prefix="subst-", dir=TMP))
+        marker = folder / "pwned"
+        plain = "x; touch %s" % marker
+        for template, value in (
+                ('echo "$(echo {X})"', plain),
+                ('echo "`echo {X}`"', plain),
+                ('echo "${UNSET:-{X}}"', plain),
+                ('echo $(echo hi) {X}', plain),
+                ("echo \\'{X}", plain),
+                ("echo $'{X}'", "\\'; touch %s; echo \\'" % marker),
+                ('echo "$((1)) {X}"', plain),
+                ("echo hi # it's\necho {X}", plain),
+                ("echo ${X}", "\\'; touch %s; #" % marker)):
+            marker.unlink(missing_ok=True)
+            try:
+                line = crewchat.command_line(template, {"X": value})
+            except crewchat.HubError:
+                continue  # refused: nothing runs
+            subprocess.run(line, shell=True, cwd=str(folder), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.assertFalse(marker.exists(), line)
+        # Still a value: an escape outside quotes, and a plain ${NAME}, leave the parameter quoted as usual.
+        self.assertEqual(crewchat.command_line("echo \\'{X}", {"X": plain}), "echo \\'" + shlex.quote(plain))
+        self.assertEqual(crewchat.command_line('echo "${HOME}/{X}"', {"X": "a$b"}), 'echo "${HOME}/a\\$b"')
+        self.assertEqual(crewchat.command_line("echo {X} \"$(date)\"", {"X": "a b"}), "echo 'a b' \"$(date)\"")
+        for template in ('echo "$(echo {X})"', "echo ${X}"):
+            with self.assertRaises(crewchat.HubError):
+                crewchat.command_line(template, {"X": "safe"})
+
+    def test_on_windows_only_double_quotes_are_quotes(self):
+        # cmd.exe has no single quotes: '{X}' there is the value outside quotes, so it is quoted for cmd.
+        with mock.patch.object(crewchat.os, "name", "nt"):
+            self.assertEqual(crewchat.command_line("echo '{X}'", {"X": "a b"}), "echo '\"a b\"'")
+            self.assertEqual(crewchat.command_line('echo "{X} y"', {"X": "a b"}), 'echo "a b y"')
+            self.assertEqual(crewchat.command_line('echo \\"{X}', {"X": "a b"}), 'echo \\"a b')
 
 
 class LearningAnalytics(Base):
@@ -9243,6 +9982,542 @@ class Lifecycle(Base):
         with self.assertRaises(SystemExit):
             cli("update")
 
+
+class Asks(unittest.TestCase):
+    """R8: permission and browser asks wait, are answered and are dropped in one place."""
+
+    def setUp(self):
+        self.lock = threading.Condition()
+        self.changes = []
+        self.asks = crewchat.Asks(self.lock, lambda: self.changes.append(1))
+
+    def wait(self, *args, **kw):  # a waiter beside the test; out["answer"] once it returns
+        out = {}
+
+        def run():
+            with self.lock:
+                out["answer"] = self.asks.wait(*args, **kw)
+        t = threading.Thread(target=run)
+        t.start()
+        return t, out
+
+    def waiting(self, n=1):
+        for _ in range(200):
+            with self.lock:
+                now = self.asks.waiting()
+            if len(now) >= n:
+                return now
+            time.sleep(0.01)
+        self.fail("no ask came")
+
+    def test_a_wait_returns_the_answer(self):
+        t, out = self.wait("permission", "luca", "rm -rf build", time.time() + 30, tool="Bash")
+        ask = self.waiting()[0]
+        self.assertEqual((ask["kind"], ask["agent"], ask["tool"], ask["answer"]), ("permission", "luca", "Bash", ""))
+        self.assertEqual(self.asks.answer(ask["id"], "allow", ("allow", "deny"), "wrong", "gone"),
+                         {"agent": "luca", "answer": "allow"})
+        t.join(5)
+        self.assertEqual(out["answer"], "allow")
+        with self.lock:
+            self.assertEqual(self.asks.waiting(), [])
+        self.assertTrue(self.changes)
+
+    def test_the_deadline_returns_nothing(self):
+        started = time.time()
+        with self.lock:
+            self.assertEqual(self.asks.wait("permission", "luca", "t", time.time() + 0.2), "")
+            self.assertEqual(self.asks.wait("permission", "luca", "t", time.time() - 1), "")  # no time left
+            self.assertEqual(self.asks.waiting(), [])
+        self.assertLess(time.time() - started, 1)
+
+    def test_the_same_question_is_asked_once(self):
+        same = ("site", "a.com", "A1")
+        t1, out1 = self.wait("browser", "luca", "t", time.time() + 30, same=same)
+        self.waiting()
+        t2, out2 = self.wait("browser", "luca", "t", time.time() + 30, same=same)
+        time.sleep(0.1)
+        asks = self.waiting()
+        self.assertEqual(len(asks), 1)
+        self.asks.answer(asks[0]["id"], "deny", ("deny",), "wrong", "gone")
+        t1.join(5)
+        t2.join(5)
+        self.assertEqual((out1["answer"], out2["answer"]), ("deny", "deny"))
+
+    def test_asks_without_a_same_are_never_shared(self):
+        t1, _ = self.wait("browser", "luca", "t", time.time() + 30)
+        t2, _ = self.wait("browser", "luca", "t", time.time() + 30)
+        asks = self.waiting(2)
+        self.assertEqual(len(asks), 2)
+        with self.lock:
+            self.asks.drop("luca")
+        t1.join(5)
+        t2.join(5)
+
+    def test_drop_clears_only_that_agent(self):
+        t1, out1 = self.wait("permission", "luca", "t", time.time() + 30)
+        t2, out2 = self.wait("browser", "ana", "t", time.time() + 30)
+        self.waiting(2)
+        with self.lock:
+            self.assertTrue(self.asks.drop("luca"))
+            self.assertFalse(self.asks.drop("nobody"))
+            self.assertEqual([a["agent"] for a in self.asks.waiting()], ["ana"])
+        t1.join(5)
+        self.assertEqual(out1["answer"], "")
+        with self.lock:
+            self.asks.drop("ana")
+        t2.join(5)
+
+    def test_a_wrong_answer_is_refused(self):
+        t, _ = self.wait("permission", "luca", "t", time.time() + 30)
+        ask = self.waiting()[0]
+        with self.assertRaisesRegex(crewchat.HubError, "wrong"):
+            self.asks.answer(ask["id"], "maybe", ("allow", "deny"), "wrong", "gone")
+        with self.assertRaisesRegex(crewchat.HubError, "gone"):
+            self.asks.answer("feedfeedfeed", "allow", ("allow", "deny"), "wrong", "gone")
+        with self.assertRaisesRegex(crewchat.HubError, "gone"):
+            self.asks.answer(["not", "an", "id"], "allow", ("allow", "deny"), "wrong", "gone")
+        self.asks.answer(ask["id"], "deny", ("allow", "deny"), "wrong", "gone")
+        with self.assertRaisesRegex(crewchat.HubError, "gone"):  # answered already
+            self.asks.answer(ask["id"], "allow", ("allow", "deny"), "wrong", "gone")
+        t.join(5)
+
+    def test_waiting_by_kind_and_get(self):
+        t1, _ = self.wait("permission", "luca", "t", time.time() + 30)
+        t2, _ = self.wait("browser", "luca", "t", time.time() + 30, ask="site", host="a.com")
+        self.waiting(2)
+        with self.lock:
+            browser = self.asks.waiting("browser")
+            self.assertEqual([a["host"] for a in browser], ["a.com"])
+            self.assertEqual(self.asks.get(browser[0]["id"])["ask"], "site")
+            self.assertIsNone(self.asks.get("nope"))
+            self.asks.drop("luca")
+        t1.join(5)
+        t2.join(5)
+
+
+
+class ProxyGate(Base):
+    """R8: the server's side of the browser proxy: which agent a proxy serves, and its calls gated on the page the
+    browser reports."""
+
+    def gemini(self, folder="/work/app", pids=None):
+        name = self.hub.agent_for(self.hub.open_session(self.place, "gemini"))
+        key = crewchat.secrets.token_urlsafe(12)
+        with self.hub.lock:
+            self.hub.links[key] = name
+            self.hub.agents[name]["session"] = {"folder": folder}
+            self.hub.agents[name]["browser"] = True
+        if pids:
+            self.hub.note_pids(self.place, key, pids)
+        self.addCleanup(self.forget, name)
+        return name
+
+    def forget(self, name):
+        with self.hub.lock:
+            self.hub.links = {k: n for k, n in self.hub.links.items() if n != name}
+        with crewchat.BROWSER_LOCK:
+            crewchat.BROWSER.pop("holder", None)
+
+    def test_a_proxy_finds_its_agent_by_a_shared_parent(self):
+        name = self.gemini(pids=[500, 400])
+        self.gemini(pids=[600, 400])  # another gemini in the same folder: the folder alone could not tell
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/app", [500, 1])
+        self.assertEqual(self.hub.proxy_agent(proxy), name)
+
+    def test_a_far_shared_ancestor_does_not_match(self):
+        # Final review: any shared ancestor matched (a terminal app both tabs run under), so one agent's proxy could
+        # drive the browser as another. Only the nearest process of each counts: the agent tool itself.
+        self.gemini(folder="/work/far", pids=[700, 77, 400])  # gemini, login, iTerm2
+        self.gemini(folder="/work/far")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/far", [800, 78, 400])
+        self.assertIsNone(self.hub.proxy_agent(proxy))
+        self.assertEqual(self.hub.note_pids(self.place, "not-a-linked-key", [1, 2]), False)  # not kept: says so
+
+    def test_a_proxy_unknown_here_is_told_so_and_belongs_to_its_machine(self):
+        # Final review minors: "unknown proxy" and "cannot tell which agent" were one answer, so an unmatched proxy
+        # registered again on every call; and any place's token could use another place's proxy id.
+        self.assertEqual(self.hub.proxy_call("feedfeedfeed", "browser_snapshot", {})["reason"], crewchat.PROXY_GONE)
+        self.gemini(folder="/work/mine")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/mine", [9020])
+        self.assertEqual(self.hub.proxy_call(proxy, "browser_snapshot", {}, place="elsewhere")["reason"], crewchat.PROXY_GONE)
+        self.assertEqual(self.hub.proxy_call(proxy, "browser_snapshot", {}, place=self.place)["decision"], "allow")
+        self.assertIsNone(self.hub.proxy_seen(proxy, [{"url": "https://a.example.com/", "current": True}], place="elsewhere"))
+
+    def test_a_tool_without_the_browser_prefix_is_still_gated(self):
+        # Final review: a Playwright tool named otherwise was "not a browser call" and allowed at once.
+        name = self.gemini(folder="/work/bare")
+        with self.hub.lock:
+            self.hub.agents[name]["browser"] = False
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/bare", [9010])
+        self.assertEqual(self.hub.proxy_call(proxy, "run_code", {"code": "1"})["decision"], "deny")
+
+    def test_the_folder_fallback_needs_exactly_one(self):
+        name = self.gemini(folder="/work/one")
+        self.assertEqual(self.hub.proxy_agent(self.hub.register_proxy(self.place, "gemini", "/work/one", [9001])), name)
+        self.gemini(folder="/work/two")
+        self.gemini(folder="/work/two")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/two", [9002])
+        self.assertIsNone(self.hub.proxy_agent(proxy))
+        said = self.hub.proxy_call(proxy, "browser_snapshot", {})
+        self.assertEqual(said, {"decision": "deny", "reason": crewchat.PROXY_WHO})
+        self.assertIsNone(self.hub.proxy_agent("nonexistent"))
+
+    def test_a_proxy_for_an_agent_not_in_the_chat_is_refused(self):
+        name = self.gemini(folder="/work/gone")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/gone", [9003])
+        self.forget(name)  # it left the chat
+        self.assertEqual(self.hub.proxy_call(proxy, "browser_snapshot", {})["reason"], crewchat.PROXY_WHO)
+
+    def test_navigate_is_not_recorded_before_it_runs(self):
+        name = self.gemini(folder="/work/nav")
+        self.hub.set_browser_site("a.example.com", "allowed")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/nav", [9004])
+        self.assertEqual(self.hub.proxy_call(proxy, "browser_navigate", {"url": "https://a.example.com/"})["decision"],
+                         "allow")
+        self.assertIsNone(self.hub.browser_site.get(name))  # not until the browser says where it is
+        self.hub.proxy_seen(proxy, [{"url": "https://a.example.com/x", "current": True}])
+        self.assertEqual(self.hub.browser_site[name], "a.example.com")
+
+    def test_seen_from_the_proxy_moves_even_a_read_and_says_when_off_the_allowed_sites(self):
+        name = self.gemini(folder="/work/seen")
+        self.hub.set_browser_site("a.example.com", "allowed")
+        proxy = self.hub.register_proxy(self.place, "gemini", "/work/seen", [9005])
+        self.assertIsNone(self.hub.proxy_seen(proxy, [{"url": "https://a.example.com/", "current": True}]))
+        note = self.hub.proxy_seen(proxy, [{"url": "https://other.example.net/", "current": False},
+                                           {"url": "https://evil.example.org/", "current": True}])
+        self.assertEqual(self.hub.browser_site[name], "evil.example.org")
+        self.assertIn("evil.example.org", note)
+        self.hub.browser_refused.add((name, "evil.example.org"))
+        self.hub.proxy_seen(proxy, [])  # the browser could not say (a page's dialog stops it): nothing known
+        self.assertIsNone(self.hub.browser_site[name])
+        self.assertIn((name, "evil.example.org"), self.hub.browser_refused)  # a denied site is not forgotten for that
+
+    def test_only_the_argument_itself_marks_the_bridge_as_the_proxy(self):
+        for entry, want in (({"args": ["browser-proxy", "gemini"]}, "proxy"),
+                            ({"command": ["crewchat", "browser-proxy", "gemini"]}, "proxy"),
+                            ({"args": "/srv/browser-proxy/server.js"}, "npx"),
+                            ({"command": "/opt/browser-proxy/bin/run", "args": []}, "npx"), ({"args": 5}, "npx")):
+            folder = Path(tempfile.mkdtemp(prefix="bridge-", dir=TMP))
+            (folder / ".gemini").mkdir()
+            (folder / ".gemini" / "settings.json").write_text(json.dumps({"mcpServers": {"browser": dict(
+                entry, env={"PLAYWRIGHT_MCP_EXTENSION_TOKEN": "tok"})}}))
+            with mock.patch.object(crewchat, "browser_token", return_value="tok"):
+                self.assertEqual(crewchat.bridge_set_up(folder, "gemini"), want, entry)
+
+    def test_the_proxy_routes_take_a_place_token(self):
+        self.gemini(folder="/work/http")
+        out = crewchat.post_json(self.base + "/api/hook", self.token,
+                                 {"event": "proxy", "client": "gemini", "folder": "/work/http", "pids": [9006]})
+        said = crewchat.post_json(self.base + "/api/hook", self.token,
+                                  {"event": "proxy_call", "proxy": out["proxy"], "tool": "browser_snapshot", "args": {}})
+        self.assertEqual(said["decision"], "allow")
+        seen = crewchat.post_json(self.base + "/api/hook", self.token,
+                                  {"event": "proxy_seen", "proxy": out["proxy"],
+                                   "tabs": [{"url": "https://a.example.com/", "current": True}]})
+        self.assertIn("note", seen)
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/hook", self.owner, {"event": "proxy", "client": "gemini"})
+        self.assertEqual(e.exception.code, 403)
+
+    def test_a_new_site_through_the_proxy_asks_in_needs_you(self):
+        # The proxy, a fake Playwright child and this server, end to end: a new site waits for the owner's Allow.
+        name = self.gemini(folder="/work/e2e")
+        server = crewchat.ProxyServer(self.base, self.token, "gemini", "/work/e2e")
+        to_r, to_w = os.pipe()
+        from_r, from_w = os.pipe()
+        inp, out = os.fdopen(to_w, "w", buffering=1), os.fdopen(from_r, "r")
+        proxy = crewchat.BrowserProxy("gemini", [sys.executable, BrowserProxy.FAKE], server, os.fdopen(to_r, "r"),
+                                      os.fdopen(from_w, "w", buffering=1))
+        thread = threading.Thread(target=proxy.run, daemon=True)
+        thread.start()
+        self.addCleanup(out.close)
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(inp.close)
+        inp.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                              "params": {"name": "browser_navigate", "arguments": {"url": "https://new.example.com/"}}}) + "\n")
+        item = eventually(lambda: next((n for n in self.hub.needs_you() if n["kind"] == "browser"), None),
+                          what="the browser ask in Needs you")
+        self.assertEqual((item["agent"], item["host"]), (name, "new.example.com"))
+        crewchat.post_json(self.base + "/api/needs", self.owner, {"key": item["key"], "answer": "allow_site"})
+        answer = json.loads(out.readline())
+        self.assertEqual(answer["id"], 1)
+        self.assertFalse(answer["result"].get("isError"))
+        self.assertEqual(self.hub.browser_site[name], "new.example.com")  # from the browser, after the call
+
+    def test_the_hook_sends_its_pids_only_when_the_server_wants_them(self):
+        # E2E benchmark (29 Oct): the prompt hook walked `ps` and told the server its pids at every prompt, 26 ms more
+        # than 1.1.0. The server says when it has none (a new agent, or after a restart); only then are they sent.
+        name = self.gemini(folder="/work/pids")
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        self.assertEqual(self.hub.hook(self.place, key, 0, 0, "prompt").get("pids"), "want")
+        walked = []
+
+        def pids():
+            walked.append(1)
+            return [4242, 4000]
+        crewchat.hook_check(self.base, self.token, key, 0, 0, "prompt", pids=pids)
+        self.assertEqual((walked, self.hub.hook_pids[name]), ([1], [4242, 4000]))
+        self.assertNotIn("pids", self.hub.hook(self.place, key, 0, 0, "prompt"))
+        crewchat.hook_check(self.base, self.token, key, 0, 0, "prompt", pids=pids)
+        self.assertEqual(walked, [1])  # known: not walked again
+        with self.hub.lock:
+            self.hub.hook_pids.clear()  # what a restarted server knows
+        crewchat.hook_check(self.base, self.token, key, 0, 0, "stop", pids=pids)
+        self.assertEqual(walked, [1, 1])
+
+    def test_a_reopened_agent_gives_its_new_pids_and_still_hears_of_its_reclaim(self):
+        # A Reopen keeps the agent's name and key, but its process is another: the old pids would not find its proxy.
+        # The session report that says so is a "tool" event too, and nobody reads its answer: it must not use up the
+        # notice of a task reclaimed while the agent was gone.
+        name = self.gemini(folder="/work/pids2")
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        task = self.hub.add_row(crewchat.OWNER, "Push the release notes")["id"]
+        session = {"id": "abc12345", "pid": 4242, "started": "x", "tool": "gemini", "folder": "/work/pids2"}
+        walked = []
+
+        def pids():
+            walked.append(1)
+            return [5151, 4000]
+        with mock.patch.object(self.hub, "agent_folders", return_value=["/work/pids2"]), \
+                mock.patch.object(self.hub, "_wants_session", return_value=True):
+            self.hub.hook(self.place, key, 0, 0, "tool", session=session)
+            self.hub.note_pids(self.place, key, [4242, 4000])
+            with self.hub.lock:
+                self.hub.sheet[task]["reclaimed"] = name
+            crewchat.hook_check(self.base, self.token, key, 0, 0, "prompt", pids=pids,
+                                report=lambda: dict(session, pid=5151))
+        self.assertEqual((walked, self.hub.hook_pids[name]), ([1], [5151, 4000]))
+        self.assertIn("#%s was reclaimed from you" % task, self.hub.hook(self.place, key, 0, 0, "write")["refuse"])
+
+    def test_ancestor_pids_skips_shells(self):
+        table = {100: (300, "python3"), 300: (200, "/bin/zsh"), 200: (1, "gemini")}
+
+        def ps(cmd, **kw):
+            pid = int(cmd[-1])
+            parent, comm = table[pid]
+            return types.SimpleNamespace(returncode=0, stdout="%d %s\n" % (parent, comm))
+        with mock.patch.object(crewchat.os, "getppid", return_value=100), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=ps), mock.patch.object(crewchat, "PS_TREE", True):
+            self.assertEqual(crewchat.ancestor_pids(), [100, 200])
+        with mock.patch.object(crewchat.os, "getppid", return_value=100), mock.patch.object(crewchat, "PS_TREE", False):
+            self.assertEqual(crewchat.ancestor_pids(), [100])
+
+class BrowserProxy(unittest.TestCase):
+    """R8: crewchat's bridge runs behind `crewchat browser-proxy`, which gates each call and reads the page from the
+    browser (a fake Playwright MCP child here)."""
+    FAKE = str(Path(__file__).resolve().parent / "fake_playwright_mcp.py")
+
+    class Server:  # what the proxy asks, recorded; `deny` refuses calls, `down` is a server that is not running
+        def __init__(self):
+            self.calls, self.seen_tabs, self.deny, self.down, self.gate, self.broken = [], [], "", False, None, False
+
+        def call(self, tool, args):
+            if self.down:
+                raise OSError("connection refused")
+            if self.broken:
+                raise KeyError("proxy")  # an answer it could not read
+            self.calls.append((tool, args, len(self.seen_tabs)))
+            if self.gate:
+                self.gate.wait(5)
+            return {"decision": "deny", "reason": self.deny} if self.deny else {"decision": "allow"}
+
+        def seen(self, tabs):
+            self.seen_tabs.append(tabs)
+
+    def start(self, env=None, child=None):
+        self.server = self.Server()
+        self.log = Path(tempfile.mkdtemp(prefix="proxy-", dir=TMP)) / "calls"
+        env = dict(os.environ, FAKE_LOG=str(self.log), **(env or {}))
+        to_proxy_r, self.to_proxy = os.pipe()
+        from_proxy, from_proxy_w = os.pipe()
+        self.inp = os.fdopen(self.to_proxy, "w", buffering=1)
+        self.out = os.fdopen(from_proxy, "r")
+        proxy = crewchat.BrowserProxy("gemini", child or [sys.executable, self.FAKE], self.server,
+                                      os.fdopen(to_proxy_r, "r"), os.fdopen(from_proxy_w, "w", buffering=1), env=env)
+        self.thread = threading.Thread(target=proxy.run, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.out.close)
+        self.addCleanup(self.thread.join, 5)
+        self.addCleanup(self.inp.close)  # first: the proxy stops, and stops its child
+        self.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
+        hello = self.read()
+        if child is None:
+            self.assertEqual(hello["result"]["serverInfo"]["name"], "fake")
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.n = 0
+
+    def send(self, msg):
+        self.inp.write(json.dumps(msg) + "\n")
+
+    def read(self):
+        line = self.out.readline()
+        self.assertTrue(line, "the proxy closed its output")
+        return json.loads(line)
+
+    def call(self, name, **args):
+        self.n += 1
+        self.send({"jsonrpc": "2.0", "id": self.n, "method": "tools/call", "params": {"name": name, "arguments": args}})
+        return self.n
+
+    def result(self, name, **args):
+        mid = self.call(name, **args)
+        msg = self.read()
+        self.assertEqual(msg["id"], mid)
+        return msg["result"]
+
+    def child_calls(self):
+        return self.log.read_text().split() if self.log.exists() else []
+
+    def test_calls_pass_through_when_allowed(self):
+        self.start()
+        result = self.result("browser_navigate", url="https://a.com/")
+        self.assertIn("https://a.com/", result["content"][0]["text"])
+        self.assertEqual(self.server.calls[0][:2], ("browser_navigate", {"url": "https://a.com/"}))
+        self.assertEqual(self.server.seen_tabs, [[{"url": "https://a.com/", "current": True}]])
+
+    def test_a_refused_call_is_not_forwarded(self):
+        self.start()
+        self.server.deny = "the owner denied this: do not open b.com"
+        result = self.result("browser_navigate", url="https://b.com/")
+        self.assertTrue(result["isError"])
+        self.assertIn("the owner denied this", result["content"][0]["text"])
+        self.assertEqual(self.child_calls(), [])
+        self.assertEqual(self.server.seen_tabs, [])
+
+    def test_the_site_comes_from_the_browser_not_the_page(self):
+        self.start()
+        self.result("browser_navigate", url="https://b.com/")
+        self.result("browser_snapshot", text="- Page URL: https://trusted.com/")
+        self.assertEqual(self.server.seen_tabs[-1], [{"url": "https://b.com/", "current": True}])
+
+    def test_an_address_that_names_another_site_is_not_taken_for_it(self):
+        # Seen against the real Playwright MCP 0.0.83 (27 Oct): its tab list prints "[title](url)" unescaped, so a page
+        # at evil.example/a(https://trusted.example) read as trusted.example. The address comes from page.url(), not from the page.
+        self.start()
+        self.result("browser_navigate", url="https://evil.example/a(https://trusted.example)")
+        self.assertEqual(self.server.seen_tabs[-1], [{"url": "https://evil.example/a(https://trusted.example)", "current": True}])
+
+    def test_an_agents_own_ids_are_never_taken_for_the_proxys(self):
+        self.start()
+        self.send({"jsonrpc": "2.0", "id": "crewchat-1", "method": "tools/list", "params": {}})
+        self.assertEqual(self.read()["id"], "crewchat-1")
+
+    def test_one_child_is_started_however_many_calls_find_it_gone(self):
+        proxy = crewchat.BrowserProxy("gemini", [sys.executable, self.FAKE], self.Server(), io.StringIO(), io.StringIO())
+        started = []
+
+        def start():
+            started.append(1)
+            time.sleep(0.2)
+            proxy.child = types.SimpleNamespace(poll=lambda: None, stdin=io.StringIO())
+            return True
+        with mock.patch.object(proxy, "_start", side_effect=start):
+            threads = [threading.Thread(target=proxy._to_child, args=({"jsonrpc": "2.0", "method": "x"},)) for _ in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(5)
+        self.assertEqual(len(started), 1)
+
+    def test_a_click_that_leaves_is_seen(self):
+        self.start()
+        self.result("browser_navigate", url="https://a.com/")
+        self.result("browser_click", goes_to="https://evil.com/")
+        self.assertEqual(self.server.seen_tabs[-1], [{"url": "https://evil.com/", "current": True}])
+
+    def test_calls_are_gated_one_at_a_time(self):
+        self.start()
+        self.call("browser_navigate", url="https://a.com/")
+        self.call("browser_snapshot", text="x")
+        self.assertEqual({self.read()["id"], self.read()["id"]}, {1, 2})
+        # The second call was asked about only after the first had run and its page was seen.
+        self.assertEqual([(c[0], c[2]) for c in self.server.calls], [("browser_navigate", 0), ("browser_snapshot", 1)])
+
+    def test_notifications_pass_during_a_call(self):
+        self.start()
+        self.server.gate = threading.Event()
+        self.call("browser_snapshot", text="x")
+        eventually(lambda: self.server.calls, what="the call to reach the server")
+        self.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 99}})
+        eventually(lambda: "cancelled" in self.child_calls(), what="the notification to reach the child")
+        self.server.gate.set()
+        self.assertEqual(self.read()["id"], 1)
+
+    def test_a_dead_child_gives_an_error_and_restarts(self):
+        self.start(env={"FAKE_DIE": str(Path(tempfile.mkdtemp(prefix="proxy-die-", dir=TMP)) / "died")})
+        result = self.result("browser_snapshot", text="x")
+        self.assertTrue(result["isError"])
+        self.assertIn("browser", result["content"][0]["text"])
+        result = self.result("browser_navigate", url="https://a.com/")
+        self.assertFalse(result.get("isError"))
+        self.assertEqual(self.server.seen_tabs[-1], [{"url": "https://a.com/", "current": True}])
+
+    def test_no_current_tab_reports_nothing_known(self):
+        self.start(env={"FAKE_TABS": "none"})
+        self.result("browser_navigate", url="https://a.com/")
+        self.assertEqual(self.server.seen_tabs, [[]])
+
+    def test_a_batch_is_refused_not_passed_on(self):
+        # Final review: a JSON-RPC batch (a list) went to the browser as it was, tools/call and all, ungated.
+        self.start()
+        self.send([{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "browser_navigate", "arguments": {"url": "https://evil.example/"}}}])
+        answer = self.read()
+        self.assertEqual(answer["error"]["code"], -32600)
+        self.assertEqual(self.child_calls(), [])
+        self.assertEqual(self.server.calls, [])
+
+    def test_a_call_cancelled_while_it_waits_is_not_run(self):
+        # Final review: a client that gave up (its timeout) and retried got the first call run too, after the owner's Allow.
+        self.start()
+        self.server.gate = threading.Event()
+        self.call("browser_click", goes_to="https://a.example/")
+        eventually(lambda: self.server.calls, what="the call to reach the server")
+        self.send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 1}})
+        eventually(lambda: "cancelled" in self.child_calls(), what="the cancellation to pass")
+        self.server.gate.set()
+        self.server.gate = None
+        self.assertEqual(self.result("browser_snapshot", text="next")["content"][0]["text"], "next")
+        self.assertNotIn("browser_click", self.child_calls())
+
+    def test_an_unexpected_error_still_answers_the_call(self):
+        self.start()
+        self.server.broken = True
+        result = self.result("browser_snapshot", text="x")
+        self.assertTrue(result["isError"])
+        self.assertEqual(self.child_calls(), [])
+
+    def test_a_browser_that_cannot_start_answers_with_an_error(self):
+        # Final review: on Windows npx is npx.cmd, which a plain Popen cannot find: the proxy died, the agent waited.
+        self.start(child=["/nonexistent/npx-%s" % os.getpid()])
+        result = self.result("browser_snapshot", text="x")
+        self.assertTrue(result["isError"])
+        self.assertIn("could not start", result["content"][0]["text"])
+
+    def test_the_real_proxy_finds_npx_and_reads_utf8(self):
+        made = {}
+
+        class Fake:
+            def __init__(self, client, child, server, stdin, stdout, env=None):
+                made.update(child=child, stdin=stdin, stdout=stdout)
+
+            def run(self):
+                return 0
+        with mock.patch.object(crewchat, "BrowserProxy", Fake), mock.patch.object(crewchat, "find_project", return_value=None), \
+                mock.patch.object(crewchat.shutil, "which", return_value="C:/node/npx.cmd"):
+            self.assertEqual(crewchat.proxy_main("gemini"), 0)
+        self.assertEqual(made["child"][0], "C:/node/npx.cmd")
+        self.assertEqual((made["stdin"].encoding.lower(), made["stdout"].encoding.lower()), ("utf-8", "utf-8"))
+
+    def test_server_down_refuses_changes_allows_reads(self):
+        self.start()
+        self.server.down = True
+        result = self.result("browser_click", goes_to="https://x.com/")
+        self.assertTrue(result["isError"])
+        self.assertIn(crewchat.BROWSER_DOWN, result["content"][0]["text"])
+        result = self.result("browser_snapshot", text="hello")
+        self.assertEqual(result["content"][0]["text"], "hello")
+        self.assertEqual(self.child_calls(), ["browser_snapshot"])
 
 if __name__ == "__main__":
     unittest.main()
