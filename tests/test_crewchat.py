@@ -3595,6 +3595,19 @@ class TaskAreas(Base):
             self.assertIn(shown, crewchat.CHAT_PAGE)
 
 
+class QuickStart(unittest.TestCase):
+    def test_the_server_does_not_look_its_own_name_up(self):
+        # HTTPServer looks up the name of 127.0.0.1 as it starts: a Mac with slow reverse DNS waited 30 s (seen on
+        # GitHub's macOS runner, 3 Nov). Nothing uses that name.
+        root = Path(tempfile.mkdtemp(prefix="quick-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        with mock.patch("socket.getfqdn", side_effect=AssertionError("looked its own name up")):
+            server = crewchat.make_server(0, root)
+        crewchat.flush_all(server.RequestHandlerClass.projects)
+        server.server_close()
+        self.assertEqual(server.server_name, "127.0.0.1")
+
+
 class LeadTools(Base):
     """Owner, 18 Oct: the lead and the advisor get hub_code (C5 history, C7 split); every other agent's tools stay
     as short as they are. A session whose role changes is told its tool list changed (MCP list_changed)."""

@@ -1535,7 +1535,7 @@ class Auth:
                 self.end_headers()
                 self.wfile.write(page)
 
-        server = HTTPServer(("127.0.0.1", 0), Callback)
+        server = type("CallbackServer", (crewchat.QuickBind, HTTPServer), {})(("127.0.0.1", 0), Callback)
         redirect = "http://127.0.0.1:%d" % server.server_address[1]
         url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
             "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",

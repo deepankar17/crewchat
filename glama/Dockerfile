@@ -3,7 +3,7 @@
 # your project folders and agents (see the README).
 FROM python:3.12-slim
 
-COPY pyproject.toml README.md LICENSE crewchat.py crewchat_cloud.py crewchat_map.py crewchat_peers.py /opt/crewchat/
+COPY pyproject.toml README.md LICENSE NOTICE crewchat.py crewchat_cloud.py crewchat_map.py crewchat_peers.py /opt/crewchat/
 RUN pip install --no-cache-dir /opt/crewchat && useradd --create-home crew
 
 USER crew

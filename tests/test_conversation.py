@@ -497,7 +497,9 @@ class OpenCode(Home):
         started = time.monotonic()
         with self.assertRaises(crewchat.ConversationUnavailable) as caught:
             self.read("opencode", self.SES)
-        self.assertLess(time.monotonic() - started, 3)
+        # Its 2 s timeout, not SQLite's default 5. A SQLite built without usleep waits in whole seconds: 3.06 s on
+        # GitHub's macOS runner (31 Oct, 3 Nov).
+        self.assertLess(time.monotonic() - started, 4)
         self.assertIn("database", caught.exception.reason)
 
     def test_a_missing_or_wrong_database_is_not_available(self):

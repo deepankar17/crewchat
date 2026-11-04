@@ -44,6 +44,7 @@ import shlex
 import shutil
 import signal
 import socket
+import socketserver
 import stat
 import subprocess
 import sys
@@ -58,11 +59,20 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
 BIND = "127.0.0.1"  # Never anything else: reach it from other machines through a private network.
+
+
+class QuickBind:
+    """For an HTTPServer: bind without looking up the address's name, which nothing uses. That lookup of 127.0.0.1 is
+    reverse DNS, and on a Mac where it is slow the server waited 30 s to start (seen on GitHub's macOS runner)."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 DEFAULT_PORT = 8765
 PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,31}$")
@@ -9615,7 +9625,7 @@ class Handler(BaseHTTPRequestHandler):
         self._mcp(raw, who)
 
 
-class Server(ThreadingHTTPServer):
+class Server(QuickBind, ThreadingHTTPServer):
     daemon_threads = True
 
     def handle_error(self, request, client_address):

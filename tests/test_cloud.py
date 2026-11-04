@@ -257,6 +257,18 @@ class Sync(unittest.TestCase):
         self.assertLess(time.time() - started, 5)
         self.assertIn("crewchat cloud login", str(e.exception))
 
+    def test_the_sign_in_server_does_not_look_its_own_name_up(self):
+        # GitHub's macOS runner, 31 Oct and 3 Nov: HTTPServer looks up the name of 127.0.0.1 when it starts, and the
+        # first such lookup there waits 30 s. A Mac whose reverse DNS is slow would wait as long for every sign-in.
+        root = Path(tempfile.mkdtemp(prefix="no-lookup-", dir=TMP))
+        crewchat.save_config({"project": "Demo"}, root)
+        cloud.page_op(self.a.hub, root, "cloud-setup", {"web": {"projectId": "p", "apiKey": "k"},
+                                                         "oauth": {"client_id": "c", "client_secret": "s"}}, True)
+        with mock.patch.object(cloud.webbrowser, "open", return_value=False), \
+                mock.patch("socket.getfqdn", side_effect=AssertionError("looked its own name up")):
+            with self.assertRaises(cloud.CloudError):
+                cloud.page_op(self.a.hub, root, "cloud-login", {}, True)
+
     def test_shared_files_open_on_the_other_machine(self):
         # Roadmap Y4: a file up to 5 MB travels with its message, encrypted, in pieces under Firestore's limit.
         data = os.urandom(cloud.CLOUD_FILE_MAX)  # a 5 MB screenshot: ten pieces

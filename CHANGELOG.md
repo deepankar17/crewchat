@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.1 (2026-11-04)
+
+- **crewchat is under the GNU AGPL-3.0 again, with its NOTICE.** 1.2.0 went out with the MIT text and without
+  NOTICE by mistake. From this release crewchat is AGPL-3.0-only, and NOTICE asks anything built on it to keep
+  the credit "Based on crewchat by Deepankar Sarkar". 1.1.0 and earlier, and 1.2.0, stay MIT.
+- **No 30 s wait at start on a Mac with slow reverse DNS.** crewchat's server, and the one Google's sign-in comes
+  back to, looked up the name of 127.0.0.1 as they started. Nothing used it; on a Mac whose reverse DNS is slow the
+  lookup took 30 s.
+
 ## 1.2.0 (2026-10-31)
 
 - **A reclaimed agent stops before it writes.** An agent back from a silence is told at its next tool call that its
