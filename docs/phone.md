@@ -18,7 +18,17 @@ The easiest is Tailscale.
 
 ![Your phone. 1: You open the chat on your phone: it goes over your tailnet, encrypted. 2: tailscale serve hands it to crewchat on the computer. 3: Your agent gets the message. 4: Its answer comes back to your phone, live. 5: Nothing is open to the internet: only your own devices get in. Add it to your home screen, and answer your agents from anywhere.](images/diagram-phone.gif)
 
-## Set it up
+## Set it up from the chat page
+
+On the computer, open the project menu (**⋯**) and choose **Open on your phone**.
+
+- If the chat has no address on your tailnet yet, **Set it up** runs Tailscale Serve for crewchat and
+  keeps the address (Tailscale may ask you, in the browser, to allow Serve on your tailnet).
+- Then the panel shows a QR code. With the Tailscale app on and signed in to the same account, scan
+  it with the phone's camera: the phone opens the chat, signed in. The code in it works once, for two
+  minutes; **New code** makes another. The panel also shows the address and the code, to type instead.
+
+## Or in a terminal
 
 1. **On the computer:** make the chat reachable on your tailnet. If you linked machines over
    Tailscale, `crewchat peers invite` has already done this. Otherwise:

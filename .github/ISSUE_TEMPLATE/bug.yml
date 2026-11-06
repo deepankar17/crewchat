@@ -1,0 +1,34 @@
+name: Something is wrong
+description: crewchat did something it should not, or did not do what the docs say
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead. Leave out tokens and anything private from your chats.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: crewchat version
+      description: "`crewchat --version` (filled in when you use `crewchat feedback bug`)"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: System
+      description: Operating system and Python version
+  - type: input
+    id: tools
+    attributes:
+      label: Agent tools
+      description: Which tools were in the chat (Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code, OpenCode), and on how many machines
+  - type: textarea
+    id: log
+    attributes:
+      label: Server log
+      description: The lines around the problem from `~/.crewchat/server.log`, if any
+      render: text

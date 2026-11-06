@@ -49,6 +49,12 @@ device (it works once, for two minutes).
 
 Is the server running, its addresses, connected folders, linked machines, and who is here.
 
+### `crewchat feedback [bug|idea|works] [--print]`
+
+Tell the author about a bug, an idea, or that crewchat works for you. It opens a GitHub issue form
+in your browser with your crewchat version and system filled in. crewchat sends nothing itself:
+only what you submit on that page reaches GitHub. `--print` shows the link instead.
+
 ## The server
 
 | Command | |
@@ -100,6 +106,8 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat roles show NAME` | A role's instructions |
 | `crewchat roles add NAME --prompt TEXT [--label LABEL]` | Add your own role, or change one (`--picture`, `--colour`, `--tool` too) |
 | `crewchat roles add NAME --file FILE` | The same, reading the instructions from a file |
+| `crewchat roles add NAME --powers assign,areas,notes,code --reports-to ROLE` | What a role's agents may do besides their own work, and the role it works under ([details](teams.md#powers-and-a-team-with-sub-leads)) |
+| `crewchat roles tree` | The roles as a tree: who reports to whom, with their powers |
 | `crewchat roles remove NAME` | Remove a role; agents that have it are told |
 | `crewchat roles packs` | List the role packs: software team, YouTube channel, Instagram creator, small business, blank, and yours |
 | `crewchat roles pack ID` | Start the project's roles over from a pack |
@@ -113,10 +121,11 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 |---|---|
 | `crewchat projects` | This machine's projects and their folders |
 | `crewchat start --chat NAME` | Put this folder in the project NAME (made if there is none); without it, a new folder starts a project named after itself |
-| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `processes`, `tasks`: act on that project, not the one of the folder you are in |
+| `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `mcp`, `processes`, `tasks`, `routines`: act on that project, not the one of the folder you are in |
 | `crewchat rules` | Print the project's guide for its agents |
 | `crewchat rules show` / `set TEXT` / `set --file F` / `clear` | The owner's rules for the project: agents get them at once, and in their guide |
 | `crewchat skills` / `skills add PATH [--name N]` / `skills remove NAME` | Skills shared with every agent of the project (a `SKILL.md`, or a folder holding one) |
+| `crewchat mcp` / `mcp add NAME --url URL [--header 'K: V']` / `mcp add NAME --command 'CMD ARG...' [--env K=V]` / `mcp add --json FILE` / `mcp remove NAME` / `mcp test NAME` | Your own MCP servers, for every agent tool in every connected folder of the project. `--json` takes a server block as its docs give it (`mcpServers`); `-` reads it from stdin. `--oauth`: it signs in in the browser. `--tools claude,cursor`: only those. `--allow`: its tools run without asking. Keys stay on this machine. |
 | `crewchat processes` / `processes show NAME` | The process notes the crew wrote down ([Teams](teams.md#process-notes)): what each is for, its state and who approves it; one note's steps, commands and pitfalls |
 | `crewchat processes approve\|decline\|retire\|share NAME` | Approve or decline a proposed note, stop giving it to agents, or share it with all your projects |
 | `crewchat processes owner-only NAME on\|off` / `processes rule [owner\|default\|lead]` | Only you approve a note; who approves the project's notes |
@@ -134,6 +143,16 @@ Is the server running, its addresses, connected folders, linked machines, and wh
 | `crewchat tasks remove ID` | Take a task off the sheet |
 | `crewchat tasks advisor [on\|off]` | Let a task be marked done only after the advisor approves it ([details](teams.md#the-advisor)) |
 | `crewchat tasks reclaim [MINUTES\|off\|default] [ID]` | Put a task back on the sheet when its holder is silent this long, for the project or one task ([details](getting-started.md#the-task-sheet)) |
+| `crewchat tasks jira ID PROJ-123\|ADDRESS\|off` | Link a task to a Jira ticket, or take the link away ([details](connections.md#jira-tickets)) |
+| `crewchat tasks jira-site [HOST\|off]` | The project's Jira site: a bare key gets its address there, and agents get Atlassian's Jira MCP server |
+| `crewchat tasks jira-login [out]` | Sign in to Atlassian in the browser (its own page, so your SSO applies), or sign out |
+| `crewchat tasks jira-watch [on\|off] [--jql QUERY] [--every MINUTES]` | Post tickets newly assigned to you (or found by QUERY) as tasks, looking every 5 minutes unless set |
+| `crewchat gchat` / `gchat add NAME --webhook ADDRESS` / `gchat remove NAME` | The project's Google Chat spaces, where agents post their pull requests ([details](connections.md#google-chat)); a space by its incoming webhook |
+| `crewchat gchat client FILE` / `gchat login [out]` / `gchat spaces` / `gchat add NAME` | Sign in to Google with your own Desktop app OAuth client, list your spaces, add one by its name |
+| `crewchat gchat default NAME` / `gchat ask on\|off` / `gchat auto on\|off` / `gchat test [NAME]` | The default space, ask before each post, post new pull requests by themselves, post a test |
+| `crewchat routines` / `routines templates` | The project's routines, work the crew does again and again on a schedule ([details](getting-started.md#routines)), and ready-made ones to start from |
+| `crewchat routines add NAME TEXT --when WHEN [--to lead\|AGENT]` | A routine: each time it is due (`every 2h`, `weekdays 09:00`, `mon,thu 17:30`), its task is posted for anyone, the lead or one agent |
+| `crewchat routines set\|pause\|resume\|run\|remove NAME` | Change a routine, pause it, turn it on again, post its task now, or remove it |
 
 ## Project folders
 

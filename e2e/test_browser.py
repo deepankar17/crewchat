@@ -469,6 +469,26 @@ class NewPage(Signed):
         c.until("$('edits-note').textContent.startsWith('Kept')", what="back to auto")
         self.assertEqual(c.errors, [])
 
+    def test_mcp_servers_in_the_project_panel(self):
+        c = self.chrome
+        c.js("openPanel('project')")
+        key = "Bearer e2e-key-0123456789abcdef"
+        block = {"mcpServers": {"my-server": {"type": "http", "url": "http://localhost:9/mcp",
+                                              "headers": {"Authorization": "Bearer <YOUR_API_KEY>"}}}}
+        c.js("$('mcp-json').value = %s; $('mcp-add-json').click()" % json.dumps(json.dumps(block)))
+        c.until("$('mcp-note').textContent.includes('<YOUR_API_KEY>')", what="the placeholder refused")
+        block["mcpServers"]["my-server"]["headers"]["Authorization"] = key
+        c.js("$('mcp-json').value = %s; $('mcp-add-json').click()" % json.dumps(json.dumps(block)))
+        c.until("$('mcp-list').textContent.includes('my-server')", what="the server listed")
+        self.assertNotIn("e2e-key", c.js("$('mcp-list').textContent"))  # a key never comes back to the page
+        self.assertIn("key: Authorization", c.js("$('mcp-list').textContent"))
+        listed = self.m.cli("mcp", "list")
+        self.assertIn("my-server", listed)
+        self.assertNotIn("e2e-key", listed)
+        c.js("window.confirm = () => true; [...$('mcp-list').querySelectorAll('button')].find(b => b.textContent === 'Remove').click()")
+        c.until("!$('mcp-list').textContent.includes('my-server')", what="the server removed")
+        self.assertEqual(c.errors, [])
+
     def test_open_folder_for_the_projects_folders_and_an_agents_folder(self):
         c = self.chrome
         folder = json.loads(self.m.owner.post("/api/folders", {"op": "project"})[1])["folders"][0]["path"]
@@ -522,6 +542,38 @@ class NewPage(Signed):
         c.until("!state.roles.some(r => r.name === 'designer')", what="the page's list to follow (the poll's boot tag)")
         self.assertEqual(c.errors, [])
 
+    def test_a_role_under_another_in_the_panel(self):
+        # Roles as a tree (roadmap H3): a role made under the lead, with the assign power, sits under it in the list.
+        c = self.chrome
+        c.js("openPanel('roles')")
+        c.until("$('panel-body').innerText.includes('Software team')", what="the roles")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'New role').click()")
+        c.until("!!document.querySelector('#panel-body form.roleform')", what="the role form")
+        c.js("""(() => { const f = document.querySelector('#panel-body form');
+            f.querySelector('[aria-label=Name]').value = 'ux-lead';
+            f.querySelector('[aria-label=Label]').value = 'UX lead';
+            f.querySelector('textarea').value = 'You lead the designers.';
+            f.querySelector('[aria-label="Reports to"]').value = 'lead';
+            [...f.querySelectorAll('.powers label')].find(l => l.textContent.includes('Hands out work'))
+              .querySelector('input').checked = true;
+            f.requestSubmit(); })()""")
+        c.until("$('panel-title').textContent === 'UX lead'", what="the new role's panel")
+        text = c.js("$('panel-body').innerText")
+        self.assertIn("Lead", text.split("Reports to")[1][:40])
+        self.assertIn("Hands out work", text)
+        c.js("openPanel('roles')")
+        c.until("[...document.querySelectorAll('.rolelist li.under')].some(li => li.innerText.includes('UX lead'))",
+                what="the role under the lead")
+        order = c.js("[...document.querySelectorAll('.rolelist li')].map(li => li.innerText.split('\\n')[0])")
+        self.assertEqual(order[0], "Lead")
+        c.js("openPanel('role', 'ux-lead')")
+        c.until("$('panel-title').textContent === 'UX lead'", what="its panel")
+        c.js("window.confirm = () => true")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
+        c.until("$('panel-title').textContent === 'Roles' && !$('panel-body').innerText.includes('UX lead')",
+                what="the role gone")
+        self.assertEqual(c.errors, [])
+
     def test_adding_and_taking_off_tasks_on_the_sheet(self):
         c = self.chrome
         c.click("#view-tasks")
@@ -565,6 +617,36 @@ class NewPage(Signed):
         self.assertFalse(c.js("$('log').hidden"))  # the search is of the chat: it shows, with what matches
         self.assertTrue(c.js("$('tasks').hidden"))
         self.assertEqual(c.errors, [])
+
+    def test_reply_keeps_clear_of_a_messages_pills_on_a_phone(self):
+        # At phone width a task update's pill ("#11 done") ran under the Reply button at the top right.
+        c = self.chrome
+        mid = self.m.owner.task("all", "Build the theme switch")
+        try:
+            self.m.cli("role", self.agent.name, "developer")
+            self.agent.call("hub_task", action="take", id=mid)
+            self.agent.call("hub_task", action="update", id=mid, status="review", note="Passes on Android 14 and 12")
+            c.size(390, 844, mobile=True)
+            c.until("innerWidth === 390 && [...document.querySelectorAll('#log .msg .meta .pill')].length > 0",
+                    what="a phone, and the update's pill")
+            overlaps = c.js("""[...document.querySelectorAll('#log .msg')].filter(m => m.querySelector(':scope > .reply'))
+                .flatMap(m => { const r = m.querySelector(':scope > .reply').getBoundingClientRect();
+                  return [...m.querySelectorAll(':scope > .meta > *')].filter(e => { const b = e.getBoundingClientRect();
+                    return b.width && b.right > r.left && b.left < r.right && b.bottom > r.top && b.top < r.bottom; })
+                  .map(e => e.textContent); })""")
+            self.assertEqual(overlaps, [])
+            # Whatever the width, the meta's pills wrap before they reach the button.
+            crowded = c.js("""[...document.querySelectorAll('#log .msg')].filter(m => m.querySelector(':scope > .reply'))
+                .filter(m => { const meta = m.querySelector(':scope > .meta'), b = meta.getBoundingClientRect();
+                  return b.right - parseFloat(getComputedStyle(meta).paddingRight) >
+                    m.querySelector(':scope > .reply').getBoundingClientRect().left; })
+                .map(m => m.querySelector(':scope > .meta').innerText)""")
+            self.assertEqual(crowded, [])
+            self.assertEqual(c.errors, [])
+        finally:
+            self.m.cli("role", self.agent.name, "none")
+            self.m.cli("tasks", "remove", mid)  # nothing left in Needs you for the tests after
+            c.size(1280, 900)
 
     def test_a_blocked_tasks_answer_shows_in_its_history(self):
         c = self.chrome
@@ -1030,6 +1112,43 @@ class NewPage(Signed):
         c.until("$('project').textContent === 'Demo' && state.agents.length > 0", what="back to Demo")
         self.assertEqual(c.errors, [])
 
+    def test_close_a_tab_and_remove_a_project(self):
+        c = self.chrome
+        tabs = "[...document.querySelectorAll('#tabs .tab .pname')].map(t => t.textContent)"
+        c.js("postJSON('/api/projects', {op: 'create', name: 'Scratch pad'})")
+        c.open(c.js("location.href"))  # a new project shows on the next answer that changes; this page sees it now
+        c.until("%s.includes('Scratch pad')" % tabs, what="a tab for the new project")
+        # Close tab: off the bar, still in the + menu, and back on the bar once opened from there.
+        c.js("[...document.querySelectorAll('#tabs .tab')].find(t => t.innerText.includes('Scratch')).querySelector('.tab-x').click()")
+        c.until("$('close-dialog').open", what="the close dialog")
+        self.assertEqual(c.js("$('close-title').textContent"), "Close Scratch pad?")
+        c.js("$('close-form').requestSubmit()")
+        c.until("!%s.includes('Scratch pad')" % tabs, what="the tab closed")
+        self.assertIn("Scratch pad", c.js("$('tab-menu').textContent"))
+        c.js("[...$('tab-menu').children].find(b => b.textContent === 'Scratch pad').click()")
+        c.until("$('project').textContent === 'Scratch pad' && %s.includes('Scratch pad')" % tabs, what="opened again")
+        # Remove: the first project cannot be; this one only once its name is typed, and then the page goes to Demo.
+        c.js("document.querySelector('#tabs .tab:first-child .tab-x').click()")
+        c.until("$('close-dialog').open")
+        self.assertTrue(c.js("$('close-remove').hidden"))
+        self.assertIn("first project", c.js("$('close-note').textContent"))
+        c.click("#close-cancel")
+        c.js("document.querySelector('#tabs .tab[aria-current=page] .tab-x').click()")
+        c.until("$('close-dialog').open && !$('close-remove').hidden")
+        c.click("#close-remove")
+        self.assertFalse(c.js("$('remove-part').hidden"))
+        self.assertTrue(c.js("$('close-tab').hidden"))
+        self.assertEqual(self.shown_though_hidden(), [])
+        c.type_into("#remove-name", "scratch")
+        c.click("#close-remove")
+        self.assertIn("Type Scratch pad", c.js("$('close-note').textContent"))
+        self.assertIn("Scratch pad", c.js("%s.join()" % tabs))
+        c.type_into("#remove-name", "scratch pad")
+        c.js("$('close-form').requestSubmit()")  # Enter in the name box removes too
+        c.until("$('project').textContent === 'Demo' && !%s.includes('Scratch pad')" % tabs, what="removed, back on Demo")
+        self.assertNotIn("Scratch pad", c.js("$('tab-menu').textContent"))
+        self.assertEqual(c.errors, [])
+
     def test_the_analytics_view(self):
         # Roadmap X2: the crew at a glance, live through the chat's own poll; light and dark, desktop and phone.
         c = self.chrome
@@ -1358,6 +1477,93 @@ class AdvisorOnThePage(Signed):
             advisor.call("hub_answer", id=ask_id, text="Yes.")
             thread.join(30)
         self.assertIn("Yes.", asked.get("text", ""))
+
+
+class MobileBridge:
+    """`crewchat device-proxy claude` in the agent's folder, as its tool would run it, with a stand-in for Mobile MCP
+    (tests/fake_mobile_mcp.py, run by an `npx` of the test's own) whose devices are one real Android phone."""
+    PHONE = "R58M123ABC"
+
+    def __init__(self, machine):
+        bin_dir = H.TMP / "fake-npx"
+        bin_dir.mkdir(exist_ok=True)
+        npx = bin_dir / "npx"
+        npx.write_text("#!/bin/sh\nexec %s %s\n" % (sys.executable, H.ROOT / "tests" / "fake_mobile_mcp.py"))
+        npx.chmod(0o755)
+        env = dict(machine.env, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""),
+                   FAKE_DEVICES=json.dumps([{"id": self.PHONE, "name": "Galaxy", "platform": "android", "type": "real",
+                                             "state": "online"}]))
+        self.proc = subprocess.Popen(H.crewchat_command() + ["device-proxy", "claude"], cwd=str(machine.folder), env=env,
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.n = 0
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t"}})
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        self.proc.stdin.flush()
+
+    def rpc(self, method, params):
+        self.n += 1
+        self.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params}) + "\n")
+        self.proc.stdin.flush()
+        while True:
+            msg = json.loads(self.proc.stdout.readline())
+            if msg.get("id") == self.n:
+                return msg
+
+    def call(self, tool, **args):
+        out = self.rpc("tools/call", {"name": tool, "arguments": dict(args, device=self.PHONE)})["result"]
+        return out.get("isError", False), out["content"][0]["text"]
+
+    def close(self):
+        self.proc.stdin.close()
+        self.proc.terminate()
+        self.proc.wait(10)
+        self.proc.stdout.close()
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class MobileDevicesOnThePage(Signed):
+    """D4: mobile devices from the owner's side, with the device proxy and a stand-in for Mobile MCP."""
+
+    def test_turn_on_pick_a_phone_allow_an_app_and_see_it_in_the_panel(self):
+        c, name = self.chrome, self.agent.name
+        card = "document.querySelector('#agents .agent[data-agent=%s]')" % json.dumps(name)
+        c.until("!!%s" % card, what="the agent")
+        # 1. Mobile devices on, from the agent's card: its folder gets crewchat's "mobile" server.
+        c.js(card + ".click()")
+        c.until("$('agent-pane-body').innerText.includes('Mobile devices')", what="the agent's settings")
+        c.js("[...$('agent-pane-body').querySelectorAll('button')].find(b => b.title === %s).click()"
+             % json.dumps("Mobile devices for " + name))
+        eventually(lambda: "mobile" in json.loads((self.m.folder / ".mcp.json").read_text())["mcpServers"],
+                   what="the mobile server in the folder")
+        c.js("closeAgent()")
+        bridge = MobileBridge(self.m)
+        self.addCleanup(bridge.close)
+        # A real phone the owner has not picked: refused, and the Devices panel shows it to pick.
+        refused, text = bridge.call("mobile_take_screenshot")
+        self.assertTrue(refused)
+        self.assertIn("not picked", text)
+        c.js("openPanel('devices')")
+        c.until("$('panel-body').innerText.includes(%s)" % json.dumps(bridge.PHONE), what="the phone in the panel")
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Let agents use it').click()")
+        c.until("$('panel-body').innerText.includes('Agents may use it')", what="the phone picked")
+        # 2. Its first app on the phone asks in Needs you; 3. Allow it, and the call goes through.
+        out = {}
+        t = threading.Thread(target=lambda: out.update(said=bridge.call("mobile_launch_app",
+                                                                        packageName="com.example.shop")))
+        t.start()
+        c.until("$('needs-list').innerText.includes('com.example.shop')", what="the app ask in Needs you")
+        c.js("[...document.querySelectorAll('#needs-list .need.ask button')].find(b => b.textContent === 'Allow the app')"
+             ".click()")
+        t.join(60)
+        self.assertEqual(out["said"], (False, "Launched app com.example.shop"))
+        # 4. The panel shows who holds the phone and the app in front.
+        c.js("loadDevices()")
+        c.until("$('panel-body').innerText.includes('Used by %s') && $('panel-body').innerText.includes('in com.example.shop')"
+                % name, what="the holder and the app in the panel")
+        self.assertIn("com.example.shop", c.js("$('panel-body').innerText"))  # and the app is on the allowed list
+        c.js("[...$('panel-body').querySelectorAll('button')].find(b => b.textContent === 'Let go').click()")
+        c.until("!$('panel-body').innerText.includes('Used by')", what="the phone let go")
+        self.assertEqual(c.errors, [])
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")

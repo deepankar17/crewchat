@@ -49,6 +49,57 @@ os.environ.pop("CLAUDE_CONFIG_DIR", None)
 os.environ.pop("CODEX_HOME", None)  # Codex's settings: under user_home too
 
 
+def committed_repo(files):
+    """A new git repository in which these files (relative path -> text) are committed."""
+    folder = Path(tempfile.mkdtemp(prefix="committed-", dir=TMP)).resolve()
+    for rel, text in files.items():
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        (folder / rel).write_text(text)
+    for args in (["init", "-q"], ["add", "."], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "one"]):
+        subprocess.run(["git", "-C", str(folder)] + args, check=True, capture_output=True)
+    return folder
+
+
+class CommittedSettings(unittest.TestCase):
+    """Review of 5 Nov: crewchat wrote the folder's token into a committed .mcp.json or .cursor/mcp.json, so it went
+    into the owner's next commit; only Gemini CLI, Qwen Code and OpenCode refused. Every tool refuses now."""
+
+    def install(self, client, rel):
+        before = '{"mcpServers": {"theirs": {"command": "x"}}}'
+        folder = committed_repo({rel: before})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.object(crewchat, "install_codex") as codex:
+            written = crewchat.install_client(client, folder, "http://127.0.0.1:9", "secret-tok-42")
+        return folder, rel, before, written, out.getvalue(), codex
+
+    def test_no_tool_writes_its_token_into_a_committed_file(self):
+        for client, rel in (("claude", ".mcp.json"), ("cursor", ".cursor/mcp.json"), ("codex", ".mcp.json"),
+                            ("gemini", ".gemini/settings.json"), ("qwen", ".qwen/settings.json"),
+                            ("opencode", "opencode.json")):
+            with self.subTest(client=client):
+                folder, rel, before, written, out, codex = self.install(client, rel)
+                self.assertEqual(written, [])
+                self.assertEqual((folder / rel).read_text(), before)
+                self.assertIn("%s is committed in this folder" % rel, out)
+                self.assertIn("git rm --cached %s" % rel, out)
+                self.assertFalse(codex.called)
+                self.assertNotIn("secret-tok-42", subprocess.run(
+                    ["grep", "-r", "secret-tok-42", str(folder), "--exclude-dir=.git"], capture_output=True,
+                    text=True).stdout)
+                for other in (".claude/settings.local.json", ".cursor/hooks.json", ".cursor/cli.json"):
+                    self.assertFalse((folder / other).exists())  # no hooks for a tool with no chat to reach
+
+    def test_an_untracked_file_in_a_repository_still_gets_the_token(self):
+        folder = committed_repo({"README.md": "x"})
+        written = crewchat.install_client("claude", folder, "http://127.0.0.1:9", "secret-tok-42")
+        self.assertEqual(written, [".mcp.json", ".claude/settings.local.json"])
+        self.assertIn("secret-tok-42", (folder / ".mcp.json").read_text())
+
+    def test_security_md_says_committed_files_are_left_alone(self):
+        self.assertIn("crewchat never writes a token into a settings file the repository has committed",
+                      (ROOT / "SECURITY.md").read_text())
+
+
 def cli(*argv):
     """Run a crewchat command in-process; returns what it printed."""
     out = io.StringIO()
@@ -816,7 +867,7 @@ class MachinesEndpoint(Base):
         self.assertEqual((status["via"], status["machines"], status["local"]), ("none", [], True))
         self.assertEqual((status["me"]["version"], status["me"]["os"]), (crewchat.__version__, crewchat.os_name()))
         for op in ("status", "peer-invite", "peer-join", "peer-remove", "peer-leave", "prefer", "restart",
-                   "cloud-setup", "cloud-login", "cloud-approve", "cloud-remove", "cloud-logout"):
+                   "update", "cloud-setup", "cloud-login", "cloud-approve", "cloud-remove", "cloud-logout"):
             for token, code in ((self.token, 403), (None, 401)):
                 with self.assertRaises(urllib.error.HTTPError) as e:
                     self.ask({"op": op}, token)
@@ -878,6 +929,24 @@ class MachinesEndpoint(Base):
         command, kwargs = popen.call_args[0][0], popen.call_args[1]
         self.assertEqual(command[-1], "restart")
         self.assertTrue(kwargs.get("start_new_session") or kwargs.get("creationflags"))
+
+    def test_update_from_the_page(self):
+        # The owner's Windows laptop, 6 Nov: the banner said to run `crewchat update`; Update now runs it from the page.
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat.subprocess, "Popen") as popen:
+            self.assertEqual(self.ask({"op": "update"}, self.owner), {"updating": True, "window": os.name == "nt"})
+        command, kwargs = popen.call_args[0][0], popen.call_args[1]
+        self.assertEqual(command[-1], "update")
+        self.assertTrue(kwargs.get("start_new_session") or kwargs.get("creationflags"))
+
+    def test_a_checkout_does_not_update_from_the_page(self):
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=False), \
+                mock.patch.object(crewchat.subprocess, "Popen") as popen:
+            with self.assertRaises(urllib.error.HTTPError) as e:
+                self.ask({"op": "update"}, self.owner)
+        self.assertEqual(e.exception.code, 400)
+        self.assertIn("not from the installer", json.loads(e.exception.read().decode())["error"])
+        popen.assert_not_called()
 
 
 class LinkChecks(unittest.TestCase):
@@ -982,6 +1051,13 @@ class MachinesPage(unittest.TestCase):
         for os_name in ("mac:", "windows:", "linux:"):
             self.assertIn(os_name, logos)
         self.assertGreaterEqual(logos.count('"M'), 3)  # a path for each
+
+    def test_the_update_banner_can_run_the_update(self):
+        page = crewchat.CHAT_PAGE
+        banner = page[page.index('<div id="update"'):page.index('<div id="offered"')]
+        self.assertTrue('id="update-run"' in banner and "Update now" in banner)
+        run = page[page.index('$("update-run").addEventListener'):page.index('$("update-close").addEventListener')]
+        self.assertTrue('op: "update"' in run and "serverRestarted(" in run and "location.reload()" in run)
 
     def test_the_page_has_a_machines_panel(self):
         page = crewchat.CHAT_PAGE
@@ -1194,7 +1270,7 @@ class BrowserPanel(Base):
         self.assertTrue("function browserItem" in page)
         self.assertTrue('"allow_task"' in page and '"allow_site"' in page)
         # Release review: a browser ask sorts first in Needs you, and the task panel took it for the task's own card.
-        self.assertTrue('state.needs.find((n) => n.task === r.id && n.kind !== "browser")' in page)
+        self.assertTrue('state.needs.find((n) => n.task === r.id && n.kind !== "browser" && n.kind !== "device")' in page)
 
 
 class NoConsoleWindows(unittest.TestCase):
@@ -3895,7 +3971,8 @@ class RolePacks(unittest.TestCase):
         role = self.change(config, "create", name="Designer", label="Designer", description="You design.",
                            picture="preset:palette", colour="#ABCDEF", tool="cursor")["role"]
         self.assertEqual(role, {"name": "designer", "label": "Designer", "description": "You design.",
-                                "picture": "preset:palette", "colour": "#abcdef", "tool": "cursor"})
+                                "picture": "preset:palette", "colour": "#abcdef", "tool": "cursor", "powers": [],
+                                "reports_to": ""})
         with self.assertRaisesRegex(crewchat.HubError, "already"):
             self.change(config, "create", name="designer", description="Again.")
         with self.assertRaisesRegex(crewchat.HubError, "description"):
@@ -4137,6 +4214,30 @@ class Roles(Base):
                           ({"op": "create", "name": "x", "pack": "nope"}, "no pack called nope"), ({"op": "drop"}, "op must be")):
             self.assertIn(why, self.op_at("/api/projects", **body)["error"])
         self.assertEqual(self.op_at("/api/projects", token=self.token, op="create", name="sneaky")["status"], 403)
+
+    def test_the_owner_removes_a_project_from_the_page(self):
+        made = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": "Old idea"})
+        root = crewchat.find_chat(made["id"])["root"]
+        (root / "messages.jsonl").write_text('{"id": 1}\n')
+        projects = self.server.RequestHandlerClass.projects
+        first = projects.primary
+        for body, why in (({"id": made["id"], "name": "old"}, "type the project's name"),
+                          ({"id": "nope", "name": "nope"}, "no project nope"),
+                          ({"id": first.id, "name": first.name}, "first project, which cannot be removed")):
+            self.assertIn(why, self.op_at("/api/projects", op="remove", **body)["error"])
+        self.assertEqual(self.op_at("/api/projects", token=self.token, op="remove", id=made["id"], name="Old idea")["status"], 403)
+        self.assertTrue(root.exists())
+        gone = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "remove", "id": made["id"], "name": " old  IDEA "})
+        self.assertEqual(gone["removed"], "Old idea")
+        self.assertFalse(root.exists())
+        kept = Path(gone["kept"])
+        self.assertEqual(kept.parent, root.parent / ".removed")
+        self.assertEqual((kept / "messages.jsonl").read_text(), '{"id": 1}\n')  # the chat is kept, not deleted
+        self.assertNotIn(made["id"], [p.id for p in projects.all()])
+        self.assertIsNone(crewchat.find_chat(made["id"]))
+        self.assertIn("Old idea", first.roster.config.get("dismissed_projects"))  # not offered straight back
+        again = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": "Old idea"})
+        self.assertEqual(again["id"], made["id"])  # the name is free again
 
     def op_at(self, path, token=None, **body):
         try:
@@ -4490,6 +4591,149 @@ class NeedsYou(Base):
             return dict(json.loads(e.read()), status=e.code)
 
 
+class RoleHierarchy(Base):
+    """Role powers (H1) and a per-project tree of roles (H2): custom roles can lead, and work and reports follow the
+    tree."""
+
+    def setUp(self):
+        self.root = crewchat.home()
+        self.saved = crewchat.load_config(self.root)
+
+    def tearDown(self):
+        for name in list(self.hub.agents):
+            if self.hub.agents[name].get("role"):
+                self.role(name, "none")
+        crewchat.save_config(self.saved, self.root)
+        self.hub.roster.refresh(force=True)
+        with self.hub.lock:
+            self.hub.tree, self.hub.tree_ts = {}, 0.0
+
+    def op(self, **body):
+        try:
+            return crewchat.post_json(self.base + "/api/roles", self.owner, body)
+        except urllib.error.HTTPError as e:
+            return dict(json.loads(e.read()), status=e.code)
+
+    def role(self, agent, role):
+        return crewchat.post_json(self.base + "/api/role", self.owner, {"agent": agent, "role": role})
+
+    def test_a_project_from_before_keeps_the_lead_and_advisor_powers(self):
+        table = crewchat.role_table({"roles": {"lead": {"description": "You lead."}}}, crewchat.role_packs())
+        self.assertEqual(table["lead"]["powers"], ["assign", "areas", "notes", "code"])
+        self.assertEqual(table["advisor"]["powers"], ["code", "advise"])
+        self.assertEqual((table["developer"]["powers"], table["developer"]["reports_to"]), ([], ""))
+        self.assertEqual(crewchat.top_role(table), "lead")
+        # An owner may take a power away: an empty list is kept as empty, not read as "the defaults".
+        table = crewchat.role_table({"roles": {"lead": {"description": "x", "powers": []}}}, crewchat.role_packs())
+        self.assertEqual((table["lead"]["powers"], crewchat.top_role(table)), ([], ""))
+        self.assertEqual(crewchat.clean_powers("assign, fly,notes"), ["assign", "notes"])
+
+    def test_a_custom_role_with_the_assign_power_hands_out_work(self):
+        made = self.op(op="create", name="tech-lead", label="Tech lead", description="You run the tech side.",
+                       powers=["assign", "code"], reports_to="lead")["role"]
+        self.assertEqual((made["powers"], made["reports_to"]), (["assign", "code"], "lead"))
+        self.assertIn("powers", next(r for r in self.hub.boot()["roles"] if r["name"] == "tech-lead"))
+        (tl, tl_name), (dev, dev_name) = self.agent(), self.agent()
+        self.role(tl_name, "tech-lead")
+        self.role(dev_name, "developer")
+        self.assertEqual(self.hub.tool_kind(tl.sid), "lead")  # hub_code comes with the code power
+        # The developer works under the top lead: a sub-lead may not take it, until it works under the tech lead.
+        self.assertIn("does not work under you", tl.text("hub_task", action="assign", to=dev_name, title="x"))
+        self.op(op="edit", name="developer", reports_to="tech-lead")
+        out = tl.text("hub_task", action="assign", to=dev_name, title="Write the parser")
+        self.assertEqual(self.hub.taken[re.search(r"task #(\w+)", out).group(1)], dev_name)
+        self.op(op="edit", name="tech-lead", powers=[])
+        self.assertIn("only the lead assigns", tl.text("hub_task", action="assign", to=dev_name, title="x"))
+
+    def test_work_goes_down_the_tree_and_reports_come_up(self):
+        for name, label, powers, up in (("frontend-lead", "Frontend lead", ["assign"], "lead"),
+                                        ("frontend-dev", "Frontend developer", [], "frontend-lead"),
+                                        ("backend-dev", "Backend developer", [], "")):
+            self.assertNotIn("error", self.op(op="create", name=name, label=label, description="You work.",
+                                              powers=powers, reports_to=up))
+        (lead, lead_name), (fl, fl_name), (fd, fd_name), (bd, bd_name) = [self.agent() for _ in range(4)]
+        for agent, role in ((lead_name, "lead"), (fl_name, "frontend-lead"), (fd_name, "frontend-dev"),
+                            (bd_name, "backend-dev")):
+            self.role(agent, role)
+        self.assertIn("You report to the Frontend lead", fd.text("hub_inbox"))
+        self.assertIn("You report to the Frontend lead", fd.text("hub_role"))
+        self.assertIn("Working under you: Frontend developer.", fl.text("hub_inbox"))
+        self.assertIn("%s (you) [frontend-dev]" % fd_name, fd.text("hub_agents"))
+        self.assertIn("reports to %s" % fl_name, fd.text("hub_agents"))
+        # A sub-lead gives work in its branch only; the top lead to anyone.
+        refused = fl.text("hub_task", action="assign", to=bd_name, title="Fix the API")
+        self.assertIn("%s does not work under you" % bd_name, refused)
+        self.assertIn("ask %s" % lead_name, refused)
+        out = fl.text("hub_task", action="assign", to=fd_name, title="Build the form")
+        piece = re.search(r"task #(\w+)", out).group(1)
+        lead.text("hub_task", action="assign", to=bd_name, title="Fix the API")
+        # The developer's update goes to its own lead, not the top lead.
+        fl.text("hub_inbox")
+        lead.text("hub_inbox")
+        fd.call("hub_task", action="update", id=piece, status="review", note="Form ready")
+        self.assertIn("[UPDATE on #%s: ready for review] Form ready" % piece, fl.text("hub_inbox"))
+        self.assertNotIn("Form ready", lead.text("hub_inbox"))
+        # With no frontend lead in the chat, its developer reports to the top lead.
+        self.role(fl_name, "none")
+        fd.call("hub_task", action="update", id=piece, status="in_progress", note="Back on it")
+        self.assertIn("Back on it", lead.text("hub_inbox"))
+
+    def test_a_loop_a_missing_role_or_a_second_top_lead_is_refused(self):
+        self.assertIn("one top lead", self.op(op="create", name="boss", description="x", powers=["assign"])["error"])
+        self.assertIn("no role called ghost", self.op(op="create", name="a", description="x", reports_to="ghost")["error"])
+        self.op(op="create", name="a", description="x", reports_to="lead")
+        self.op(op="create", name="b", description="x", reports_to="a")
+        self.assertIn("makes a loop", self.op(op="edit", name="a", reports_to="b")["error"])
+        self.assertEqual(self.op(op="list")["roles"][-2]["reports_to"], "lead")  # nothing was saved
+        lines = crewchat.role_tree_lines(self.hub.roster.role_rows)
+        self.assertEqual(lines[0], "Lead (lead) [assign, areas, notes, code]")
+        self.assertIn("    B (b)", lines)
+        # Deleting a role moves the roles under it up to the one it reported to.
+        self.assertEqual(self.op(op="delete", name="a"), {"deleted": "a", "moved": ["b"]})
+        self.assertEqual(self.hub.roster.role_rows["b"]["reports_to"], "lead")
+
+    def test_export_and_import_carry_powers_and_the_tree(self):
+        self.op(op="create", name="ux-lead", description="x", powers="assign", reports_to="lead")
+        self.op(op="create", name="ux", description="y", reports_to="ux-lead")
+        out = self.op(op="export", names=["ux"])["roles"]["ux"]
+        self.assertEqual((out["powers"], out["reports_to"]), ([], "ux-lead"))
+        self.op(op="delete", name="ux")
+        self.op(op="delete", name="ux-lead")
+        self.op(op="import", roles={"ux": out})  # its lead is not here: it works under the top lead
+        self.assertEqual(self.hub.roster.role_rows["ux"]["reports_to"], "")
+
+    def test_the_tree_travels_to_linked_machines_and_the_newest_wins(self):
+        # H4: a change to roles here goes out as a plan message with the tree.
+        self.op(op="create", name="ux-lead", description="x", powers=["assign"], reports_to="lead")
+        sent = next(m for m in reversed(self.hub.history(20)) if m.get("tree"))
+        self.assertEqual(json.loads(sent["tree"])["ux-lead"], {"powers": ["assign"], "reports_to": "lead"})
+        self.op(op="edit", name="ux-lead", label="UX lead")  # the tree is the same: nothing more is sent
+        self.assertFalse([m for m in self.hub.history(50) if m.get("tree") and m["seq"] > sent["seq"]])
+        # Another machine's newer tree is taken in: this machine's roles follow it, and a role only it has counts here.
+        other = {"developer": {"powers": [], "reports_to": "ux-lead"},
+                 "ops-lead": {"powers": ["assign", "areas"], "reports_to": "lead"}}
+        self.hub.ingest({"id": "zz1", "ts": time.time() + 1, "from": "Owner", "to": "all", "text": "", "kind": "plan",
+                         "tree": json.dumps(other)})
+        self.assertEqual(self.hub.roster.role_rows["developer"]["reports_to"], "ux-lead")
+        self.assertEqual(crewchat.load_config(self.root)["roles"]["developer"]["reports_to"], "ux-lead")
+        with self.hub.lock:
+            self.assertEqual(self.hub._powers("ops-lead"), {"assign", "areas"})
+            self.assertEqual(crewchat.role_chain(self.hub._table(), "ops-lead"), ["lead"])
+        # An older one, arriving late, does not undo it.
+        self.hub.ingest({"id": "zz2", "ts": 1.0, "from": "Owner", "to": "all", "text": "", "kind": "plan",
+                         "tree": json.dumps({"developer": {"powers": [], "reports_to": ""}})})
+        self.assertEqual(self.hub.roster.role_rows["developer"]["reports_to"], "ux-lead")
+
+    def test_the_command_line_sets_powers_and_reports_to_and_shows_the_tree(self):
+        with mock.patch.object(crewchat, "local_url", lambda config=None: "http://127.0.0.1:9"):  # nothing listens
+            cli("roles", "add", "qa-lead", "--prompt", "You run QA.", "--powers", "assign,areas", "--reports-to", "lead")
+            cli("roles", "add", "qa", "--reports-to", "qa-lead")
+            tree = cli("roles", "tree")
+        self.assertIn("Lead (lead)", tree)
+        self.assertIn("\n  Qa lead (qa-lead) [assign, areas]", tree)
+        self.assertIn("    QA (qa)", tree)
+
+
 PNG = bytes.fromhex("89504e470d0a1a0a0000000d4948445200000001000000010802000000907753de"
                     "0000000c4944415408d763f8cfc000000301010018dd8db00000000049454e44ae426082")
 
@@ -4826,7 +5070,7 @@ class Launching(Base):
                 self.assertEqual(ready("codex", folder), [("todo", "Codex CLI is not installed here", "npm install -g @openai/codex")])
         # The page asks the server, for this project's folders only, and only as the owner.
         opener, _ = self.owner_browser()
-        with mock.patch.object(crewchat, "tool_readiness", lambda tool, folder, config, fresh=False, account="", browser=False: [
+        with mock.patch.object(crewchat, "tool_readiness", lambda tool, folder, config, fresh=False, account="", browser=False, mobile=False: [
                 {"state": "ok", "text": "%s in %s%s" % (tool, folder or "-", " again" if fresh else ""), "fix": ""}]):
             out = json.loads(self.raw("/api/tool-check?tool=gemini&folder=" + urllib.parse.quote(folder), opener=opener)[1])
             self.assertEqual(out["items"][0]["text"], "gemini in %s" % folder)
@@ -4834,6 +5078,31 @@ class Launching(Base):
             self.assertEqual(out["items"][0]["text"], "gemini in - again")  # not one of its folders: not looked at
         self.assertEqual(self.raw("/api/tool-check?tool=vim", opener=opener)[0], 400)
         self.assertEqual(self.raw("/api/tool-check?tool=claude")[0], 401)
+
+    def test_an_agent_launched_with_mobile_devices_finds_the_server_there(self):
+        # D3: its tool reads its MCP servers when it starts, so crewchat's "mobile" server is in the folder first; the
+        # card's Turn off takes it out again when no agent there has devices on.
+        refresh = mock.patch.object(crewchat, "refresh_codex")
+        refresh.start()
+        self.addCleanup(refresh.stop)
+        mcp, local = self.folder / ".mcp.json", self.folder / ".claude" / "settings.local.json"
+        self.assertNotIn("mobile", json.loads(mcp.read_text())["mcpServers"])
+        self.assertEqual(self.launch(name="phone-tester", task="Try the sign-up screen", mobile=True), {"ok": True})
+        entry = json.loads(mcp.read_text())["mcpServers"]["mobile"]
+        self.assertTrue(crewchat.is_device("claude", entry))
+        self.assertEqual(entry["args"][-2:], ["device-proxy", "claude"])
+        self.assertIn("mobile", json.loads(local.read_text())["enabledMcpjsonServers"])
+        self.assertIn("mcp__mobile", json.loads(local.read_text())["permissions"]["allow"])
+        self.assertTrue(self.hub.machine_config().get("mobile_used"))
+        session = Session(self.base, crewchat.read_token(self.place))
+        session.text("hub_link", key=self.launched[-1][2])
+        self.assertTrue(self.hub.agents["phone-tester"].get("mobile"))
+        self.hub.set_mobile("phone-tester", False)
+        self.assertNotIn("mobile", json.loads(mcp.read_text())["mcpServers"])
+        self.assertNotIn("mobile", json.loads(local.read_text()).get("enabledMcpjsonServers", []))
+        self.hub.set_mobile("phone-tester", True)  # and the card's Turn on puts it back
+        self.assertIn("mobile", json.loads(mcp.read_text())["mcpServers"])
+        self.hub.set_mobile("phone-tester", False)
 
     def test_a_launched_agent_gets_its_name_role_and_task(self):
         self.assertEqual(self.launch(name="docs-writer", role="docs", task="Write the settings guide"), {"ok": True})
@@ -5839,7 +6108,7 @@ class AgentCards(Base):
         row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
         self.assertEqual((row["status"], row["holder"], row["reclaimed"]), ("todo", "", "page-named"))  # free at once
         self.assertIn("no agent called nobody", self.op(op="listen", agent="nobody", mode="on")["error"])
-        self.assertIn("op is rename, remove, listen, stop, reopen, reconnect, start, model, profile or browser", self.op(op="kick", agent=name)["error"])
+        self.assertIn("op is rename, remove, listen, stop, reopen, reconnect, start, model, profile, browser or mobile", self.op(op="kick", agent=name)["error"])
 
     def test_cards_never_wait_for_the_process_list(self):
         _, name = self.agent()
@@ -6124,15 +6393,15 @@ class NewAgentOrder(unittest.TestCase):
 
 
 class ProjectSettingsMenu(unittest.TestCase):
-    """Roadmap U9: each project setting is reached one way: Project settings, Roles, Machines, Browser, then Commands."""
+    """Roadmap U9: each project setting is reached one way: Project settings, Roles, Machines, Browser, Devices, then Commands."""
 
     def test_the_menu_names_each_panel_once(self):
         page = crewchat.CHAT_PAGE
         menu = page[page.index('<details id="space-menu"'):]
         menu = menu[:menu.index("</details>")]
         self.assertEqual(re.findall(r'data-panel="([a-z]+)">([^<]+)<', menu),
-                         [("project", "Project settings"), ("roles", "Roles"), ("machines", "Machines"),
-                          ("browser", "Browser"), ("commands", "Commands")])
+                         [("project", "Project settings"), ("roles", "Roles"), ("machines", "Machines"), ("phone", "Open on your phone"),
+                          ("browser", "Browser"), ("devices", "Devices"), ("commands", "Commands")])
         self.assertNotIn("Rules, skills and machines", page)
         self.assertIn('<details class="help"><summary>How it works</summary>', page)  # help, not a settings card
 
@@ -6567,7 +6836,7 @@ class CommandsTab(Base):
         sub = next(a for a in crewchat.build_parser()._actions if isinstance(a, argparse._SubParsersAction))
         missing = []
         for name, parser in sub.choices.items():
-            if name in ("hook", "browser-proxy"):  # run by the hooks, and by agent tools as their browser
+            if name in ("hook", "browser-proxy", "device-proxy"):  # run by the hooks, and by agent tools as their browser or device
                 continue
             mine = [words(u) for u in usages if u.split()[0] == name]
             if not mine:
@@ -8339,11 +8608,25 @@ class ProcessNotes(unittest.TestCase):
         for part in ("v1", "Before you build a release", "2. Build the wheel", "python3 -m unittest", "clean tree",
                      "approved by %s" % lead):
             self.assertIn(part, text)
-        self.assertIn("alwaysApply: false", (self.folder / ".cursor/rules/crewchat-process-release-build.mdc").read_text())
+        rule = self.folder / ".cursor/rules/crewchat-process-release-build.mdc"  # written just after the skill
+        self.assertIn("alwaysApply: false", eventually(lambda: rule.exists() and rule.read_text(), what="the note's rule"))
         guide = eventually(lambda: "release-build" in (self.folder / crewchat.GUIDE_SKILL).read_text()
                            and (self.folder / crewchat.GUIDE_SKILL).read_text(), what="the guide to list it")
         self.assertIn("## Process notes", guide)
         self.assertTrue(any(m["text"].startswith("Approved the process note") for m in self.hub._unread(dev)))
+
+    @unittest.skipIf(os.name == "nt", "Windows does not replace a file another handle has open")
+    def test_a_note_rewritten_is_replaced_in_one_step(self):
+        # An agent (or this suite) reading a note's skill or rule while it is rewritten saw it empty: it was
+        # truncated, then filled. Written in one step, a reader that already opened it reads the old text whole.
+        path = Path(tempfile.mkdtemp()) / "crewchat-process-x.mdc"
+        self.addCleanup(shutil.rmtree, path.parent, True)
+        path.write_text("old\n", encoding="utf-8")
+        with open(str(path), encoding="utf-8") as reader:
+            self.assertTrue(crewchat._write_if_changed(path, "new\n"))
+            self.assertEqual(reader.read(), "old\n")
+        self.assertEqual(path.read_text(encoding="utf-8"), "new\n")
+        self.assertFalse(crewchat._write_if_changed(path, "new\n"))
 
     def test_a_lead_approving_a_risky_note_puts_it_in_the_owners_needs_you(self):
         dev, lead = self.agent(), self.agent("lead")
@@ -9725,6 +10008,17 @@ class Lifecycle(Base):
         self.assertEqual((folder / "AGENTS.md").read_text(), "# Mine\n")
         crewchat.post_json(self.base + "/api/skills", self.owner, {"op": "remove", "name": "deploy"})
 
+    def test_a_committed_agents_md_is_left_alone(self):
+        # Review of 5 Nov: crewchat added its ~8 KB section to an AGENTS.md the repository commits, so it went into
+        # the owner's next commit. Only one git does not track gets it; the skill and the rule still reach the agents.
+        folder = committed_repo({"AGENTS.md": "# Ours, committed\n"})
+        changed = crewchat.write_guides(folder, self.hub.roster.root)
+        self.assertEqual((folder / "AGENTS.md").read_text(), "# Ours, committed\n")
+        self.assertNotIn("AGENTS.md", changed)
+        self.assertTrue((folder / crewchat.GUIDE_SKILL).exists())
+        self.assertEqual(subprocess.run(["git", "-C", str(folder), "status", "--porcelain"], capture_output=True,
+                                        text=True).stdout, "")  # nothing for the owner to commit
+
     def test_add_an_agent_says_how_to_get_a_missing_tool(self):
         saved = crewchat.find_tool
         crewchat.find_tool = lambda tool, config: "/usr/local/bin/claude" if tool == "claude" else None
@@ -10315,16 +10609,17 @@ class ProxyGate(Base):
         with mock.patch.object(crewchat.os, "getppid", return_value=100), mock.patch.object(crewchat, "PS_TREE", False):
             self.assertEqual(crewchat.ancestor_pids(), [100])
 
-class BrowserProxy(unittest.TestCase):
-    """R8: crewchat's bridge runs behind `crewchat browser-proxy`, which gates each call and reads the page from the
-    browser (a fake Playwright MCP child here)."""
-    FAKE = str(Path(__file__).resolve().parent / "fake_playwright_mcp.py")
+class ProxyHarness:
+    """A proxy (PROXY, crewchat's class) between a test and a fake MCP child (FAKE, whose server is called NAME), with a
+    stand-in for the crewchat server it asks."""
 
     class Server:  # what the proxy asks, recorded; `deny` refuses calls, `down` is a server that is not running
         def __init__(self):
             self.calls, self.seen_tabs, self.deny, self.down, self.gate, self.broken = [], [], "", False, None, False
+            self.about = []
 
-        def call(self, tool, args):
+        def call(self, tool, args, **about):
+            self.about.append(about)
             if self.down:
                 raise OSError("connection refused")
             if self.broken:
@@ -10345,8 +10640,9 @@ class BrowserProxy(unittest.TestCase):
         from_proxy, from_proxy_w = os.pipe()
         self.inp = os.fdopen(self.to_proxy, "w", buffering=1)
         self.out = os.fdopen(from_proxy, "r")
-        proxy = crewchat.BrowserProxy("gemini", child or [sys.executable, self.FAKE], self.server,
-                                      os.fdopen(to_proxy_r, "r"), os.fdopen(from_proxy_w, "w", buffering=1), env=env)
+        proxy = getattr(crewchat, self.PROXY)("gemini", child or [sys.executable, self.FAKE], self.server,
+                                              os.fdopen(to_proxy_r, "r"), os.fdopen(from_proxy_w, "w", buffering=1),
+                                              env=env)
         self.thread = threading.Thread(target=proxy.run, daemon=True)
         self.thread.start()
         self.addCleanup(self.out.close)
@@ -10355,7 +10651,7 @@ class BrowserProxy(unittest.TestCase):
         self.send({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})
         hello = self.read()
         if child is None:
-            self.assertEqual(hello["result"]["serverInfo"]["name"], "fake")
+            self.assertEqual(hello["result"]["serverInfo"]["name"], self.NAME)
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         self.n = 0
 
@@ -10380,6 +10676,14 @@ class BrowserProxy(unittest.TestCase):
 
     def child_calls(self):
         return self.log.read_text().split() if self.log.exists() else []
+
+
+class BrowserProxy(ProxyHarness, unittest.TestCase):
+    """R8: crewchat's bridge runs behind `crewchat browser-proxy`, which gates each call and reads the page from the
+    browser (a fake Playwright MCP child here)."""
+    FAKE = str(Path(__file__).resolve().parent / "fake_playwright_mcp.py")
+    PROXY = "BrowserProxy"
+    NAME = "fake"
 
     def test_calls_pass_through_when_allowed(self):
         self.start()
@@ -10531,6 +10835,1605 @@ class BrowserProxy(unittest.TestCase):
         result = self.result("browser_snapshot", text="hello")
         self.assertEqual(result["content"][0]["text"], "hello")
         self.assertEqual(self.child_calls(), ["browser_snapshot"])
+
+class JiraTicketRef(unittest.TestCase):
+    """J1: a Jira ticket's key, from the key or from an address that names it."""
+
+    def test_keys_and_addresses(self):
+        ticket = crewchat.jira_ticket
+        self.assertEqual(ticket("https://acme.atlassian.net/browse/PROJ-123"),
+                         ("PROJ-123", "https://acme.atlassian.net/browse/PROJ-123"))
+        # A board address names the ticket in its query; only the ticket's own address is kept.
+        self.assertEqual(ticket("see https://Acme.atlassian.net/jira/software/projects/PROJ/boards/1?selectedIssue=PROJ-9#x"),
+                         ("PROJ-9", "https://acme.atlassian.net/browse/PROJ-9"))
+        self.assertEqual(ticket("http://jira.corp.local:8080/browse/OPS-4"), ("OPS-4", "http://jira.corp.local/browse/OPS-4"))
+        self.assertEqual(ticket("proj-7"), ("PROJ-7", ""))  # a bare key has an address only on a known site
+        self.assertEqual(ticket("PROJ-7", "acme.atlassian.net"), ("PROJ-7", "https://acme.atlassian.net/browse/PROJ-7"))
+        for nothing in ("", "Fix the login", "PROJ-0", "P-1", "https://acme.atlassian.net/browse/",
+                        "https://evil.com@acme.atlassian.net/browse/PROJ-1", "Fix PROJ-1 and PROJ-2"):
+            self.assertEqual(ticket(nothing), ("", ""), nothing)
+
+
+class JiraTickets(unittest.TestCase):
+    """J1: the owner links a task to a Jira ticket; the agent that takes it is told to read it with its Jira tools,
+    or in the owner's Chrome, or to ask; every linked machine's sheet has it."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="jira-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        self.hub = crewchat.Hub(crewchat.Roster(root))
+
+    def tearDown(self):
+        self.hub.events.close()
+
+    def agent(self, browser):
+        sid = self.hub.open_session("mac", "claude")
+        name = self.hub.agent_for(sid)
+        with self.hub.lock:
+            self.hub.agents[name]["browser"] = browser
+        return sid, name
+
+    def test_the_jira_site_gives_keys_an_address_and_lets_the_browser_read_there(self):
+        self.assertEqual(self.hub.set_jira_site("https://acme.atlassian.net/jira/")["site"], "acme.atlassian.net")
+        self.assertEqual(self.hub.browser_sites()["acme.atlassian.net"], "allowed")
+        task = self.hub.add_row(crewchat.OWNER, "Fix the login page")["id"]
+        out = self.hub.set_task_jira(task, "proj-12")
+        self.assertEqual((out["jira"], out["url"]), ("PROJ-12", "https://acme.atlassian.net/browse/PROJ-12"))
+        row = next(r for r in self.hub.sheet_rows() if r["id"] == task)
+        self.assertEqual((row["jira"], row["jira_url"]), ("PROJ-12", "https://acme.atlassian.net/browse/PROJ-12"))
+        self.assertIn("Jira https://acme.atlassian.net/browse/PROJ-12", crewchat.sheet_line(row))
+        self.assertEqual(self.hub.set_jira_site("off")["site"], "")
+        self.assertEqual(self.hub.jira_site(), "")
+
+    def test_a_trusted_site_stays_trusted(self):
+        self.hub.set_browser_site("acme.atlassian.net", "trusted")
+        self.hub.set_jira_site("acme.atlassian.net")
+        self.assertEqual(self.hub.browser_sites()["acme.atlassian.net"], "trusted")
+
+    def test_the_taker_is_told_how_to_read_the_ticket(self):
+        task = self.hub.add_row(crewchat.OWNER, "Fix the login page")["id"]
+        self.hub.set_task_jira(task, "https://acme.atlassian.net/browse/PROJ-3")
+        sid, _ = self.agent(browser=True)
+        out = crewchat.call_tool(self.hub, sid, "hub_task", {"action": "take", "id": task})
+        self.assertIn("Jira ticket PROJ-3 (https://acme.atlassian.net/browse/PROJ-3)", out)
+        self.assertIn("with your Jira tools", out)
+        self.assertIn("else open https://acme.atlassian.net/browse/PROJ-3 in the browser", out)
+        self.assertIn("Do not change the ticket", out)
+        other = self.hub.add_row(crewchat.OWNER, "Fix the signup page")["id"]
+        self.hub.set_task_jira(other, "https://acme.atlassian.net/browse/PROJ-4")
+        sid, _ = self.agent(browser=False)
+        out = crewchat.call_tool(self.hub, sid, "hub_task", {"action": "take", "id": other})
+        self.assertIn("ask Owner to turn the browser on for you", out)
+        plain = self.hub.add_row(crewchat.OWNER, "Tidy the README")["id"]
+        self.assertNotIn("Jira", crewchat.call_tool(self.hub, sid, "hub_task", {"action": "take", "id": plain}))
+
+    def test_an_assigned_task_carries_the_ticket(self):
+        task = self.hub.add_row(crewchat.OWNER, "Fix the login page")["id"]
+        self.hub.set_task_jira(task, "https://acme.atlassian.net/browse/PROJ-5")
+        _, name = self.agent(browser=True)
+        msg = self.hub.assign_row(crewchat.OWNER, name, task)
+        self.assertIn("Jira ticket PROJ-5", msg["text"])
+
+    def test_an_address_in_the_title_links_the_task(self):
+        task = self.hub.add_row(crewchat.OWNER, "Do https://acme.atlassian.net/browse/WEB-77 today")["id"]
+        self.assertEqual(self.hub.sheet[task]["jira"], "WEB-77")
+        bare = self.hub.add_row(crewchat.OWNER, "Move to UTF-8 everywhere")["id"]
+        self.assertNotIn("jira", self.hub.sheet[bare])  # a bare key in a title is not taken for a ticket
+
+    def test_a_wrong_ticket_is_refused_and_off_takes_it_away(self):
+        task = self.hub.add_row(crewchat.OWNER, "Fix the login page")["id"]
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_task_jira(task, "not a ticket")
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_task_jira("999", "PROJ-1")
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_jira_site("not a host/")
+        self.hub.set_task_jira(task, "PROJ-1")
+        self.assertEqual(self.hub.sheet[task]["jira"], "PROJ-1")
+        self.hub.set_task_jira(task, "off")
+        self.assertNotIn("jira", self.hub.sheet[task])
+
+    def test_the_link_reaches_every_machine(self):
+        task = self.hub.add_row(crewchat.OWNER, "Fix the login page")["id"]
+        self.hub.set_task_jira(task, "https://acme.atlassian.net/browse/PROJ-8")
+        plan = self.hub.messages[-1]
+        self.assertEqual((plan["kind"], plan["task"], plan["jira"]), ("plan", task, "https://acme.atlassian.net/browse/PROJ-8"))
+        self.assertIn("jira", crewchat.EXTRA_FIELDS)  # it travels between machines with its message
+        root = Path(tempfile.mkdtemp(prefix="jira-other-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        other = crewchat.Hub(crewchat.Roster(root))
+        self.addCleanup(other.events.close)
+        for m in self.hub.messages:
+            other.ingest(dict(m, origin="mac-1"))
+        self.assertEqual((other.sheet[task]["jira"], other.sheet[task]["jira_url"]),
+                         ("PROJ-8", "https://acme.atlassian.net/browse/PROJ-8"))
+        self.hub.set_task_jira(task, "off")
+        other.ingest(dict(self.hub.messages[-1], origin="mac-1"))
+        self.assertNotIn("jira", other.sheet[task])
+
+
+class JiraOverHttp(Base):
+    """J1: the owner sets the Jira site and links a task from the page or the command line (/api/task)."""
+
+    def test_the_owner_links_a_task(self):
+        task = lambda body: crewchat.post_json(self.base + "/api/task", self.owner, body)  # noqa: E731
+        self.assertEqual(task({"op": "jira_site"})["site"], "")
+        try:
+            self.assertEqual(task({"op": "jira_site", "value": "acme.atlassian.net"})["site"], "acme.atlassian.net")
+            mid = task({"op": "add", "title": "Fix the login page"})["id"]
+            out = task({"op": "jira", "task": mid, "value": "PROJ-21"})
+            self.assertEqual(out["url"], "https://acme.atlassian.net/browse/PROJ-21")
+            self.assertEqual(next(r for r in self.hub.sheet_rows() if r["id"] == mid)["jira"], "PROJ-21")
+        finally:
+            task({"op": "jira_site", "value": "off"})
+            self.hub.set_browser_site("acme.atlassian.net", "remove")
+
+
+class JiraServers(unittest.TestCase):
+    """J2: Atlassian's MCP server in each tool's settings in a connected folder, while the project has a Jira site."""
+
+    def folder(self, client):
+        folder = Path(tempfile.mkdtemp(prefix="jira-%s-" % client, dir=TMP)).resolve()
+        crewchat.install_client(client, folder, "http://127.0.0.1:9", "tok")
+        return folder
+
+    def test_every_tool_gets_the_server_and_loses_it(self):
+        for client, rel, servers, key in (("claude", ".mcp.json", "mcpServers", "url"),
+                                          ("cursor", ".cursor/mcp.json", "mcpServers", "url"),
+                                          ("gemini", ".gemini/settings.json", "mcpServers", "httpUrl"),
+                                          ("qwen", ".qwen/settings.json", "mcpServers", "httpUrl"),
+                                          ("opencode", "opencode.json", "mcp", "url")):
+            folder = self.folder(client)
+            self.assertTrue(crewchat.sync_jira_server(folder, True), client)
+            table = json.loads((folder / rel).read_text())[servers]
+            self.assertEqual(table["atlassian"][key], "https://mcp.atlassian.com/v2/mcp", client)
+            self.assertIn(crewchat.SERVER_NAME, table)  # crewchat's stays
+            self.assertEqual(crewchat.sync_jira_server(folder, True), [], client)  # up to date
+            if client == "claude":
+                settings = json.loads((folder / ".claude/settings.local.json").read_text())
+                self.assertIn("atlassian", settings["enabledMcpjsonServers"])
+                self.assertNotIn("mcp__atlassian", json.dumps(settings))  # its tools still ask: a change in Jira asks
+            crewchat.sync_jira_server(folder, False)
+            self.assertNotIn("atlassian", json.loads((folder / rel).read_text())[servers], client)
+            if client == "claude":
+                settings = json.loads((folder / ".claude/settings.local.json").read_text())
+                self.assertNotIn("atlassian", settings.get("enabledMcpjsonServers", []))
+
+    def test_the_users_own_server_is_left_alone(self):
+        folder = self.folder("cursor")
+        path = folder / ".cursor/mcp.json"
+        data = json.loads(path.read_text())
+        data["mcpServers"]["atlassian"] = {"url": "https://mcp.atlassian.com/v1/mcp", "headers": {"Authorization": "Basic x"}}
+        path.write_text(json.dumps(data))
+        self.assertEqual(crewchat.sync_jira_server(folder, True), [])
+        self.assertEqual(crewchat.sync_jira_server(folder, False), [])
+        self.assertIn("v1", json.loads(path.read_text())["mcpServers"]["atlassian"]["url"])
+
+    def test_a_folder_not_connected_gets_nothing(self):
+        folder = Path(tempfile.mkdtemp(prefix="jira-none-", dir=TMP))
+        (folder / ".mcp.json").write_text(json.dumps({"mcpServers": {"other": {"url": "https://x.example/"}}}))
+        self.assertEqual(crewchat.sync_jira_server(folder, True), [])
+
+    def test_the_jira_site_puts_it_in_the_projects_folders(self):
+        root = Path(tempfile.mkdtemp(prefix="jira-hub-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        hub = crewchat.Hub(crewchat.Roster(root))
+        self.addCleanup(hub.events.close)
+        folder = self.folder("claude")
+        with mock.patch.object(hub, "project_folders", return_value=[folder]):
+            hub.set_jira_site("acme.atlassian.net")
+            self.assertIn("atlassian", json.loads((folder / ".mcp.json").read_text())["mcpServers"])
+            hub.set_jira_site("off")
+            self.assertNotIn("atlassian", json.loads((folder / ".mcp.json").read_text())["mcpServers"])
+
+    def test_disconnecting_takes_it_out(self):
+        folder = self.folder("claude")
+        crewchat.sync_jira_server(folder, True)
+        crewchat.disconnect_folder(folder)
+        self.assertNotIn("atlassian", (folder / ".mcp.json").read_text() if (folder / ".mcp.json").exists() else "")
+
+
+class FakeAtlassian:
+    """Atlassian's MCP sign-in and server, as urllib.request.urlopen sees them (J3)."""
+
+    def __init__(self):
+        self.issues = [{"key": "BUG-1", "fields": {"summary": "Old bug"}}]
+        self.requests, self.refused, self.cloud_by_site = [], False, True
+        self.access = "access-" + "a" * 30
+
+    def __call__(self, req, timeout=None):
+        self.requests.append(req)
+        url = req.full_url
+        body = req.data.decode("utf-8") if req.data else ""
+        if url == crewchat.JIRA_OAUTH + "/register":
+            return self.answer({"client_id": "client-1"})
+        if url == crewchat.JIRA_OAUTH + "/token":
+            form = urllib.parse.parse_qs(body)
+            if form["grant_type"] == ["authorization_code"]:
+                self.verifier = form["code_verifier"][0]
+                assert form["code"] == ["the-code"] and form["client_id"] == ["client-1"]
+            return self.answer({"access_token": self.access, "refresh_token": "refresh-" + "r" * 30, "expires_in": 3600})
+        assert url == crewchat.JIRA_MCP, url
+        if self.refused or req.get_header("Authorization") != "Bearer " + self.access:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, None)
+        rpc = json.loads(body)
+        if "id" not in rpc:
+            return self.answer(None)
+        result = {"initialize": {"protocolVersion": "2025-06-18"},
+                  "tools/list": {"tools": [{"name": "getAccessibleAtlassianResources"}, {"name": "searchJiraIssuesUsingJql"}]}
+                  }.get(rpc["method"])
+        if rpc["method"] == "tools/call":
+            name, args = rpc["params"]["name"], rpc["params"]["arguments"]
+            if name == "getAccessibleAtlassianResources":
+                result = self.text([{"id": "cloud-9", "url": "https://acme.atlassian.net"}])
+            elif not self.cloud_by_site and args["cloudId"] != "cloud-9":
+                result = dict(self.text("cloudId not found"), isError=True)
+            else:
+                self.jql = args["jql"]
+                result = self.text({"issues": self.issues})
+        return self.answer({"jsonrpc": "2.0", "id": rpc["id"], "result": result}, sse=rpc["method"] == "tools/call")
+
+    @staticmethod
+    def text(value):
+        return {"content": [{"type": "text", "text": value if isinstance(value, str) else json.dumps(value)}]}
+
+    @staticmethod
+    def answer(value, sse=False):
+        raw = "" if value is None else json.dumps(value)
+        resp = io.BytesIO(("event: message\ndata: %s\n\n" % raw if sse else raw).encode("utf-8"))
+        resp.headers = {"Content-Type": "text/event-stream" if sse else "application/json", "Mcp-Session-Id": "s-1"}
+        return _Resp(resp)
+
+
+class _Resp:
+    def __init__(self, body):
+        self.body, self.headers = body, body.headers
+
+    def read(self):
+        return self.body.read()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class JiraWatch(unittest.TestCase):
+    """J3: the owner signs in to Atlassian in the browser (SSO), and tickets newly assigned in Jira become tasks."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="jira-watch-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        self.root = root
+        self.hub = crewchat.Hub(crewchat.Roster(root))
+        self.hub.set_jira_site("acme.atlassian.net")
+        self.atlassian = FakeAtlassian()
+        patch = mock.patch.object(crewchat.urllib.request, "urlopen", self.atlassian)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        self.hub.events.close()
+
+    def sign_in(self):
+        url = self.hub.jira_login_start("http://127.0.0.1:9")["url"]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        self.assertTrue(url.startswith(crewchat.JIRA_OAUTH + "/authorize?"))
+        self.assertEqual(query["redirect_uri"], ["http://127.0.0.1:9/jira/callback"])
+        self.assertEqual(query["code_challenge_method"], ["S256"])
+        self.assertTrue(self.hub.jira_login_waiting(query["state"][0]))
+        self.hub.jira_login_finish(query["state"][0], "the-code")
+        challenge = base64.urlsafe_b64encode(crewchat.hashlib.sha256(self.atlassian.verifier.encode()).digest()).rstrip(b"=")
+        self.assertEqual(query["code_challenge"], [challenge.decode()])  # PKCE: the verifier matches the challenge
+        return query["state"][0]
+
+    def test_signed_in_a_ticket_assigned_after_it_is_on_becomes_a_task(self):
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.set_jira_watch(True)
+        self.assertIn("sign in to Atlassian first", str(e.exception))
+        state = self.sign_in()
+        self.assertFalse(self.hub.jira_login_waiting(state))  # once
+        with self.assertRaises(crewchat.HubError):
+            self.hub.jira_login_finish(state, "the-code")
+        out = self.hub.set_jira_watch(True)
+        self.assertTrue(out["on"])
+        self.assertEqual(out["found"], 1)  # open when it was turned on: remembered, not posted
+        self.assertIn("assignee = currentUser()", self.atlassian.jql)
+        self.assertEqual(self.hub.jira_poll(), [])
+        self.atlassian.issues = [{"key": "BUG-2", "fields": {"summary": "Login\nfails"}}] + self.atlassian.issues
+        added = self.hub.jira_poll()
+        self.assertEqual(len(added), 1)
+        row = self.hub.sheet[added[0]]
+        self.assertEqual((row["jira"], row["jira_url"]), ("BUG-2", "https://acme.atlassian.net/browse/BUG-2"))
+        self.assertIn("BUG-2 Login fails (from Jira", row["title"])
+        self.assertEqual(self.hub.jira_poll(), [])  # once
+        self.hub.plan_change(added[0], status="removed")
+        self.assertEqual(self.hub.jira_poll(), [])  # taken off the sheet: not posted again
+        self.assertNotIn(self.atlassian.access, json.dumps(self.hub.jira_watch()))  # no token is sent back
+        self.assertIn(self.atlassian.access.encode(), crewchat.stored_tokens({self.root}))  # never shared in a file
+
+    def test_the_cloud_id_is_found_when_the_site_name_is_not_taken(self):
+        self.atlassian.cloud_by_site = False
+        self.sign_in()
+        self.hub.set_jira_watch(True)
+        self.assertEqual(crewchat.load_config(self.root)["jira_cloud"], "cloud-9")
+
+    def test_an_access_token_that_ran_out_is_refreshed(self):
+        self.sign_in()
+        self.atlassian.access = "access-" + "b" * 30  # Atlassian no longer takes the old one
+        self.hub.set_jira_watch(True)
+        self.assertEqual(crewchat.load_config(self.root)["jira_oauth"]["access"], self.atlassian.access)
+
+    def test_a_refused_sign_in_is_told_and_sign_out_forgets_it(self):
+        self.sign_in()
+        self.hub.set_jira_watch(True)
+        self.atlassian.refused = True
+        with mock.patch.object(crewchat.sys, "stderr", io.StringIO()):
+            self.assertEqual(self.hub.jira_poll(), [])
+        self.assertIn("sign in again", self.hub.jira_watch()["error"])
+        self.hub.jira_logout()
+        self.assertNotIn("jira_oauth", crewchat.load_config(self.root))
+        self.assertFalse(self.hub.jira_watch()["signed_in"])
+
+    def test_it_needs_a_site(self):
+        self.sign_in()
+        self.hub.set_jira_site("off")
+        with self.assertRaises(crewchat.HubError):
+            self.hub.set_jira_watch(True)
+
+    def test_the_taker_is_told_the_ticket_is_others_words(self):
+        task = self.hub.add_row(crewchat.OWNER, "BUG-9 x https://acme.atlassian.net/browse/BUG-9")["id"]
+        self.assertIn("does not override Owner", self.hub.jira_note(task, "nobody"))
+
+
+class JiraSignInPage(Base):
+    """J3: Atlassian sends the browser back to this server's /jira/callback; only a waiting state is taken."""
+
+    def test_the_callback(self):
+        status, body, _ = self.raw("/jira/callback?state=nope&code=x")
+        self.assertEqual(status, 400)
+        self.assertIn(b"not waiting any more", body)
+        status, body, _ = self.raw("/jira/callback?error=access_denied&state=nope")
+        self.assertIn(b"access_denied", body)
+        with mock.patch.object(self.hub, "jira_login_waiting", return_value=True), \
+                mock.patch.object(self.hub, "jira_login_finish", return_value={}) as finish:
+            status, body, headers = self.raw("/jira/callback?state=s1&code=c1")
+        self.assertEqual(status, 200)
+        finish.assert_called_once_with("s1", "c1")
+        self.assertIn(b"Signed in to Atlassian", body)
+        self.assertEqual(headers["Content-Security-Policy"], "default-src 'none'")
+
+
+CLIENT_JSON = json.dumps({"installed": {"client_id": "123-abc.apps.googleusercontent.com",
+                                        "client_secret": "GOCSPX-" + "s" * 28,
+                                        "redirect_uris": ["http://localhost"]}})
+HOOK = ("https://chat.googleapis.com/v1/spaces/AAAAhook/messages?key=AIza" + "k" * 35
+        + "&token=" + "t" * 43)
+
+
+class GchatHelpers(unittest.TestCase):
+    """G1, G4: the pieces a post is made of, and what the owner pastes, checked."""
+
+    def test_the_client_file(self):
+        self.assertEqual(crewchat.gchat_client_of(CLIENT_JSON)["id"], "123-abc.apps.googleusercontent.com")
+        for bad, why in ((json.dumps({"web": {"client_id": "x.apps.googleusercontent.com", "client_secret": "y"}}),
+                          "Desktop app"), ("not json", "JSON file"), (json.dumps({"installed": {}}), "no Desktop")):
+            with self.assertRaises(crewchat.HubError) as e:
+                crewchat.gchat_client_of(bad)
+            self.assertIn(why, str(e.exception))
+
+    def test_a_webhook_address_is_checked(self):
+        self.assertEqual(crewchat.gchat_hook_of(HOOK), (HOOK, "spaces/AAAAhook"))
+        for bad in ("http://chat.googleapis.com/v1/spaces/A/messages?key=k&token=t",
+                    "https://evil.example/v1/spaces/A/messages?key=k&token=t",
+                    "https://chat.googleapis.com/v1/spaces/A/messages?key=k",
+                    "https://chat.googleapis.com.evil.example/v1/spaces/A/messages?key=k&token=t"):
+            with self.assertRaises(crewchat.HubError):
+                crewchat.gchat_hook_of(bad)
+
+    def test_pull_requests_in_a_text(self):
+        text = ("Opened https://github.com/acme/web/pull/63 and https://github.com/acme/web/pull/63/files, "
+                "then https://github.com/acme/api/pull/7. Not https://github.com/acme/web/issues/5.")
+        self.assertEqual(crewchat.gchat_prs(text), ["https://github.com/acme/web/pull/63",
+                                                    "https://github.com/acme/api/pull/7"])
+
+    def test_the_post(self):
+        body = crewchat.gchat_message("Ada", "developer", "Review the Codex part first.",
+                                      "https://github.com/acme/web/pull/63", "Plan servers")
+        self.assertEqual(body.splitlines(), [
+            "*Pull request: Plan servers* <https://github.com/acme/web/pull/63|acme/web#63>",
+            "Review the Codex part first.", "_Posted by Ada (developer) from crewchat_"])
+
+
+class FakeGoogle:
+    """Google's sign-in and the Chat API, and a space's webhook, as urllib.request.urlopen sees them (G1, G4)."""
+
+    def __init__(self):
+        self.access = "ya29." + "a" * 30
+        self.posts, self.revoked, self.refused, self.forms = [], [], False, []
+        self.spaces = [{"name": "spaces/AAAteam", "displayName": "Team", "spaceType": "SPACE"},
+                       {"name": "spaces/AAAdm", "spaceType": "DIRECT_MESSAGE"}]
+
+    def __call__(self, req, timeout=None):
+        url, body = req.full_url, req.data.decode("utf-8") if req.data else ""
+        if url == crewchat.GCHAT_TOKEN:
+            form = urllib.parse.parse_qs(body)
+            self.forms.append(form)
+            assert form["client_secret"] == ["GOCSPX-" + "s" * 28]
+            if form["grant_type"] == ["authorization_code"]:
+                self.verifier = form["code_verifier"][0]
+                assert form["code"] == ["the-code"]
+            return FakeAtlassian.answer({"access_token": self.access, "expires_in": 3599,
+                                         **({"refresh_token": "1//refresh-" + "r" * 30}
+                                            if form["grant_type"] == ["authorization_code"] else {})})
+        if url == crewchat.GCHAT_REVOKE:
+            self.revoked.append(urllib.parse.parse_qs(body)["token"][0])
+            return FakeAtlassian.answer({})
+        if url.startswith(HOOK):
+            self.posts.append((url, json.loads(body)))
+            return FakeAtlassian.answer({"name": "spaces/AAAAhook/messages/m1"})
+        assert url.startswith(crewchat.GCHAT_API), url
+        if self.refused or req.get_header("Authorization") != "Bearer " + self.access:
+            raise urllib.error.HTTPError(url, 401, "Unauthorized", {}, io.BytesIO(
+                b'{"error": {"code": 401, "message": "Request had invalid authentication credentials."}}'))
+        if url.startswith(crewchat.GCHAT_API + "/spaces?"):
+            return FakeAtlassian.answer({"spaces": self.spaces})
+        self.posts.append((url, json.loads(body)))
+        return FakeAtlassian.answer({"name": "spaces/AAAteam/messages/m2"})
+
+
+class GchatHarness(unittest.TestCase):
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="gchat-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        self.root = root
+        self.hub = crewchat.Hub(crewchat.Roster(root))
+        self.google = FakeGoogle()
+        patch = mock.patch.object(crewchat.urllib.request, "urlopen", self.google)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def tearDown(self):
+        self.hub.events.close()
+
+    def sign_in(self):
+        self.hub.gchat_set_client(CLIENT_JSON)
+        url = self.hub.gchat_login_start("http://127.0.0.1:9")["url"]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        self.assertTrue(url.startswith(crewchat.GCHAT_AUTHORIZE + "?"))
+        self.assertEqual(query["redirect_uri"], ["http://127.0.0.1:9/gchat/callback"])
+        self.assertEqual((query["access_type"], query["prompt"]), (["offline"], ["consent"]))
+        self.assertEqual(query["scope"][0].split(), list(crewchat.GCHAT_SCOPES))
+        self.hub.gchat_login_finish(query["state"][0], "the-code")
+        challenge = base64.urlsafe_b64encode(crewchat.hashlib.sha256(self.google.verifier.encode()).digest()).rstrip(b"=")
+        self.assertEqual(query["code_challenge"], [challenge.decode()])  # PKCE
+        return query["state"][0]
+
+    def agent(self):
+        sid = self.hub.open_session("mac", "claude")
+        return sid, self.hub.agent_for(sid)
+
+
+class GchatSignIn(GchatHarness):
+    """G1: the owner signs in to Google in the browser with their own client; crewchat keeps the tokens, never shows
+    them, refreshes them, and forgets them."""
+
+    def test_sign_in_and_out(self):
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_login_start("http://127.0.0.1:9")
+        self.assertIn("OAuth client", str(e.exception))
+        state = self.sign_in()
+        self.assertFalse(self.hub.gchat_login_waiting(state))  # once
+        with self.assertRaises(crewchat.HubError):
+            self.hub.gchat_login_finish(state, "the-code")
+        shown = json.dumps(self.hub.gchat_state())
+        self.assertTrue(self.hub.gchat_state()["signed_in"])
+        for secret in (self.google.access, "1//refresh-", "GOCSPX-"):
+            self.assertNotIn(secret, shown)
+        tokens = crewchat.stored_tokens({self.root})
+        self.assertIn(self.google.access.encode(), tokens)  # never shared in a file
+        self.assertIn(("GOCSPX-" + "s" * 28).encode(), tokens)
+        self.hub.gchat_logout()
+        self.assertEqual(self.google.revoked, ["1//refresh-" + "r" * 30])
+        self.assertNotIn("gchat_oauth", crewchat.load_config(self.root))
+
+    def test_spaces_by_name_and_a_token_that_ran_out(self):
+        self.sign_in()
+        self.assertEqual(self.hub.gchat_list(), [{"space": "spaces/AAAteam", "title": "Team"}])  # no direct messages
+        self.google.access = "ya29." + "b" * 30  # Google no longer takes the old one: refreshed once
+        out = self.hub.gchat_space_add("team")
+        self.assertEqual(out["spaces"], [{"title": "Team", "kind": "api", "space": "spaces/AAAteam", "default": True,
+                                          "ready": True}])
+        self.assertEqual(self.google.forms[-1]["grant_type"], ["refresh_token"])
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_space_add("Nowhere")
+        self.assertIn("no space called", str(e.exception))
+        self.google.refused = True
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_list()
+        self.assertIn("sign in again", str(e.exception))
+
+    def test_a_change_of_client_signs_out(self):
+        self.sign_in()
+        other = json.loads(CLIENT_JSON)
+        other["installed"]["client_id"] = "456-def.apps.googleusercontent.com"
+        self.hub.gchat_set_client(json.dumps(other))
+        self.assertFalse(self.hub.gchat_state()["signed_in"])
+
+
+class GchatPosts(GchatHarness):
+    """G2 to G4: hub_gchat posts to a space the owner added, as the owner (signed in) or by its webhook, limited,
+    asked of the owner first if the owner wants, said in the chat; and new pull requests posted on their own."""
+
+    def tool_names(self, sid):
+        return [t["name"] for t in crewchat.tools_for(self.hub, sid)]
+
+    def test_the_tool_comes_with_a_space(self):
+        sid, _ = self.agent()
+        self.assertNotIn("hub_gchat", self.tool_names(sid))
+        with self.assertRaises(crewchat.HubError):
+            crewchat.call_tool(self.hub, sid, "hub_gchat", {"text": "hi"})
+        self.hub.gchat_space_add("Team", HOOK)
+        self.assertTrue(self.hub.tools_changed(sid))  # told: its list changed
+        self.assertIn("hub_gchat", self.tool_names(sid))
+        self.assertIn("Team", crewchat.project_guide(self.root))
+        self.assertNotIn(HOOK, json.dumps(self.hub.gchat_state()))  # the webhook's address is a secret
+        self.assertIn(("t" * 43).encode(), crewchat.stored_tokens({self.root}))
+
+    def test_a_pull_request_by_webhook_in_its_thread(self):
+        self.hub.gchat_space_add("Team", HOOK)
+        sid, name = self.agent()
+        out = crewchat.call_tool(self.hub, sid, "hub_gchat", {
+            "text": "Adds the Google Chat card.", "url": "https://github.com/acme/web/pull/70", "title": "Google Chat"})
+        self.assertIn("space Team", out)
+        url, body = self.google.posts[-1]
+        self.assertTrue(url.endswith("&messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"))
+        self.assertEqual(body["thread"], {"threadKey": "https://github.com/acme/web/pull/70"})
+        self.assertIn("<https://github.com/acme/web/pull/70|acme/web#70>", body["text"])
+        self.assertIn("_Posted by %s from crewchat_" % name, body["text"])
+        self.assertEqual(body["cardsV2"][0]["card"]["header"]["title"], "Google Chat")
+        self.assertIn("posted to Google Chat, space Team: acme/web#70", self.hub.messages[-1]["text"])
+
+    def test_signed_in_as_the_owner(self):
+        self.sign_in()
+        self.hub.gchat_space_add("Team")
+        out = self.hub.gchat_post("Ada", "Ready for review.", "https://github.com/acme/web/pull/71")
+        self.assertEqual(out["space"], "Team")
+        url, body = self.google.posts[-1]
+        self.assertEqual(url, crewchat.GCHAT_API + "/spaces/AAAteam/messages"
+                         "?messageReplyOption=REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD")
+        self.assertNotIn("cardsV2", body)  # a person's post cannot carry a card
+        self.hub.gchat_logout()
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_post("Ada", "Again.")
+        self.assertIn("not signed in", str(e.exception))
+
+    def test_what_is_refused(self):
+        self.hub.gchat_space_add("Team", HOOK)
+        for args, why in ((("",), "text"), (("x" * (crewchat.GCHAT_MAX_TEXT + 1),), "text"),
+                          (("hi", "javascript:alert(1)"), "url"), (("hi", "", "", "Other"), "no Google Chat space")):
+            with self.assertRaises(crewchat.HubError) as e:
+                self.hub.gchat_post("Ada", *args)
+            self.assertIn(why, str(e.exception))
+        self.hub.gchat_post("Ada", "Same words.")
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_post("Ada", "Same  words.")
+        self.assertIn("just posted", str(e.exception))
+        for n in range(crewchat.GCHAT_AGENT_HOUR - 1):
+            self.hub.gchat_post("Ada", "Post %d." % n)
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.gchat_post("Ada", "One more.")
+        self.assertIn("in the last hour", str(e.exception))
+        self.hub.gchat_post("Bo", "Bo's first.")  # each agent its own
+
+    def test_ask_me_first(self):
+        self.hub.gchat_space_add("Team", HOOK)
+        self.hub.gchat_settings(ask=True)
+        for answer in ("post", "drop"):
+            done = {}
+            thread = threading.Thread(target=lambda: done.update(
+                out=self.catch(lambda: self.hub.gchat_post("Ada", "Please look: %s." % answer))))
+            thread.start()
+            for _ in range(200):
+                waiting = [n for n in self.hub.needs_you() if n["kind"] == "gchat"]
+                if waiting:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(waiting[0]["choices"], ["post", "drop"])
+            self.assertIn("Please look", waiting[0]["text"])
+            self.hub.gchat_answer(waiting[0]["id"], answer)
+            thread.join(5)
+            if answer == "post":
+                self.assertEqual(done["out"]["space"], "Team")
+            else:
+                self.assertIn("did not let", str(done["out"]))
+        self.assertEqual(len(self.google.posts), 1)
+
+    @staticmethod
+    def catch(fn):
+        try:
+            return fn()
+        except crewchat.HubError as e:
+            return e
+
+    def test_new_pull_requests_on_their_own(self):
+        self.hub.gchat_space_add("Team", HOOK)
+        pr = "https://github.com/acme/web/pull/80"
+        self.assertEqual(self.hub.gchat_watch("Ada", "Opened " + pr, wait=True), [])  # off unless the owner turns it on
+        self.hub.gchat_settings(auto=True)
+        self.assertEqual(self.hub.gchat_watch("Ada", "Opened %s (%s/files)" % (pr, pr), wait=True), [pr])
+        self.assertEqual(len(self.google.posts), 1)
+        self.assertEqual(self.hub.gchat_watch("Ada", "Still " + pr, wait=True), [])  # once
+        self.hub.gchat_post("Ada", "Ready.", "https://github.com/acme/web/pull/81")
+        self.assertEqual(self.hub.gchat_watch("Ada", "see https://github.com/acme/web/pull/81", wait=True), [])
+
+    def test_space_settings(self):
+        self.hub.gchat_space_add("Team", HOOK)
+        self.hub.gchat_space_add("Releases", HOOK.replace("AAAAhook", "AAAArel"))
+        self.assertEqual(self.hub.gchat_space_default("releases")["spaces"][1]["default"], True)
+        self.hub.gchat_space_remove("Team")
+        self.assertEqual([s["title"] for s in self.hub.gchat_state()["spaces"]], ["Releases"])
+        self.assertEqual(list(crewchat.load_config(self.root)["gchat_hooks"]), ["Releases"])
+
+
+class GchatOverHttp(Base):
+    """G1, G4: the owner's /api/gchat and Google's /gchat/callback."""
+
+    def test_the_owners_ops(self):
+        call = lambda body: crewchat.post_json(self.base + "/api/gchat", self.owner, body)  # noqa: E731
+        self.assertEqual(call({"op": "state"})["spaces"], [])
+        try:
+            out = call({"op": "add", "title": "Team", "webhook": HOOK})
+            self.assertEqual(out["spaces"][0]["kind"], "webhook")
+            self.assertNotIn("token=", json.dumps(out))
+            self.assertTrue(call({"op": "set", "ask": True})["ask"])
+        finally:
+            call({"op": "remove", "title": "Team"})
+            call({"op": "set", "ask": False})
+
+    def test_the_callback(self):
+        status, body, _ = self.raw("/gchat/callback?state=nope&code=x")
+        self.assertEqual(status, 400)
+        self.assertIn(b"not waiting any more", body)
+        with mock.patch.object(self.hub, "gchat_login_waiting", return_value=True), \
+                mock.patch.object(self.hub, "gchat_login_finish", return_value={}) as finish:
+            status, body, headers = self.raw("/gchat/callback?state=s1&code=c1")
+        self.assertEqual(status, 200)
+        finish.assert_called_once_with("s1", "c1")
+        self.assertIn(b"Signed in to Google", body)
+        self.assertEqual(headers["Content-Security-Policy"], "default-src 'none'")
+
+
+class DeviceGate(Base):
+    """D2: the server's gate for the mobile device proxy. The browser's rules, with apps for sites: mobile devices on
+    per agent, one driver per device, real devices picked by the owner, allowed and trusted apps, and the owner's
+    answers in Needs you. Emulators and simulators allow every app and change (owner, 5 Nov 2026)."""
+    EMU, SIM, PHONE = "emulator-5554", "7C1D5A0E-3B6F-4F8A-9D2E-1A2B3C4D5E6F", "R58M123ABC"
+    KINDS = {EMU: "emulator", SIM: "simulator", PHONE: "real"}
+
+    def agent(self, mobile=True, folder="/work/app"):
+        name = self.hub.agent_for(self.hub.open_session(self.place, "gemini"))
+        key = crewchat.secrets.token_urlsafe(12)
+        with self.hub.lock:
+            self.hub.links[key] = name
+            self.hub.agents[name]["session"] = {"folder": folder}
+            self.hub.agents[name]["mobile"] = mobile
+        self.hub.note_pids(self.place, key, [hash(name) % 90000 + 1000])
+        proxy = self.hub.register_proxy(self.place, "gemini", folder, self.hub.hook_pids[name])
+        self.addCleanup(self.forget, name)
+        return name, proxy
+
+    def forget(self, name):
+        with self.hub.lock:
+            self.hub.links = {k: n for k, n in self.hub.links.items() if n != name}
+        crewchat.DEVICES.clear()
+
+    def setUp(self):
+        super().setUp()
+        self.hub.roster.update("mobile_apps", lambda old: {})
+        self.hub.roster.update("browser_sites", lambda old: {})
+        with self.hub.lock:
+            self.hub.device_app.clear()
+            self.hub.device_ok.clear()
+            self.hub.device_refused.clear()
+        self.picked = [self.PHONE]
+        patch = mock.patch.object(self.hub, "mobile_devices", side_effect=lambda: list(self.picked))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def call(self, proxy, tool, wait=2, **args):
+        return self.hub.device_call(proxy, tool, args, kinds=self.KINDS, wait=wait)
+
+    def seen(self, proxy, device, app):
+        return self.hub.device_seen(proxy, [{"device": device, "app": app}])
+
+    def answer_next(self, answer, asked=None):
+        """Answer the next device ask in Needs you from another thread, as the owner on the page does."""
+        def run():
+            for _ in range(200):
+                asks = [n for n in self.hub.needs_you() if n["kind"] == "device"]
+                if asks:
+                    if asked is not None:
+                        asked.append(asks[0])
+                    self.hub.answer_device(asks[0]["id"], answer)
+                    return
+                time.sleep(0.01)
+        threading.Thread(target=run, daemon=True).start()
+
+    def test_an_agent_without_mobile_devices_on_is_refused(self):
+        _, proxy = self.agent(mobile=False)
+        said = self.call(proxy, "mobile_take_screenshot", device=self.EMU)
+        self.assertEqual(said["decision"], "deny")
+        self.assertIn("mobile devices are not on", said["reason"])
+
+    def test_on_an_emulator_or_simulator_nothing_asks(self):
+        _, proxy = self.agent()
+        for device in (self.EMU, self.SIM):
+            self.assertEqual(self.call(proxy, "mobile_launch_app", device=device, packageName="com.bank.app")["decision"],
+                             "allow")
+            self.seen(proxy, device, "com.bank.app")
+            self.assertEqual(self.call(proxy, "mobile_type_keys", device=device, text="x")["decision"], "allow")
+        self.assertEqual([n for n in self.hub.needs_you() if n["kind"] == "device"], [])
+
+    def test_taking_an_app_off_asks_on_any_device(self):
+        _, proxy = self.agent()
+        self.hub.set_mobile_app("com.example.shop", "trusted")
+        asked = []
+        self.answer_next("deny", asked)
+        said = self.call(proxy, "mobile_uninstall_app", device=self.EMU, packageName="com.example.shop")
+        self.assertEqual(said["decision"], "deny")
+        self.assertIn("the owner denied this: do not uninstall com.example.shop", said["reason"])
+        self.assertEqual((asked[0]["ask"], asked[0]["choices"]), ("manage", ["allow_task", "deny"]))
+        self.answer_next("allow_task")
+        self.assertEqual(self.call(proxy, "mobile_clear_app_data", device=self.SIM,
+                                   packageName="com.example.shop")["decision"], "allow")
+        self.assertEqual(self.call(proxy, "mobile_clear_app_data", device=self.SIM, packageName="com.example.shop",
+                                   wait=0)["decision"], "deny")  # each time: an allow does not last
+
+    def test_a_real_device_must_be_picked_by_the_owner(self):
+        _, proxy = self.agent()
+        self.picked = []
+        said = self.call(proxy, "mobile_take_screenshot", device=self.PHONE)
+        self.assertEqual(said["decision"], "deny")
+        self.assertIn("has not picked it", said["reason"])
+        # A device Mobile MCP did not list is taken for a real one.
+        said = self.hub.device_call(proxy, "mobile_take_screenshot", {"device": "emulator-9999"}, kinds={})
+        self.assertIn("has not picked it", said["reason"])
+        self.assertEqual(self.call(proxy, "mobile_list_available_devices")["decision"], "allow")  # no device: a read
+
+    def test_a_new_app_on_a_phone_asks_and_is_allowed_for_the_project(self):
+        _, proxy = self.agent()
+        asked = []
+        self.answer_next("allow_app", asked)
+        self.assertEqual(self.call(proxy, "mobile_launch_app", device=self.PHONE, packageName="com.example.shop")[
+            "decision"], "allow")
+        self.assertEqual((asked[0]["ask"], asked[0]["app"], asked[0]["device"], asked[0]["choices"]),
+                         ("app", "com.example.shop", self.PHONE, ["allow_app", "deny"]))
+        self.assertEqual(self.hub.mobile_apps(), {"com.example.shop": "allowed"})
+        self.assertEqual(self.call(proxy, "mobile_launch_app", device=self.PHONE, packageName="com.example.shop",
+                                   wait=0)["decision"], "allow")  # allowed now: no question
+
+    def test_a_refused_app_is_refused_without_asking_again(self):
+        _, proxy = self.agent()
+        self.answer_next("deny")
+        self.assertEqual(self.call(proxy, "mobile_launch_app", device=self.PHONE, packageName="com.bank.app")[
+            "decision"], "deny")
+        said = self.call(proxy, "mobile_launch_app", device=self.PHONE, packageName="com.bank.app", wait=0)
+        self.assertIn("the owner denied this", said["reason"])
+
+    def test_a_change_on_a_phone_asks_once_per_task_and_a_trusted_app_never(self):
+        name, proxy = self.agent()
+        self.hub.set_mobile_app("com.example.shop", "allowed")
+        task = self.hub.add_row(crewchat.OWNER, "Check checkout on the phone")["id"]
+        with mock.patch.object(self.hub, "_usage_task", return_value=task):
+            self.seen(proxy, self.PHONE, "com.example.shop")
+            self.assertEqual(self.call(proxy, "mobile_take_screenshot", device=self.PHONE, wait=0)["decision"], "allow")
+            self.assertEqual(self.call(proxy, "mobile_type_keys", device=self.PHONE, text="x", wait=0)["decision"], "deny")
+            self.answer_next("allow_task")
+            self.assertEqual(self.call(proxy, "mobile_type_keys", device=self.PHONE, text="x")["decision"], "allow")
+            self.assertEqual(self.call(proxy, "mobile_swipe_on_screen", device=self.PHONE, wait=0)["decision"], "allow")
+        self.hub.set_mobile_app("com.other.app", "trusted")
+        self.seen(proxy, self.PHONE, "com.other.app")
+        self.assertEqual(self.call(proxy, "mobile_type_keys", device=self.PHONE, text="x", wait=0)["decision"], "allow")
+
+    def test_an_app_a_tap_brought_to_the_front_asks_before_the_next_call(self):
+        _, proxy = self.agent()
+        self.hub.set_mobile_app("com.example.shop", "trusted")
+        self.seen(proxy, self.PHONE, "com.example.shop")
+        note = self.seen(proxy, self.PHONE, "com.google.android.gm")
+        self.assertIn("com.google.android.gm", note)
+        said = self.call(proxy, "mobile_take_screenshot", device=self.PHONE, wait=0)  # a read too: it shows the mail
+        self.assertEqual(said["decision"], "deny")
+        self.assertEqual(self.seen(proxy, self.PHONE, "com.google.android.apps.nexuslauncher"), None)  # Home: fine
+        self.assertEqual(self.call(proxy, "mobile_click_on_screen_at_coordinates", device=self.PHONE, x=1, y=1,
+                                   wait=0)["decision"], "allow")
+        self.assertIsNone(self.seen(proxy, self.EMU, "com.google.android.gm"))  # an emulator: nothing to say
+
+    def test_a_batch_is_checked_step_by_step_on_the_app_each_step_leaves(self):
+        _, proxy = self.agent()
+        self.hub.set_mobile_app("com.example.shop", "trusted")
+        steps = [{"name": "mobile_launch_app", "arguments": {"packageName": "com.example.shop"}},
+                 {"name": "mobile_type_keys", "arguments": {"text": "x"}},
+                 {"name": "mobile_launch_app", "arguments": {"packageName": "com.bank.app"}}]
+        asked = []
+        self.answer_next("deny", asked)
+        said = self.call(proxy, "mobile_batch_commands", device=self.PHONE, steps=steps)
+        self.assertEqual(said["decision"], "deny")
+        self.assertEqual(asked[0]["app"], "com.bank.app")  # the typing in the trusted shop asked nothing
+
+    def test_one_driver_per_device(self):
+        _, first = self.agent(folder="/work/a")
+        second_name, second = self.agent(folder="/work/b")
+        self.assertEqual(self.call(first, "mobile_take_screenshot", device=self.EMU)["decision"], "allow")
+        said = self.call(second, "mobile_take_screenshot", device=self.EMU)
+        self.assertEqual(said["decision"], "deny")
+        self.assertIn("is using %s" % self.EMU, said["reason"])
+        self.assertEqual(self.call(second, "mobile_take_screenshot", device=self.SIM)["decision"], "allow")  # another
+        self.hub.set_mobile(second_name, False)  # turned off: it lets its devices go
+        self.assertNotIn(self.SIM, crewchat.DEVICES)
+
+    def test_a_refused_call_does_not_take_the_device(self):
+        _, proxy = self.agent()
+        self.picked = []
+        self.call(proxy, "mobile_take_screenshot", device=self.PHONE)
+        self.answer_next("deny")
+        self.call(proxy, "mobile_uninstall_app", device=self.EMU, packageName="a.b")
+        self.assertEqual(crewchat.DEVICES, {})
+
+    def test_a_web_address_on_a_phone_uses_the_browser_sites(self):
+        _, proxy = self.agent()
+        self.hub.set_browser_site("shop.example.com", "allowed")
+        self.assertEqual(self.call(proxy, "mobile_open_url", device=self.PHONE, url="https://shop.example.com/x",
+                                   wait=0)["decision"], "allow")
+        asked = []
+        self.answer_next("allow_site", asked)
+        self.assertEqual(self.call(proxy, "mobile_open_url", device=self.PHONE, url="https://new.example.com/")[
+            "decision"], "allow")
+        self.assertEqual((asked[0]["ask"], asked[0]["choices"]), ("site", ["allow_site", "deny"]))
+        self.assertIn("new.example.com", self.hub.browser_sites())
+
+    def test_cloud_tools_and_unknown_tools(self):
+        _, proxy = self.agent()
+        self.assertIn("cloud devices are not", self.call(proxy, "mobile_allocate_remote_device")["reason"])
+        self.seen(proxy, self.PHONE, "com.android.launcher3")
+        # A tool by another name is Mobile MCP's, and a change: asked about on a real device.
+        self.assertEqual(self.hub.device_call(proxy, "something_new", {"device": self.PHONE}, kinds=self.KINDS,
+                                              wait=0)["decision"], "allow")  # on the home screen: nothing to ask
+        self.hub.set_mobile_app("com.example.shop", "allowed")
+        self.seen(proxy, self.PHONE, "com.example.shop")
+        self.assertEqual(self.hub.device_call(proxy, "something_new", {"device": self.PHONE}, kinds=self.KINDS,
+                                              wait=0)["decision"], "deny")
+
+    def test_answers_must_fit_the_question(self):
+        _, proxy = self.agent()
+        done = []
+        threading.Thread(target=lambda: done.append(self.call(proxy, "mobile_launch_app", device=self.PHONE,
+                                                              packageName="com.x.y", wait=5)), daemon=True).start()
+        ask = eventually(lambda: next((n for n in self.hub.needs_you() if n["kind"] == "device"), None), what="the ask")
+        with self.assertRaises(crewchat.HubError):
+            self.hub.answer_device(ask["id"], "allow_task")
+        crewchat.post_json(self.base + "/api/needs", self.owner, {"key": ask["key"], "answer": "allow_app"})
+        eventually(lambda: done, what="the call to go on")
+        self.assertEqual(done[0]["decision"], "allow")
+
+    def test_the_routes(self):
+        name, proxy = self.agent()
+        said = crewchat.post_json(self.base + "/api/hook", self.token,
+                                  {"event": "device_call", "proxy": proxy, "tool": "mobile_take_screenshot",
+                                   "args": {"device": self.EMU}, "kinds": {self.EMU: "emulator"}})
+        self.assertEqual(said["decision"], "allow")
+        seen = crewchat.post_json(self.base + "/api/hook", self.token,
+                                  {"event": "device_seen", "proxy": proxy, "apps": [{"device": self.EMU, "app": "a.b"}]})
+        self.assertEqual(seen, {"note": None})
+        status = crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "status"})
+        self.assertEqual(status["holders"][self.EMU]["agent"], name)
+        self.assertEqual(status["holders"][self.EMU]["app"], "a.b")
+        self.assertEqual(status["kinds"][self.EMU], "emulator")
+        crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "app", "app": "com.x.y", "state": "trusted"})
+        self.assertEqual(self.hub.mobile_apps(), {"com.x.y": "trusted"})
+        crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "release", "device": self.EMU})
+        self.assertEqual(crewchat.DEVICES, {})
+        crewchat.post_json(self.base + "/api/agent", self.owner, {"op": "mobile", "agent": name, "mode": "off"})
+        self.assertFalse(self.hub.agents[name]["mobile"])
+        with self.assertRaises(urllib.error.HTTPError):
+            crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "app", "app": "not a package", "state": "allowed"})
+
+    def test_picking_a_real_device(self):
+        self.addCleanup(self.hub.roster.update, "mobile_devices", lambda old: [])
+        picked = lambda: crewchat.Hub.mobile_devices(self.hub)  # noqa: E731  (this machine's settings, not the stand-in)
+        crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "device", "device": self.PHONE, "on": True})
+        self.assertEqual(picked(), [self.PHONE])
+        crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "device", "device": self.PHONE, "on": False})
+        self.assertEqual(picked(), [])
+
+    def test_the_page_answers_device_asks(self):
+        page = crewchat.CHAT_PAGE
+        self.assertIn('if (n.kind === "device") return deviceItem(n);', page)
+        self.assertIn('["allow_app", "Allow the app"]', page)
+        self.assertEqual(crewchat.NEED_KINDS["device"][3], "buttons")
+
+    def test_a_task_moving_on_lets_its_devices_go(self):
+        name, proxy = self.agent()
+        task = self.hub.add_row(crewchat.OWNER, "Try the app")["id"]
+        with mock.patch.object(self.hub, "_usage_task", return_value=task):
+            self.call(proxy, "mobile_take_screenshot", device=self.EMU)
+        self.assertEqual(crewchat.DEVICES[self.EMU]["task"], task)
+        with self.hub.lock:
+            self.hub._task_moved_on(task, "done")
+        self.assertNotIn(self.EMU, crewchat.DEVICES)
+
+
+    def test_a_mobile_task_is_taken_only_with_mobile_devices_on(self):
+        # D4, as the browser's B3: a plan message, so every linked machine's sheet says so.
+        task = self.hub.add_row(crewchat.OWNER, "Try the sign-up screen on Android")["id"]
+        crewchat.post_json(self.base + "/api/task", self.owner, {"op": "mobile", "task": task, "value": True})
+        plan = self.hub.messages[-1]
+        self.assertEqual((plan["kind"], plan["task"], plan["mobile"]), ("plan", task, "on"))
+        plain, _ = self.agent(mobile=False)
+        with self.assertRaises(crewchat.HubError) as e:
+            self.hub.take(plain, task)
+        self.assertIn("needs a mobile device", str(e.exception))
+        name, _ = self.agent()
+        self.hub.take(name, task)
+        self.assertTrue(next(r for r in self.hub.sheet_rows() if r["id"] == task)["mobile"])
+        self.hub.set_task_mobile(task, False)
+        self.assertFalse(self.hub.sheet[task]["mobile"])
+
+    def test_the_agent_row_says_mobile_devices_are_on(self):
+        name, _ = self.agent()
+        self.assertTrue(next(r for r in self.hub.rows() if r["agent"] == name)["mobile"])
+        plain, _ = self.agent(mobile=False)
+        self.assertFalse(next(r for r in self.hub.rows() if r["agent"] == plain)["mobile"])
+
+    def test_the_holder_is_reminded_to_post_progress(self):
+        name, proxy = self.agent()
+        key = next(k for k, n in self.hub.links.items() if n == name)
+        task = self.hub.add_row(crewchat.OWNER, "Check the login screen")["id"]
+        self.hub.take(name, task)
+        now = [1000.0]
+        with mock.patch.object(crewchat.time, "time", lambda: now[0]):
+            self.assertEqual(self.call(proxy, "mobile_take_screenshot", device=self.EMU)["decision"], "allow")
+            self.assertNotIn("remind", self.hub.hook(self.place, key, 0, 0, "tool"))
+            now[0] += crewchat.BROWSER_NOTE_EVERY + 1
+            self.call(proxy, "mobile_take_screenshot", device=self.EMU)  # still using it
+            remind = self.hub.hook(self.place, key, 0, 0, "tool").get("remind", "")
+            self.assertIn("mobile device", remind)
+            self.assertIn("#%s" % task, remind)
+            self.assertNotIn("remind", self.hub.hook(self.place, key, 0, 0, "tool"))  # once, not every call
+            self.hub.update(name, task, "in_progress", "Signed up with a test account")  # a note: the clock starts again
+            now[0] += crewchat.BROWSER_NOTE_EVERY - 10
+            self.call(proxy, "mobile_take_screenshot", device=self.EMU)
+            self.assertNotIn("remind", self.hub.hook(self.place, key, 0, 0, "tool"))
+
+    def test_the_panel_lists_the_devices_this_machine_sees(self):
+        seen = [{"id": self.EMU, "platform": "android", "kind": "emulator", "name": "Pixel 9", "online": True}]
+        with mock.patch.object(crewchat, "local_devices", return_value=seen):
+            status = crewchat.post_json(self.base + "/api/devices", self.owner, {"op": "status"})
+        self.assertEqual(status["devices"], seen)
+
+    def test_local_devices_reads_adb_and_simctl(self):
+        sims = {"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-18-0": [
+            {"udid": self.SIM, "name": "iPhone 16", "state": "Booted"}]}}
+
+        def status(command, env=None):
+            if command[0] == "/sdk/adb":
+                return 0, ("List of devices attached\nemulator-5554 device product:sdk model:Pixel_9 device:emu\n"
+                           "R58M123ABC unauthorized usb:1-1\n")
+            return 0, json.dumps(sims)
+        with mock.patch.object(crewchat, "find_adb", return_value="/sdk/adb"), \
+                mock.patch.object(crewchat, "status_of", side_effect=status):
+            found = crewchat.local_devices(mac=True)
+        self.assertEqual([(d["id"], d["platform"], d["kind"], d["name"], d["online"]) for d in found],
+                         [(self.EMU, "android", "emulator", "Pixel 9", True),
+                          (self.PHONE, "android", "real", "", False),
+                          (self.SIM, "ios", "simulator", "iPhone 16", True)])
+        with mock.patch.object(crewchat, "find_adb", return_value=None):
+            self.assertEqual(crewchat.local_devices(mac=False), [])
+
+    def test_the_page_has_the_devices_panel_and_switches(self):
+        page = crewchat.CHAT_PAGE
+        self.assertIn('data-panel="devices"', page)
+        self.assertIn("devices: panelDevices", page)
+        self.assertIn('id="l-use-mobile"', page)
+        self.assertIn('mobile: $("l-use-mobile").checked', page)
+        self.assertIn('"&mobile="', page)
+        self.assertIn('op: "mobile", agent: a.agent', page)
+        self.assertIn('op: "mobile", task: r.id', page)
+        ids = re.findall(r'\bid="([^"]+)"', page)
+        self.assertEqual([i for i in set(ids) if ids.count(i) > 1], [])
+
+
+class DeviceServers(unittest.TestCase):
+    """D3: crewchat's "mobile" MCP server in a folder's settings for every tool, where an agent has devices on."""
+    CLIENTS = (("claude", ".mcp.json", "mcpServers"), ("cursor", ".cursor/mcp.json", "mcpServers"),
+               ("gemini", ".gemini/settings.json", "mcpServers"), ("qwen", ".qwen/settings.json", "mcpServers"),
+               ("opencode", "opencode.json", "mcp"))
+
+    def folder(self, client):
+        folder = Path(tempfile.mkdtemp(prefix="mobile-%s-" % client, dir=TMP)).resolve()
+        crewchat.install_client(client, folder, "http://127.0.0.1:9", "tok")
+        return folder
+
+    def test_every_tool_gets_the_mobile_server_and_loses_it(self):
+        for client, rel, servers in self.CLIENTS:
+            folder = self.folder(client)
+            self.assertNotIn("mobile", json.loads((folder / rel).read_text())[servers], client)
+            self.assertIn(rel, crewchat.sync_device_server(folder, True), client)
+            entry = json.loads((folder / rel).read_text())[servers]["mobile"]
+            self.assertIn('"device-proxy", "%s"' % client, json.dumps(entry), client)
+            self.assertTrue(crewchat.is_device(client, entry), client)
+            self.assertIn(crewchat.SERVER_NAME, json.loads((folder / rel).read_text())[servers])  # crewchat's stays
+            if client != "cursor":  # the owner's Allow can take PERMISSION_WAIT inside a call
+                self.assertGreaterEqual(entry["timeout"], crewchat.PERMISSION_WAIT * 1000, client)
+            self.assertEqual(crewchat.sync_device_server(folder, True), [], client)  # up to date
+            crewchat.sync_device_server(folder, False)
+            self.assertNotIn("mobile", json.loads((folder / rel).read_text())[servers], client)
+        home = Path(tempfile.mkdtemp(prefix="codex-mobile-", dir=TMP))
+        for used in (False, True):
+            with mock.patch.object(crewchat, "codex_config", return_value=home / "config.toml"), \
+                    mock.patch.object(crewchat, "devices_used", return_value=used):
+                crewchat.install_codex()
+            text = (home / "config.toml").read_text()
+            self.assertEqual("[mcp_servers.mobile]" in text, used)
+        self.assertIn('"device-proxy", "codex"', text)
+        self.assertIn("CREWCHAT_DEVICE", text)
+
+    def test_claude_code_turns_the_server_on_and_allows_its_tools(self):
+        folder = self.folder("claude")
+        local = folder / ".claude" / "settings.local.json"
+        crewchat.sync_device_server(folder, True)
+        settings = json.loads(local.read_text())
+        self.assertIn("mobile", settings["enabledMcpjsonServers"])  # else Claude Code asks about a new .mcp.json server
+        self.assertIn("mcp__mobile", settings["permissions"]["allow"])  # the device gate asks what needs asking
+        crewchat.sync_device_server(folder, False)
+        settings = json.loads(local.read_text())
+        self.assertNotIn("mobile", settings.get("enabledMcpjsonServers", []))
+        self.assertNotIn("mcp__mobile", settings.get("permissions", {}).get("allow", []))
+
+    def test_a_mobile_server_of_the_owners_own_is_left_alone(self):
+        theirs = {"command": "npx", "args": ["-y", "@mobilenext/mobile-mcp@latest"]}
+        for client, rel, servers in self.CLIENTS:
+            folder = self.folder(client)
+            data = json.loads((folder / rel).read_text())
+            data[servers]["mobile"] = theirs
+            (folder / rel).write_text(json.dumps(data))
+            self.assertFalse(crewchat.is_device(client, theirs))
+            for on in (True, False):
+                self.assertNotIn(rel, crewchat.sync_device_server(folder, on), client)
+                self.assertEqual(json.loads((folder / rel).read_text())[servers]["mobile"], theirs, client)
+        home = Path(tempfile.mkdtemp(prefix="codex-mobile-theirs-", dir=TMP))
+        (home / "config.toml").write_text('[mcp_servers.mobile]\ncommand = "npx"\n')
+        with mock.patch.object(crewchat, "codex_config", return_value=home / "config.toml"), \
+                mock.patch.object(crewchat, "devices_used", return_value=True):
+            crewchat.install_codex()
+        text = (home / "config.toml").read_text()
+        self.assertEqual(text.count("[mcp_servers.mobile]"), 1)
+        self.assertNotIn("device-proxy", text)
+
+    def test_a_settings_file_git_tracks_is_left_alone(self):
+        folder = self.folder("gemini")
+        with mock.patch.object(crewchat, "tracked_by_git", return_value=True):
+            self.assertEqual(crewchat.sync_device_server(folder, True), [])
+        self.assertNotIn("mobile", json.loads((folder / ".gemini/settings.json").read_text())["mcpServers"])
+
+    def test_the_guide_has_the_mobile_rules(self):
+        self.assertIn("## Mobile devices", crewchat.MOBILE_GUIDE)
+        for rule in ("One agent uses a device at a time", "Never type a password", "screenshot",
+                     "Uninstalling an app or clearing its\n  data always asks"):
+            self.assertIn(rule, crewchat.MOBILE_GUIDE)
+        with mock.patch.object(crewchat, "load_config", return_value={"project": "Demo"}), \
+                mock.patch.object(crewchat, "project_rules", return_value=""), \
+                mock.patch.object(crewchat, "project_skills", return_value=[]):
+            self.assertIn(crewchat.MOBILE_GUIDE, crewchat.project_guide(TMP))
+
+    def test_server_start_keeps_the_mobile_server_up_to_date(self):
+        folder = Path(tempfile.mkdtemp(prefix="mobile-start-", dir=TMP)).resolve()
+        hub = mock.Mock()
+        hub.project_folders.return_value = [folder]
+        hub.live_processes.return_value = []
+        project = types.SimpleNamespace(hub=hub, roster=types.SimpleNamespace(root=folder), name="demo")
+        projects = types.SimpleNamespace(all=lambda: [project])
+        with mock.patch.object(crewchat, "refresh_codex"), mock.patch.object(crewchat, "write_guides"), \
+                mock.patch.object(crewchat, "update_hooks"):
+            crewchat.upgrade_folders(projects)
+        hub.sync_mobile.assert_called_once_with([folder])
+
+
+class DeviceReadiness(unittest.TestCase):
+    """D3: what agents need to use mobile devices here: npx, and an Android device online or a booted Simulator."""
+
+    def ready(self, npx=True, adb="/sdk/platform-tools/adb", adb_out="", simctl=(0, ""), mac=True):
+        def status(command, env=None):
+            return (0, adb_out) if command[0] == adb else simctl
+        with mock.patch.object(crewchat.shutil, "which", side_effect=lambda n: "/usr/bin/npx" if npx and n == "npx" else None), \
+                mock.patch.object(crewchat, "find_adb", return_value=adb), \
+                mock.patch.object(crewchat, "status_of", side_effect=status):
+            return crewchat.device_readiness(mac=mac)
+
+    def states(self, items):
+        return [(i["state"], i["text"]) for i in items]
+
+    def test_an_online_emulator_is_ready(self):
+        items = self.ready(adb_out="List of devices attached\nemulator-5554\tdevice\n\n")
+        self.assertEqual([i["state"] for i in items if i["state"] == "todo"], [])
+        self.assertIn(("ok", "Android: emulator-5554 online"), self.states(items))
+        self.assertIn("1.0.16", items[0]["text"])  # the pinned Mobile MCP
+
+    def test_a_booted_simulator_is_ready_on_a_mac(self):
+        items = self.ready(adb=None, simctl=(0, "== Devices ==\n-- iOS 18.0 --\n    iPhone 16 (7C1D) (Booted)\n"))
+        self.assertIn(("ok", "iOS: a Simulator is booted"), self.states(items))
+        self.assertEqual([i for i in items if i["state"] == "todo"], [])
+
+    def test_nothing_online_says_what_to_start(self):
+        items = self.ready(adb_out="List of devices attached\n\n", simctl=(0, "== Devices ==\n"))
+        self.assertTrue(any(i["state"] == "todo" and "Start an Android emulator" in i["text"] for i in items))
+
+    def test_a_phone_waiting_for_usb_debugging_is_a_todo(self):
+        items = self.ready(adb_out="List of devices attached\nR58M123ABC\tunauthorized\n")
+        self.assertIn(("todo", "Android: R58M123ABC is waiting for you to allow USB debugging on the phone"),
+                      self.states(items))
+
+    def test_no_npx_and_no_mac(self):
+        items = self.ready(npx=False, adb_out="List of devices attached\nemulator-5554\tdevice\n", mac=False)
+        self.assertEqual(items[0]["state"], "todo")
+        self.assertIn("iOS Simulators need a Mac", [i["text"] for i in items])
+
+    def test_adb_is_found_where_android_studio_puts_it(self):
+        sdk = Path(tempfile.mkdtemp(prefix="sdk-", dir=TMP))
+        (sdk / "platform-tools").mkdir()
+        (sdk / "platform-tools" / "adb").write_text("")
+        with mock.patch.object(crewchat.shutil, "which", return_value=None), \
+                mock.patch.dict(os.environ, {"ANDROID_HOME": str(sdk)}):
+            self.assertEqual(crewchat.find_adb(), str(sdk / "platform-tools" / "adb"))
+        self.assertEqual(crewchat.adb_devices("List of devices attached\n* daemon started\nX\tdevice\n"),
+                         {"X": "device"})
+
+    def test_tool_readiness_adds_the_device_lines(self):
+        with mock.patch.object(crewchat, "find_tool", return_value="/usr/bin/gemini"), \
+                mock.patch.object(crewchat, "signed_in", return_value=crewchat.ready_item("ok", "signed in")), \
+                mock.patch.object(crewchat, "device_readiness", return_value=[crewchat.ready_item("ok", "dev")]):
+            self.assertEqual(crewchat.tool_readiness("gemini", fresh=True, mobile=True)[-1]["text"], "dev")
+            self.assertNotIn("dev", [i["text"] for i in crewchat.tool_readiness("gemini", fresh=True)])
+
+
+class DeviceProxy(ProxyHarness, unittest.TestCase):
+    """D1: crewchat's mobile bridge (Android and iOS) runs behind `crewchat device-proxy`, which gates each call, refuses Mobile MCP's
+    cloud devices, and reads the app in front from the device (a fake Mobile MCP child here). What the proxy does
+    whatever its child (a dead child, a cancelled call, notifications) is GatedProxy's, tested on BrowserProxy."""
+    FAKE = str(Path(__file__).resolve().parent / "fake_mobile_mcp.py")
+    PROXY = "DeviceProxy"
+    NAME = "fake-mobile"
+    EMU = "emulator-5554"
+
+    def tap(self, **args):
+        return self.result("mobile_click_on_screen_at_coordinates", device=self.EMU, x=10, y=10, **args)
+
+    def test_calls_pass_through_when_allowed(self):
+        self.start()
+        result = self.result("mobile_launch_app", device=self.EMU, packageName="com.example.shop")
+        self.assertIn("com.example.shop", result["content"][0]["text"])
+        self.assertEqual(self.server.calls[0][:2], ("mobile_launch_app",
+                                                    {"device": self.EMU, "packageName": "com.example.shop"}))
+        self.assertEqual(self.server.seen_tabs, [[{"device": self.EMU, "app": "com.example.shop"}]])
+
+    def test_a_refused_call_is_not_forwarded(self):
+        self.start()
+        self.server.deny = "the owner denied this: do not open com.bank.app"
+        result = self.result("mobile_launch_app", device=self.EMU, packageName="com.bank.app")
+        self.assertTrue(result["isError"])
+        self.assertIn("the owner denied this", result["content"][0]["text"])
+        self.assertEqual(self.child_calls(), ["mobile_list_available_devices"])  # the proxy's own question only
+        self.assertEqual(self.server.seen_tabs, [])
+
+    def test_each_device_is_said_to_be_what_mobile_mcp_lists_it_as(self):
+        # D2: an emulator or a simulator asks nothing; the proxy reads which a device is from Mobile MCP's own list,
+        # once, and a device the list does not have is a real one.
+        self.start(env={"FAKE_DEVICES": json.dumps([{"id": self.EMU, "type": "emulator"},
+                                                    {"id": "SIM-1", "type": "simulator"},
+                                                    {"id": "R58M", "type": "real"}, {"id": "odd", "type": "toaster"}])})
+        for device in (self.EMU, "SIM-1", "R58M", "odd", "gone", self.EMU):
+            self.result("mobile_take_screenshot", device=device)
+        self.assertEqual([a["kinds"] for a in self.server.about],
+                         [{self.EMU: "emulator"}, {"SIM-1": "simulator"}, {"R58M": "real"}, {"odd": "real"},
+                          {"gone": "real"}, {self.EMU: "emulator"}])
+        self.assertEqual(self.child_calls().count("mobile_list_available_devices"), 2)  # again only for "gone"
+
+    def test_a_tap_that_brings_another_app_to_the_front_is_seen(self):
+        self.start()
+        self.result("mobile_launch_app", device=self.EMU, packageName="com.example.shop")
+        self.tap(goes_to="com.android.chrome")
+        self.assertEqual(self.server.seen_tabs[-1], [{"device": self.EMU, "app": "com.android.chrome"}])
+
+    def test_the_app_comes_from_the_device_not_from_its_name(self):
+        # An app's name is its own text: one that calls itself "Shop (com.example.shop)" is still the app it is.
+        self.start(env={"FAKE_NAME": "Shop (com.example.shop), activity: com.example.shop.Main"})
+        self.result("mobile_launch_app", device=self.EMU, packageName="com.evil.app")
+        self.assertEqual(self.server.seen_tabs[-1], [{"device": self.EMU, "app": "com.evil.app"}])
+
+    def test_cloud_devices_are_refused_by_the_proxy(self):
+        self.start()
+        for tool, args in (("mobile_allocate_remote_device", {}), ("mobile_login_to_cloud_provider", {}),
+                           ("mobile_batch_commands", {"device": self.EMU, "steps": [
+                               {"name": "mobile_take_screenshot", "arguments": {}},
+                               {"name": "mobile_list_remote_devices", "arguments": {}}]})):
+            result = self.result(tool, **args)
+            self.assertTrue(result["isError"])
+            self.assertIn("cloud devices are not used", result["content"][0]["text"])
+        self.assertEqual((self.server.calls, self.child_calls()), ([], []))
+
+    def test_a_batch_is_asked_about_as_a_whole_and_every_device_it_used_is_seen(self):
+        self.start()
+        steps = [{"name": "mobile_launch_app", "arguments": {"packageName": "com.example.shop"}},
+                 {"name": "mobile_launch_app", "arguments": {"device": "emulator-5556", "packageName": "com.mail"}}]
+        self.result("mobile_batch_commands", device=self.EMU, steps=steps)
+        self.assertEqual(self.server.calls[0][0], "mobile_batch_commands")
+        self.assertEqual(self.server.seen_tabs[-1], [{"device": self.EMU, "app": "com.example.shop"},
+                                                     {"device": "emulator-5556", "app": "com.mail"}])
+
+    def test_a_call_on_no_device_tells_the_server_nothing(self):
+        self.start()
+        self.assertIn("emulator-5554", self.result("mobile_list_available_devices")["content"][0]["text"])
+        self.assertEqual(self.server.seen_tabs, [])
+
+    def test_an_ios_simulator_is_driven_the_same_way(self):
+        # Mobile MCP drives the iOS Simulator with the same tools: a simulator's id is a UUID, an app a bundle id.
+        self.start()
+        sim = "7C1D5A0E-3B6F-4F8A-9D2E-1A2B3C4D5E6F"
+        self.result("mobile_launch_app", device=sim, packageName="com.example.my-app")
+        self.result("mobile_click_on_screen_at_coordinates", device=sim, x=5, y=5, goes_to="com.apple.mobilesafari")
+        self.assertEqual(self.server.seen_tabs, [[{"device": sim, "app": "com.example.my-app"}],
+                                                 [{"device": sim, "app": "com.apple.mobilesafari"}]])
+
+    def test_an_app_the_device_cannot_name_is_none(self):
+        self.start(env={"FAKE_FRONT": "none"})
+        self.tap()
+        self.assertEqual(self.server.seen_tabs, [[{"device": self.EMU, "app": None}]])
+
+    def test_server_down_refuses_changes_allows_reads(self):
+        self.start()
+        self.server.down = True
+        result = self.tap()
+        self.assertTrue(result["isError"])
+        self.assertIn(crewchat.BROWSER_DOWN, result["content"][0]["text"])
+        result = self.result("mobile_take_screenshot", device=self.EMU, text="the screen")
+        self.assertEqual(result["content"][0]["text"], "the screen")
+        self.assertNotIn("mobile_click_on_screen_at_coordinates", self.child_calls())
+        self.assertIn("mobile_take_screenshot", self.child_calls())
+
+    def test_calls_are_gated_one_at_a_time(self):
+        self.start()
+        self.call("mobile_launch_app", device=self.EMU, packageName="com.example.shop")
+        self.call("mobile_take_screenshot", device=self.EMU, text="x")
+        self.assertEqual({self.read()["id"], self.read()["id"]}, {1, 2})
+        self.assertEqual([(c[0], c[2]) for c in self.server.calls],
+                         [("mobile_launch_app", 0), ("mobile_take_screenshot", 1)])
+
+    def test_mobile_mcp_runs_without_telemetry_or_other_url_schemes(self):
+        dump = Path(tempfile.mkdtemp(prefix="proxy-env-", dir=TMP)) / "env"
+        self.start(env={"FAKE_ENV": str(dump), "MOBILEMCP_ALLOW_UNSAFE_URLS": "1", "MOBILEMCP_LEGACY_ROBOT": "1"})
+        self.assertEqual(json.loads(dump.read_text()), {"MOBILEMCP_DISABLE_TELEMETRY": "1",
+                                                        "MOBILEMCP_ALLOW_UNSAFE_URLS": None,
+                                                        "MOBILEMCP_LEGACY_ROBOT": None})
+
+    def test_a_device_that_cannot_start_answers_with_an_error(self):
+        self.start(child=["/nonexistent/npx-%s" % os.getpid()])
+        result = self.result("mobile_take_screenshot", device=self.EMU)
+        self.assertTrue(result["isError"])
+        self.assertIn("the mobile device could not start", result["content"][0]["text"])
+
+    def test_an_unexpected_error_still_answers_the_call(self):
+        self.start()
+        self.server.broken = True
+        result = self.result("mobile_take_screenshot", device=self.EMU)
+        self.assertTrue(result["isError"])
+        self.assertIn("crewchat's mobile bridge failed", result["content"][0]["text"])
+        self.assertNotIn("mobile_take_screenshot", self.child_calls())
+
+    def test_a_batch_is_refused_not_passed_on(self):
+        self.start()
+        self.send([{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                    "params": {"name": "mobile_launch_app", "arguments": {"device": self.EMU, "packageName": "x.y"}}}])
+        answer = self.read()
+        self.assertEqual(answer["error"]["code"], -32600)
+        self.assertIn("crewchat's mobile bridge", answer["error"]["message"])
+        self.assertEqual((self.child_calls(), self.server.calls), ([], []))
+
+    def test_the_real_proxy_finds_npx_and_reads_utf8(self):
+        made = {}
+
+        class Fake:
+            def __init__(self, client, child, server, stdin, stdout, env=None):
+                made.update(child=child, server=server, stdin=stdin, stdout=stdout)
+
+            def run(self):
+                return 0
+        # Its own stand-ins for stdin and stdout: a wrapper around the real ones closes them when it goes.
+        pipes = types.SimpleNamespace(buffer=io.BytesIO())
+        with mock.patch.object(crewchat, "DeviceProxy", Fake), mock.patch.object(crewchat, "find_project", return_value=None), \
+                mock.patch.object(crewchat.shutil, "which", return_value="C:/node/npx.cmd"), \
+                mock.patch.object(crewchat.sys, "stdin", pipes), mock.patch.object(crewchat.sys, "stdout", pipes):
+            self.assertEqual(crewchat.device_proxy_main("gemini"), 0)
+        self.assertEqual(made["child"], ["C:/node/npx.cmd", "-y", crewchat.MOBILE_MCP])
+        self.assertRegex(crewchat.MOBILE_MCP, r"^@mobilenext/mobile-mcp@\d+\.\d+\.\d+$")  # pinned, never @latest
+        self.assertEqual(made["server"].call("mobile_take_screenshot", {}),
+                         {"decision": "deny", "reason": crewchat.DEVICE_ONLY})  # no chat here: only the chat's agents
+        self.assertEqual((made["stdin"].encoding.lower(), made["stdout"].encoding.lower()), ("utf-8", "utf-8"))
+
+
+class DeviceCalls(unittest.TestCase):
+    """D1: what a Mobile MCP call does, as the device gate (D2) and a proxy without a server sort it."""
+
+    def test_tools_by_any_name_their_tool_gives_them(self):
+        for tool in ("mobile_launch_app", "mcp__mobile__mobile_launch_app", "mobile_mobile_launch_app"):
+            self.assertEqual(crewchat.device_tool_name(tool), "launch_app", tool)
+        for tool in ("browser_click", "mcp__mobile__launch_app", "mobilelaunch", ""):
+            self.assertEqual(crewchat.device_tool_name(tool), "", tool)
+
+    def test_each_kind_of_call(self):
+        cases = {("mobile_take_screenshot", ()): ("read", ""),
+                 ("mobile_list_elements_on_screen", ()): ("read", ""),
+                 ("mobile_click_on_screen_at_coordinates", ()): ("change", ""),
+                 ("mobile_type_keys", ()): ("change", ""),
+                 ("mobile_something_new", ()): ("change", ""),
+                 ("mobile_launch_app", (("packageName", "com.a.b"),)): ("launch", "com.a.b"),
+                 ("mobile_open_url", (("url", "https://x.example/"),)): ("navigate", "https://x.example/"),
+                 ("mobile_install_app", (("path", "/w/app.apk"),)): ("install", "/w/app.apk"),
+                 ("mobile_uninstall_app", (("packageName", "com.a.b"),)): ("manage", "com.a.b"),
+                 ("mobile_clear_app_data", (("packageName", "com.a.b"),)): ("manage", "com.a.b"),
+                 ("mobile_allocate_remote_device", ()): ("cloud", ""),
+                 ("browser_click", ()): ("other", "")}
+        for (tool, args), want in cases.items():
+            self.assertEqual(crewchat.device_action(tool, dict(args)), want, tool)
+
+    def test_a_batch_is_as_strict_as_its_strictest_step(self):
+        steps = [{"name": "mobile_take_screenshot", "arguments": {}},
+                 {"name": "mobile_launch_app", "arguments": {"packageName": "com.bank.app"}},
+                 {"name": "mobile_click_on_screen_at_coordinates", "arguments": {"x": 1, "y": 1}}]
+        self.assertEqual(crewchat.device_action("mobile_batch_commands", {"device": "d", "steps": steps}),
+                         ("launch", "com.bank.app"))
+        many = [{"name": "mobile_take_screenshot", "arguments": {}}] * 150 + [
+            {"name": "mobile_uninstall_app", "arguments": {"packageName": "com.a.b"}}]
+        self.assertEqual(crewchat.device_action("mobile_batch_commands", {"steps": many}), ("manage", "com.a.b"))
+        for steps in ([{"name": "mobile_batch_commands", "arguments": {}}], ["junk"], [], "junk"):
+            self.assertEqual(crewchat.device_action("mobile_batch_commands", {"steps": steps}), ("change", ""), steps)
+        reads = [{"name": "mobile_take_screenshot"}, {"name": "mobile_get_device_logs", "arguments": {"limit": 5}}]
+        self.assertEqual(crewchat.device_action("mobile_batch_commands", {"steps": reads}), ("read", ""))
+
+    def test_the_devices_a_call_uses(self):
+        self.assertEqual(crewchat.device_ids("mobile_take_screenshot", {"device": "emulator-5554"}), ["emulator-5554"])
+        self.assertEqual(crewchat.device_ids("mobile_list_available_devices", {}), [])
+        steps = [{"name": "mobile_take_screenshot", "arguments": {}},
+                 {"name": "mobile_launch_app", "arguments": {"device": "R58M", "packageName": "a.b"}},
+                 {"name": "mobile_take_screenshot", "arguments": {"device": 5}}]
+        self.assertEqual(crewchat.device_ids("mobile_batch_commands", {"device": "emulator-5554", "steps": steps}),
+                         ["emulator-5554", "R58M"])
+
+    def test_the_app_in_front_is_read_from_its_end(self):
+        read = crewchat.front_app
+        self.assertEqual(read("Foreground app: Shop (com.example.shop), activity: com.example.shop.MainActivity"),
+                         "com.example.shop")
+        self.assertEqual(read("Foreground app: Shop (com.example.shop)"), "com.example.shop")
+        self.assertEqual(read("Foreground app: Bank (com.bank.app), activity: x.Y (com.evil.app)"), "com.evil.app")
+        self.assertEqual(read("Foreground app: X (com.bank.app) (com.evil.app), activity: com.evil.app.Main"),
+                         "com.evil.app")
+        # iOS (Mobile MCP 1.0.16 through mobilecli): a bundle id, which may hold hyphens, and a view controller.
+        self.assertEqual(read("Foreground app: Safari (com.apple.mobilesafari)"), "com.apple.mobilesafari")
+        self.assertEqual(read("Foreground app: My App (com.example.my-app), activity: UIHostingController<ContentView>"),
+                         "com.example.my-app")
+        for text in (None, "", "Foreground app: Shop", "Foreground app: Shop (shop)", "nothing (com.a.b)",
+                     "Foreground app: X (com.a.b), activity: has space"):
+            self.assertIsNone(read(text), text)
+
+class RoutineSchedule(unittest.TestCase):
+    """T1: a routine's "when", in the one spelling kept, and the next time it runs (local time)."""
+
+    def test_the_spellings(self):
+        parse = crewchat.parse_schedule
+        self.assertEqual(parse("every 15 minutes"), "every 15m")
+        self.assertEqual(parse("Every 120m"), "every 2h")
+        self.assertEqual(parse("every 1 day"), "every 1d")
+        self.assertEqual(parse("daily at 9:05"), "daily 09:05")
+        self.assertEqual(parse("every day 18:00"), "daily 18:00")
+        self.assertEqual(parse("thu, Monday 17:30"), "mon,thu 17:30")
+        self.assertEqual(parse("mon,tue,wed,thu,fri 09:00"), "weekdays 09:00")
+        for bad in ("every 2m", "every 8d", "daily 24:00", "funday 09:00", "sometimes", "", None):
+            with self.assertRaises(crewchat.HubError):
+                parse(bad)
+
+    def test_the_next_run(self):
+        local = lambda *a: crewchat.datetime.datetime(*a).timestamp()  # noqa: E731
+        monday_8 = local(2026, 11, 2, 8, 0)  # 2 Nov 2026 is a Monday
+        self.assertEqual(crewchat.next_run("every 15m", monday_8), monday_8 + 900)
+        self.assertEqual(crewchat.next_run("daily 09:00", monday_8), local(2026, 11, 2, 9, 0))
+        self.assertEqual(crewchat.next_run("daily 09:00", local(2026, 11, 2, 9, 0)), local(2026, 11, 3, 9, 0))
+        friday_10 = local(2026, 11, 6, 10, 0)
+        self.assertEqual(crewchat.next_run("weekdays 09:00", friday_10), local(2026, 11, 9, 9, 0))
+        self.assertEqual(crewchat.next_run("mon,thu 17:30", monday_8), local(2026, 11, 2, 17, 30))
+        self.assertEqual(crewchat.next_run("sat 07:00", monday_8), local(2026, 11, 7, 7, 0))
+
+
+class Routines(unittest.TestCase):
+    """T1: the owner's routines post their task when due, once, and wait while the last one is open."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="routines-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, self.root)
+        self.hub = crewchat.Hub(crewchat.Roster(self.root))
+
+    def tearDown(self):
+        self.hub.events.close()
+
+    def routine(self, name="jira-review", when="every 30m", to="all"):
+        return self.hub.set_routine(name, "Go through my Jira tickets and summarize them", to, when)
+
+    def test_due_it_posts_its_task_once_and_waits_for_it(self):
+        out = self.routine()
+        start = self.hub.routines["jira-review"]["changed"]
+        self.assertEqual(out["next"], start + 1800)
+        self.assertEqual(self.hub.routine_tick(start + 60), [])  # not due yet
+        posted = self.hub.routine_tick(start + 1800)
+        self.assertEqual(len(posted), 1)
+        row = self.hub.sheet[posted[0]]
+        self.assertEqual(row["title"], "Routine jira-review: Go through my Jira tickets and summarize them")
+        self.assertEqual(self.hub.by_id[posted[0]]["routine"], "jira-review")
+        self.assertEqual(self.hub.routine_tick(start + 1860), [])  # once
+        # Due again while its task is still open: it waits, and says so once.
+        last = self.hub.routines["jira-review"]["last"]
+        self.assertEqual(self.hub.routine_tick(last + 1800), [])
+        self.assertEqual(self.hub.routine_tick(last + 1860), [])
+        waits = [m for m in self.hub.messages if m["kind"] == "event" and "waits" in m["text"]]
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.hub.routines_view()["routines"][0]["waits"], posted[0])
+        self.hub.owner_status(posted[0], "done", "")
+        again = self.hub.routine_tick(last + 1920)
+        self.assertEqual(len(again), 1)  # finished: the late run goes out
+        self.assertEqual(self.hub.routines_view()["routines"][0]["last_task"], again[0])
+
+    def test_for_an_agent_or_the_lead_it_is_theirs_at_once(self):
+        sid = self.hub.open_session("mac", "claude")
+        name = self.hub.agent_for(sid)
+        self.hub.set_role(crewchat.OWNER, name, "lead")
+        self.routine("standup", "every 5m", "lead")
+        due = self.hub.routines["standup"]["changed"] + 300
+        mid = self.hub.routine_tick(due)[0]
+        self.assertEqual(self.hub.taken[mid], name)
+        self.routine("triage", "every 5m", name)
+        mid = self.hub.routine_tick(due + 600)[-1]
+        self.assertEqual(self.hub.by_id[mid]["to"], name)
+        with self.assertRaises(crewchat.HubError):
+            self.routine("nobody", "every 5m", "ghost")  # not an agent here
+
+    def test_with_no_lead_its_task_is_on_the_sheet(self):
+        self.routine("standup", "every 5m", "lead")
+        mid = self.hub.routine_tick(self.hub.routines["standup"]["changed"] + 300)[0]
+        self.assertEqual(self.hub.by_id[mid]["to"], "all")
+        self.assertNotIn(mid, self.hub.taken)
+
+    def test_paused_changed_and_removed(self):
+        self.routine()
+        self.hub.set_routine("jira-review", on=False)
+        far = time.time() + 86400
+        self.assertEqual(self.hub.routine_tick(far), [])
+        self.hub.set_routine("jira-review", on=True, when="daily 09:00")
+        view = self.hub.routines_view()["routines"][0]
+        self.assertEqual((view["when"], view["on"]), ("daily 09:00", True))
+        self.assertEqual(view["what"], "Go through my Jira tickets and summarize them")  # kept
+        self.hub.remove_routine("jira-review")
+        self.assertEqual(self.hub.routines_view()["routines"], [])
+        self.assertEqual(self.hub.routine_tick(far * 2), [])
+        with self.assertRaises(crewchat.HubError):
+            self.hub.run_routine("jira-review")
+        for bad in (("Bad Name", "x", None, "every 5m"), ("ok", "", None, "every 5m"), ("ok", "x", None, "now")):
+            with self.assertRaises(crewchat.HubError):
+                self.hub.set_routine(*bad)
+
+    def test_run_now_posts_even_while_the_last_is_open(self):
+        self.routine()
+        first = self.hub.run_routine("jira-review", force=True)
+        self.assertEqual(self.hub.run_routine("jira-review"), "")
+        self.assertNotEqual(self.hub.run_routine("jira-review", force=True), first)
+
+    def test_only_the_coordinating_machine_posts(self):
+        self.routine()
+        due = self.hub.routines["jira-review"]["changed"] + 1800
+        self.hub.sync = types.SimpleNamespace(coordinator=lambda: {"me": False}, publish=lambda msg: None,
+                                               state_changed=lambda: None, device_id="m2")
+        try:
+            self.assertEqual(self.hub.routine_tick(due), [])
+            self.assertFalse(self.hub.routines_view()["coordinating"])
+            self.hub.sync.coordinator = lambda: {"me": True}
+            self.assertEqual(len(self.hub.routine_tick(due)), 1)
+        finally:
+            self.hub.sync = None
+
+    def test_routines_and_runs_travel_to_other_machines_and_survive_a_restart(self):
+        self.routine()
+        defined = next(m for m in self.hub.messages if m["kind"] == "plan" and m.get("routine"))
+        run = self.hub.run_routine("jira-review", force=True)
+        root = Path(tempfile.mkdtemp(prefix="routines-other-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        other = crewchat.Hub(crewchat.Roster(root))
+        try:
+            self.assertTrue(other.ingest(dict(defined, id="A1")))
+            self.assertTrue(other.ingest(dict(self.hub.by_id[run], id="A2")))
+            routine = other.routines["jira-review"]
+            self.assertEqual((routine["when"], routine["last_task"]), ("every 30m", "A2"))
+            older = json.dumps({"name": "jira-review", "what": "old", "when": "every 5m"})
+            other.ingest(dict(defined, id="A3", ts=defined["ts"] - 60, routine=older))  # an older change, late
+            self.assertEqual(other.routines["jira-review"]["when"], "every 30m")
+        finally:
+            other.events.close()
+        with self.hub.lock:
+            self.hub._save()
+        again = crewchat.Hub(crewchat.Roster(self.root))
+        try:
+            self.assertEqual(again.routines["jira-review"]["last_task"], run)
+        finally:
+            again.events.close()
+        state = json.loads((self.root / "state.json").read_text())
+        del state["routines"]  # as an older crewchat wrote it: read back from the log
+        (self.root / "state.json").write_text(json.dumps(state))
+        replayed = crewchat.Hub(crewchat.Roster(self.root))
+        try:
+            self.assertEqual(replayed.routines["jira-review"]["last_task"], run)
+        finally:
+            replayed.events.close()
+
+
+class RoutinesOverHttp(Base):
+    """T2: the owner's routines from the page and the command line (/api/routines); agents cannot reach it."""
+
+    def test_the_owner_adds_runs_pauses_and_removes_one(self):
+        call = lambda body: crewchat.post_json(self.base + "/api/routines", self.owner, body)  # noqa: E731
+        view = call({"op": "view"})
+        self.assertTrue(view["coordinating"])
+        self.assertIn("jira-review", [t["name"] for t in view["templates"]])
+        try:
+            out = cli("routines", "add", "pr-check", "Look", "at", "open", "PRs", "--when", "every 2h")
+            self.assertIn("Routine pr-check: every 2h, next", out)
+            self.assertIn("pr-check", cli("routines"))
+            mid = call({"op": "run", "name": "pr-check"})["id"]
+            self.assertIn("Routine pr-check: Look at open PRs", next(r for r in self.hub.sheet_rows() if r["id"] == mid)["title"])
+            self.assertIn("paused", cli("routines", "pause", "pr-check"))
+            self.assertFalse(call({})["routines"][0]["on"])
+            self.assertIn("weekdays 09:00", cli("routines", "templates"))
+        finally:
+            cli("routines", "remove", "pr-check")
+        self.assertEqual(call({})["routines"], [])
+        with self.assertRaises(urllib.error.HTTPError) as e:
+            crewchat.post_json(self.base + "/api/routines", self.token, {"op": "view"})  # an agent's place token
+        self.assertIn(e.exception.code, (401, 403))
+
+    def test_the_page_has_the_routines_card(self):
+        for part in ('id="routines-card"', 'id="routine-template"', 'postJSON("/api/routines"', "loadRoutines();",
+                     'id="jira-every"'):
+            self.assertIn(part, crewchat.CHAT_PAGE)
+
+
+class JiraEvery(unittest.TestCase):
+    """T3: the owner sets how often the look in Jira runs; it runs no more often than that."""
+
+    def setUp(self):
+        root = Path(tempfile.mkdtemp(prefix="jira-every-", dir=TMP))
+        crewchat.save_config({"project": "web", "port": 9}, root)
+        self.hub = crewchat.Hub(crewchat.Roster(root))
+
+    def tearDown(self):
+        self.hub.events.close()
+
+    def test_the_interval(self):
+        self.assertEqual(self.hub.jira_watch()["every"], 5)
+        self.assertEqual(self.hub.set_jira_every("30")["every"], 30)
+        for bad in ("2", "2000", "soon"):
+            with self.assertRaises(crewchat.HubError):
+                self.hub.set_jira_every(bad)
+        with mock.patch.object(self.hub, "jira_poll", return_value=["A1"]) as poll:
+            self.assertEqual(self.hub.jira_poll_if_due(1000000), ["A1"])
+            self.assertEqual(self.hub.jira_poll_if_due(1000000 + 29 * 60), [])
+            self.assertEqual(self.hub.jira_poll_if_due(1000000 + 30 * 60), ["A1"])
+            self.assertEqual(poll.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

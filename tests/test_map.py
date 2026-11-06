@@ -650,6 +650,18 @@ class Brief(unittest.TestCase):
 
 
 class Speed(unittest.TestCase):
+    def test_the_quick_walk_finds_the_calls_and_imports_ast_walk_does(self):
+        """The Python reader skips the insides of names, constants and the like; it must still find every call and
+        import, in the same order, including a call inside an annotation or a default."""
+        import ast
+        wanted = (ast.Call, ast.Import, ast.ImportFrom)
+        texts = [p.read_text(encoding="utf-8") for p in sorted(ROOT.glob("*.py"))]
+        texts.append("def f(x: g() = h(), *a: k()) -> m(): import os\nlambda y=n(): p()\n")
+        for text in texts:
+            tree = ast.parse(text)
+            seen = lambda walk: [(type(n).__name__, n.lineno, n.col_offset) for n in walk(tree) if isinstance(n, wanted)]
+            self.assertEqual(seen(crewchat_map._walk), seen(ast.walk))
+
     def test_the_crewchat_repository_maps_in_under_two_seconds(self):
         out = Path(tempfile.mkdtemp(prefix="crewchat-map-speed-"))
         try:

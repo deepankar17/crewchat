@@ -38,7 +38,7 @@ import crewchat
 PULL_WAIT = 25  # seconds a pull waits for something new
 MISSING_WAIT = 30  # seconds before asking again a member that has no project by this name
 INVITE_TTL = 600
-REKEY_GRACE = 600  # the old key still works this long after a change, while members catch up
+CONFIRM_WAIT = 10  # seconds a member waits for the remover to confirm a key change
 OFFLINE_AFTER = 2  # failed pulls in a row before a member shows as offline
 BACKOFF = (1, 2, 5, 10, 20, 30)
 MAX_BATCH = 500
@@ -168,17 +168,21 @@ class Mesh:
             return name
 
     def key_ok(self, token):
+        """The current shared key. The one before it opens nothing: a machine removed with it knows it too."""
         with self.lock:
-            if token and hmac.compare_digest(token, self.data.get("secret", "")):
-                return True
-            old, until = self.data.get("old_secret"), float(self.data.get("old_until") or 0)
-            return bool(token and old and time.time() < until and hmac.compare_digest(token, old))
+            return bool(token and hmac.compare_digest(token, self.data.get("secret", "")))
+
+    def old_key(self, token):
+        """The key before the last change: only recognised, to tell its holder what happened."""
+        with self.lock:
+            old = self.data.get("old_secret")
+            return bool(token and old and hmac.compare_digest(token, old))
 
     def rekey(self, secret=None, removed=None):
-        """Change the shared key (to `secret`, or a new one). The old one works a little longer."""
+        """Change the shared key (to `secret`, or a new one). The old one stops working at once."""
         with self.lock:
             self.data["old_secret"] = self.data["secret"]
-            self.data["old_until"] = time.time() + REKEY_GRACE
+            self.data.pop("old_until", None)
             self.data["secret"] = secret or secrets.token_urlsafe(32)
             self.merge({}, removed)
             return self.data["secret"]
@@ -715,6 +719,12 @@ class PeerSync(crewchat.ProjectLink):
         if path == "/peer/join":
             return self._join(body)
         if not self.mesh.key_ok(token):
+            if self.mesh.old_key(token):
+                # The key changed. A member still catching up gets it with the news and tries again; a removed
+                # machine learns it was removed. Neither gets anything, whichever machine it says it is.
+                if device in self.mesh.data.get("removed", {}):
+                    return 403, {"error": "this machine was removed from the chat"}
+                return 409, {"error": "the key changed; waiting for the news of it"}
             return 401, {"error": "wrong key: this machine is not a member, or was left behind when the "
                                   "key changed; join again with a new code"}
         if device in self.mesh.data.get("removed", {}):
@@ -781,8 +791,11 @@ class PeerSync(crewchat.ProjectLink):
             secret = str(body.get("secret") or "")
             if len(secret) < 32:
                 return 400, {"error": "bad key"}
-            self.mesh.rekey(secret, body.get("removed") or {})
-            for gone in body.get("removed") or {}:
+            removed = body.get("removed") if isinstance(body.get("removed"), dict) else {}
+            if not self._remover_confirms(device, secret, removed):
+                return 403, {"error": "the machine that changed the key did not confirm it"}
+            self.mesh.rekey(secret, removed)
+            for gone in removed:
                 self.hub.drop_remote(gone)
             self.mesh.save()
             return 200, {"ok": True}
@@ -792,6 +805,20 @@ class PeerSync(crewchat.ProjectLink):
             self.remove(device)
             return 200, {"ok": True}
         return 404, {"error": "unknown request"}
+
+    def _remover_confirms(self, device, secret, removed):
+        """A key change is real only when the member that sent it removed someone else, and, asked at the
+        address this machine has for it, already takes the new key. Every member holds the shared key, so the
+        key alone cannot tell the remover from a removed machine that missed the news (review, 5 Nov)."""
+        remover = self.mesh.members().get(device)
+        if remover is None or not removed or device in removed or self.device_id in removed:
+            return False
+        try:
+            self._call(remover, "/peer/pull", {"since": 1 << 62, "decided": 1 << 62, "wait": 0},
+                       timeout=CONFIRM_WAIT, key=secret)
+        except PeerError:
+            return False
+        return True
 
     def _join(self, body):
         code = "".join(str(body.get("code") or "").upper().split()).replace("-", "")

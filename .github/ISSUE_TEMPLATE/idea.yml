@@ -1,0 +1,23 @@
+name: An idea
+description: Something crewchat should do, or do differently
+labels: [idea]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What you were trying to do, and what got in the way
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help
+  - type: input
+    id: version
+    attributes:
+      label: crewchat version
+  - type: input
+    id: system
+    attributes:
+      label: System

@@ -1,5 +1,73 @@
 # Changelog
 
+## 1.3.0 (2026-11-06)
+
+- **Update now, from the chat page.** The "A newer crewchat is available" banner has an Update now button: it runs
+  `crewchat update` on that machine (on Windows in a window of its own, as when typed), waits for crewchat to restart
+  and reloads the page on the new version. A copy run from a checkout says to update it there instead.
+- **Close a project's tab, or remove the project.** Each tab has an × (on hover, and always on the open one). **Close
+  tab** only takes it off the bar, in that browser; the + menu opens it again. **Remove project…** asks you to type its
+  name, then takes it off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its
+  chat, tasks and roles can be brought back by moving it out again. The first project can be closed but not removed.
+- **Open on your phone, from the chat page.** The project menu's new **Open on your phone** panel sets up Tailscale
+  Serve for the chat if it has no address yet, then shows a QR code: scan it with the phone's camera and the phone
+  opens the chat, signed in. No `crewchat url` or `crewchat ui --print` in a terminal.
+- **Routines: work the crew does again and again, on a schedule.** "Every weekday at 9, go through my Jira
+  tickets" is set once, in Project settings → Routines or with `crewchat routines add`, and its task is posted
+  each time for anyone, the lead or one agent. A run waits while the last one is not finished; with linked
+  machines, only the coordinating one posts it. The look in Jira can now run less often too
+  (`crewchat tasks jira-watch on --every 15`, or the Jira card).
+- **Tasks from Jira tickets, signed in through your company's SSO.** A task can be a Jira ticket: link it from its
+  panel ("Link Jira ticket") or with `crewchat tasks jira ID PROJ-123`, and the agent that takes it reads the ticket
+  first, with its Jira tools or in your Chrome when its browser is on. Set the project's Jira site in Project settings
+  (Jira) or with `crewchat tasks jira-site HOST`, and crewchat adds Atlassian's own Jira MCP server to the agents'
+  tools in the project's folders (each tool signs in once in the browser; Codex: `codex mcp add atlassian`). **Sign
+  in to Atlassian** and **Post my tickets as tasks** turn tickets newly assigned to you into tasks by themselves
+  (`crewchat tasks jira-login`, `crewchat tasks jira-watch on [--jql QUERY]`). The sign-in is Atlassian's own page,
+  so your SSO applies: there is no API token to paste, and crewchat keeps the sign-in on this machine only.
+- **Your own MCP servers, for every agent.** Add a server once, in Project settings (MCP servers) or with `crewchat
+  mcp add`, as a remote address or a local command, or paste its JSON as its docs give it, and crewchat writes it
+  for Claude Code, Cursor, Gemini CLI, Qwen Code, OpenCode and (if you tick it) Codex, in every connected folder of
+  the project. A server that signs in with OAuth gets only its address, and each tool signs in; a key is kept in the
+  project's private settings and written only into the tools' settings files, which stay out of git. **Test** lists
+  its tools or says what went wrong. Its tools ask before they run unless you tick "Its tools run without asking".
+- **Roles that lead, in a tree.** A role can carry powers (`assign`, `areas`, `notes`, `code`, `advise`), so a
+  "Tech lead" or "Producer" of your own works like the lead, and can report to another role: a frontend lead under
+  the lead, developers under the frontend lead. Updates go to the nearest lead up the tree, and a sub-lead hands out
+  work only in its branch. **⋯ > Roles** shows the tree; `crewchat roles add NAME --powers assign --reports-to lead`
+  and `crewchat roles tree` do the same in a terminal. On linked machines the tree is shared.
+- **Agents on mobile devices: Android and iOS.** Turn mobile devices on for an agent (+ New agent, or its card) and it
+  can use Android emulators and phones and iOS Simulators through `crewchat device-proxy`, which runs Mobile MCP
+  (pinned, usage events off) and checks every call: one agent per device, every app allowed on emulators and
+  simulators, and on a real phone only once you pick it, with Allow and Deny in Needs you for new apps and first
+  changes. Uninstalling an app or clearing its data always asks; cloud devices are refused. The new **Devices** panel
+  shows the devices, who holds each and the app in front, and the allowed apps. A task can need a mobile device.
+- **Agents post their pull requests to Google Chat.** Add a space in Project settings (Google Chat) or with
+  `crewchat gchat add`: by its incoming webhook's address, or, signed in to Google with your own OAuth client (your
+  company's SSO applies), one you are in by its name. Agents get `hub_gchat`, which posts a pull request's title,
+  link and a few lines to a space you added, signed with the agent's name, in one thread per pull request. Each post
+  is said in the chat; agents may post 10 times an hour each. "Ask me before each post" puts each one in Needs you
+  first, and "Post new pull requests by themselves" posts every new GitHub pull request an agent names, once.
+- **Reply keeps clear of a message's tags on a phone.** A task update's pill ("#11 done") could run under the Reply
+  button at the top right of a message; the line of tags now wraps before it.
+- **A removed linked machine stays out.** The old shared key opens nothing once a machine is removed (it was good for
+  10 more minutes), and a new key is taken only from a member that removed someone else, after this machine checks
+  with that member.
+- **The code map reads Python about a quarter faster.**
+- **A crash or power cut cannot leave an empty state.json.** Files crewchat writes in one step now reach the disk
+  before they replace the old one. A `state.json` that cannot be read is kept as `state.json.corrupt-TIME`, and the
+  server log says so, instead of being overwritten by the next save. `state.json` and `events.sqlite` now say which
+  format wrote them, so a later crewchat can tell an old file from a new one.
+- **`crewchat feedback`** opens a GitHub issue form (a bug, an idea, or "it works for me") with your version and
+  system filled in. crewchat sends nothing itself, as before.
+- **The security notes say what agents can do as you.** Agents run as your user, so one with a shell can read
+  crewchat's owner token and post as you; SECURITY.md now says so, and the guide tells agents never to act as the
+  owner unless you told them to. It also corrects the Windows file-permission and page-policy wording.
+- **No token in a committed file.** `crewchat start` no longer writes the folder's token into a `.mcp.json` or
+  `.cursor/mcp.json` the repository has committed (for Claude Code, Cursor and Codex), as it already refused for
+  Gemini CLI, Qwen Code and OpenCode: it leaves that tool unconnected and says how to take the file out of git. It no
+  longer adds its section to a committed `AGENTS.md` either.
+
 ## 1.2.1 (2026-11-04)
 
 - **crewchat is under the GNU AGPL-3.0 again, with its NOTICE.** 1.2.0 went out with the MIT text and without

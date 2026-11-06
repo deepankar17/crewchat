@@ -1215,16 +1215,62 @@ class OfflineAndRemoval(unittest.TestCase):
             eventually(lambda: not b.sees(agent), what="stay to drop go's agent")
             self.assertNotIn(mesh_c.me["id"], peers.Mesh(b.root).members())
             self.assertNotEqual(peers.Mesh(b.root).data["secret"], old_key)
-            # go is refused by device, and its old key stops working after the grace period.
+            # go is refused by device, and its old key opens nothing at all.
             self.assertEqual(status_of(b.url + "/peer/pull", {"wait": 0}, old_key, mesh_c.me["id"]), 403)
             # go notices it was removed and stops syncing; its own chat keeps working.
             eventually(lambda: c.hub.sync is None, what="go to notice it was removed")
             self.assertEqual(c.hub.rows() and [r for r in c.hub.rows() if r["remote"]], [])
-            mesh_b = peers.Mesh(b.root)
-            mesh_b.data["old_until"] = 0
-            self.assertFalse(mesh_b.key_ok(old_key))
+            self.assertFalse(peers.Mesh(b.root).key_ok(old_key))
         finally:
             for m in (a, b, c):
+                m.stop()
+
+    def test_a_removed_machine_cannot_use_the_old_key_to_get_back_in(self):
+        """Multi-role review, 5 Nov: the old key worked for 10 minutes after a removal, and the "removed" check
+        trusted the caller's own device header. So the removed machine could pull as someone else, or send
+        /peer/rekey with a key of its choosing and be a member again."""
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        c = Machine("go").join(a)
+        try:
+            mesh_c = peers.Mesh(c.root)
+            old_key, a_id = mesh_c.data["secret"], peers.Mesh(a.root).me["id"]
+            peers.admin(a.hub, a.root, "peer-remove", {"id": peers.Mesh(a.root).find("go")})
+            new_key = peers.Mesh(b.root).data["secret"]
+            # Pretending to be the machine that stayed: no messages for the old key, and no new key either.
+            self.assertNotEqual(status_of(b.url + "/peer/pull", {"wait": 0}, old_key, a_id), 200)
+            forged = "f" * 43
+            self.assertNotEqual(status_of(b.url + "/peer/rekey", {"secret": forged, "removed": {}}, old_key, a_id), 200)
+            self.assertEqual(peers.Mesh(b.root).data["secret"], new_key)
+            # The old key is not a member's key any more, so it does not even learn which projects exist.
+            self.assertFalse(peers.Mesh(b.root).key_ok(old_key))
+        finally:
+            for m in (a, b, c):
+                m.stop()
+
+    def test_a_rekey_needs_the_remover_to_confirm_it(self):
+        """A machine that missed the news of its removal still has the current key. It must not be able to
+        change that machine's key: a rekey counts only when the machine it names as the remover agrees."""
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        try:
+            key = peers.Mesh(b.root).data["secret"]
+            a_id = peers.Mesh(a.root).me["id"]
+            forged = "f" * 43
+            status = status_of(b.url + "/peer/rekey", {"secret": forged, "removed": {"x" * 16: "Z"}}, key, a_id)
+            self.assertEqual(status, 403)
+            self.assertEqual(peers.Mesh(b.root).data["secret"], key)
+            # A real removal still reaches it.
+            c = Machine("go").join(a)
+            try:
+                eventually(lambda: peers.Mesh(b.root).find("go"), what="stay to hear of go")
+                out = peers.admin(a.hub, a.root, "peer-remove", {"id": peers.Mesh(a.root).find("go")})
+                self.assertEqual(out["told"], ["stay"])
+                self.assertEqual(peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).data["secret"])
+            finally:
+                c.stop()
+        finally:
+            for m in (a, b):
                 m.stop()
 
     def test_leaving(self):

@@ -51,6 +51,7 @@ named, how machines stay in step, and where everything is kept.
 | `hub_process` | Process notes ([Teams](teams.md#process-notes)): `propose` one after working something out the hard way (when to use it, steps, commands, pitfalls, the areas it touches), `update` it (a new version, saying what changed), `list`, `get` or `find` notes; the lead's also `approve`, `decline` and `retire` |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
 | `hub_code` | The lead and the advisor only: who changed a file, for which task and what was said about it (`history`), or a task's files in groups that hang together, to hand out one per agent (`split`). Needs the code map (edit tracking on) |
+| `hub_gchat` | Post a pull request (its address and title, and a few lines) to a Google Chat space the owner added; listed only while one can be reached ([Jira, Google Chat and MCP servers](connections.md#google-chat)) |
 
 The descriptions agents load are short (about 7,600 characters for all of them, `hub_process` under
 600 of it); the lead and the advisor get `hub_code` too (about 660 more), and a session given one of those roles is told its tool
@@ -250,8 +251,9 @@ skills in `.claude/skills/`, the project brief (`.claude/skills/crewchat-brief/`
 `.cursor/rules/crewchat-brief.mdc`) with edit tracking on, the approved process notes
 (`.claude/skills/crewchat-process-NAME/`, `.cursor/rules/crewchat-process-NAME.mdc`), `.crewchat-listen` if you changed how
 long agents wait, and `.crewchat-hooks` if you turned the hooks off. All are kept out of git
-through the repository's local exclude list. A Gemini CLI, Qwen Code or OpenCode settings file the
-repository has committed is left alone: the token would go into a commit.
+through the repository's local exclude list. A settings file the repository has committed (`.mcp.json`,
+`.cursor/mcp.json`, `.gemini/settings.json`, `.qwen/settings.json`, `opencode.json`) is left alone, and that tool
+is not connected there: the token would go into a commit. A committed `AGENTS.md` is left alone too.
 
 ## Status
 
@@ -271,8 +273,11 @@ laptop. What has been tried for real, and what has not yet:
   sessions, the new page, the task sheet and Analytics. Cloud sync against a real Firebase project,
   with several servers on one Mac. Two fixes came from that test: no console windows flashing up on
   Windows, and joining while cloud sync still ran.
+- **Used live across vendors and machines** (6 Nov 2026): Claude Code and Cursor agents on a Mac and a
+  Claude Code agent on a Windows laptop, linked over Tailscale, in one chat: the lead handing out work,
+  agents answering each other with nothing relayed, and both machines' pages showing the same chat.
 - **Not tried by hand yet** (covered by the test suite):
-  - Cursor's hooks and waiting, and Codex CLI, Gemini CLI, Qwen Code and OpenCode in a chat;
+  - Codex CLI, Gemini CLI, Qwen Code and OpenCode in a chat;
   - cloud sync between two physical machines: the coordinator, catch-up and files over it;
   - starting at login on Linux and Windows;
   - agents following role instructions in long sessions.

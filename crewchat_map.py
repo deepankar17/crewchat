@@ -18,6 +18,7 @@ package, a class name defined in more than one file) is stored with certain = 0 
 """
 import ast
 import bisect
+import collections
 import hashlib
 import json
 import os
@@ -146,6 +147,33 @@ def line_of(text, index):
 #   definitions  [(kind, name, line)]        an Angular component's name is "Name|selector"
 #   references   [(kind, target, certain)]   target is a list for _resolve: ["py", module, name], ["jvm", ...]
 # --------------------------------------------------------------------------------------------
+# Nodes that can hold no call and no import, so their insides need not be visited: every concrete class of these.
+def _classes(*bases):
+    out = set()
+    for base in bases:
+        out |= {base} | _classes(*base.__subclasses__())
+    return out
+
+
+_LEAVES = frozenset(_classes(ast.expr_context, ast.Constant, ast.Name, ast.alias, ast.operator, ast.boolop,
+                             ast.unaryop, ast.cmpop))
+
+
+def _walk(tree):
+    """ast.walk, in the same order, without going inside nodes that cannot hold a call or an import: about
+    half the time on this repository, which keeps mapping it under two seconds."""
+    todo = collections.deque([tree])
+    while todo:
+        node = todo.popleft()
+        yield node
+        for field in node._fields:
+            value = getattr(node, field, None)
+            if type(value) is list:
+                todo.extend([v for v in value if isinstance(v, ast.AST) and type(v) not in _LEAVES])
+            elif isinstance(value, ast.AST) and type(value) not in _LEAVES:
+                todo.append(value)
+
+
 def read_python(rel, text):
     """(definitions, references, signatures): signatures is None for a file that does not parse (someone is in
     the middle of an edit), so what it had stays."""
@@ -160,7 +188,7 @@ def read_python(rel, text):
         package = rel.rsplit("/", 1)[0].replace("/", ".") if "/" in rel else ""
     names = {}  # a name this file imported -> (module, name or "") it came from
     calls = []
-    for node in ast.walk(tree):  # once over the tree: imports, and the calls to look at once all imports are known
+    for node in _walk(tree):  # once over the tree: imports, and the calls to look at once all imports are known
         if isinstance(node, ast.Call):
             calls.append(node.func)
         elif isinstance(node, ast.Import):

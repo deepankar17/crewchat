@@ -139,7 +139,12 @@ session to its chat name, and tells it who else is here:
 | Codex CLI | `~/.codex/config.toml`, once for every folder: `crewchat stdio --local-only`, which finds the folder's chat (only this machine's, never one a cloned repository names), and its hooks | `codex [--sandbox workspace-write --ask-for-approval on-request]` with the joining prompt |
 | Gemini CLI | the folder's `.gemini/settings.json` (crewchat's tools trusted, and its hooks) | `gemini [--approval-mode auto_edit \| --yolo] -i …` |
 | Qwen Code | the folder's `.qwen/settings.json` (trusted, and its hooks) | `qwen [--approval-mode auto-edit \| --yolo] -i …` |
-| OpenCode | the folder's `opencode.json` (not a committed one: the token would go into a commit), and its plugin | `opencode --prompt …` |
+| OpenCode | the folder's `opencode.json`, and its plugin | `opencode --prompt …` |
+
+crewchat never adds itself to a settings file the folder's repository has committed (`.mcp.json`,
+`.cursor/mcp.json` and the files above): the token would go into a commit. It leaves that tool
+unconnected and says so; take the file out of git (`git rm --cached FILE`, and add it to
+`.gitignore`), then run `crewchat start` again.
 
 **They get their messages at the end of each turn**, as Claude Code and Cursor do: a message
 arriving while one works starts its next turn. Codex CLI, Gemini CLI and Qwen Code run crewchat's
@@ -297,6 +302,16 @@ the agent's card (Browser: Turn on).
 The first time an agent opens a site, or changes something on one, you are asked in Needs you. See
 [Agents in your browser](teams.md#agents-in-your-browser).
 
+### Agents on mobile devices
+
+An agent can use an Android emulator or phone, or an iOS Simulator, to try the app it built. Turn it on in
+**+ New agent** (Use mobile devices) or on the agent's card (Mobile devices: Turn on). crewchat adds a `mobile` MCP
+server to the folder's settings for every tool there; it runs [Mobile MCP](https://github.com/mobile-next/mobile-mcp)
+with `npx`, so Node.js is needed, and `adb` (Android Studio) for Android or Xcode for iOS.
+
+Start an emulator or a simulator yourself first. Agents use those freely. A real phone is used only after you pick it
+in **Devices** (the project menu). See [Agents on mobile devices](teams.md#agents-on-mobile-devices).
+
 ## 5. Share screenshots and files
 
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use
@@ -395,6 +410,11 @@ project of the folder you run them in; `--chat NAME` picks another (`crewchat sa
 agents and links as they are. Linked over Tailscale, machines share projects by name: start `t2` on
 both and it is one chat, with one task sheet ([Several machines](multiple-machines.md)).
 
+Each tab has an **×** (on hover, and always on the open one). **Close tab** only takes the project off the bar, in
+that browser; the **+** menu opens it again. **Remove project…** asks you to type the project's name, then takes it
+off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its chat, tasks and roles
+come back if you move it out again. The first project can be closed but not removed.
+
 ## The task sheet
 
 Every project has a task sheet: every task in order, with who holds it. Agents work from it by
@@ -431,6 +451,10 @@ crewchat tasks done A12                                # or todo (back on the sh
 
 A message you post as a task also goes on the sheet.
 
+**A task for a Jira ticket.** **Link Jira ticket** in a task's panel (or `crewchat tasks jira A12 PROJ-123`) links it
+to the ticket, and the agent that takes it reads the ticket first. Tickets assigned to you can become tasks by
+themselves: see [Jira tickets](connections.md#jira-tickets).
+
 **A task's files.** `--areas` says which files a task changes, as path prefixes, and two tasks over
 the same files never run at once. With edit tracking on (a software team's default), crewchat also
 maps which file imports which, holds back tasks over code that depends on each other, suggests the
@@ -457,6 +481,34 @@ crewchat tasks reclaim off         # turn it off; with no value, shows the setti
 The setting reaches every linked machine. The machine a task was posted on reclaims it, so while that
 machine is off, its tasks stay with their holders. Run the same crewchat version on every linked
 machine: an older one does not know reclaims and keeps showing the old holder.
+
+### Routines
+
+Work the crew should do again and again, such as going through your Jira tickets every morning, is a
+**routine**: a name, what to do, who does it and when. Each time a routine is due, crewchat posts its
+task: on the sheet for anyone, to the lead, or to one agent, who has it at once. Add one in **Project
+settings → Routines** (it offers a few to start from) or from a terminal:
+
+```bash
+crewchat routines add jira-review "Go through my Jira tickets that are not done and summarize them" \
+  --when "weekdays 09:00" --to lead
+crewchat routines                     # each one, when it runs next, and how its last task is doing
+crewchat routines run jira-review     # post its task now
+crewchat routines pause jira-review   # or resume, set (change it), remove
+crewchat routines templates           # ready-made ones to start from
+```
+
+`--when` is `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekdays 09:00` or days and a time
+(`mon,thu 17:30`), in the local time of the machine that posts it; a routine runs at most every 5 minutes.
+A run waits while the routine's last task is not finished (to do, in progress or blocked), and goes out
+as soon as it is, so a slow agent never gets a pile. A machine that was asleep posts a routine it
+missed once, when it wakes. With linked machines the routines reach all of them, and only the one that
+coordinates posts them, so each run is posted once. Only you can set routines: an agent cannot, so
+nothing it reads can set work going on its own.
+
+An agent sees a routine's task at once when it is waiting for messages, and otherwise at its next
+turn. To have Jira tickets assigned to you posted as tasks without an agent at all, use the look in
+Jira (`crewchat tasks jira-watch on`, every 5 minutes unless you set `--every`).
 
 ## Analytics
 
@@ -492,8 +544,8 @@ your chat, and off again when you leave the view.
 
 Every folder of a project gets crewchat's guide in the form each tool reads by itself: a Claude
 Code skill (`.claude/skills/crewchat/`), a Cursor rule (`.cursor/rules/crewchat.mdc`), and a
-section of the folder's `AGENTS.md` if it has one (for Codex, Gemini and others). They are kept out
-of git and rewritten when something changes. The guide explains the chat and the task sheet, and
+section of the folder's `AGENTS.md` if it has one and git does not track it (for Codex, Gemini and
+others). They are kept out of git and rewritten when something changes. The guide explains the chat and the task sheet, and
 carries two things you set per project:
 
 - **Project rules**: who does what, how to test, what never to do. Edit them in the chat page's
@@ -509,7 +561,10 @@ and a Cursor rule made from the code map ([details](code-map.md#the-code-at-a-gl
 
 ## Upgrade and uninstall
 
-**Upgrade:** `crewchat update` installs the latest release and starts the server again on it.
+**Upgrade:** `crewchat update` installs the latest release and starts the server again on it. On the chat page, the
+"A newer crewchat is available" banner has **Update now**, which does the same on the machine that hosts the page (on
+Windows in a window of its own), waits for crewchat to restart and reloads the page on the new version. A copy run
+from a git checkout says to update it there instead.
 The chat page, the server's log and every command you type in a terminal say when a newer
 crewchat is out: the server asks GitHub for the latest release every 6 hours, sending nothing
 about you or your chat (`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).

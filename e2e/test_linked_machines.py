@@ -137,6 +137,28 @@ class TwoMachines(unittest.TestCase):
             self.dev.call("hub_task", action="assign", to=self.lead.name, title="not the lead")
         self.mac.owner.role(self.lead.name, "none")
 
+    def test_a_role_tree_made_on_one_machine_holds_on_the_other(self):
+        # H4: the mac's owner puts developers under a web lead, a role only the mac has; on Windows the developer's
+        # update goes to the web lead too. (Each change on one machine reaches the other before the owner writes
+        # there: one sender's messages keep their order.)
+        for body in ({"op": "create", "name": "web-lead", "label": "Web lead", "description": "You lead the web work.",
+                      "powers": ["assign"], "reports_to": "lead"},
+                     {"op": "edit", "name": "developer", "reports_to": "web-lead"}):
+            self.assertEqual(self.mac.owner.post("/api/roles", body)[0], 200)
+        self.mac.owner.role(self.lead.name, "web-lead")
+        eventually(lambda: self.win.owner.row(self.lead.name)["role"] == "web-lead", what="the role to travel")
+        self.win.owner.role(self.dev.name, "developer")
+        eventually(lambda: "reports to %s" % self.lead.name in self.dev.call("hub_agents"), what="the tree to travel")
+        tid = self.win.owner.task("all", "make the pricing page")
+        self.dev.call("hub_task", action="take", id=tid)
+        self.dev.call("hub_task", action="update", id=tid, status="in_progress", note="pricing page started")
+        self.win.owner.wait_for("pricing page started", kind="update", to=self.lead.name)
+        self.mac.owner.wait_for("pricing page started", kind="update", to=self.lead.name)
+        self.win.owner.role(self.dev.name, "none")
+        eventually(lambda: self.mac.owner.row(self.dev.name)["role"] == "", what="the role to go")
+        self.mac.owner.role(self.lead.name, "none")
+        eventually(lambda: self.win.owner.row(self.lead.name)["role"] == "", what="the role to go")
+
     def test_one_task_one_taker_across_machines(self):
         extra = [self.mac.agent(), self.win.agent(), self.win.agent()]
         for a in extra:

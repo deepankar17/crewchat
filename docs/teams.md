@@ -20,6 +20,7 @@ sends bugs straight to the developer.
 - [Pictures and colours](#pictures-and-colours)
 - [Role packs](#role-packs)
 - [Your own roles](#your-own-roles)
+- [Powers and a team with sub-leads](#powers-and-a-team-with-sub-leads)
 - [A worked example](#a-worked-example)
 - [Limits](#limits)
 
@@ -485,6 +486,56 @@ Tips for a role's instructions:
 - Say whom it reports to, and with which tool: `hub_task` update on its task, `hub_send` to a person.
 - Name the other roles it works with ("tell the QA agent what changed").
 
+## Powers and a team with sub-leads
+
+A role can carry **powers**: what its agents may do besides their own work.
+
+| Power | What it lets the agent do |
+|---|---|
+| `assign` | Hand out work (`hub_task assign`) |
+| `areas` | Set and accept a task's areas |
+| `notes` | Approve process notes, as the lead does |
+| `code` | Use `hub_code`: who changed a file, and splitting a task |
+| `advise` | Answer `hub_ask` questions and give verdicts before done (only you give a role with it) |
+
+The packs' Lead has `assign`, `areas`, `notes` and `code`; the Advisor has `advise` and `code`; the other roles have
+none. Any role you write can have them, so a "Tech lead" or "Producer" works like the lead.
+
+Roles can also sit in a **tree**: each role says which role it **reports to**. A role that reports to no role works
+under the top lead, the one role with `assign` that reports to no role (a project has one). With
+
+```bash
+crewchat roles add frontend-lead --label "Frontend lead" --prompt "You lead the frontend." \
+    --powers assign,areas --reports-to lead
+crewchat roles add developer --reports-to frontend-lead
+crewchat roles tree
+```
+
+```
+Lead (lead) [assign, areas, notes, code]
+  Frontend lead (frontend-lead) [assign, areas]
+    Developer (developer)
+  QA (qa)
+  Reviewer (reviewer)
+  ...
+```
+
+- A developer's `hub_task update`s go to its nearest lead up the tree: the frontend lead when one is in the chat,
+  else the lead, else you.
+- A sub-lead gives work only to agents in its branch; asked for someone else's, it is told to ask its own lead. The
+  top lead and you give work to anyone.
+- Several agents may hold a sub-lead role; one holds the top lead's.
+- `hub_agents` shows whom each agent reports to, and an agent given a role is told whom it reports to and who
+  works under it.
+- Deleting a role moves the roles under it up to the role it reported to. A loop, a role that is not there, or a
+  second top lead is refused.
+
+On the chat page, **⋯ > Roles** shows the roles as a tree; a role's **Edit** has **Reports to** and **Powers**.
+Exported roles keep both. On linked machines the tree is shared: when you change roles with crewchat running, the
+powers and Reports to of every role go to the other machines, and the newest change wins. A role only one machine
+has still counts on the others (an agent there can report to it). A change made with `crewchat roles` while the
+server is stopped is shared at the next change made with it running.
+
 ## A worked example
 
 Three Claude Code sessions in `~/code/notes-app` on a Mac, and Cursor on a Windows laptop linked
@@ -535,6 +586,10 @@ in them with your logins. crewchat keeps it under your control:
 - The **Browser** panel (project menu) shows who drives, on which site, the bridge token (set or not, never shown),
   the allowed and trusted sites, and what agents opened and what you answered (since the server started).
 
+These checks stop mistakes and pages that try to lead an agent astray. They do not stop an agent that sets out to get
+round them: the bridge token is in a file your user can read, so an agent with shell access could start its own
+Playwright server with it. See [Agents run as you](../SECURITY.md#agents-run-as-you).
+
 Limits: an address other than http or https (a file, a script), or one a browser could read another way than crewchat
 does (a user name, a backslash, a %-escape or a space in its host), is refused. While crewchat is not running, agents
 may read the page they are on, but not open a site or change anything. The bridge is only for agents in the chat:
@@ -544,6 +599,38 @@ browser says so; the agent is told, and its next call there asks you. Claude in 
 Claude Code's calls to it are checked by hooks, from the tab list Chrome gives after each call. Cursor gives a tool call about 60 seconds and
 has no setting for more: a question to you that takes longer ends that call in Cursor (the call is not run later),
 and the agent asks again.
+
+## Agents on mobile devices
+
+With mobile devices on ([how](getting-started.md#agents-on-mobile-devices)), an agent drives Android emulators and
+phones and iOS Simulators through `crewchat device-proxy`, which runs [Mobile MCP](https://github.com/mobile-next/mobile-mcp)
+(pinned, with its usage events switched off) and checks each call before it reaches the device. crewchat keeps it
+under your control as it does the browser:
+
+- **One driver per device.** Another agent's call on a device is refused with who holds it and for which task; it can
+  use another device. A device is let go when its holder's task moves on, from the Devices panel (Let go), or after
+  10 minutes without a call on it.
+- **Emulators and simulators are test devices.** Every app is allowed there and no change asks.
+- **Real phones hold your accounts.** Agents use one only after you pick it in the Devices panel (Let agents use it).
+  There, opening an app that is not allowed, or ending up in one (a link, a share sheet), asks you in Needs you:
+  **Allow the app** or **Deny**. The first tap or typing in an app that is not trusted asks once for that task. An app
+  the agent installs is allowed. The home screen and the system's own screens never ask.
+- **Always asked:** uninstalling an app or clearing its data, on any device, trusted or not.
+- **Cloud devices are refused.** Mobile MCP's remote devices would send your code and data off your machines.
+- **Where the agent is** comes from the device itself (Mobile MCP's foreground app), never from text on the screen.
+- **Tasks.** A task's panel can say it **Needs a mobile device**; then only an agent with mobile devices on takes it.
+  While it holds a device the agent posts short progress notes with a screenshot; after 5 minutes without one,
+  crewchat reminds it.
+- The **Devices** panel (project menu) shows the devices this machine sees (adb's, and booted Simulators on a Mac),
+  which real ones agents may use, who holds each and the app in front, the allowed and trusted apps, and what agents
+  did and what you answered (since the server started).
+- **Readiness.** + New agent checks npx, adb and an online Android device, and on a Mac Xcode's tools and a booted
+  Simulator.
+
+Limits: crewchat does not boot an emulator or a simulator for you. A real iPhone needs Mobile MCP's own set-up on the
+Mac. A `mobile` MCP server of your own is left alone. While crewchat is not running, agents may take screenshots and
+read logs, but not tap or launch anything. A session that was open when you turned mobile devices on sees them after
+Reopen.
 
 ## Limits
 

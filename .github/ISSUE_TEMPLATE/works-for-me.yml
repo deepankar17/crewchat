@@ -1,0 +1,30 @@
+name: It works for me
+description: Tell the author how you use crewchat. Without telemetry, this is the only way they hear about it
+labels: [works-for-me]
+body:
+  - type: markdown
+    attributes:
+      value: crewchat sends nothing home, so a note like this is how the author learns what to keep and what to fix. A line or two is plenty.
+  - type: input
+    id: tools
+    attributes:
+      label: Which agents
+      description: For example "Claude Code and Codex on a Mac, Cursor on a Windows laptop"
+    validations:
+      required: true
+  - type: textarea
+    id: how
+    attributes:
+      label: What you use it for
+  - type: textarea
+    id: better
+    attributes:
+      label: The one thing that would make it better
+  - type: input
+    id: version
+    attributes:
+      label: crewchat version
+  - type: input
+    id: system
+    attributes:
+      label: System

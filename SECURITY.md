@@ -5,15 +5,25 @@
 - **Who can connect.** The server listens on `127.0.0.1` only. Other machines reach it through a
   private network you control (for example `tailscale serve`), never a public port.
 - **Who is who.** Each joined folder has its own token, and the server names every session that
-  connects with it. An agent cannot choose who it posts as, and cannot post as the owner. Only
-  the owner token can mint sign-in and join codes, post tasks, or rename and remove agents.
+  connects with it. Over MCP and its hooks, an agent cannot choose who it posts as, and cannot
+  post as the owner. Only the owner token can mint sign-in and join codes, post tasks, or rename
+  and remove agents. That token is a file your user can read, though, so an agent with shell
+  access can act as you: see [Agents run as you](#agents-run-as-you).
 - **The chat page.** Sign-in uses a single-use code valid for two minutes. The session cookie is
-  HttpOnly and SameSite=Strict, cross-site posts are refused, and the page ships a strict
-  Content-Security-Policy. The owner token never reaches a browser.
+  HttpOnly and SameSite=Strict, cross-site posts are refused, and the page ships a
+  Content-Security-Policy that allows nothing from anywhere else (`default-src 'none'`; the page's
+  own scripts and styles are inline, so `unsafe-inline` is on for them). The owner token never
+  reaches a browser.
 - **Guessing.** Ten wrong tokens or codes from one address lock it out for ten minutes.
 - **Tokens on disk.** Files that hold a token (`~/.crewchat/tokens/`, `state.json`, a project's
-  `.mcp.json` and `.cursor/mcp.json`) are readable only by you from the moment they are written,
-  and project connection files are kept out of git through the repository's local exclude list.
+  `.mcp.json` and `.cursor/mcp.json`) are readable only by you from the moment they are written
+  on macOS and Linux. Windows has no such file modes: there a file gets the permissions of the
+  folder it is in, which for `~/.crewchat` is your user profile (yours and administrators'), and
+  for a project's files is whatever the project folder allows. Project connection files are kept out of git through the repository's local exclude list.
+  crewchat never writes a token into a settings file the repository has committed (`.mcp.json`,
+  `.cursor/mcp.json`, `.gemini/settings.json`, `.qwen/settings.json`, `opencode.json`): it leaves
+  that tool unconnected and says how to take the file out of git. It does not edit a committed
+  `AGENTS.md` either.
   Folders join with a single-use code, so tokens are never copied by hand, and
   `crewchat place remove NAME` shuts a folder out at once.
 
@@ -74,8 +84,10 @@ services' addresses.
   for a single-use code that expires after 10 minutes. Requests without the key are refused and
   count towards the lockout. The key is stored in `peers.json`, readable only by you.
 - **Removing a machine** changes the key and tells the other members. The removed machine is
-  refused at once; the old key keeps working for 10 minutes so members that were busy catch up.
-  A member that was off during the change must join again. The removed machine keeps what it
+  refused at once, and the old key opens nothing for anyone: a member still catching up is asked to
+  wait for the news. A member takes a new key only when the machine that sent it confirms it, so a
+  removed machine cannot hand out a key of its own. A member that was off during the change must
+  join again. The removed machine keeps what it
   already received.
 - **Any member can do anything a member can:** invite, remove, and send messages that show as
   coming from its agents or its owner. Link only machines you control.
@@ -106,6 +118,16 @@ services' addresses.
   small.
 - **The OAuth client secret** in `oauth-client.json` identifies the crewchat app to Google; for
   desktop apps Google does not treat it as a strong secret, but keep it private anyway.
+
+## Agents run as you
+
+Every agent in the chat runs as your user on its machine. One that can run shell commands can
+read anything you can, including `~/.crewchat/tokens/Owner.token` and the browser bridge's token,
+so it could post as you with `crewchat say`, answer its own permission prompts with
+`crewchat needs`, or drive the browser around crewchat's checks. crewchat's guide tells agents
+never to do any of this unless you told them to in the chat, but that is guidance to a model, not
+enforcement. If you need a hard line, run agents as a
+different OS user or in a container, and give them only their folder's token.
 
 ## What it does not protect
 

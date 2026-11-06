@@ -368,6 +368,28 @@ class Team(unittest.TestCase):
         self.dev2.call("hub_task", action="update", id=tid, status="in_progress", note="starting the notes")
         self.owner.wait_for("starting the notes", kind="update", to=self.lead.name)
 
+    def test_a_sub_lead_hands_out_work_in_its_branch_and_hears_back(self):
+        # A tree of roles (roadmap H2): lead > frontend-lead > developer. The developer's reports go to the frontend
+        # lead, and the frontend lead cannot give work outside its branch.
+        for body in ({"op": "create", "name": "frontend-lead", "label": "Frontend lead", "description": "You lead the "
+                      "frontend.", "powers": ["assign"], "reports_to": "lead"},
+                     {"op": "edit", "name": "developer", "reports_to": "frontend-lead"},
+                     {"op": "create", "name": "backend", "description": "You build the API."}):
+            self.assertEqual(self.owner.post("/api/roles", body)[0], 200)
+        self.owner.role(self.dev2.name, "frontend-lead")
+        self.assertIn("You report to the Frontend lead", self.dev.call("hub_role"))
+        backend = self.m.agent()
+        backend.link()
+        self.owner.role(backend.name, "backend")
+        with self.assertRaises(ToolError):
+            self.dev2.call("hub_task", action="assign", to=backend.name, title="not in my branch")
+        out = self.dev2.call("hub_task", action="assign", to=self.dev.name, title="make the form")
+        piece = re.search(r"#(\d+)", out).group(1)
+        self.dev.call("hub_task", action="update", id=piece, status="in_progress", note="building the form")
+        update = self.owner.wait_for("building the form", kind="update")
+        self.assertEqual(update["to"], self.dev2.name)
+        self.assertIn("reports to %s" % self.dev2.name, self.dev.call("hub_agents"))
+
     def test_one_lead_at_a_time_and_roles_can_be_removed(self):
         self.lead.stop_hook()
         self.owner.role(self.dev.name, "lead")
