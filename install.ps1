@@ -1,19 +1,19 @@
 # crewchat installer for Windows (PowerShell 5.1 or later).
 #
-#   powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+#   powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 #
 # Installs uv (Astral's Python installer) if it is missing, then crewchat with cloud sync, in its
 # own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   $env:CREWCHAT_VERSION = "1.3.0"   install this release ("main" for the latest code)
+#   $env:CREWCHAT_VERSION = "1.3.1"   install this release ("main" for the latest code)
 #   $env:CREWCHAT_LEAN = "1"          leave out cloud sync (about 70 MB of libraries)
 #   $env:CREWCHAT_SOURCE = "PATH"     install from a local checkout (for testing this script)
 # Native programs report failure through $LASTEXITCODE, checked after each one. ("Stop" would
 # also turn uv's progress output into errors in Windows PowerShell 5.1.)
 $ErrorActionPreference = "Continue"
 
-$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "1.3.0" }
+$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "1.3.1" }
 $Repo = "https://github.com/deepankar17/crewchat"
 
 # Where to install from, in order: PyPI, the release's package file on GitHub, its source archive
@@ -46,7 +46,7 @@ if (-not $Uv) {
 # files open, and Windows cannot replace open files. Stop them, and start the server again after.
 $Running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
     $_.ProcessId -ne $PID -and $_.CommandLine -and
-    ($_.CommandLine -match '\\uv\\tools\\crewchat\\' -or $_.CommandLine -match 'crewchat(\.exe)?"?\s+(serve|hook)\b')
+    ($_.CommandLine -match '[\\/]uv[\\/]tools[\\/]crewchat[\\/]' -or $_.CommandLine -match 'crewchat(\.exe|\.py)?"?\s+(serve|hook)\b')
 })
 $Restart = $false
 if ($Running.Count -gt 0) {
@@ -69,16 +69,47 @@ if ($LASTEXITCODE -ne 0) { throw "crewchat did not install (uv exit code $LASTEX
 $Bin = (& $Uv tool dir --bin).Trim()
 if (-not $Bin) { $Bin = Join-Path $env:USERPROFILE ".local\bin" }
 $Exe = Join-Path $Bin "crewchat.exe"
-$Installed = & $Exe --version
-if ($LASTEXITCODE -ne 0 -or -not $Installed) { throw "crewchat installed but does not run; try: $Exe --version" }
+# This script runs crewchat by its Python and script, not by uv's crewchat.exe: Smart App Control
+# blocks that program (it is unsigned, and new with each install), while python.org's Python is signed.
+$Tool = Join-Path (& $Uv tool dir).Trim() "crewchat"
+$Python = Join-Path $Tool "Scripts\python.exe"
+$Script = Join-Path $Tool "Lib\site-packages\crewchat.py"
+function Invoke-Crewchat { & $Python $Script @args }
+$Installed = Invoke-Crewchat --version
+if ($LASTEXITCODE -ne 0 -or -not $Installed) {
+    throw "crewchat installed but does not run; try: & '$Python' '$Script' --version. If Windows says an Application Control policy blocked it, see Windows in crewchat's troubleshooting guide."
+}
+# Typing `crewchat` runs that crewchat.exe, though. Where Windows blocks it, a crewchat.cmd that runs
+# Python and the script goes first on the user's PATH instead; updates keep those two paths.
+$Shims = Join-Path $env:USERPROFILE ".crewchat\bin"
+$Blocked = $true
+try { $Blocked = -not (& $Exe --version 2>$null) } catch { }
+if ($Blocked) {
+    New-Item -ItemType Directory -Force -Path $Shims | Out-Null
+    $Line = ('@"{0}" "{1}" %*' -f $Python, $Script) -replace [regex]::Escape($env:USERPROFILE), "%USERPROFILE%"  # stays ASCII
+    Set-Content -Path (Join-Path $Shims "crewchat.cmd") -Value $Line -Encoding Ascii
+    # The registry keeps the user's PATH as it is written (%VAR% entries unexpanded), which
+    # [Environment]::SetEnvironmentVariable would not.
+    $Key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
+    $UserPath = [string]$Key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    if (-not (($UserPath -split ";") -contains $Shims)) {
+        $Key.SetValue("Path", (@($Shims) + @($UserPath -split ";" | Where-Object { $_ })) -join ";",
+                      [Microsoft.Win32.RegistryValueKind]::ExpandString)
+        # Setting a variable tells open programs (Explorer, so new terminals) that the environment changed.
+        [Environment]::SetEnvironmentVariable("CREWCHAT_PATH_CHANGED", "1", "User")
+        [Environment]::SetEnvironmentVariable("CREWCHAT_PATH_CHANGED", $null, "User")
+    }
+    $Key.Close()
+    Write-Host "Windows blocks uv's crewchat.exe (Smart App Control), so the crewchat command is $Shims\crewchat.cmd, which runs crewchat by Python."
+}
 # Hooks in connected folders run crewchat by its path, which a reinstall can move: write them again
 # (an older release has no `hooks refresh`; that is fine).
-& $Exe hooks refresh *> $null
+Invoke-Crewchat hooks refresh *> $null
 if ($Restart) {
     # The new crewchat starts its server again: through its login service, or by setting that up
     # (unless the owner turned it off), or else in the background. A release before 0.9.10 has no
     # `resume`, and is started with `crewchat start`.
-    & $Exe resume *> $null
+    Invoke-Crewchat resume *> $null
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Started the crewchat server again."
     } else {
@@ -112,6 +143,7 @@ if (-not (($env:Path -split ";") -contains $Bin)) {
     $env:Path = "$Bin;$env:Path"
     Write-Host "Open a new terminal if the crewchat command is not found."
 }
+if ($Blocked) { $env:Path = "$Shims;$env:Path" }  # before the blocked crewchat.exe in this terminal too
 Write-Host ""
 Write-Host "Start a chat: open a terminal in your project folder and run"
 Write-Host ""

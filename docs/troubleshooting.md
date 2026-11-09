@@ -23,6 +23,12 @@ release: `crewchat --version` shows yours, `crewchat update` gets the latest.
 
 ## Installing and starting
 
+**The one-line installer fails: `curl: (35) Recv failure: Connection reset`, or PowerShell's `The underlying
+connection was closed`.** Something on that network (a firewall, or the provider) cuts the connection to the
+installer's address. The installers come from crewchat.dev; older guides fetch them from
+`raw.githubusercontent.com`, which some networks block. Use the command in [1. Install](getting-started.md#1-install),
+or, with uv, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"`, which needs only PyPI.
+
 **`crewchat: command not found` after installing.** The command is in `~/.local/bin`, which a new
 terminal finds. Open a new terminal. In zsh, `rehash` also works. If it is still not found, add
 `~/.local/bin` to your PATH.
@@ -53,6 +59,20 @@ crewchat service restart
 
 Open a new PowerShell window after the `winget` line. To check the result:
 `& "$env:APPDATA\uv\tools\crewchat\Scripts\python.exe" -c "import asyncio, google.cloud.firestore; print('ok')"`.
+
+**`Program 'crewchat.exe' failed to run: An Application Control policy has blocked this file`.**
+Smart App Control blocks the `crewchat.exe` that uv makes, which is unsigned and new with each install. Since
+1.3.1 crewchat's hooks don't use it, and the installer adds a `crewchat.cmd` that runs crewchat by Python
+instead, ahead of it on your PATH. Run the installer again to get it:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
+```
+
+Open a new PowerShell window after it, then `crewchat start`. Until then, run crewchat by Python:
+`& "$env:APPDATA\uv\tools\crewchat\Scripts\python.exe" "$env:APPDATA\uv\tools\crewchat\Lib\site-packages\crewchat.py" start`.
+If Windows blocks that `python.exe` too, uv installed its own unsigned Python: move crewchat onto
+python.org's Python as the entry above says.
 
 **Reinstalling fails with `failed to remove directory ... Scripts: Access is denied`.** crewchat is
 still running from that folder, so Windows keeps its files open. Stop it first: `crewchat stop`.

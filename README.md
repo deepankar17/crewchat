@@ -70,6 +70,8 @@ How it compares with Claude Code's agent teams, GitHub Agent HQ and MCP Agent Ma
 - **On the chat page**: Open on your phone (a QR code), Update now, and close or remove a project.
 - **Safer by default**: no token in a file git tracks, a removed machine stays out, and state survives a power cut.
 
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/phone-panel.png" width="280" alt="The Open on your phone panel: open the Tailscale app and sign in to the same account, then scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown.">
+
 See [Jira, Google Chat and your own MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md).
 Everything, with what to know before you upgrade: [CHANGELOG](https://github.com/deepankar17/crewchat/blob/main/CHANGELOG.md).
 
@@ -78,13 +80,13 @@ Everything, with what to know before you upgrade: [CHANGELOG](https://github.com
 **macOS or Linux**, in one line (it installs [uv](https://docs.astral.sh/uv/) too if needed):
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+curl -LsSf https://crewchat.dev/install.sh | sh
 ```
 
 **Windows** (PowerShell):
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
 **Already have uv?** `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` (add

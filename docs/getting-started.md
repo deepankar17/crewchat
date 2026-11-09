@@ -9,10 +9,12 @@ minutes: install, start, open your agents, talk to them, share files, and tune h
 - [4. Talk to them](#4-talk-to-them)
 - [Needs you](#needs-you)
 - [5. Share screenshots and files](#5-share-screenshots-and-files)
+- [6. Open it on your phone](#6-open-it-on-your-phone)
 - [Who is who](#who-is-who)
 - [Listening for messages](#listening-for-messages)
 - [Projects](#projects)
 - [The task sheet](#the-task-sheet)
+- [Jira, Google Chat and your own MCP servers](#jira-google-chat-and-your-own-mcp-servers)
 - [Analytics](#analytics)
 - [What agents learn: rules and skills](#what-agents-learn-rules-and-skills)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
@@ -26,7 +28,7 @@ crewchat, from [PyPI](https://pypi.org/project/crewchat/).
 **macOS or Linux**, in one line:
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+curl -LsSf https://crewchat.dev/install.sh | sh
 ```
 
 or with uv:
@@ -53,7 +55,7 @@ uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 or in one line:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/deepankar17/crewchat/main/install.ps1 | iex"
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
 Windows Defender's automatic detection sometimes takes the one-line installer (a script
@@ -330,6 +332,19 @@ Agents share files too, with `hub_send`; for example QA sending a screenshot of 
 share only files inside their own project folder (anything else they copy in first). From a
 terminal: `crewchat say --file crash.png --file logcat.txt "This happens on start"`.
 
+## 6. Open it on your phone
+
+On the computer, open the project menu (**⋯**, top right) and choose **Open on your phone**. If the chat
+has no address on your tailnet yet, **Set it up** runs Tailscale Serve for it. Then the panel shows a QR
+code: with the Tailscale app on and signed in to the same account, scan it with the phone's camera, and
+the phone opens the chat, signed in. The code works once, for two minutes (**New code** makes another);
+the address and the code are there to type instead.
+
+<img src="images/phone-panel.png" width="320" alt="The Open on your phone panel: open the Tailscale app and sign in to the same account; scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown, with New code and Copy link; then add it to the home screen.">
+
+Add it to the phone's home screen and it opens like an app. More, and how to do it from a terminal:
+[Your phone](phone.md).
+
 ## Who is who
 
 Each agent session gets a first name of its own, one nobody else in the chat has: **Maya**, **Teo**,
@@ -410,6 +425,8 @@ project of the folder you run them in; `--chat NAME` picks another (`crewchat sa
 agents and links as they are. Linked over Tailscale, machines share projects by name: start `t2` on
 both and it is one chat, with one task sheet ([Several machines](multiple-machines.md)).
 
+<img src="images/close-project.png" width="440" alt="Close Website?: Close tab only takes it off the bar; removing takes the project off this machine and keeps its chat, tasks and roles in projects/.removed. The project's name typed in the box, with Cancel and Remove Website.">
+
 Each tab has an **×** (on hover, and always on the open one). **Close tab** only takes the project off the bar, in
 that browser; the **+** menu opens it again. **Remove project…** asks you to type the project's name, then takes it
 off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its chat, tasks and roles
@@ -489,6 +506,8 @@ Work the crew should do again and again, such as going through your Jira tickets
 task: on the sheet for anyone, to the lead, or to one agent, who has it at once. Add one in **Project
 settings → Routines** (it offers a few to start from) or from a terminal:
 
+<img src="images/settings-routines.png" width="300" alt="Project settings, Routines: jira-review, weekdays 09:00, for the lead, next Monday 09:00, Go through my Jira tickets that are not done and summarize them, with Run now, Pause, Edit and Remove; Add a routine below.">
+
 ```bash
 crewchat routines add jira-review "Go through my Jira tickets that are not done and summarize them" \
   --when "weekdays 09:00" --to lead
@@ -509,6 +528,28 @@ nothing it reads can set work going on its own.
 An agent sees a routine's task at once when it is waiting for messages, and otherwise at its next
 turn. To have Jira tickets assigned to you posted as tasks without an agent at all, use the look in
 Jira (`crewchat tasks jira-watch on`, every 5 minutes unless you set `--every`).
+
+## Jira, Google Chat and your own MCP servers
+
+**Project settings** (the project menu, **⋯**) connects a project to the rest of your work, once, for
+every agent in it:
+
+- **Jira:** give the project its Jira site, and a task linked to a ticket is read by its agent first;
+  **Sign in to Atlassian** (your company's SSO, no API token) and tickets assigned to you become tasks.
+- **Google Chat:** add a space, by its webhook or signed in to Google, and agents post the pull
+  requests they open there.
+- **MCP servers:** add your own server once, or paste its JSON, and crewchat writes it for every agent
+  tool in every folder of the project. **Test** lists its tools.
+
+<p>
+<img src="images/settings-jira.png" width="260" alt="Project settings, Jira: the Jira site yourcompany.atlassian.net with Save; Sign in to Atlassian so tickets assigned to you become tasks, and how many minutes apart to look.">
+&nbsp;
+<img src="images/settings-gchat.png" width="260" alt="Project settings, Google Chat: the space Mobile team (default), by its webhook, with Test and Remove; a form to add a space; Ask me before each post; Post new pull requests by themselves; Sign in with Google instead.">
+&nbsp;
+<img src="images/settings-mcp.png" width="260" alt="Project settings, MCP servers: my-server at https://mcp.example.com/mcp, which signs in in the browser, with Test, Edit and Remove; a form for a name, an address or command, keys, and Add server; Paste JSON.">
+</p>
+
+Each, step by step: [Jira, Google Chat and your own MCP servers](connections.md).
 
 ## Analytics
 
@@ -565,6 +606,9 @@ and a Cursor rule made from the code map ([details](code-map.md#the-code-at-a-gl
 "A newer crewchat is available" banner has **Update now**, which does the same on the machine that hosts the page (on
 Windows in a window of its own), waits for crewchat to restart and reloads the page on the new version. A copy run
 from a git checkout says to update it there instead.
+
+<img src="images/update-now.png" width="760" alt="The banner at the top of the chat page: A newer crewchat, 1.3.1, is available. Update now, or run crewchat update on this machine. What's new.">
+
 The chat page, the server's log and every command you type in a terminal say when a newer
 crewchat is out: the server asks GitHub for the latest release every 6 hours, sending nothing
 about you or your chat (`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).

@@ -648,6 +648,17 @@ class NewPage(Signed):
             self.m.cli("tasks", "remove", mid)  # nothing left in Needs you for the tests after
             c.size(1280, 900)
 
+    def test_a_routines_links_read_as_separate_words(self):
+        c = self.chrome
+        self.m.cli("routines", "add", "jira-review", "Go through my Jira tickets", "--when", "weekdays 09:00")
+        try:
+            c.js("openPanel('project')")
+            c.until("$('routines-list').innerText.includes('jira-review')", what="the routine in Project settings")
+            self.assertIn("Run now Pause Edit Remove", c.js("$('routines-list').innerText"))
+            self.assertEqual(c.errors, [])
+        finally:
+            self.m.cli("routines", "remove", "jira-review")
+
     def test_a_blocked_tasks_answer_shows_in_its_history(self):
         c = self.chrome
         mid = self.m.owner.task("all", "Pick the default theme")

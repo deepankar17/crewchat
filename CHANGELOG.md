@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.3.1 (2026-11-09)
+
+- **The installers come from crewchat.dev.** The one-line installs fetch `https://crewchat.dev/install.sh` and
+  `https://crewchat.dev/install.ps1`, the latest release's installers. Some networks reset connections to
+  `raw.githubusercontent.com`, where they came from, so the install failed there before it began.
+- **crewchat runs where Windows blocks `crewchat.exe`.** Smart App Control blocks the `crewchat.exe` that uv makes
+  (it is unsigned, and new with each install), so `crewchat start` failed with "An Application Control policy has
+  blocked this file", and agents' hooks failed the same way. On Windows, hooks, `crewchat update` and the installer
+  now run crewchat by its Python and script. Where the exe is blocked, the installer adds a `crewchat.cmd` that does
+  the same, ahead of it on your PATH. Run the installer again to get it.
+- **A routine's links read as words.** Project settings → Routines showed "Run nowPauseEditRemove"; the links now
+  have spaces between them.
+- **Getting started shows what 1.3.0 added**, with pictures: Open on your phone (the QR code), Update now, closing
+  or removing a project, routines, and the Jira, Google Chat and MCP servers cards in Project settings.
+
 ## 1.3.0 (2026-11-06)
 
 - **Update now, from the chat page.** The "A newer crewchat is available" banner has an Update now button: it runs

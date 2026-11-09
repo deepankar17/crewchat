@@ -61,7 +61,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 OWNER = "Owner"
 SERVER_NAME = "crewchat"
@@ -12218,16 +12218,20 @@ def launcher():
     """An installed crewchat's own command (the uv tool's bin/crewchat), or None for a checkout. It
     stays put when uv rebuilds the tool, perhaps on another Python, unlike this file's path; and if
     crewchat is gone, running it fails in the shell (not with Python's exit 2, which Claude Code's
-    hooks take as "block")."""
+    hooks take as "block"). None on Windows: Smart App Control blocks uv's crewchat.exe, unsigned and new
+    with each install, so hooks run the tool's Python and this script, whose paths stay put there too."""
+    if os.name == "nt":
+        return None
     folder = tool_folder()
-    exe = folder / ("Scripts/crewchat.exe" if os.name == "nt" else "bin/crewchat") if folder else None
+    exe = folder / "bin/crewchat" if folder else None
     return exe if exe and exe.is_file() else None
 
 
 def run_command():
-    """How hooks and the login service run crewchat: its launcher, else Python and this script."""
+    """How hooks and the login service run crewchat: its launcher, else Python (the console one, which a
+    hook's answer is printed by) and this script."""
     exe = launcher()
-    return [exe.as_posix()] if exe else self_command()
+    return [exe.as_posix()] if exe else [console_python().as_posix()] + self_command()[1:]
 
 
 # --------------------------------------------------------------------------------------------
@@ -18063,7 +18067,7 @@ def push_checks(projects):
         time.sleep(PUSH_EVERY)
 
 
-INSTALL_SH = "https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh"
+INSTALL_SH = "https://crewchat.dev/install.sh"
 
 
 def service_file(mac=None):
@@ -18260,31 +18264,36 @@ def update_specs(version):
     return specs
 
 
-def windows_update_script(uv, specs, crewchat_exe, folder, pid):
+def ps_quote(text):
+    """`text` as a PowerShell string literal, which takes nothing from inside it."""
+    return "'%s'" % str(text).replace("'", "''")
+
+
+def windows_update_script(uv, specs, command, folder, pid):
     """The PowerShell that updates crewchat on Windows, in a window of its own: Windows cannot
     replace a program while it runs, so it waits for this crewchat to end and stops the others
-    (the server, hooks waiting for messages), installs with uv, and starts the chat again. It
-    downloads no script."""
-    quote = lambda text: "'%s'" % str(text).replace("'", "''")  # noqa: E731
+    (the server, hooks waiting for messages), installs with uv, and starts the chat again, by
+    `command` (the tool's Python and script). It downloads no script."""
     lines = [
         "$ErrorActionPreference = 'Continue'",
         "Wait-Process -Id %d -ErrorAction SilentlyContinue" % pid,
         "Write-Host 'Stopping crewchat for the update...'",
         "schtasks /End /TN crewchat *> $null",
+        # Hooks name the tool with forward slashes (run_command), and Windows paths ignore case.
         "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.CommandLine -and "
-        "$_.CommandLine.Contains(%s) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force "
-        "-ErrorAction SilentlyContinue }" % quote(folder),
+        "$_.CommandLine.Replace('/', '\\').IndexOf(%s, [StringComparison]::OrdinalIgnoreCase) -ge 0 } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }" % ps_quote(folder),
         "Start-Sleep -Seconds 2",
         "$done = $false",
     ]
-    install = lambda spec: " ".join([quote(uv)] + UV_INSTALL + [quote(spec)])  # noqa: E731
+    install = lambda spec: " ".join([ps_quote(uv)] + UV_INSTALL + [ps_quote(spec)])  # noqa: E731
     for spec in specs[:-1]:  # quietly: PyPI may not have a release minutes old yet
         lines.append("if (-not $done) { & %s *> $null; $done = $LASTEXITCODE -eq 0; if (-not $done) { Write-Host "
                      "'Not on PyPI yet; installing it from its GitHub release.' } }" % install(spec))
     lines.append("if (-not $done) { & %s; $done = $LASTEXITCODE -eq 0 }" % install(specs[-1]))
+    program = " ".join(ps_quote(part) for part in command)
     lines += [
-        "if ($done) { & %s hooks refresh; & %s resume; Write-Host ''; & %s --version }"
-        % (quote(crewchat_exe), quote(crewchat_exe), quote(crewchat_exe)),
+        "if ($done) { & %s hooks refresh; & %s resume; Write-Host ''; & %s --version }" % (program, program, program),
         "else { Write-Host 'The update did not install: see the message above. crewchat is unchanged.' }",
         "Write-Host ''",
         "Read-Host 'Press Enter to close'",
@@ -18303,9 +18312,8 @@ def cmd_update(args):
     uv = find_uv()
     local = os.environ.get("CREWCHAT_SOURCE")  # a checkout being tested: its own installer
     if os.name == "nt" and uv and not local:
-        exe = launcher() or Path(shutil.which("crewchat") or Path(uv).with_name("crewchat.exe"))
-        script = windows_update_script(uv, update_specs(version), exe, tool_folder() or Path(__file__).parent,
-                                       os.getpid())
+        script = windows_update_script(uv, update_specs(version), [str(Path(part)) for part in run_command()],
+                                       tool_folder() or Path(__file__).parent, os.getpid())
         subprocess.Popen(["powershell", "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", script],
                          env=env, creationflags=0x00000010)  # CREATE_NEW_CONSOLE
         print("Updating crewchat in a new window; this crewchat stops while it does.")
@@ -18335,6 +18343,10 @@ def cmd_update(args):
              "wget -qO- %s" % INSTALL_SH if shutil.which("wget") else None)
     if fetch is None:
         die("needs curl or wget")
+    # The site's installer installs the release it was deployed with, which may be older than the
+    # latest; a latest no newer than this copy may be the last check's answer, so the site decides.
+    if version_tuple(version) > version_tuple(__version__):
+        env["CREWCHAT_VERSION"] = version
     if subprocess.run(["sh", "-c", fetch + " | sh"], env=env).returncode != 0:
         die("the update did not install; crewchat %s is still in place." % __version__)
     # install.sh restarts a server that was running.
@@ -18436,6 +18448,18 @@ def ask(question, default=False):
     return default if not answer else answer in ("y", "yes")
 
 
+# Where the Windows installer puts a crewchat command that runs Python, when Windows blocks uv's crewchat.exe.
+WINDOWS_SHIM = Path("~/.crewchat/bin/crewchat.cmd")
+
+
+def windows_uninstall_script(uv, pid):
+    """The PowerShell that removes crewchat on Windows once this process has ended (Windows cannot remove a
+    program while it runs): the uv tool, and the installer's crewchat.cmd if it wrote one."""
+    return ("Wait-Process -Id %d -ErrorAction SilentlyContinue; & %s tool uninstall crewchat; Start-Sleep -Seconds 1; "
+            "Remove-Item -Force -ErrorAction SilentlyContinue %s"
+            % (pid, ps_quote(uv), ps_quote(WINDOWS_SHIM.expanduser())))
+
+
 def cmd_uninstall(args):
     config = load_config() if (home() / "config.json").exists() else {}
     folders = sorted((config.get("folders") or {}).keys())
@@ -18485,10 +18509,8 @@ def cmd_uninstall(args):
         print("Done, except the program itself: run `uv tool uninstall crewchat`.")
         return
     if os.name == "nt":
-        # Windows cannot remove a program while it runs: remove it once this process has ended.
         subprocess.Popen(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
-                          "Wait-Process -Id %d -ErrorAction SilentlyContinue; & '%s' tool uninstall crewchat"
-                          % (os.getpid(), uv)], creationflags=CREATE_NO_WINDOW)
+                          windows_uninstall_script(uv, os.getpid())], creationflags=CREATE_NO_WINDOW)
         print("Done. The crewchat program is removed in a moment, once this window's command ends.")
         return
     out = run([uv, "tool", "uninstall", "crewchat"])
@@ -21310,7 +21332,7 @@ async function loadRoutines(body) {
       const b = el("button", "link", label);
       b.type = "button";
       b.addEventListener("click", () => loadRoutines(Object.assign({ name: x.name }, op)));
-      item.append(b);
+      item.append(" ", b);  // a space between the links, or they read as one word: "Run nowPauseEditRemove"
     };
     act("Run now", { op: "run" });
     act(x.on ? "Pause" : "Resume", { op: "set", on: !x.on });
@@ -21320,7 +21342,7 @@ async function loadRoutines(body) {
       $("routine-name").value = x.name; $("routine-what").value = x.what; $("routine-when").value = x.when;
       $("routine-to").value = x.to === "all" ? "anyone" : x.to; $("routine-form-box").open = true;
     });
-    item.append(edit);
+    item.append(" ", edit);
     act("Remove", { op: "remove" });
     return item;
   }));

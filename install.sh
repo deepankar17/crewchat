@@ -1,19 +1,19 @@
 #!/bin/sh
 # crewchat installer for macOS and Linux.
 #
-#   curl -LsSf https://raw.githubusercontent.com/deepankar17/crewchat/main/install.sh | sh
+#   curl -LsSf https://crewchat.dev/install.sh | sh
 #
 # Installs uv (Astral's Python installer) if it is missing, then crewchat with cloud sync, in its
 # own environment with its own Python. Nothing is installed system-wide and no password is asked.
 # Run it again to upgrade.
 #
 # Settings, as environment variables:
-#   CREWCHAT_VERSION=1.3.0   install this release instead of the one below ("main" for the latest code)
+#   CREWCHAT_VERSION=1.3.1   install this release instead of the one below ("main" for the latest code)
 #   CREWCHAT_LEAN=1          leave out cloud sync (about 70 MB of libraries); the chat works the same
 #   CREWCHAT_SOURCE=PATH     install from a local checkout (for testing this script)
 set -eu
 
-VERSION="${CREWCHAT_VERSION:-1.3.0}"
+VERSION="${CREWCHAT_VERSION:-1.3.1}"
 REPO="https://github.com/deepankar17/crewchat"
 
 say() { printf '%s\n' "$*"; }

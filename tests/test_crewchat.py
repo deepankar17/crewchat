@@ -9795,6 +9795,36 @@ class Lifecycle(Base):
                 crewchat.hook_check("http://127.0.0.1:%d" % port, "token", "key", 1800, 0)  # listening 30 min
         self.assertLess(time.time() - began, 10)  # not the 30 minutes it would have listened
 
+    def test_on_windows_hooks_run_python_not_uvs_launcher_which_smart_app_control_blocks(self):
+        # 6 Nov: "Program 'crewchat.exe' failed to run: An Application Control policy has blocked this file".
+        # uv's crewchat.exe is unsigned and new with each install; the python.org Python is signed.
+        tool = Path(tempfile.mkdtemp(prefix="uv-tool-", dir=TMP)).resolve()
+        (tool / "uv-receipt.toml").write_text("")
+        site = tool / "Lib" / "site-packages"
+        site.mkdir(parents=True)
+        (tool / "Scripts").mkdir()
+        for name in ("crewchat.exe", "python.exe", "pythonw.exe"):
+            (tool / "Scripts" / name).write_text("")
+        with mock.patch.object(crewchat, "__file__", str(site / "crewchat.py")), \
+                mock.patch.object(crewchat.sys, "executable", str(tool / "Scripts" / "pythonw.exe")):
+            with mock.patch.object(crewchat.os, "name", "nt"):
+                self.assertIsNone(crewchat.launcher())
+            with mock.patch.object(crewchat, "launcher", lambda: None):
+                # The console python.exe, also when the windowless server writes them: a hook prints its answer.
+                self.assertEqual(crewchat.run_command(), [(tool / "Scripts" / "python.exe").as_posix(),
+                                                          (site / "crewchat.py").as_posix()])
+
+    def test_the_windows_installer_runs_crewchat_by_python_and_adds_a_command_when_the_exe_is_blocked(self):
+        text = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        # uv's crewchat.exe may be blocked: it is only tried, and the crewchat.cmd goes before it on the PATH.
+        self.assertEqual(re.findall(r"& \$Exe\b.*", text), ["& $Exe --version 2>$null) } catch { }"])
+        self.assertLess(text.index('$env:Path = "$Bin;$env:Path"'), text.index('$env:Path = "$Shims;$env:Path"'))
+        self.assertIn("Lib\\site-packages\\crewchat.py", text)
+        self.assertIn("crewchat.cmd", text)
+        self.assertIn("RegistryValueKind]::ExpandString", text)  # the user's own %VAR% entries stay
+        self.assertTrue(text.isascii())
+
+    @unittest.skipIf(os.name == "nt", "on Windows hooks run Python and the script (Smart App Control)")
     def test_an_installed_crewchat_runs_by_its_own_launcher(self):
         tool = Path(tempfile.mkdtemp(prefix="uv-tool-", dir=TMP)).resolve()
         (tool / "uv-receipt.toml").write_text("")
@@ -9905,6 +9935,70 @@ class Lifecycle(Base):
         # This process's script may be gone (uv rebuilt the tool, perhaps on another Python).
         self.assertEqual(ran[1:], [["/new/bin/crewchat", "hooks", "refresh"], ["/new/bin/crewchat", "restart"]])
 
+    def test_update_without_uv_asks_the_installer_for_the_latest_release(self):
+        ran = []
+
+        def run(command, **kw):
+            ran.append((list(command), kw["env"]))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat, "find_uv", return_value=None), \
+                mock.patch.object(crewchat, "latest_release", return_value="99.0.0"), \
+                mock.patch.object(crewchat, "server_up", return_value=False), \
+                mock.patch.object(crewchat.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CREWCHAT_SOURCE", None)
+            os.environ.pop("CREWCHAT_VERSION", None)
+            crewchat.cmd_update(argparse.Namespace(version=None))
+        (command, env), = ran
+        self.assertIn("curl -LsSf https://crewchat.dev/install.sh", command[-1])
+        # The site's installer names the release it was deployed with, which may be an older one.
+        self.assertEqual(env["CREWCHAT_VERSION"], "99.0.0")
+        # A latest no newer than this copy (GitHub unreachable, the last check's answer) is left to the site.
+        ran.clear()
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True), \
+                mock.patch.object(crewchat, "find_uv", return_value=None), \
+                mock.patch.object(crewchat, "latest_release", return_value=crewchat.__version__), \
+                mock.patch.object(crewchat, "server_up", return_value=False), \
+                mock.patch.object(crewchat.shutil, "which", return_value="/usr/bin/curl"), \
+                mock.patch.object(crewchat.subprocess, "run", side_effect=run), \
+                mock.patch.dict(os.environ, {}), contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("CREWCHAT_SOURCE", None)
+            os.environ.pop("CREWCHAT_VERSION", None)
+            crewchat.cmd_update(argparse.Namespace(version=None))
+        self.assertNotIn("CREWCHAT_VERSION", ran[0][1])
+
+    def test_the_installers_crewchat_cmd_names_the_profile_folder_whatever_its_case(self):
+        # The .cmd is written as ASCII, so the profile folder (which may hold any letter) goes in as
+        # %USERPROFILE%; uv may report it in another case, and -replace ignores case where .Replace does not.
+        text = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if l.strip().startswith("$Line = "))
+        self.assertIn('-replace [regex]::Escape($env:USERPROFILE), "%USERPROFILE%"', line)
+
+    def test_the_installer_stops_hooks_that_run_crewchat_by_python(self):
+        # Hooks on Windows run the tool's Python and script, written with forward slashes (run_command).
+        tool = "C:/Users/x/AppData/Roaming/uv/tools/crewchat"
+        hook = "%s/Scripts/python.exe %s/Lib/site-packages/crewchat.py hook claude stop" % (tool, tool)
+        text = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        line = next(l for l in text.splitlines() if "$_.CommandLine -match" in l)
+        patterns = re.findall(r"-match '([^']*)'", line)
+        self.assertTrue(patterns)
+        # PowerShell's -match ignores case.
+        self.assertTrue(any(re.search(p, hook, re.I) for p in patterns), patterns)
+        self.assertTrue(any(re.search(p, hook.replace("/", "\\").upper(), re.I) for p in patterns), patterns)
+        self.assertFalse(any(re.search(p, "C:/Windows/system32/notepad.exe crewchat-notes.txt", re.I)
+                             for p in patterns), patterns)
+
+    def test_the_windows_uninstall_removes_the_installers_crewchat_command_too(self):
+        script = crewchat.windows_uninstall_script(r"C:\Users\o'neil\.local\bin\uv.exe", 4242)
+        self.assertTrue(script.startswith("Wait-Process -Id 4242 "))
+        self.assertIn("& 'C:\\Users\\o''neil\\.local\\bin\\uv.exe' tool uninstall crewchat", script)
+        shim = str(Path.home() / ".crewchat" / "bin" / "crewchat.cmd").replace("'", "''")
+        self.assertIn("Remove-Item -Force -ErrorAction SilentlyContinue '%s'" % shim, script)
+        self.assertIn(r".crewchat\bin", (ROOT / "install.ps1").read_text(encoding="utf-8"))  # where it goes
+
     def test_uninstall_takes_crewchat_out_of_a_folder_and_leaves_the_rest(self):
         mine = Path(tempfile.mkdtemp(dir=TMP))
         crewchat.install_claude(mine, self.base, self.token)
@@ -9948,13 +10042,22 @@ class Lifecycle(Base):
         self.assertEqual(len(crewchat.update_specs("")), 1)
 
     def test_the_windows_update_waits_installs_with_uv_and_resumes_without_running_a_download(self):
+        tool = r"C:\Users\o'neil\AppData\Roaming\uv\tools\crewchat"
         script = crewchat.windows_update_script(r"C:\Users\o'neil\.local\bin\uv.exe",
                                                 crewchat.update_specs("1.2.3"),
-                                                r"C:\Users\o'neil\.local\bin\crewchat.exe",
-                                                r"C:\Users\o'neil\AppData\Roaming\uv\tools\crewchat", 4242)
+                                                [tool + r"\Scripts\python.exe", tool + r"\Lib\site-packages\crewchat.py"],
+                                                tool, 4242)
+        # The new crewchat runs by Python and the script: Smart App Control blocks uv's crewchat.exe (6 Nov).
+        self.assertNotIn("crewchat.exe", script)
+        self.assertIn("& '%s\\Scripts\\python.exe' '%s\\Lib\\site-packages\\crewchat.py' hooks refresh"
+                      % ((tool.replace("'", "''"),) * 2), script)
         lines = script.splitlines()
         self.assertEqual(lines[1], "Wait-Process -Id 4242 -ErrorAction SilentlyContinue")
         self.assertIn("'C:\\Users\\o''neil\\AppData\\Roaming\\uv\\tools\\crewchat'", script)  # quoted
+        # Hooks' command lines name the tool with forward slashes, and Windows paths ignore case.
+        stop = next(l for l in script.splitlines() if "Stop-Process" in l)
+        self.assertIn(".Replace('/', '\\').IndexOf(", stop)
+        self.assertIn("[StringComparison]::OrdinalIgnoreCase) -ge 0", stop)
         installs = [l for l in lines if "tool install" in l]
         self.assertEqual(len(installs), 2)
         self.assertIn("==1.2.3'", installs[0])

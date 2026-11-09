@@ -28,6 +28,8 @@ On the computer, open the project menu (**⋯**) and choose **Open on your phone
   it with the phone's camera: the phone opens the chat, signed in. The code in it works once, for two
   minutes; **New code** makes another. The panel also shows the address and the code, to type instead.
 
+<img src="images/phone-panel.png" width="320" alt="The Open on your phone panel: open the Tailscale app and sign in to the same account; scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown, with New code and Copy link; then add it to the home screen.">
+
 ## Or in a terminal
 
 1. **On the computer:** make the chat reachable on your tailnet. If you linked machines over

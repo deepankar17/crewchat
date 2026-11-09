@@ -37,6 +37,8 @@ so add it there yourself: `codex mcp add atlassian --url https://mcp.atlassian.c
 
 ### Tickets assigned to you become tasks
 
+<img src="images/settings-jira.png" width="300" alt="Project settings, Jira: the Jira site yourcompany.atlassian.net with Save; Sign in to Atlassian so tickets assigned to you become tasks, and how many minutes apart to look.">
+
 In Project settings, the **Jira** card: **Sign in to Atlassian**, then **Post my tickets as tasks**. Every 5 minutes
 (**Look every**, or `--every`) this machine asks Jira for open tickets assigned to you, and posts each new one as a
 task linked to its ticket. Tickets already assigned to you when you turn it on are not posted; a task you take off
@@ -88,6 +90,8 @@ crewchat gchat test                  # post a test message
 crewchat gchat remove "Mobile team"
 ```
 
+<img src="images/settings-gchat.png" width="300" alt="Project settings, Google Chat: the space Mobile team (default), by its webhook, with Test and Remove; a form to add a space; Ask me before each post; Post new pull requests by themselves; Sign in with Google instead.">
+
 ### What agents can post
 
 Agents get a tool, `hub_gchat`, while the project has a space they can reach. They are told to post a pull request
@@ -110,7 +114,11 @@ project, as it does for its own. An agent already running gets a new server when
 
 In Project settings, the **MCP servers** card: a name, the server's address (or the command that runs it), and a key
 if it needs one; or **Paste JSON** with the server block from its docs. **Test** connects and lists its tools, or says
-what went wrong. In a terminal:
+what went wrong.
+
+<img src="images/settings-mcp.png" width="300" alt="Project settings, MCP servers: my-server at https://mcp.example.com/mcp, which signs in in the browser, with Test, Edit and Remove; a form for a name, an address or command, keys, and Add server; Paste JSON.">
+
+In a terminal:
 
 ```bash
 crewchat mcp add my-server --url https://mcp.example.com/mcp --oauth
