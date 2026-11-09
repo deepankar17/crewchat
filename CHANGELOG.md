@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Removing a project works on Windows.** It failed with "Access is denied": the project's databases were still
+  open, and Windows cannot move a folder with an open file in it. They are closed first, and a move that a virus
+  scanner holds up for a moment is tried again.
+- **The Windows installer says to open a new terminal** when Windows blocks `crewchat.exe`: a terminal opened before
+  the install still finds the blocked program, so `crewchat start` failed there with "blocked by your organization's
+  Device Guard policy". It also names the command that works in that terminal.
+
 ## 1.3.1 (2026-11-09)
 
 - **The installers come from crewchat.dev.** The one-line installs fetch `https://crewchat.dev/install.sh` and

@@ -2079,7 +2079,12 @@ class Projects:
             place, number = bin_ / ("%s-%s-%d" % (project.root.name, time.strftime("%Y%m%d-%H%M%S"), number)), number + 1
         with project.hub.lock:  # nothing is written into it while it moves
             bin_.mkdir(parents=True, exist_ok=True)
-            os.replace(str(project.root), str(place))
+            try:
+                project.hub.close_stores()  # Windows cannot move a folder with a file in it open ("Access is denied")
+                retry_on_windows(lambda: os.replace(str(project.root), str(place)))  # a virus scanner, for a moment
+            except Exception:
+                project.hub.open_stores()  # it stays here
+                raise
         self.refresh()
         return place
 
@@ -4204,6 +4209,7 @@ class Hub(GoogleChat):
         self.chat_index = History(roster.root / HISTORY_FILE, roster.root / "messages.jsonl")  # derived, for C5
         self._recorded = {}  # agent -> the state its timeline last recorded (memory only)
         self._maps = None  # the code maps of the project's folders (C1), made when first wanted
+        self.retired = False  # its stores closed (close_stores): the project is leaving this machine
         self._map_edited = set()  # the files agents edited since the maps were last brought up to date
         self._briefed = None  # what the briefs were last made from (write_briefs)
         self._editors = {}  # a path in the project -> the agent that edited it last (memory only)
@@ -4389,6 +4395,22 @@ class Hub(GoogleChat):
             timer = threading.Timer(SAVE_DELAY, self.flush)
             timer.daemon = True
             timer.start()
+
+    def close_stores(self):
+        """Close the project's SQLite files (the events, the chat index, the code maps): Windows cannot move a folder
+        with a file in it open. The two stores open again if wanted (in a folder that has moved, they cannot); the
+        code maps are not made again, as a new one would make a maps/ folder where the project was. open_stores
+        undoes it."""
+        self.retired = True
+        self.events.close()
+        self.chat_index.close()
+        maps, self._maps = self._maps, None
+        if maps is not None:
+            maps.close()
+
+    def open_stores(self):
+        """The project stays after all (its folder could not move): its code maps are made again when wanted."""
+        self.retired = False
 
     def flush(self):
         """Write what _save_soon let wait (its timer, and the server stopping), and the events the store's writer
@@ -6300,7 +6322,7 @@ class Hub(GoogleChat):
     def code_maps(self):
         """The code maps of the project's folders (crewchat_map.py), or None: kept only while edit tracking is on,
         and only when crewchat_map.py is next to crewchat.py (a crewchat.py copied alone works without)."""
-        if not self.edits_on():
+        if self.retired or not self.edits_on():
             return None
         if self._maps is None:
             try:

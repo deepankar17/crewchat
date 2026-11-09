@@ -4239,6 +4239,65 @@ class Roles(Base):
         again = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": "Old idea"})
         self.assertEqual(again["id"], made["id"])  # the name is free again
 
+    def test_removing_a_project_closes_its_databases_before_the_folder_moves(self):
+        # Windows cannot move a folder with a file in it open ("Access is denied"), and a virus scanner may hold
+        # one for a moment: the project's SQLite stores are closed first, and the move is tried again.
+        made = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": "Locked"})
+        project = self.server.RequestHandlerClass.projects.get(made["id"])
+        hub = project.hub
+        hub.events._conn()
+        hub.chat_index._conn()
+        maps = hub._maps = mock.Mock()
+        seen, real = [], os.replace
+
+        def replace(src, dst):
+            if src != str(project.root):  # a config file saved meanwhile
+                return real(src, dst)
+            seen.append((hub.events.db, hub.chat_index.db, hub._maps))
+            if len(seen) < 3:
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.sys, "platform", "win32"), \
+                mock.patch.object(crewchat.time, "sleep"):
+            gone = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "remove", "id": made["id"],
+                                                                                "name": "Locked"})
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(seen[0], (None, None, None))
+        maps.close.assert_called_once_with()
+        self.assertTrue(Path(gone["kept"]).is_dir())
+        # A late reader (the map thread) makes no code map, and so no maps/ folder where the project was.
+        with mock.patch.object(hub, "edits_on", lambda: True):
+            self.assertIsNone(hub.code_maps())
+        self.assertFalse(project.root.exists())
+
+    def test_closed_code_maps_make_no_map_again(self):
+        import crewchat_map
+        root = Path(tempfile.mkdtemp(prefix="gone-", dir=TMP))
+        maps = crewchat_map.Maps(root / "project")
+        maps.close()  # its project is being removed; a map thread still holds it
+        self.assertIn("could not map", maps.check([root])[str(root)])
+        self.assertFalse((root / "project").exists())
+
+    def test_a_project_whose_folder_cannot_move_stays_and_works(self):
+        made = crewchat.post_json(self.base + "/api/projects", self.owner, {"op": "create", "name": "Stuck"})
+        project = self.server.RequestHandlerClass.projects.get(made["id"])
+        real = os.replace
+
+        def replace(src, dst):
+            if src == str(project.root):
+                raise PermissionError(13, "Access is denied")
+            return real(src, dst)
+
+        with mock.patch.object(crewchat.os, "replace", replace), mock.patch.object(crewchat.sys, "platform", "win32"), \
+                mock.patch.object(crewchat.time, "sleep"):
+            answer = self.op_at("/api/projects", op="remove", id=made["id"], name="Stuck")
+        self.assertIn("Stuck was not removed (Access is denied)", answer["error"])
+        self.assertIs(self.server.RequestHandlerClass.projects.get(made["id"]), project)
+        self.assertFalse(project.hub.retired)
+        project.hub.chat_index._conn()  # its stores open again
+        project.hub.events._conn()
+
     def op_at(self, path, token=None, **body):
         try:
             return crewchat.post_json(self.base + path, token or self.owner, body)
@@ -9822,6 +9881,9 @@ class Lifecycle(Base):
         self.assertIn("Lib\\site-packages\\crewchat.py", text)
         self.assertIn("crewchat.cmd", text)
         self.assertIn("RegistryValueKind]::ExpandString", text)  # the user's own %VAR% entries stay
+        # A terminal opened before the install keeps the old PATH, where crewchat is the blocked exe: the last words
+        # say so, and name the command that works there.
+        self.assertRegex(text, r'if \(\$Blocked\) \{[^}]*opened before[^}]*\$Shims\\crewchat\.cmd start')
         self.assertTrue(text.isascii())
 
     @unittest.skipIf(os.name == "nt", "on Windows hooks run Python and the script (Smart App Control)")

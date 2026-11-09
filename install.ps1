@@ -149,4 +149,10 @@ Write-Host "Start a chat: open a terminal in your project folder and run"
 Write-Host ""
 Write-Host "  crewchat start"
 Write-Host ""
+if ($Blocked) {
+    # The new PATH reaches only terminals opened after this: the others still find the blocked crewchat.exe.
+    Write-Host "Use a new terminal window (close every tab of Windows Terminal): one opened before this install still"
+    Write-Host "finds the blocked crewchat.exe. Or, in that one, run: $Shims\crewchat.cmd start"
+    Write-Host ""
+}
 Write-Host 'Later: `crewchat update` upgrades it, `crewchat uninstall` removes it.' 

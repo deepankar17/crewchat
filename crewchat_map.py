@@ -1256,9 +1256,12 @@ class Maps:
         # the folder is in its repository: "" or "app/")
         self.tops = {}  # folder -> (its map, where the folder is in its repository), for linked()
         self.lock = threading.Lock()
+        self.closed = False  # its project is leaving: no map is made again (a new one would make maps/ again)
 
     def for_folder(self, folder):
         """(the folder's map, its commit)."""
+        if self.closed:
+            raise OSError("the code maps of a removed project")
         repo, branch, commit, top = repo_of(folder)
         key = map_key(repo, branch)
         with self.lock:
@@ -1355,6 +1358,7 @@ class Maps:
 
     def close(self):
         with self.lock:
+            self.closed = True
             for cmap in self.maps.values():
                 cmap.close()
             self.maps = {}
