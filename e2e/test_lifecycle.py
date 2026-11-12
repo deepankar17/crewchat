@@ -48,7 +48,9 @@ class StopRestart(unittest.TestCase):
             self.assertFalse(m.up())
             self.assertFalse(m.server_pids())
             self.assertIn("was not running", m.cli("stop"))
-            self.assertIn("is running at %s" % m.url, m.cli("restart"))
+            out = m.cli("restart")  # it says the server was not running, and where it started it
+            self.assertIn("was not running; started crewchat", out)
+            self.assertIn("at %s" % m.url, out)
             self.assertTrue(m.up())
             self.assertNotEqual(m.server_pids(), pid)
             # The agent's session carries on under its name.
@@ -56,7 +58,7 @@ class StopRestart(unittest.TestCase):
             a.stop_hook()
             m.owner.send(a.name, "back after a stop")
             self.assertIn("back after a stop", a.stop_hook())
-            self.assertIn("is running at", m.cli("restart"))  # restart while running
+            self.assertIn("Restarted crewchat", m.cli("restart"))  # restart while running
             self.assertTrue(m.up())
         finally:
             m.stop()

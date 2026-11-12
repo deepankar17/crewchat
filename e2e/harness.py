@@ -20,6 +20,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -120,6 +121,9 @@ class Machine:
         folder = Path(folder or self.folder)
         out = self.cli("start", "--no-service", "--no-open", "--port", self.port, "--place", place or self.name,
                        "--project", self.project_name, "--client", client, cwd=folder)
+        # The tests' sessions link with their hooks' keys, as any session may, in every project made here (a crewchat
+        # from before --join, as the upgrade test runs, lets any session join anyway).
+        self.cli("setup", "--join", "anyone", check=False)
         if self.agent_names:
             self.cli("setup", "--agent-names", self.agent_names)
         self.wait_up()
@@ -268,19 +272,23 @@ class Agent:
             if event == "browser":  # the before-hook on browser calls (B1), beside other PreToolUse hooks
                 return next(h["hooks"][0]["command"] for h in settings["hooks"]["PreToolUse"]
                             if "browser" in h.get("matcher", ""))
+            if event == "question":  # the before-hook on Claude Code's AskUserQuestion
+                return next(h["hooks"][0]["command"] for h in settings["hooks"]["PreToolUse"]
+                            if "AskUserQuestion" in h.get("matcher", ""))
             key = {"prompt": "UserPromptSubmit", "stop": "Stop", "permission": "PermissionRequest"}[event]
             return settings["hooks"][key][0]["hooks"][0]["command"]
         hooks = json.loads((self.folder / ".cursor" / "hooks.json").read_text())
-        return hooks["hooks"]["stop"][0]["command"]
+        event = {"write": "beforeShellExecution", "tool": "afterShellExecution"}.get(event, event)  # Cursor's names
+        return next(h["command"] for h in hooks["hooks"][event] if "crewchat" in h["command"])
 
-    def hook(self, event, listen=0, extra=None, timeout=120):
-        """Run this session's hook as the client would. Returns its stdout."""
+    def hook(self, event, listen=0, extra=None, timeout=120, env=None):
+        """Run this session's hook as the client would (with `env`'s variables too). Returns its stdout."""
         payload = {"session_id": self.session, "hook_event_name": event}
         if self.client == "cursor":
             payload = {"conversation_id": self.session, "status": "completed", "loop_count": 0,
                        "workspace_roots": [str(self.folder)]}
         payload.update(extra or {})
-        env = dict(self.machine.env)
+        env = dict(self.machine.env, **(env or {}))
         if listen is not None:  # None: the project's own setting (crewchat listen)
             env["CREWCHAT_LISTEN"] = str(listen)
         if self.client == "claude":
@@ -318,6 +326,39 @@ class Agent:
 
 class ToolError(AssertionError):
     pass
+
+
+class Inbox:
+    """A Claude Code session's inbox, as Claude Code makes it (W2): a socket only this user can use, and its record in
+    the settings folder's sessions/. `env` is what Claude Code gives the session's hooks; `taken` what the socket took."""
+
+    def __init__(self, session):
+        self.dir = Path(tempfile.mkdtemp(prefix="cc", dir="/tmp"))  # short: a socket's path has a length limit
+        path = str(self.dir / "1.sock")
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(path)
+        os.chmod(path, 0o600)
+        self.server.listen(8)
+        self.taken = []
+        threading.Thread(target=self._serve, daemon=True).start()
+        config = self.dir / "config"
+        (config / "sessions").mkdir(parents=True)
+        (config / "sessions" / "4242.json").write_text(json.dumps(
+            {"pid": 4242, "sessionId": session, "messagingSocketPath": path}))
+        self.env = {"CLAUDE_CODE_MESSAGING_SOCKET": path, "CLAUDE_CONFIG_DIR": str(config)}
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.server.accept()
+            except OSError:
+                return
+            with conn:
+                self.taken.extend(json.loads(line) for line in conn.makefile().read().splitlines() if line)
+
+    def close(self):
+        self.server.close()
+        shutil.rmtree(str(self.dir), ignore_errors=True)
 
 
 class Owner:

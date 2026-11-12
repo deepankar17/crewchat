@@ -124,6 +124,29 @@ class OneMachine(unittest.TestCase):
         self.assertEqual(a.stop_hook(), "")  # handled: not shown again
         self.assertEqual(a.hook("prompt"), "")
 
+    def test_an_agents_question_is_answered_from_needs_you(self):
+        # Claude Code's AskUserQuestion: its before-hook (as `crewchat start` wrote it) waits on the owner's answer in
+        # Needs you, and hands it back with the call, so the agent never asks in its terminal.
+        a = self.linked()
+        questions = [{"question": "Which store?", "header": "Store", "multiSelect": False,
+                      "options": [{"label": "SQLite", "description": ""}, {"label": "Room", "description": ""}]}]
+        out = {}
+        t = threading.Thread(target=lambda: out.update(text=a.hook("question", extra={
+            "tool_name": "AskUserQuestion", "tool_input": {"questions": questions}}, timeout=300)))
+        t.start()
+
+        def waiting():
+            status, body, _ = H.request(self.m.url + "/api/poll?after=-1&v=-1&wait=0", opener=self.m.owner.opener)
+            return next((n for n in json.loads(body).get("needs", []) if n["kind"] == "question"), None)
+        item = eventually(waiting, what="the question in Needs you")
+        self.assertEqual((item["agent"], item["questions"]), (a.name, questions))
+        status, body, _ = self.m.owner.post("/api/needs", {"key": item["key"], "answer": "answer",
+                                                           "answers": {"Which store?": "Room"}})
+        self.assertEqual(status, 200, body)
+        t.join(60)
+        said = json.loads(out["text"])["hookSpecificOutput"]
+        self.assertEqual((said["permissionDecision"], said["updatedInput"]["answers"]), ("allow", {"Which store?": "Room"}))
+
     def test_cursor_gets_messages_as_a_followup(self):
         c = self.linked("cursor")
         c.stop_hook()

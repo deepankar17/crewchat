@@ -2,8 +2,10 @@
 
 Every `crewchat` command. `crewchat COMMAND --help` shows the same options.
 
-The chat page has them too: its **Commands** tab lists every command, with **Copy** to paste one
-into a terminal on the host. Commands that only show something (`status`, `tasks`, `peers status`,
+You rarely need one: everything here can be done on the chat page, and after `crewchat start`
+nothing needs a terminal ([Getting started](getting-started.md#the-page)). The page has the commands
+too: **Settings › Advanced** lists every one, with **Copy** to paste it into a terminal on the host,
+and ⌘K finds them by name. Commands that only show something (`status`, `tasks`, `peers status`,
 `cloud devices` and the like), and a few that hand out a code (`invite`, `peers invite`,
 `ui --print`, and `cloud approve` with the new machine's fingerprint), also have **Run**: the host runs it and the page shows what it
 printed. The page asks before running one that changes something. Commands that remove, unlink,
@@ -64,8 +66,8 @@ only what you submit on that page reaches GitHub. `--print` shows the link inste
 | `crewchat service status` | Is it installed and running |
 | `crewchat service restart` | Restart it, for example after an upgrade |
 | `crewchat service uninstall` | Stop starting at login |
-| `crewchat stop` | Stop the server now (it starts again with `crewchat restart`, or at the next login if installed) |
-| `crewchat restart` | Start the server again, or restart a running one |
+| `crewchat stop [--keep-agents]` | Stop the server now, and close this machine's agents (`--keep-agents` leaves them running). It starts again with `crewchat restart`, or at the next login if installed |
+| `crewchat restart [--project NAME] [--port N] [--no-service]` | Start the server again, or restart a running one. It says which it did. Takes `start`'s server options: `--project` and `--port` set up a machine not set up yet, a new `--port` moves the server, `--no-service` runs it until you log out |
 | `crewchat resume` | After an upgrade (the installers run it): start the server again, and set it to start at login unless you turned that off |
 | `crewchat update [--version X]` | Install the latest release (or X) and restart the server on it |
 | `crewchat uninstall [--yes] [--purge]` | Remove crewchat: server, login start, its hooks in your folders, the program. Asks before deleting your chats (`--purge`: delete them) |
@@ -229,7 +231,8 @@ first time.
 | `--max-chain N` | Turns in a row an agent may take on other agents' messages before only you can wake it (default 10, at most 50) |
 | `--agent-names people\|place` | How new agents are named: a first name (default), or their tool and folder |
 | `--activity on\|off` | Whether the page shows what each agent is doing (default on) |
-| `--permissions page\|terminal` | Where a Claude Code agent's permission prompts are answered: in **Needs you** first, with Allow and Deny, then in its terminal if nobody answers in 10 minutes (page, the default), or only in its terminal |
+| `--permissions page\|terminal` | Where a Claude Code agent's permission prompts are answered: in **Needs you** first, with Allow once, Always allow and Deny, then in its terminal if nobody answers in 10 minutes (page, the default), or only in its terminal |
+| `--join own\|anyone` | Who joins this project: only agents started from crewchat (own, the default for a new project), or any session opened in a connected folder (anyone). On the page: **Project settings › Safety › Who can join** |
 
 Other settings in `~/.crewchat/config.json`:
 

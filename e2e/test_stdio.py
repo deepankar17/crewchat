@@ -1,6 +1,7 @@
 """`crewchat stdio`: a client that only starts local servers (Claude Desktop, Glama's build) talks
 MCP over stdin and stdout, relayed to the chat's server."""
 import json
+import os
 import queue
 import subprocess
 import threading
@@ -45,10 +46,22 @@ class Relay:
                     return msg
                 kept.append(msg)
         except queue.Empty:
-            raise AssertionError("no answer from crewchat stdio")
+            raise AssertionError("no answer from crewchat stdio (%s)" % self.why())
         finally:
             for msg in kept:
                 self.lines.put(msg)
+
+    def why(self):
+        """What the relay says for itself when it does not answer: that it exited, and what it wrote to stderr."""
+        code = self.proc.poll()
+        if code is None:
+            return "still running"
+        try:
+            os.set_blocking(self.proc.stderr.fileno(), False)
+            said = (self.proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+        except (OSError, ValueError):
+            said = ""
+        return "exited %s: %s" % (code, said[-500:])
 
     def call(self, tool, **arguments):
         msg = self.answer(self.request("tools/call", {"name": tool, "arguments": arguments}))
@@ -139,6 +152,18 @@ class Stdio(unittest.TestCase):
         try:
             msg = relay.answer(relay.request("initialize", {}))
             self.assertIn("wrong token", msg["error"]["message"])
+        finally:
+            relay.stop()
+
+    def test_a_relay_that_exits_says_why_when_it_does_not_answer(self):
+        # A token that starts with "-" reads as an option: the relay exits at once, and a test that waits for its
+        # answer should be told that, not only that nothing came.
+        relay = Relay(self.m, "--url", self.m.url, "--token", "-oops", cwd=H.TMP)
+        try:
+            with self.assertRaises(AssertionError) as e:
+                relay.answer(relay.request("initialize", {}), timeout=10)
+            self.assertIn("exited 2", str(e.exception))
+            self.assertIn("expected one argument", str(e.exception))
         finally:
             relay.stop()
 

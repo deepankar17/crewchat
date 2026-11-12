@@ -104,9 +104,28 @@ crewchat cloud approve NEW-MACHINE-NAME
 Copy the two files between machines privately (for example over AirDrop, Tailscale or a USB
 stick), and delete the copies once `crewchat cloud setup` has read them.
 
+### 8. The phone page
+
+Optional: the page your phone opens from anywhere ([your phone](phone.md#from-anywhere-with-cloud-sync)).
+
+1. In the Firebase console, open **Build → Hosting** and click **Get started**. Skip the steps that install the
+   Firebase command line: crewchat deploys the page itself.
+2. On a computer with cloud sync, open **Settings › Machines & devices**: the **Phone from anywhere** card, **Publish the page**. Google asks you
+   to let crewchat manage your project's Hosting. If it says the app is not verified, it is your own client from step
+   6: choose **Advanced**, then go on. crewchat asks each time and keeps no permission afterwards.
+3. The page is at `https://your-project-id.firebaseapp.com/`. Its Google sign-in works there with no more setup.
+
+After a crewchat update, the card says when there is a newer page: **Publish the new page**.
+
 ## With an agent
 
-Paste this into Claude Code or Claude Desktop with the Claude in Chrome extension connected, or
+**From the chat page:** Settings › Machines & devices → Link with cloud sync → pick where your database lives →
+**Set it up with an agent**. crewchat starts a Claude Code agent with the browser on (Claude in
+Chrome), with the steps below as its task. It may open Google's two consoles, and asks you in
+Needs you before it changes anything in each. When it is done, press **Sign in with Google** in
+the same panel.
+
+**Or by hand:** paste this into Claude Code or Claude Desktop with the Claude in Chrome extension connected, or
 any agent that can drive your browser. You stay signed in to Google in that browser; the agent
 never needs your password.
 
@@ -128,14 +147,17 @@ Use my browser, where I am already signed in to Google.
 5. Project settings → Your apps → add a Web app named "crewchat", without Hosting. From the
    firebaseConfig it shows, write {"projectId": ..., "apiKey": ...} to
    ~/.crewchat/firebase-web.json.
-6. Google Cloud console (https://console.cloud.google.com), same project: create an OAuth client
+6. Hosting, for the phone page: Build → Hosting → Get started. Skip the steps that install the
+   Firebase command line and deploy: crewchat deploys the page itself.
+7. Google Cloud console (https://console.cloud.google.com), same project: create an OAuth client
    of type "Desktop app" named "crewchat cli". From the dialog, save the client ID and secret to
    ~/.crewchat/oauth-client.json as {"installed": {"client_id": ..., "client_secret": ...}},
    with file permissions 600. The secret is shown only once.
-7. Check the OAuth consent screen / Audience: if it is in Testing, add my Google account as a
+8. Check the OAuth consent screen / Audience: if it is in Testing, add my Google account as a
    test user.
-8. Run: crewchat cloud setup --web-config ~/.crewchat/firebase-web.json --oauth-client ~/.crewchat/oauth-client.json
-   Then tell me to run `crewchat cloud login` myself (it opens a Google sign-in I must approve).
+9. Run: crewchat cloud setup --web-config ~/.crewchat/firebase-web.json --oauth-client ~/.crewchat/oauth-client.json
+   Then tell me to run `crewchat cloud login` myself (it opens a Google sign-in I must approve),
+   and, for my phone, to press Publish the page in Settings › Machines & devices (Google asks me there too).
 
 Rules for you:
 - Never paste the OAuth client secret into this chat or any message, and never commit it.

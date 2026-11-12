@@ -36,6 +36,7 @@ from pathlib import Path
 import crewchat
 
 PULL_WAIT = 25  # seconds a pull waits for something new
+NEEDS_EVERY = 1.0  # seconds: the pulls work out what waits on the owner here (Needs you) at most this often
 MISSING_WAIT = 30  # seconds before asking again a member that has no project by this name
 INVITE_TTL = 600
 CONFIRM_WAIT = 10  # seconds a member waits for the remover to confirm a key change
@@ -43,6 +44,7 @@ OFFLINE_AFTER = 2  # failed pulls in a row before a member shows as offline
 BACKOFF = (1, 2, 5, 10, 20, 30)
 MAX_BATCH = 500
 RELAY_EVERY = 300  # seconds between asking others for an unreachable member's messages (Y3)
+AGENT_WAIT = 120  # seconds another member may take to act on its agents (a launch runs the tool there, W10)
 TAGS = [chr(c) for c in range(ord("A"), ord("Z") + 1)]
 TAGS += [a + b for a in TAGS for b in TAGS]
 
@@ -302,6 +304,7 @@ class PeerSync(crewchat.ProjectLink):
         self.stopped = threading.Event()
         self.removed_me = False
         self._coordinator, self._term = None, 0  # who this machine last saw coordinating, and how many changes
+        self._needs_seen = None  # (hub version, when, the items): what _pulled_needs last worked out
 
     def coordinator(self, exclude=()):
         """Which machine coordinates now (roadmap Y1): the owner's preferred machine if this one can reach it,
@@ -514,6 +517,38 @@ class PeerSync(crewchat.ProjectLink):
         except PeerError as e:
             raise crewchat.HubError("cannot fetch the file from %s (%s)" % (member["name"], e))
 
+    def launch_members(self):
+        """The other members + New agent can start agents on, for this project (W10): every member for the first
+        project, and for another the members that share it."""
+        members = self.mesh.members()
+        ids = [d for d in members if d != self.device_id and (self.chat is None or d in self.shared_with)]
+        return [{"id": d, "name": members[d].get("name") or d} for d in sorted(ids, key=lambda d: members[d].get("name") or d)]
+
+    def agent_call(self, device, body):
+        """Ask another member to act on its own agents for this project (/peer/agent, W10): its New agent's options, a
+        launch, or an agent's Stop, Reopen, Start again, Fork, Show terminal, mode or model. Its answer, or HubError."""
+        member = self.mesh.members().get(device)
+        if member is None or device == self.device_id:
+            raise crewchat.HubError("that machine is not linked to this chat")
+        try:
+            return self._call(member, "/peer/agent", body, timeout=AGENT_WAIT)
+        except PeerError as e:
+            raise crewchat.HubError("%s: %s" % (member.get("name") or device, e))
+
+    def needs_answer(self, device, body):
+        """The owner's answer, given here, to one of another member's Needs you items (/peer/needs): its answer, or
+        HubError."""
+        member = self.mesh.members().get(device)
+        if member is None or device == self.device_id:
+            raise crewchat.HubError("that machine is not linked to this chat")
+        try:
+            return self._call(member, "/peer/needs", body, timeout=AGENT_WAIT)
+        except PeerError as e:
+            if e.status == 404:
+                raise crewchat.HubError("%s runs an older crewchat: answer it there, or update it" % (
+                    member.get("name") or device))
+            raise crewchat.HubError("%s: %s" % (member.get("name") or device, e))
+
     # Talking to members ----------------------------------------------------------------------
     def _call(self, member, path, body, timeout=PULL_WAIT + 20, key=None, raw=False):
         """POST to another member; its JSON answer, or with raw its bytes."""
@@ -697,6 +732,8 @@ class PeerSync(crewchat.ProjectLink):
         with self.hub.lock:  # (reentrant) detach() lets go of the hub under this lock
             if self.hub.sync is self:
                 self.hub.set_remote(mid, member["name"], self.agents[mid], time.time())
+                if hasattr(self.hub, "set_remote_needs"):  # an older crewchat sends none: nothing of its shows here
+                    self.hub.set_remote_needs(mid, member["name"], out.get("needs") or [])
 
     def _settle(self, decisions):
         """Claim decisions another machine made (for this link's project): adopt them, and where two machines
@@ -729,7 +766,8 @@ class PeerSync(crewchat.ProjectLink):
                                   "key changed; join again with a new code"}
         if device in self.mesh.data.get("removed", {}):
             return 403, {"error": "this machine was removed from the chat"}
-        if self.chat is not None and path not in ("/peer/pull", "/peer/file", "/peer/claim", "/peer/relay"):
+        if self.chat is not None and path not in ("/peer/pull", "/peer/file", "/peer/claim", "/peer/relay", "/peer/agent",
+                                                    "/peer/needs"):
             return 404, {"error": "unknown request"}
         sender = body.get("sender") if isinstance(body.get("sender"), dict) else {}
         if self.chat is None and device and sender.get("id") == device:
@@ -787,6 +825,25 @@ class PeerSync(crewchat.ProjectLink):
             # key, not the asker's, which may lag (a machine that joined later, or lost old messages).
             key = self.hub.claim_key(task) if hasattr(self.hub, "claim_key") else key
             return 200, {"holder": self.mesh.claim(self._key(key), agent)}
+        if path == "/peer/agent":  # the owner's page on another member acts on this machine's agents (W10)
+            if not device or device not in self.mesh.members():
+                return 403, {"error": "not a member"}
+            if self.chat is not None and device not in self.shared_with:
+                # Another project: only a machine that has it too (as launch_members lists them), never any member.
+                return 403, {"error": "this project is not shared with that machine"}
+            try:
+                return 200, self.hub.peer_agent(body)
+            except crewchat.HubError as e:
+                return 400, {"error": str(e)}
+        if path == "/peer/needs":  # the owner's page on another member answers what waits on them here
+            if not device or device not in self.mesh.members():
+                return 403, {"error": "not a member"}
+            if self.chat is not None and device not in self.shared_with:
+                return 403, {"error": "this project is not shared with that machine"}
+            try:
+                return 200, self.hub.peer_need(body)
+            except crewchat.HubError as e:
+                return 400, {"error": str(e)}
         if path == "/peer/rekey":
             secret = str(body.get("secret") or "")
             if len(secret) < 32:
@@ -867,18 +924,21 @@ class PeerSync(crewchat.ProjectLink):
                 while True:
                     own = [m for m in hub.messages[hub._after(since):] if m.get("origin") == self.device_id]
                     agents = hub.local_state()
+                    needs, due = self._pulled_needs()
                     info = self.my_info()
-                    key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock"), info])
+                    key = self._state_key(agents, [self.mesh.data.get("preferred"), self.mesh.data.get("clock"), info,
+                                                   needs])
                     if own or key != known or time.time() >= deadline or self.stopped.is_set():
                         break
-                    hub.lock.wait(timeout=max(0.0, deadline - time.time()))
+                    hub.lock.wait(timeout=max(0.0, min(deadline, due or deadline) - time.time()))
                 own = [dict(m) for m in own[:MAX_BATCH]]
             # More than memory holds was written while this pull waited: its first ones are in the log only.
             older = self._older(since) if own else []
         if older:
             own, agents, key, info = older, hub.local_state(), "", self.my_info()  # "": the roster comes again next pull
+            needs = self._needs()
         out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
-               "preferred": self.mesh.data.get("preferred")}
+               "preferred": self.mesh.data.get("preferred"), "needs": needs}
         if self.chat is None:  # this machine's version, OS and projects (M1, M2): the machine's link only; null while
             out["info"] = info  # it is not known yet (an older crewchat sends no "info" at all)
         try:
@@ -892,6 +952,30 @@ class PeerSync(crewchat.ProjectLink):
         else:
             out["chat"] = self.chat  # so the asker knows this is the project it asked for (it ignores members)
         return out
+
+    def _pulled_needs(self):
+        """_needs for the pulls' wait (caller holds the hub's lock): worked out again only when the chat changed since
+        the last time, and then at most every NEEDS_EVERY seconds, not at each of the many changes a busy chat makes
+        (each one woke every waiting pull, and Needs you was built again from the whole chat). Returns (the items,
+        when they are next worked out if the chat changed meanwhile, else None)."""
+        version, now, seen = getattr(self.hub, "version", None), time.time(), self._needs_seen
+        if version is None:  # a hub that does not count its changes
+            return self._needs(), None
+        if seen and seen[0] == version:
+            return seen[2], None
+        if seen and now - seen[1] < NEEDS_EVERY:
+            return seen[2], seen[1] + NEEDS_EVERY
+        self._needs_seen = (version, now, self._needs())
+        return self._needs_seen[2], None
+
+    def _needs(self):
+        """What waits on the owner here that the others cannot see for themselves (Hub.shared_needs): they show it
+        on their pages, and their answers come back through /peer/needs."""
+        try:
+            return self.hub.shared_needs() if hasattr(self.hub, "shared_needs") else []
+        except Exception as e:  # never the reason a pull fails
+            self.log("could not list what waits on you here for the others (%s: %s)" % (type(e).__name__, e))
+            return []
 
     def _older(self, since):
         """This machine's messages after `since` when memory no longer reaches back that far (roadmap Y3): a page

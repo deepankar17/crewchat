@@ -40,7 +40,8 @@ class Start(unittest.TestCase):
             self.assertIn("the code still works", out)
             self.assertNotIn(b.name, a.peers_status())  # the desk did not count it in
             self.assertFalse((b.home / "peers.json").exists())
-            b.cli("start", "--no-service", "--no-open")
+            started = b.cli("start", "--no-service", "--no-open")
+            self.assertIn("joins the chat by itself", started)  # the harness lets any session join (--join anyone)
             b.wait_up()
             b.cli("peers", "join", target, code, "--url", b.url, "--name", b.name)
             H.eventually(lambda: "online" in a.peers_status() and b.name in a.peers_status(), timeout=30,

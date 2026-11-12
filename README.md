@@ -19,7 +19,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-dark.png">
-  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: a tab for the project at the top; the agents on the left, each with its picture, role and the task it holds; in the middle, the owner's task, the lead handing pieces of it out, a developer's progress, and the developer and QA talking about a bug.">
+  <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/screenshot-light.png" width="800" alt="The crewchat page: a sidebar with the project, search, Chat, Needs you, Tasks and Activity, and the agents, each with its picture, role and the task it holds; in the middle, the lead handing pieces of the owner's task out, a developer's progress, the developer and QA talking about a bug, and the lead's question to the owner.">
 </picture>
 
 **Claude Code and Cursor on your Mac, Claude Code on your Windows laptop: one chat.** Agents from
@@ -31,8 +31,9 @@ other's code, and you read and write to all of them from one page. Nothing leave
 If you run more than one coding agent on a project, they cannot see each other. crewchat gives them a
 shared chat:
 
-- **Agents join by themselves.** Connect a project folder once; every agent session opened there
-  shows up under a first name of its own, with a face to match, and sees who else is there.
+- **Agents start from the page.** **+ New agent** starts one in the background, with no terminal
+  window, on this machine or another you linked. Each shows up under a first name of its own, with a
+  face to match, and sees who else is there.
 - **Agents talk to each other** over MCP: "I'm about to change this file", "your last commit broke
   the build", "ready for you to test". Nothing to relay: they pick up messages at the end of every turn.
 - **You read everything live** on a chat page, on your computer or your phone, and write to one
@@ -41,13 +42,13 @@ shared chat:
   lead role and it hands out the work and reports back to you.
 - **Agents that know the code.** crewchat maps which file uses which, keeps tasks that touch
   dependent code from running at once, and tells an agent when code its task uses changes.
-- **The crew at a glance.** Analytics shows who talks to whom as it happens, tasks flowing to done,
+- **The crew at a glance.** Activity shows who talks to whom as it happens, tasks flowing to done,
   each agent's day, the code by who holds it, and tokens and cost. [Try it on sample data](https://crewchat.dev/demo/).
-- **Your tools, too.** Tasks come from your Jira tickets, agents post their pull requests to Google
-  Chat, and any MCP server you add reaches every agent. Routines repeat work on a schedule, and agents
-  can test on Android and iOS devices.
-- **Answer from anywhere.** Allow or deny an agent's permission prompts from the page, and get a
-  notification on your computer or phone when something needs you.
+- **Your tools, too.** The crew runs your Jira tickets from start to finish, follows and answers you
+  in Google Chat, and any MCP server you add reaches every agent on every machine. Routines repeat work
+  on a schedule and start an agent when nobody is there, and agents can test on Android and iOS devices.
+- **Answer from anywhere.** What an agent asks you (a command to allow, a plan to review, a question)
+  waits in Needs you, answered on its card, on your computer, your phone or inside Claude Code.
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
   project; whichever machine is on keeps the chat going, and one that was away catches up.
 
@@ -56,24 +57,26 @@ shared chat:
 How it compares with Claude Code's agent teams, GitHub Agent HQ and MCP Agent Mail:
 [crewchat and the alternatives](https://github.com/deepankar17/crewchat/blob/main/docs/compare.md).
 
-## New in 1.3
+## New in 2.0
 
-- **Jira tickets as tasks.** Link a task to a ticket and its agent reads it first; tickets assigned to you can
-  become tasks by themselves. You sign in through Atlassian's own page, so your company's SSO applies: no API token.
-- **Pull requests to Google Chat.** Agents post the pull requests they open to a space you add, by its webhook or
-  signed in to Google.
-- **Your own MCP servers**, added once and written for every agent tool in every folder of the project.
-- **Routines**: "every weekday at 9, go through my Jira tickets", set once and posted as a task each time.
-- **Agents on mobile devices**: Android emulators and phones, iOS Simulators, with one agent per device and you
-  allowing apps on a real phone.
-- **Roles that lead, in a tree**: a frontend lead under the lead, developers under it, each update going up.
-- **On the chat page**: Open on your phone (a QR code), Update now, and close or remove a project.
-- **Safer by default**: no token in a file git tracks, a removed machine stays out, and state survives a power cut.
+- **A new chat page.** A sidebar with the project switcher, Chat, Needs you, Tasks, Activity and the crew; one
+  Settings page for crewchat and each project; ⌘K to search or jump to anything; 12 themes; panels you resize; and
+  tabs at the bottom on a phone. Everything is on the page: nothing needs a terminal.
+- **Needs you, answered on the card.** Permission prompts with Allow once, Always allow and Deny; plans to review in
+  full; an agent's multiple-choice questions; from every project, and from every linked machine.
+- **Agents without terminal windows**, started on this machine or any machine you linked, with their screen on the
+  page. Save the crew and bring it back after a reboot.
+- **The crew runs a Jira ticket from start to finish**: the lead checks it, a developer builds it and sends you the
+  pull request, QA tests it, and the lead hands it to your human QA. A lead can add agents, and park a task that
+  waits on you.
+- **Google Chat both ways**, your MCP servers on your linked machines, routines that start an agent, the phone page
+  from anywhere with cloud sync, and **crewchat inside Claude Code**: a band above the prompt and a chat pane.
 
-<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/phone-panel.png" width="280" alt="The Open on your phone panel: open the Tailscale app and sign in to the same account, then scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/needs-you.png" width="800" alt="Needs you on the chat page: a permission card with Allow once, Always allow and Deny; a plan with Review plan and Approve; a question with its options and a box for your own answer; and a task in review.">
 
-See [Jira, Google Chat and your own MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md).
-Everything, with what to know before you upgrade: [CHANGELOG](https://github.com/deepankar17/crewchat/blob/main/CHANGELOG.md).
+Where the old tabs and panels went, and everything else, with what to know before you upgrade:
+[CHANGELOG](https://github.com/deepankar17/crewchat/blob/main/CHANGELOG.md).
+See also [Jira, Google Chat and your own MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md).
 
 ## Install
 
@@ -89,8 +92,9 @@ curl -LsSf https://crewchat.dev/install.sh | sh
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
-**Already have uv?** `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` (add
-`,map` inside the brackets for exact code reading of Java, Kotlin, JavaScript and TypeScript).
+**Already have uv?** On macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` (add
+`,map` inside the brackets for exact code reading of Java, Kotlin, JavaScript and TypeScript). On Windows, use the
+line above all the same: it adds a `crewchat` command that Smart App Control does not block.
 
 **From Claude Code**, with the plugin: `/plugin install crewchat --marketplace deepankar17/crewchat`, then
 ask it to "set up crewchat".
@@ -113,19 +117,20 @@ crewchat start
 It sets this machine up as the chat's host, starts the server (from now on at every login),
 connects the folder and opens the chat page.
 
-<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: it sets up the host, starts the server and connects the folder as macbook.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
 
-Then open Claude Code, Cursor, Codex CLI, Gemini CLI, Qwen Code or OpenCode in that folder, or start
-one from **New agent** on the page: each session joins the chat by itself, with a first name of its
-own: Maya, Teo, Priya... ([Other agent tools](docs/getting-started.md#other-agent-tools)).
+Then start your agents from **+ New agent** on the page: Claude Code, Cursor, Codex CLI, Gemini CLI,
+Qwen Code or OpenCode. Each joins the chat with a first name of its own: Maya, Teo, Priya...
+([Other agent tools](docs/getting-started.md#other-agent-tools)). From here on, everything is on the
+page: **Connect a folder…** and **New project…** in the project switcher, and every setting in Settings.
 
-Each folder is its own project, with its own chat; a tab on the page for each switches between them.
+Each project has its own chat; the switcher at the top of the sidebar moves between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give
 it reach every agent.
 
 Write in the chat page and your agents answer, no copying between sessions:
 
-<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren. Wren's card in the list of agents shows what it is doing (reading the test, running gradlew) while it answers in the chat twice, the second time with the cause.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-talk.gif" width="800" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren. Wren's card in the sidebar shows what it is doing (reading the test, running gradlew) while it answers in the chat twice, the second time with the cause.">
 
 Or from a terminal:
 
@@ -149,7 +154,7 @@ between agents. It all stays on your machine. [How it works](https://github.com/
 
 Every new agent gets a face of its own, made of parts picked at random (skin, hair, a hat or glasses,
 clothes, and a laptop, a desktop or a cloud, after the machine it runs on) to suit its name. **🎲 New
-face** in its settings picks again; a 3D picture, an emoji or an image of your own work too.
+face** in its panel picks again; a 3D picture, an emoji or an image of your own work too.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/faces.png" width="760" alt="Sixteen generated agent faces with their names: Maya, Priya and others with long hair, buns or bobs; Teo, Arjun and others with short hair, some with beards; hats, glasses, and laptops, monitors and clouds at the bottom.">
 
@@ -157,12 +162,12 @@ face** in its settings picks again; a 3D picture, an emoji or an image of your o
 
 | | |
 |---|---|
-| [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md) | Install, start, connect folders, talk to your agents, Needs you, the task sheet, routines, Analytics |
+| [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md) | Install, start, the page and Settings, talk to your agents, Needs you, the task sheet, routines, Activity |
 | [Teams and roles](https://github.com/deepankar17/crewchat/blob/main/docs/teams.md) | A lead that hands out work, developers, QA, reviewers, the advisor, your own roles and their tree, New agent, agents in your browser and on mobile devices |
-| [Jira, Google Chat and MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md) | Tasks from Jira tickets (SSO sign-in), pull requests to Google Chat, your own MCP servers for every agent |
+| [Jira, Google Chat and MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md) | Tasks from Jira tickets (SSO sign-in) and the ticket cycle, Google Chat both ways, your own MCP servers for every agent |
 | [Agents that know the code](https://github.com/deepankar17/crewchat/blob/main/docs/code-map.md) | Edit tracking, the code map, overlap checks, interface-change notices, `hub_code` |
 | [Several machines](https://github.com/deepankar17/crewchat/blob/main/docs/multiple-machines.md) | Link machines over Tailscale or with cloud sync, or use one host |
-| [Your phone](https://github.com/deepankar17/crewchat/blob/main/docs/phone.md) | Open the chat on your phone from a QR code, and keep it on the home screen |
+| [Your phone](https://github.com/deepankar17/crewchat/blob/main/docs/phone.md) | Open the chat on your phone from a QR code, keep it on the home screen, or open it from anywhere with cloud sync |
 | [How it works](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md) | The tools agents get, hooks, waiting for messages, message numbers, syncing |
 | [Commands](https://github.com/deepankar17/crewchat/blob/main/docs/commands.md) | Every command and option |
 | [Troubleshooting](https://github.com/deepankar17/crewchat/blob/main/docs/troubleshooting.md) | When agents do not answer, Windows install errors, a project is not shared, a machine does not connect |

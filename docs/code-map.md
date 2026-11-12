@@ -15,7 +15,7 @@ Everything here stays on your machine.
 - [A heads-up when a task is taken or given](#a-heads-up-when-a-task-is-taken-or-given)
 - [The code at a glance, for agents that join](#the-code-at-a-glance-for-agents-that-join)
 - [hub_code, for the lead and the advisor](#hub_code-for-the-lead-and-the-advisor)
-- [The code in Analytics](#the-code-in-analytics)
+- [The code in Activity](#the-code-in-activity)
 - [Privacy](#privacy)
 
 ## Edit tracking
@@ -192,9 +192,9 @@ The lead and the advisor get one more tool, `hub_code`; the other agents' tool l
 
 `split` needs the code map, and `history` the edit records: both need edit tracking on.
 
-## The code in Analytics
+## The code in Activity
 
-**Analytics** on the chat page ([Getting started](getting-started.md#analytics)) has two views of
+**Activity**, in the chat page's sidebar, ([Getting started](getting-started.md#activity)) has two views of
 the code:
 
 - **Code heat map:** the files agents edited, coloured by the agent that edits each most.

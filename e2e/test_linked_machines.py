@@ -1,4 +1,5 @@
 """Machines linked with `crewchat peers`: each runs its own server, and they share one chat."""
+import json
 import re
 import threading
 import time
@@ -158,6 +159,26 @@ class TwoMachines(unittest.TestCase):
         eventually(lambda: self.mac.owner.row(self.dev.name)["role"] == "", what="the role to go")
         self.mac.owner.role(self.lead.name, "none")
         eventually(lambda: self.win.owner.row(self.lead.name)["role"] == "", what="the role to go")
+
+    def test_an_mcp_server_reaches_the_other_machine_without_its_key(self):
+        # E4: the mac's owner adds a server with a key; Windows gets its description, says it needs its key there,
+        # and writes nothing for it until it has one. A removal travels too.
+        body = {"op": "add", "name": "e2e-linked", "url": "https://mcp.e2e.example/mcp",
+                "headers": {"Authorization": "Bearer e2e-linked-key-0123456789"}}
+        self.assertEqual(self.mac.owner.post("/api/mcp", body)[0], 200)
+
+        def on_win():
+            rows = [r for r in json.loads(self.win.owner.post("/api/mcp", {"op": "list"})[1])["servers"] if r["name"] == "e2e-linked"]
+            return rows[0] if rows else None
+        row = eventually(on_win, what="the server to reach Windows")
+        self.assertEqual((row["url"], row["missing_keys"]), ("https://mcp.e2e.example/mcp", ["Authorization"]))
+        for m in (self.mac, self.win):
+            for path in m.home.rglob("messages.jsonl"):
+                self.assertNotIn("e2e-linked-key", path.read_text(), path)
+        self.assertNotIn("e2e-linked", (self.win.folder / ".mcp.json").read_text())
+        self.assertIn("e2e-linked-key", (self.mac.folder / ".mcp.json").read_text())
+        self.assertEqual(self.mac.owner.post("/api/mcp", {"op": "remove", "name": "e2e-linked"})[0], 200)
+        eventually(lambda: on_win() is None, what="the removal to reach Windows")
 
     def test_one_task_one_taker_across_machines(self):
         extra = [self.mac.agent(), self.win.agent(), self.win.agent()]

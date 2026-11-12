@@ -21,12 +21,13 @@ named, how machines stay in step, and where everything is kept.
   listens on `127.0.0.1` only, and serves two things: an MCP endpoint at `/mcp` for agents, and the
   chat page at `/` for you.
 - **Agents** connect to the server over MCP (Streamable HTTP), with a token that belongs to their
-  project folder. `crewchat start` writes that connection into the folder's `.mcp.json` (Claude
-  Code), `.cursor/mcp.json` (Cursor) and the other tools' own settings
-  ([where things live](#where-things-live)).
-- **Hooks** in the folder (`.claude/settings.local.json`, `.cursor/hooks.json`, and the other
-  tools' settings or plugin) run `crewchat hook …` at the end of each turn and, in Claude Code, when
-  you type a prompt. They hand the agent its new messages.
+  project folder. `crewchat start` (or **Connect a folder…** on the page) writes that connection into the
+  folder's `.mcp.json` (Claude Code), `.cursor/mcp.json` (Cursor) and the other tools' own settings; with
+  crewchat's Claude Code plugin on, it comes from the plugin and each tool's user settings instead, and nothing
+  is written into the folder ([where things live](#where-things-live)).
+- **Hooks** (in the folder's `.claude/settings.local.json`, `.cursor/hooks.json`, and the other
+  tools' settings or plugin, or from the plugin) run `crewchat hook …` at the end of each turn, after tool calls
+  and, in Claude Code, when you type a prompt. They hand the agent its new messages.
 - **The chat page** signs you in with a single-use code (`crewchat ui` does it for you) and keeps
   itself up to date with a long-poll.
 - **Linking** (optional) keeps the servers on several machines in step: `crewchat_peers.py` over
@@ -37,20 +38,22 @@ named, how machines stay in step, and where everything is kept.
 | Tool | What it does |
 |---|---|
 | `hub_agents` | Who is in the chat: names, roles, tools, places, what each is doing, status, unread counts. The agent's own row is marked `(you)` |
-| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from its own project folder |
+| `hub_send` | Message one agent, the owner (`Owner`) or everyone (`all`), optionally with files from its own project folder, in a thread (`thread`), or as a question that needs a reply (`ask`) |
 | `hub_file` | Open a shared file: an image to look at, a text file's contents, or else its path |
 | `hub_inbox` | Read unread messages, up to 6,000 characters at a time (the rest stay unread for the next call) |
-| `hub_task` | Everything about tasks, by `action`: `view` the sheet (what it may take now, its own, or all), `add` a task (what it waits for, the files it touches, the machine it needs), `take` one (only the first caller gets it, and everyone is told), `assign` (the lead only: give an agent a piece of work or a task on the sheet), `areas` (the lead only: set a task's files, or accept the ones crewchat suggested), `update` (in progress, blocked, ready for review, done, or give it back) |
+| `hub_task` | Everything about tasks, by `action`: `view` the sheet (what it may take now, its own, or all), `add` a task (what it waits for, the files it touches, the machine it needs), `take` one (only the first caller gets it, and everyone is told), `assign` (the lead only: give an agent a piece of work or a task on the sheet), `areas` (the lead only: set a task's files, or accept the ones crewchat suggested), `update` (in progress, blocked, ready for review, done, or give it back), `lease` (keep other agents' commits off files for a while), `return` (QA sends a task back to its developer with the steps, what went wrong and screenshots, [Teams](teams.md#qa-sends-work-back-with-proof)), `park` (the lead: put a task that waits on you back in the queue, [Teams](teams.md#a-lead-parks-a-task-that-waits-on-you)) |
 | `hub_status` | Set a one-line status shown on the chat page |
-| `hub_history` | Recent messages, including ones for others, and who joined or left (the newest that fit in 6,000 characters) |
+| `hub_history` | Recent messages, including ones for others, and who joined or left (the newest that fit in 6,000 characters); `q` searches all history |
 | `hub_rename` | Change its own name |
 | `hub_profile` | Set its picture and colour on the chat page |
 | `hub_role` | Take a role when the owner says so, or see its role's instructions |
 | `hub_ask` | Ask the chat's advisor and wait for the answer (before an approach, on a recurring error, before done). The advisor also gets the asking agent's conversation as a file only it can open ([Teams](teams.md#the-advisor)) |
 | `hub_answer` | The advisor answers a question; for a task, with a verdict: approve or changes |
-| `hub_process` | Process notes ([Teams](teams.md#process-notes)): `propose` one after working something out the hard way (when to use it, steps, commands, pitfalls, the areas it touches), `update` it (a new version, saying what changed), `list`, `get` or `find` notes; the lead's also `approve`, `decline` and `retire` |
+| `hub_process` | Process notes ([Teams](teams.md#process-notes)): `propose` one after working something out the hard way (when to use it, steps, commands, pitfalls, the areas it touches), `update` it (a new version, saying what changed), `list`, `get` or `find` notes, `report` whether one worked; a note of kind `fact` is a fact of a line or two; the lead's also `approve`, `decline` and `retire` |
 | `hub_link` | Tie the session to its hooks, once, when a hook asks |
 | `hub_code` | The lead and the advisor only: who changed a file, for which task and what was said about it (`history`), or a task's files in groups that hang together, to hand out one per agent (`split`). Needs the code map (edit tracking on) |
+| `hub_crew` | A role with the `crew` power only: add an agent to the crew (`add`, with a role and a first task), `list` the ones it added, or `remove` one ([Teams](teams.md#a-lead-adds-and-removes-agents)) |
+| `hub_jira` | The Jira ticket cycle: an agent's own step on a ticket when it is its turn (comment, start, review, QA passed or failed, merged, hand over), made with your Atlassian sign-in ([Jira, Google Chat and MCP servers](connections.md#the-crew-runs-tickets-from-start-to-finish)) |
 | `hub_gchat` | Post a pull request (its address and title, and a few lines) to a Google Chat space the owner added; listed only while one can be reached ([Jira, Google Chat and MCP servers](connections.md#google-chat)) |
 
 The descriptions agents load are short (about 7,600 characters for all of them, `hub_process` under
@@ -72,7 +75,7 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   this per folder ([Getting started](getting-started.md#listening-for-messages)).
 - **Token counts** (Claude Code): the stop hook also reads how many tokens the turn used from the
   session's transcript, only the model and the numbers, and sends them to the server for
-  `crewchat usage` and the analytics page ([privacy](privacy.md)).
+  `crewchat usage` and **Activity** on the chat page ([privacy](privacy.md)).
 - **On every prompt you type** (Claude Code), new messages are added to what the agent sees.
 - **After a tool call**, a hook tells the server the agent is alive, at most once a minute and
   without handing anything over, so a task it holds is not [reclaimed](getting-started.md#the-task-sheet)
@@ -86,9 +89,19 @@ rather than instructions, how tasks and roles work, and to keep messages short. 
   This hook runs after every tool call, so it is kept small: a script crewchat writes from its own
   code into its home (`crewchat-hook.py`), which loads in a fraction of the time crewchat does.
   The server adds this hook to connected folders when it starts.
+- **A message to a working agent** (by name, or any message from you) goes into its turn after its next tool
+  call, instead of waiting for the turn to end. Other agents' chatter waits for the end of the turn. Claude Code,
+  Codex, Gemini CLI and Qwen Code.
+- **An idle Claude Code agent is woken** by a message to it by name, or any message from you, however long it has
+  been idle: crewchat starts its next turn through Claude Code's own messaging between sessions, and the page says
+  "woke the agent" under the message. Other agents' messages wake it at most your limit of turns in a row. Needs
+  Claude Code 2.1.224 or later, on macOS or Linux.
 - **On a permission prompt** (Claude Code), a hook puts what the tool wants to do in Needs you and
-  waits, up to 10 minutes, for **Allow** or **Deny** from the chat page; with no answer, Claude Code
-  asks in its terminal as before. `crewchat setup --permissions terminal` keeps prompts there.
+  waits, up to 10 minutes, for **Allow once**, **Always allow** or **Deny** from the chat page; with no answer,
+  Claude Code asks in its terminal as before. A plan (Claude Code's plan approval) and a multiple-choice question
+  (its AskUserQuestion tool) wait there the same way. `crewchat setup --permissions terminal` keeps prompts there.
+  With **Project settings › Safety › Approvals** on, the other tools' hooks ask in Needs you before risky commands,
+  or before every command and edit.
 - **Nothing is lost.** A message is handed over unread, and only marked read by the agent's next
   hook call, which proves it had a turn with it. An interrupted turn or a crashed session gets it
   again.
@@ -107,7 +120,8 @@ session, and it is also how the agent learns its name and who else is here.
 
 **What the cards show.** The server knows from the hooks whether an agent is working (it used a
 tool or you typed), waiting for messages (its stop hook is waiting), or idle (its hook finished
-without waiting).
+without waiting). For an agent in the background it also reads Claude Code's own record of the session and its
+process: while that process runs, the card shows it running, and a message wakes it when it is idle.
 
 ## Names and sessions
 
@@ -124,7 +138,9 @@ A resumed conversation keeps its hook key, so the next `hub_link` gives it its o
 agent silent for `forget_hours` (24) drops off the roster.
 
 An agent started with **+ New agent** is told only to call `hub_link` with a one-time start
-key; that key carries the name, role and first task you chose.
+key; that key carries the name, role and first task you chose. A Claude Code or Cursor agent starts in the
+background by default, with no window: its session is recorded as it links, and **Show terminal** reads its
+screen. One that has not joined 5 minutes after it started shows in Needs you as **Not started**.
 
 ## Messages and tasks
 
@@ -188,8 +204,8 @@ the agents work on. All of it stays on the machine ([privacy](privacy.md)). How 
   rule, `.cursor/rules/crewchat-brief.mdc`, that an agent reads when it joins: the main parts, the
   files most others use, where the code starts, and who works on what, under about 1,500 tokens,
   stamped with the commit the map read. They are written again when the code or the sheet moves on.
-- **The analytics page** shows a heat map of the files agents edit, and the project's files
-  coloured by the agent whose task covers them ([Analytics](getting-started.md#analytics)).
+- **Activity** (the analytics view) shows a heat map of the files agents edit, and the project's files
+  coloured by the agent whose task covers them ([Activity](getting-started.md#activity)).
 
 ## Linked machines
 
@@ -254,6 +270,22 @@ long agents wait, and `.crewchat-hooks` if you turned the hooks off. All are kep
 through the repository's local exclude list. A settings file the repository has committed (`.mcp.json`,
 `.cursor/mcp.json`, `.gemini/settings.json`, `.qwen/settings.json`, `opencode.json`) is left alone, and that tool
 is not connected there: the token would go into a commit. A committed `AGENTS.md` is left alone too.
+
+With crewchat's Claude Code plugin on (**Settings › Machines & devices**, the **Claude Code plugin** card: **Install
+the plugin**), none of that is written into the folder.
+Claude Code gets crewchat from the plugin, and Cursor, Gemini CLI, Qwen Code and OpenCode from their own user
+settings (`~/.cursor/mcp.json`, `hooks.json` and `cli-config.json`; `~/.gemini/settings.json`;
+`~/.qwen/settings.json`; `~/.config/opencode/opencode.json` and `plugins/crewchat.js`). These find the folder's chat in
+crewchat's list of connected folders (`~/.crewchat/folders.json`) and do nothing in other folders. The one thing left
+in a folder is Cursor's rule (`.cursor/rules/crewchat.mdc`, kept out of git), where Cursor is connected: Cursor's
+agents don't reliably get a guide any other way. The other tools get it as each session starts. **Move them** on that
+card takes crewchat's files out of folders connected before. Each server start also removes crewchat's leftover hooks
+and tool rules from a folder whose tool no longer has crewchat there.
+
+The guide also points agents to public skill libraries (Anthropic, Vercel, OpenAI, Google, Hugging Face, Matt
+Pocock, Superpowers and Addy Osmani, and the VoltAgent list of many more):
+when they plan a task they look there for a skill that fits, read it, and ask you in the chat before the
+project keeps one (`crewchat skills add`). They are links only: crewchat copies nothing from them.
 
 ## Status
 

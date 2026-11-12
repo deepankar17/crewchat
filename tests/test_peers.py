@@ -426,6 +426,258 @@ class Linked(unittest.TestCase):
         peers.admin(self.a.hub, self.a.root, "peer-remove", {"id": mid})
 
 
+
+class AgentsOnLinkedMachines(unittest.TestCase):
+    """W10: the page on one machine starts, stops and forks agents on another, and saves the crew."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = Machine("alpha").found()
+        cls.b = Machine("beta").join(cls.a)
+        cls.folder = Path(tempfile.mkdtemp(prefix="beta-work-", dir=TMP)).resolve()
+
+    @classmethod
+    def tearDownClass(cls):
+        for m in (cls.a, cls.b):
+            m.stop()
+
+    def setUp(self):
+        self.launched = []
+        folder = str(self.folder)
+        patches = [
+            mock.patch.object(crewchat, "launch_folders", lambda config, root=None, chat="": [
+                {"path": folder, "name": "beta-work", "place": "beta"}]),
+            mock.patch.object(crewchat, "find_tool", lambda tool, config: "/x/" + tool),
+            mock.patch.object(crewchat, "launch_agent", lambda tool, folder, key, permissions="ask", root=None, model="",
+                              env=None, chrome=False, background=False, fork="":
+                              self.launched.append((tool, folder, key, permissions, background, fork)) or "5e551011"),
+            mock.patch.object(crewchat, "first_run_questions", lambda tool, folder, env=None: [
+                {"id": "trust", "text": "Trust the files in %s" % folder}]),
+            mock.patch.object(crewchat, "answer_first_run", lambda tool, folder, questions, env=None:
+                              self.launched.append(("answered", folder))),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        config = crewchat.load_config(self.b.root)
+        config.pop("linked_starts", None)
+        crewchat.save_config(config, self.b.root)
+        self.beta = self.b.sync.device_id
+
+    def test_new_agent_offers_the_linked_machine_and_starts_it_there(self):
+        machines = self.a.hub.launch_machines()
+        self.assertEqual([m["id"] for m in machines], ["", self.beta])
+        self.assertEqual(machines[1]["name"], "beta")
+        options = self.a.hub.remote_call(self.beta, {"op": "options"})
+        self.assertEqual(options["folders"][0]["path"], str(self.folder))
+        self.assertIn("claude", [t["id"] for t in options["tools"]])
+        # Its first-run questions come back to the page that asked, as one card; Approve and start asks again.
+        body = {"op": "launch", "tool": "claude", "folder": str(self.folder), "name": "Remy"}
+        out = self.a.hub.remote_call(self.beta, body)
+        self.assertEqual((out["first_run"], out["questions"]), (True, ["Trust the files in %s" % self.folder]))
+        self.assertEqual(self.launched, [])
+        self.assertEqual(self.a.hub.remote_call(self.beta, dict(body, approve=True)), {"ok": True})
+        self.assertEqual(self.launched[0], ("answered", str(self.folder)))
+        self.assertEqual(self.launched[1][:2] + self.launched[1][4:], ("claude", str(self.folder), True, ""))
+        # Beta can say no to all of it.
+        config = crewchat.load_config(self.b.root)
+        config["linked_starts"] = False
+        crewchat.save_config(config, self.b.root)
+        with self.assertRaises(crewchat.HubError) as caught:
+            self.a.hub.remote_call(self.beta, {"op": "options"})
+        self.assertIn("does not let your other machines", str(caught.exception))
+
+    def test_a_linked_machines_agent_is_stopped_reopened_and_forked_from_here(self):
+        agent = self.b.agent()
+        with self.b.hub.lock:
+            self.b.hub.agents[agent]["session"] = {"id": "5e551011-aaaa", "pid": 999999, "started": "x",
+                                                   "app": "background", "tool": "claude", "folder": str(self.folder),
+                                                   "since": 1.0}
+            self.b.hub._changed()
+
+        def row():
+            return next((r for r in self.a.hub.rows() if r["agent"] == agent), None)
+        eventually(lambda: row() and row()["session"], what="alpha to see beta's agent's session")
+        self.assertEqual((row()["machine"], row()["session"]["app"], row()["session"]["attach"]),
+                         (self.beta, "background", False))
+        self.assertEqual(self.a.hub.remote_machine_of(agent), self.beta)
+        calls = []
+        with mock.patch.object(self.b.hub, "stop_agent", lambda name: calls.append(("stop", name))), \
+                mock.patch.object(self.b.hub, "reopen_agent", lambda name: calls.append(("reopen", name))), \
+                mock.patch.object(self.b.hub, "agent_screen", lambda name: "> hello"):
+            self.assertEqual(self.a.hub.remote_call(self.beta, {"op": "stop", "agent": agent}), {"ok": True})
+            self.assertEqual(self.a.hub.remote_call(self.beta, {"op": "reopen", "agent": agent}), {"ok": True})
+            self.assertEqual(self.a.hub.remote_call(self.beta, {"op": "screen", "agent": agent}), {"text": "> hello"})
+        self.assertEqual(calls, [("stop", agent), ("reopen", agent)])
+        with mock.patch.object(crewchat, "first_run_questions", lambda tool, folder, env=None: []):
+            out = self.a.hub.remote_call(self.beta, {"op": "fork", "agent": agent, "new": "Twin"})
+        self.assertEqual(out, {"ok": True})
+        self.assertEqual(self.launched[-1][4:], (True, "5e551011-aaaa"))  # in the background, from its conversation
+        self.assertIn("from %s's conversation" % agent, "\n".join(m["text"] for m in self.b.hub.messages[-3:]))
+        with self.assertRaises(crewchat.HubError):
+            self.a.hub.remote_call(self.beta, {"op": "rename", "agent": agent})  # only the session's controls
+
+    def test_save_crew_and_start_it_again_on_every_machine(self):
+        mine, theirs = self.a.agent(), self.b.agent()
+        eventually(lambda: self.a.sees(theirs), what="alpha to see beta's agent")
+        crew = self.a.hub.save_crew()
+        self.assertIn({"agent": mine, "machine": ""}, crew)
+        self.assertIn({"agent": theirs, "machine": self.beta}, crew)
+        self.assertIn({"agent": theirs, "machine": self.beta}, crewchat.load_config(self.a.root)["crew"])
+        done = []
+        with mock.patch.object(self.b.hub, "bring_back", lambda name: done.append(("beta", name)) or "reopened"), \
+                mock.patch.object(self.a.hub, "bring_back", lambda name: done.append(("alpha", name)) or "started"):
+            out = self.a.hub.start_crew()
+        self.assertEqual(out[theirs], "reopened")
+        self.assertEqual(out[mine], "started")
+        self.assertIn(("beta", theirs), done)
+        with mock.patch.object(self.b.hub, "stop_agent", lambda name: done.append(("stopped", name))):
+            out = self.a.hub.start_crew(stop=True)
+        self.assertEqual(out[theirs], "stopped")
+        self.assertEqual(out[mine], "not running")
+        self.assertIn(("stopped", theirs), done)
+
+class NeedsOnLinkedMachines(unittest.TestCase):
+    """What waits on the owner on one machine (its agents' permission prompts, browser and device approvals, stuck
+    background sessions) shows on every linked machine's page, is answered from any of them, and clears everywhere."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.a = Machine("alpha").found()
+        cls.b = Machine("beta").join(cls.a)
+
+    @classmethod
+    def tearDownClass(cls):
+        for m in (cls.a, cls.b):
+            m.stop()
+
+    def setUp(self):
+        self.beta = self.b.sync.device_id
+        self.answers = {}
+        self.addCleanup(self.setting, "linked_answers", None)
+        self.addCleanup(self.setting, "linked_starts", None)
+
+    def setting(self, key, value):
+        config = crewchat.load_config(self.b.root)
+        if value is None:
+            config.pop(key, None)
+        else:
+            config[key] = value
+        crewchat.save_config(config, self.b.root)
+        self.b.hub.roster.refresh()
+        with self.b.hub.lock:
+            self.b.hub._changed()
+
+    def ask(self, agent, kind="permission", text="git push origin main", wait=20, **fields):
+        """An ask waiting on beta, as its hooks make one; its answer lands in self.answers[text]."""
+        fields = fields or {"tool": "Bash"}
+
+        def run():
+            with self.b.hub.lock:
+                self.answers[text] = self.b.hub.asks.wait_for(kind, agent, text, time.time() + wait, **fields)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(self.drop, agent)
+        return thread
+
+    def drop(self, agent):
+        with self.b.hub.lock:
+            self.b.hub.asks.drop(agent)
+            self.b.hub._changed()
+
+    def theirs(self, kind="permission", text=None):
+        return next((n for n in self.a.hub.needs_you() if n["kind"] == kind and n.get("remote")
+                     and (text is None or n["text"] == text)), None)
+
+    def test_a_permission_prompt_shows_on_the_other_machine_and_is_answered_there(self):
+        agent = self.b.agent()
+        thread = self.ask(agent)
+        item = eventually(lambda: self.theirs(text="git push origin main"), what="alpha to show beta's prompt")
+        local = next(n for n in self.b.hub.needs_you() if n["kind"] == "permission")
+        self.assertEqual(item["key"], "%s@%s" % (local["key"], self.beta))
+        self.assertEqual((item["agent"], item["machine"], item["tool"], item["choices"]),
+                         (agent, "beta", "Bash", ["allow", "deny"]))
+        # An answer beta does not offer is refused there; one it does is beta's answer, as if given on its own page.
+        with self.assertRaises(crewchat.HubError):
+            crewchat.answer_need(self.a.hub, {"key": item["key"], "answer": "allow_always"})
+        self.assertEqual(crewchat.answer_need(self.a.hub, {"key": item["key"], "answer": "deny", "note": "not yet"}),
+                         {"agent": agent, "answer": "deny"})
+        thread.join(5)
+        self.assertEqual((self.answers["git push origin main"]["answer"], self.answers["git push origin main"]["note"]),
+                         ("deny", "not yet"))
+        self.assertIsNone(self.theirs(text="git push origin main"))  # gone here at once
+        self.assertFalse([n for n in self.b.hub.needs_you() if n["text"] == "git push origin main"])
+        with self.assertRaises(crewchat.HubError):  # answered: a second answer finds nothing
+            crewchat.answer_need(self.a.hub, {"key": item["key"], "answer": "allow"})
+
+    def test_answered_on_its_own_machine_it_clears_on_the_others(self):
+        agent = self.b.agent()
+        thread = self.ask(agent, "browser", "open example.com", host="example.com", ask="open", task="")
+        item = eventually(lambda: self.theirs("browser"), what="alpha to show beta's browser approval")
+        self.assertIn("allow_site", item["choices"])
+        local = next(n for n in self.b.hub.needs_you() if n["kind"] == "browser")
+        self.b.hub.asks.answer(local["id"], "deny", ("deny",), "", "")
+        thread.join(5)
+        eventually(lambda: self.theirs("browser") is None, what="alpha to drop it")
+
+    def test_the_owner_keeps_them_to_the_machine(self):
+        agent = self.b.agent()
+        self.ask(agent, text="rm -rf build", wait=10)
+        item = eventually(lambda: self.theirs(text="rm -rf build"), what="alpha to show it")
+        self.setting("linked_answers", False)
+        eventually(lambda: self.theirs(text="rm -rf build") is None, what="alpha to drop it")
+        self.assertTrue([n for n in self.b.hub.needs_you() if n["kind"] == "permission"])  # still on beta
+        secret = self.b.sync.mesh.data["secret"]
+        body = {"key": item["key"].rpartition("@")[0], "answer": "allow", "sender": {"id": self.a.sync.device_id}}
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            post(self.b.url + "/peer/needs", body, secret, self.a.sync.device_id)
+        self.assertEqual(caught.exception.code, 400)
+        self.assertIn("does not let your other machines answer", caught.exception.read().decode())
+
+    def test_only_members_answer(self):
+        agent = self.b.agent()
+        self.ask(agent, text="make deploy", wait=10)
+        item = eventually(lambda: self.theirs(text="make deploy"), what="alpha to show it")
+        body = {"key": item["key"].rpartition("@")[0], "answer": "allow"}
+        secret = self.b.sync.mesh.data["secret"]
+        self.assertEqual(status_of(self.b.url + "/peer/needs", body, "wrong-key", self.a.sync.device_id), 401)
+        self.assertEqual(status_of(self.b.url + "/peer/needs", body, secret, "0123456789abcdef"), 403)
+        self.assertEqual(status_of(self.b.url + "/peer/needs", body, secret, ""), 403)
+        self.assertTrue([n for n in self.b.hub.needs_you() if n["text"] == "make deploy"])  # nobody answered it
+
+    def test_a_stuck_background_agent_is_stopped_from_the_other_machine_but_opened_only_on_its_own(self):
+        stuck = {"kind": "stuck", "id": "remy", "agent": "remy", "tool": "Claude Code", "text": "waits on a question",
+                 "ts": time.time(), "blocking": 0}
+        stopped = []
+        with mock.patch.object(self.b.hub, "_background_needs", lambda: [dict(stuck)]), \
+                mock.patch.object(self.b.hub, "stop_agent", lambda name: stopped.append(name)):
+            with self.b.hub.lock:
+                self.b.hub._changed()
+            item = eventually(lambda: self.theirs("stuck"), what="alpha to show beta's stuck agent")
+            self.assertEqual(item["choices"], ["stop"])  # its terminal is on beta: Show and Open in Terminal stay there
+            with self.assertRaises(crewchat.HubError):
+                crewchat.answer_need(self.a.hub, {"key": item["key"], "answer": "attach"})
+            # Beta lets its other machines answer, but not start and stop its agents: its background agents stay there.
+            self.setting("linked_starts", False)
+            eventually(lambda: self.theirs("stuck") is None, what="alpha to drop it")
+            self.setting("linked_starts", None)
+            item = eventually(lambda: self.theirs("stuck"), what="alpha to show it again")
+            self.assertEqual(crewchat.answer_need(self.a.hub, {"key": item["key"], "answer": "stop"}), {"ok": True})
+        self.assertEqual(stopped, ["remy"])
+
+    def test_a_linked_machines_items_are_not_pushed_here(self):
+        agent = self.b.agent()
+        self.ask(agent, text="npm publish", wait=10)
+        eventually(lambda: self.theirs(text="npm publish"), what="alpha to show it")
+        projects = self.a.server.RequestHandlerClass.projects
+        store = mock.Mock()
+        store.wanted.return_value = [("endpoint", "all")]
+        seen = {p.id: set() for p in projects.all()}
+        self.a.hub.page_seen = 0
+        crewchat.push_round(projects, store, seen, send=lambda *a: None)
+        self.assertFalse([c for c in store.queue.call_args_list if "npm publish" in json.dumps(c.args[1])])
+
+
 class Projects(unittest.TestCase):
     """Projects besides the first are shared by name: t2 on alpha and t2 on beta are one chat."""
 
@@ -566,6 +818,17 @@ class Projects(unittest.TestCase):
                                                                         what="t2 shared"))
         for name in ("t2", "other"):
             self.assertFalse(any(m["text"] == "only on alpha" for m in self.hub(self.b, name).messages))
+
+    def test_a_member_acts_on_agents_only_in_a_project_it_shares(self):
+        # /peer/agent for a project besides the first: beta has t2 too, so it may; it lacks solo, so it may not start,
+        # stop or fork agents in solo's folders, though it is a member (as launch_members lists only sharers).
+        device, secret = self.b.sync.device_id, self.b.sync.mesh.data["secret"]
+        eventually(lambda: device in self.hub(self.a, "t2").sync.shared_with, what="alpha to know beta has t2")
+        self.assertNotIn(device, self.hub(self.a, "solo").sync.shared_with)
+        asked = {"op": "options", "sender": {"id": device}}
+        self.assertEqual(status_of(self.a.url + "/peer/agent", dict(asked, chat="solo"), secret, device), 403)
+        self.assertEqual(status_of(self.a.url + "/peer/agent", dict(asked, chat="t2"), secret, device), 200)
+        self.assertEqual(status_of(self.a.url + "/peer/agent", asked, secret, device), 200)  # the first project: any member
 
     def test_the_chat_page_shows_the_other_machine_reachable(self):
         eventually(lambda: [m["online"] for m in crewchat.link_info(self.a.hub)["machines"]] == [True],
@@ -1354,6 +1617,34 @@ class LinkInfo(unittest.TestCase):
         sync.info_changed()
         sync._pull({"since": self.a.hub.next_seq, "wait": 0})
         self.assertEqual(len(made), 2)
+
+    def test_needs_you_is_not_built_again_for_each_change_a_waiting_pull_sees(self):
+        # Review of 12 Nov: each change woke every waiting pull, and each wake built Needs you again from the whole chat
+        # (needs_you is kept per change), under the hub's lock. Now at most every NEEDS_EVERY seconds, and only when the
+        # chat changed; something that does wait on the owner still reaches the pull.
+        sync, hub, built = self.a.sync, self.a.hub, []
+        real = hub.shared_needs
+        first = sync._pull({"since": hub.next_seq, "wait": 0})
+        with mock.patch.object(hub, "shared_needs", lambda: built.append(1) or real()):
+            out = {}
+            t = threading.Thread(target=lambda: out.update(sync._pull({"since": hub.next_seq, "wait": 3, "v": first["v"]})))
+            t.start()
+            for _ in range(10):  # changes that are not the owner's to answer (a step an agent took, say)
+                time.sleep(0.03)
+                with hub.lock:
+                    hub._changed()
+                    hub.lock.notify_all()
+            self.assertLessEqual(len(built), 1)
+            item = {"kind": "permission", "id": "p1", "agent": "maya", "tool": "Bash", "text": "make deploy", "ts": 1.0,
+                    "blocking": 0, "key": "permission:p1"}
+            with mock.patch.object(hub, "needs_you", lambda: [item]):
+                with hub.lock:
+                    hub._changed()
+                    hub.lock.notify_all()
+                t.join(peers.NEEDS_EVERY + 2)
+            self.assertFalse(t.is_alive())
+        self.assertEqual([n["key"] for n in out["needs"]], ["permission:p1"])  # it came within NEEDS_EVERY
+        self.assertLessEqual(len(built), 3)
 
     def test_the_panel_and_the_command_line_say_the_same(self):
         # Release review (C8): the Machines panel and `crewchat peers status` each worked out a machine's state.

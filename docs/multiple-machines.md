@@ -8,13 +8,17 @@ agents, and the machines are linked: over Tailscale, or through your own Firebas
 - [With cloud sync](#with-cloud-sync)
 - [Or: one host for every machine](#or-one-host-for-every-machine)
 - [Projects and linked machines](#projects-and-linked-machines)
+- [Agents on your other machines](#agents-on-your-other-machines)
 - [What changes across machines](#what-changes-across-machines)
 
 ## Choose how to link
 
 On every machine, first [install crewchat](getting-started.md#1-install) and run `crewchat start` in
-the project folder. Then open **Machines** in the chat page's project menu. It shows both ways side
-by side, with what each machine still needs, and links them in a few clicks:
+the project folder. Then open **Machines & devices**, at the foot of the chat page's sidebar (or **Settings ›
+Machines & devices**, the **Machines** tab). It shows both ways side by side, with what each machine still needs,
+and links them in a few clicks:
+
+<img src="images/machines.png" width="760" alt="Settings, Machines and devices, with its tabs Machines, Phones and emulators, and Agents' browser. This machine: macbook, crewchat 2.0.0, not linked with your other machines yet. Link over Tailscale: Invite a machine, and Join a machine with a box for the join command another machine shows. Link with cloud sync: step 1, your Firebase project's two files.">
 
 - **Tailscale:** **Invite a machine** on one, then paste the join command it shows into **Join a
   machine** on the other.
@@ -22,12 +26,12 @@ by side, with what each machine still needs, and links them in a few clicks:
   itself), and approve the new machine from one already linked, after comparing the fingerprint
   both show.
 
-Once linked, the panel shows every machine: online or not, its crewchat version, its projects, and
+Once linked, the **Machines** tab shows every machine: online or not, its crewchat version, its projects, and
 which one coordinates, with **Make coordinator**, **Remove** and **Unlink**. **Check everything**
 lists what works and, for what does not, what to do. A project made on one machine is offered on
 the others' pages: **Set up here** makes it there and opens the folder picker.
 
-In a terminal, the same is:
+Or, from a terminal:
 
 ```bash
 crewchat connect
@@ -108,8 +112,11 @@ at once and decrypt it:
 
 1. **Once:** set up the Firebase project, by hand or by handing a prompt to an agent:
    [Firebase setup](firebase-setup.md). You end up with two files: `firebase-web.json` and
-   `oauth-client.json`.
-2. **On every machine,** after `crewchat start`:
+   `oauth-client.json`. Or, in **Link with cloud sync** on the **Machines** tab, pick where your database lives and
+   press **Set it up with an agent**: a Claude Code agent makes the project in your Chrome, where you are signed in
+   to Google, and asks you in Needs you before it changes anything in Google's consoles.
+2. **On every machine,** after `crewchat start`, pick the two files in **Link with cloud sync** and **Sign in with
+   Google**. Or from a terminal:
 
    ```bash
    crewchat cloud setup --web-config firebase-web.json --oauth-client oauth-client.json
@@ -130,6 +137,9 @@ crewchat cloud devices           # the machines on the account
 crewchat cloud remove laptop     # drop one; the others switch to a new key it never sees
 crewchat cloud logout
 ```
+
+With cloud sync, your phone can open the chat with no computer awake and no Tailscale: publish the phone's page and
+pair it from the **Phone from anywhere** card on the **Machines** tab ([Your phone](phone.md)).
 
 When the last machine logs out, no one holds the account key any more: its data is cleared from
 Firestore, and the next machine to log in founds the account again.
@@ -172,7 +182,7 @@ server only listens on its own machine, so this also needs a private network suc
    crewchat join --url https://host.your-tailnet.ts.net --code ABCD-EFGH
    ```
 
-The chat page says how a machine is linked, under the project's name: **Linked over Tailscale**
+The **Machines** card in **Project settings › General** says how a machine is linked: **Linked over Tailscale**
 with a dot for each other machine (filled green when it answers now, a ring when not), or **Linked with cloud sync
 (Firestore)** with online or offline, and whether the machine still waits for approval.
 
@@ -188,7 +198,7 @@ A machine can hold several [projects](getting-started.md#projects). Linked machi
 name**, over Tailscale and with cloud sync alike: a project called `t2` on the Mac and one called
 `t2` on the laptop are one chat, with one task sheet. Each machine's **first** project (the one set
 up first) is shared with the others' first, whatever their names, as before. A project only one
-machine has stays on it. The chat page marks shared projects "(shared)" in its project menu. A
+machine has stays on it. The chat page marks shared projects "(shared)" in its project switcher. A
 machine on crewchat older than 0.12 shares only its first project with cloud sync.
 
 **What was there before.** When a project becomes shared, its messages from then on reach the other
@@ -203,6 +213,26 @@ laptop has a later project also called `test`, the Mac's `test` is shared with t
 project, and the laptop's later `test` stays on the laptop. Nothing is mixed; rename one of them to
 pair the projects you mean.
 
+## Agents on your other machines
+
+With machines linked over Tailscale, you run the whole crew from one page:
+
+- **Start an agent on any linked machine.** In **+ New agent**, pick it under **Machine**: its tools and folders
+  show. What its tool asks the first time there is one card in the dialog, **Approve and start**.
+- **Its card works from here.** An agent on a linked machine has **Stop**, **Reopen**, **Show terminal** and the mode
+  switch on its card, and **Fork** starts a new Claude Code agent from a copy of its conversation. **Open in
+  Terminal**, and the agent's settings, stay on its own machine.
+- **Needs you on every machine.** An agent's permission prompts, plans, questions, browser and device approvals, and
+  a background agent's trust and stuck cards show on every linked machine's page, marked with the machine. Allow or
+  Deny there goes back to that machine, and the card clears everywhere once answered.
+- **Saved crews.** In **Settings › Agents & tools**, **Save crew** keeps the agents here now, on every machine;
+  **Start saved crew** brings the same agents back after a reboot, each on its own machine; **Stop all** stops every
+  saved agent's session (they stay in the chat).
+
+Each machine can turn these off for itself, on the **Machines** tab's **This machine** card: **Let my other machines
+start, stop and fork agents here**, and **Show what waits on me here on my other machines, and let me answer it
+there**.
+
 ## What changes across machines
 
 - **The roster** shows agents everywhere. In `hub_agents`, an agent elsewhere reads
@@ -216,11 +246,12 @@ pair the projects you mean.
   agent is told to stop.
 - **Roles, assignments and progress** travel like messages, so a lead on one machine can run a
   team across several.
-- **The chat page** works on any linked machine: each has the whole chat. Its connection line says
+- **The chat page** works on any linked machine: each has the whole chat. **Machines & devices** says
   which machine coordinates now: one machine at a time does what needs one machine to act for the
-  others, and whichever is on takes it over. `crewchat coordinator NAME` names the one you prefer
-  when it is on.
-- **Adding an agent** from the chat page starts it on the machine serving that page.
+  others, and whichever is on takes it over. **Make coordinator** on a machine's card (or `crewchat
+  coordinator NAME`) names the one you prefer when it is on.
+- **Adding an agent** from the chat page starts it on the machine you pick under **Machine** (the machine serving
+  the page, unless you pick another; [above](#agents-on-your-other-machines)).
 - **Shared files** stay on the machine they were shared on. Over Tailscale, another machine fetches
   a file when someone first opens it. With cloud sync, a file up to 5 MB travels with its message,
   encrypted, and stays in the cloud for 24 hours (`cloud_ttl_hours`) for whoever opens it; a bigger

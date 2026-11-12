@@ -27,14 +27,22 @@ Firestore layout, all under users/{uid}/ (the security rules confine an account 
   catchups/{id}     {since, after, state, parts, more, by}  a machine back after more than the TTL asks (Y3)
   catchup_parts/{id}-{n}  {for, dev, key_id, nonce, ct, created}  the messages it missed, sealed by the
                                                      coordinator, deleted once it has read them
+  pairings/{id}     {machine, version, mac, created}  a machine's half of pairing a phone (W13)
   spaces/{space}    {created}                          a project besides the first, shared by name:
     messages/, state/, tasks/, files/, catchups/, catchup_parts/  as above, for that project only
     marks/{id}        {seen, synced_to}                how far each machine has read it
+  pages/{id}        {dev, key_id, nonce, ct, updated}  what a machine's chat page shows besides the messages, for
+                                                     the hosted page (W13); in each space too
+  answers/{id}      {dev, key_id, nonce, ct, created}  a phone's signed answer to Needs you (W13); in each space too
+The phone (W13) is a device too, with kind "phone" (docs/superpowers/specs/2026-11-09-hosted-page-design.md): it
+pairs by a code a machine shows, may post only as the owner, and never approves or removes a device.
 The first projects of all machines use the top-level collections, whatever their names. Another
 project's space is a hash of its name (space_id), so the name itself never reaches the cloud.
 """
 import base64
+import gzip
 import hashlib
+import hmac
 import json
 import os
 import queue
@@ -68,14 +76,38 @@ LEASE_RENEW = 100  # and any approved machine online takes it once it has run ou
 CATCHUP_PART_BYTES = 40000  # messages per catch-up part, as JSON: sealed, it stays under the rules' 60,000 characters
 CATCHUP_DAYS = 7  # how far back a machine catches up through Firestore (Tailscale: all of it)
 CATCHUP_PARTS = 25  # parts the coordinator writes for a machine at a time: more once it has read those
+PHONE = "phone"  # a device's kind when it is a phone on the hosted page (W13); a machine has none
+PHONE_DAYS = 7  # with a phone paired, the cloud keeps messages this long (config cloud_phone_days): its history
+PHONE_IDLE_DAYS = 30  # a phone not opened for this long is removed, so a forgotten one does not keep the key
+PAIR_SECS = 600  # a pairing code works once, for this long
+PAIR_ALPHABET = crewchat.CODE_ALPHABET  # 32 letters and digits with no 0/O or 1/I to mistake
+ANSWER_SECS = 600  # a phone's answer older than this is refused
+PAGE_EVERY = 15  # seconds between a machine's page snapshots (pages/), while a phone is paired
+PAGE_BYTES = 40000  # at most this much JSON in a snapshot: sealed and in base64 it stays under the rules' 60,000 characters
+PAGE_KEEP = 300  # asks' receipts and tasks taken off the sheet a snapshot names at most, when it is cut down
+# (what pages/{id} last said, when, the hub's version and the messages received then, its signature without what
+# changes at every hook, whether a change of only that waits): _send_page
+PAGE_UNSENT = (None, 0, None, None, False)
+# A key retired by a removal (Account.rotate) still opens what was written with it before then, and for this long
+# after: a machine that was offline while the key changed may write with the old one until it hears of the new one.
+# Anything written with it later is refused, as a removed phone that kept the old key would write it. "Written" is
+# the database's own time of the write (WRITTEN), which the writer cannot choose.
+RETIRED_GRACE = 300
+HELD_MAX = 2000  # messages held at most, waiting for their key or their writer's approval
+WRITTEN = "_written"  # the database's time of a document's last write, as the stores read it (never a stored field)
+# What the hosted page's send() puts in a message (W13): a phone posts chat messages and tasks as the owner, nothing
+# else. A plan, process, server or routine message from a phone is refused, as is any other field.
+PHONE_KINDS = ("msg", "task")
+PHONE_FIELDS = frozenset(("id", "ts", "from", "to", "text", "kind", "thread", "ask", "re", "task"))
 
 
 class CloudError(Exception):
     pass
 
 
-COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts", "files")  # the layout above, but meta, spaces
-SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts", "files")  # in each spaces/{space}
+COLLECTIONS = ("messages", "tasks", "state", "devices", "catchups", "catchup_parts", "files", "pages", "answers",
+               "pairings")  # the layout above, but meta, spaces
+SPACE_COLLECTIONS = ("messages", "tasks", "state", "marks", "catchups", "catchup_parts", "files", "pages", "answers")  # in each spaces/{space}
 CLOUD_FILE_MAX = 5 * 1024 * 1024  # a shared file travels with its message up to this size (config cloud_file_mb)
 # Why the cap: the free (Spark) plan of a Firebase project allows 1 GiB stored, 20,000 writes and 50,000 reads a
 # day, and 10 GiB a month downloaded; a file is a write per 32 KB part on the way in (160 for 5 MB) and a read per
@@ -202,6 +234,24 @@ def canonical(obj):
     return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+# Phones (W13) ------------------------------------------------------------------------------------
+def is_phone(entry):
+    """A trusted-list entry (or device document) for a phone: it may read and post as the owner, and answer Needs
+    you, but its signature never changes who is trusted."""
+    return isinstance(entry, dict) and entry.get("kind") == PHONE
+
+
+def pair_code():
+    """A pairing code: 4 letters naming the pairing, then 16 (80 bits) that only the QR code carries."""
+    return "".join(secrets.choice(PAIR_ALPHABET) for _ in range(20))
+
+
+def pair_mac(secret, *parts):
+    """What proves knowledge of a pairing's secret: HMAC-SHA-256 over the parts, hex. The phone's names its public key,
+    the machine's its own key and the trust list's version, so each side knows whom the other paired with."""
+    return hmac.new(secret.encode("ascii"), "|".join(parts).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 # --------------------------------------------------------------------------------------------
 # This machine's identity
 # --------------------------------------------------------------------------------------------
@@ -242,6 +292,10 @@ class Device:
         keys = read_json(self.dir / "keys.json", {})
         self.keys = {k: unb64(v) for k, v in keys.get("keys", {}).items()}
         self.current = keys.get("current", "")
+        # key id -> when it stopped being the one in use (RETIRED_GRACE). A crewchat before this kept no such list:
+        # its older keys count as retired from now.
+        self.retired = {k: float(t) for k, t in (keys.get("retired") or {}).items()} if "retired" in keys else {
+            k: time.time() for k in self.keys if k != self.current}
         self.trust = read_json(self.dir / "trust.json", {"devices": {}, "version": 0})
         self.lock = threading.RLock()
 
@@ -271,11 +325,17 @@ class Device:
             write_private(self.dir / "device.json",
                           json.dumps({"id": self.id, "name": self.name, "tag": self.tag}, indent=2))
             write_private(self.dir / "keys.json", json.dumps(
-                {"keys": {k: b64(v) for k, v in self.keys.items()}, "current": self.current}, indent=2))
+                {"keys": {k: b64(v) for k, v in self.keys.items()}, "current": self.current, "retired": self.retired},
+                indent=2))
             write_private(self.dir / "trust.json", json.dumps(self.trust, indent=2))
 
     def trusted(self, device_id):
         return self.trust.get("devices", {}).get(device_id)
+
+    def retired_before(self, kid, written):
+        """Was key kid retired before a document written at `written` (the database's time), grace included?"""
+        at = self.retired.get(kid)
+        return kid != self.current and at is not None and float(written) > at + RETIRED_GRACE
 
 
 # --------------------------------------------------------------------------------------------
@@ -301,6 +361,7 @@ class MemoryStore:
 
     def __init__(self):
         self.docs = {}
+        self.written = {}  # path -> the store's time of its last write (WRITTEN), as Firestore's update time
         self.lock = threading.RLock()
         self.listeners = []  # (collection, callback, since)
         self.events = queue.Queue()
@@ -345,22 +406,32 @@ class MemoryStore:
                 continue
             if since and kind != "removed" and data.get(since[0], 0) < since[1]:
                 continue
-            self.events.put((callback, [(kind, doc_id, dict(data))]))
+            self.events.put((callback, [(kind, doc_id, self._out(path, data))]))
+
+    def _out(self, path, doc):
+        """A copy of a document as read, with the store's own time of its last write."""
+        out = dict(doc)
+        out[WRITTEN] = self.written.get(path, 0.0)
+        return out
+
+    def _wrote(self, path):
+        self.written[path] = max(self.clock, time.time())  # the write's own time, without moving the clock on
 
     def get(self, path):
         self._check()
         with self.lock:
             doc = self.docs.get(path)
-            return dict(doc) if doc is not None else None
+            return self._out(path, doc) if doc is not None else None
 
     def set(self, path, data, merge=False):
         self._check()
         with self.lock:
             old = self.docs.get(path)
             new = dict(old) if (merge and old) else {}
-            new.update(self._fill(data, old if merge else None))
+            new.update(self._fill({k: v for k, v in data.items() if k != WRITTEN}, old if merge else None))
             allowed(new)
             self.docs[path] = new
+            self._wrote(path)
             self._notify(path, "modified" if old is not None else "added", new)
 
     def create(self, path, data):
@@ -368,7 +439,8 @@ class MemoryStore:
         with self.lock:
             if path in self.docs:
                 return False
-            self.docs[path] = allowed(self._fill(data))
+            self.docs[path] = allowed(self._fill({k: v for k, v in data.items() if k != WRITTEN}))
+            self._wrote(path)
             self._notify(path, "added", self.docs[path])
             return True
 
@@ -378,6 +450,7 @@ class MemoryStore:
             old = self.docs.pop(path, None)
             if old is not None:
                 self._notify(path, "removed", old)
+                self.written.pop(path, None)
 
     def list(self, collection, where=None):
         self._check()
@@ -386,7 +459,7 @@ class MemoryStore:
             for path, doc in self.docs.items():
                 coll, doc_id = path.rsplit("/", 1)
                 if coll == collection and (not where or doc.get(where[0]) == where[1]):
-                    out.append((doc_id, dict(doc)))
+                    out.append((doc_id, self._out(path, doc)))
             return out
 
     def listen(self, collection, callback, since=None):
@@ -441,13 +514,22 @@ class FirestoreStore:
         return self.db.document(self.root + path)
 
     def _out(self, data):
-        return {k: (self.firestore.SERVER_TIMESTAMP if v is SERVER_TIME else v) for k, v in data.items()}
+        return {k: (self.firestore.SERVER_TIMESTAMP if v is SERVER_TIME else v) for k, v in data.items() if k != WRITTEN}
 
     @staticmethod
     def _in(snapshot_dict):
         out = {}
         for k, v in (snapshot_dict or {}).items():
             out[k] = v.timestamp() if hasattr(v, "timestamp") and not isinstance(v, (int, float)) else v
+        return out
+
+    @classmethod
+    def _read(cls, snap):
+        """A document as read, with the server's time of its last write (WRITTEN): a field of the same name is not
+        taken, so the writer cannot choose it."""
+        out = cls._in(snap.to_dict())
+        updated = getattr(snap, "update_time", None)
+        out[WRITTEN] = updated.timestamp() if hasattr(updated, "timestamp") else 0.0
         return out
 
     def _call(self, fn, *args, **kwargs):
@@ -461,7 +543,7 @@ class FirestoreStore:
 
     def get(self, path):
         snap = self._call(self._ref(path).get, timeout=CLAIM_TIMEOUT)
-        return self._in(snap.to_dict()) if snap.exists else None
+        return self._read(snap) if snap.exists else None
 
     def set(self, path, data, merge=False):
         self._call(self._ref(path).set, self._out(data), merge=merge, timeout=CLAIM_TIMEOUT)
@@ -481,7 +563,7 @@ class FirestoreStore:
         query = self.db.collection(self.root + collection)
         if where:
             query = query.where(where[0], "==", where[1])
-        return [(d.id, self._in(d.to_dict())) for d in self._call(lambda: list(query.stream(timeout=CLAIM_TIMEOUT)))]
+        return [(d.id, self._read(d)) for d in self._call(lambda: list(query.stream(timeout=CLAIM_TIMEOUT)))]
 
     def listen(self, collection, callback, since=None):
         import datetime
@@ -493,7 +575,7 @@ class FirestoreStore:
             out = []
             for change in changes:
                 kind = change.type.name.lower()
-                out.append((kind, change.document.id, self._in(change.document.to_dict())))
+                out.append((kind, change.document.id, self._read(change.document)))
             if out:
                 callback(out)
 
@@ -632,8 +714,8 @@ class Account:
                 if not ours or ours.get("pub", "").strip() != device.pub.strip():
                     return False
                 signer_entry = doc["devices"].get(signer)
-            if not signer_entry or not verify(signer_entry["pub"], doc.get("sig", ""),
-                                              trust_payload(doc["devices"], version)):
+            if not signer_entry or is_phone(signer_entry) or not verify(
+                    signer_entry["pub"], doc.get("sig", ""), trust_payload(doc["devices"], version)):
                 return False
             device.trust = {"devices": doc["devices"], "version": version, "signer": signer,
                             "sig": doc["sig"]}
@@ -652,7 +734,7 @@ class Account:
             by = (doc.get("wrapped_by") or {}).get(kid)
             entry = device.trusted(by) if by else None
             sig = (doc.get("key_sigs") or {}).get(kid, "")
-            if not entry or not verify(entry["pub"], sig, ("%s|%s|%s" % (device.id, kid, wrapped)).encode("ascii")):
+            if not entry or is_phone(entry) or not verify(entry["pub"], sig, ("%s|%s|%s" % (device.id, kid, wrapped)).encode("ascii")):
                 continue
             try:
                 key = unwrap(device.private, wrapped)
@@ -668,15 +750,32 @@ class Account:
         return new
 
     def accept_account(self, doc):
-        """Switch to the account key in use, once this device holds it."""
+        """Switch to the account key in use, once this device holds it. Every other key is retired then
+        (RETIRED_GRACE): from the database's time of the switch (retired_at, written by the device that rotated), or
+        from now if that is earlier or missing; meta/account is not signed, so a time in it can only make this stricter.
+        A key retired longer ago than the grace is never taken back, so a removed device cannot turn the account back
+        to the key it kept."""
         device = self.device
-        kid = (doc or {}).get("key_id")
-        if kid and kid in device.keys and kid != device.current:
-            with device.lock:
-                device.current = kid
-                device.save()
-            return True
-        return False
+        doc = doc or {}
+        kid = doc.get("key_id")
+        if not kid or kid not in device.keys or kid == device.current:
+            return False
+        now = time.time()
+        if kid in device.retired and now > device.retired[kid] + RETIRED_GRACE:
+            return False
+        at = now
+        try:
+            at = min(at, float(doc.get("retired_at") or now))
+        except (TypeError, ValueError):
+            pass
+        with device.lock:
+            device.retired.pop(kid, None)  # two removals at once: whichever key won is in use again
+            for old in device.keys:
+                if old != kid:
+                    device.retired.setdefault(old, at)
+            device.current = kid
+            device.save()
+        return True
 
     def refresh(self):
         self.accept_trust(self.store.get("meta/trust"))
@@ -715,7 +814,7 @@ class Account:
 
     def _valid_trust(self, doc):
         entry = self.device.trusted(doc.get("signer"))
-        return bool(entry) and verify(entry["pub"], doc.get("sig", ""),
+        return bool(entry) and not is_phone(entry) and verify(entry["pub"], doc.get("sig", ""),
                                       trust_payload(doc.get("devices", {}), int(doc.get("version", 0))))
 
     def approve(self, name_or_id, expect_fp=None):
@@ -723,6 +822,17 @@ class Account:
         if not device.ready:
             raise CloudError("this machine is not approved itself yet")
         target_id, doc = self.find(name_or_id)
+        if is_phone(doc):
+            raise CloudError("%s is a phone: a phone joins only by scanning the code of Machines -> Phone from anywhere"
+                             % doc.get("name", target_id))
+        return self._admit(target_id, doc, expect_fp)
+
+    def admit_phone(self, target_id, doc):
+        """A phone that showed the right pairing code (CloudSync._pair): trusted, as a phone, and given the keys."""
+        return self._admit(target_id, doc, None, kind=PHONE)
+
+    def _admit(self, target_id, doc, expect_fp, kind=None):
+        device = self.device
         pub = doc.get("pub", "")
         fp = fingerprint(pub) if pub else ""
         if not pub or fp != doc.get("fp"):
@@ -731,6 +841,8 @@ class Account:
             raise CloudError("fingerprint mismatch: the device shows %s. Do not approve it if that is "
                              "not what the new machine displays." % fp)
         entry = {"fp": fp, "name": doc.get("name", ""), "tag": doc.get("tag", ""), "pub": pub}
+        if kind:
+            entry["kind"] = kind
         self._change_trust(lambda devices: dict(devices, **{target_id: entry}))
         keys, sigs, by = {}, {}, {}
         for kid in device.keys:
@@ -751,11 +863,19 @@ class Account:
         for space, _ in self.store.list("spaces"):
             self.store.delete("spaces/%s/state/%s" % (space, target_id))
             self.store.delete("spaces/%s/marks/%s" % (space, target_id))
-        if not left:
+        if not any(not is_phone(entry) for entry in left.values()):  # phones never keep an account on their own
             self._reset()
         elif target_id != device.id:
             self.rotate()
         return doc.get("name", target_id)
+
+    def clear_window(self):
+        """Delete every message the cloud still holds, in every project (Remove and clear, W13): a removed phone that
+        is still signed in to Google can then read nothing it had not read yet, even under the old key. The machines
+        keep the whole history; a machine that has not read them yet catches up from the coordinator."""
+        for base in [""] + ["spaces/%s/" % space for space, _ in self.store.list("spaces")]:
+            for doc_id, _ in self.store.list(base + "messages"):
+                self.store.delete(base + "messages/" + doc_id)
 
     def _reset(self):
         """The last trusted device left. No one holds the account key any more, so what is left in
@@ -784,7 +904,7 @@ class Account:
             wrapped, sig = wrap_for(device, other_id, entry["pub"], kid)
             self.store.set("devices/" + other_id, {"keys": {kid: wrapped}, "key_sigs": {kid: sig},
                                                   "wrapped_by": {kid: device.id}}, merge=True)
-        self.store.set("meta/account", {"key_id": kid}, merge=True)
+        self.store.set("meta/account", {"key_id": kid, "retired_at": SERVER_TIME}, merge=True)
         self.accept_account({"key_id": kid})
 
 
@@ -808,8 +928,17 @@ class CloudSync(crewchat.ProjectLink):
     space, under the same account key: projects with the same name on the machines are one chat,
     and a project one machine lacks stays on the other."""
 
-    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None, file_max=CLOUD_FILE_MAX):
+    def __init__(self, hub, store, device, ttl_hours=TTL_HOURS, log=None, chat=None, file_max=CLOUD_FILE_MAX,
+                 phone_days=PHONE_DAYS):
         self._init_projects(hub, chat)
+        self.phone_days = float(phone_days)
+        self.pairings = {}  # the machine's link: pairing id -> {secret, expires}, while its code is on the page (W13)
+        self.page_sent = PAGE_UNSENT  # what pages/{id} last said and when, and as of what (_send_page)
+        self.page_too_big = False  # said once in the log, while the snapshot cannot be cut to fit
+        self.page_failing = False  # said once in the log, while the snapshot cannot be written
+        # answers/ already applied here, with when: a copy written again is not applied twice. Kept only while a copy
+        # could still pass the age check (_on_answers drops older ones), so the list does not grow for ever.
+        self.answered = {}
         self.store = store
         self.device = device
         self.account = Account(store, device)
@@ -849,7 +978,188 @@ class CloudSync(crewchat.ProjectLink):
     def _names(self):
         """The approved machines' names, by id, from the account's trust list kept on this machine: no cloud read
         (the page asks at every poll). Only an approved machine holds the lease or shares a file."""
-        return {i: e.get("name") or i for i, e in self.device.trust.get("devices", {}).items()}
+        return {i: e.get("name") or i for i, e in self.machines().items()}
+
+    def machines(self):
+        """The approved machines, this one too: id -> trusted entry."""
+        return {i: e for i, e in list(self.device.trust.get("devices", {}).items()) if not is_phone(e)}
+
+    # Phones (W13) ------------------------------------------------------------------------------
+    def phones(self):
+        """The paired phones: id -> trusted entry."""
+        return {i: e for i, e in self.device.trust.get("devices", {}).items() if is_phone(e)}
+
+    def window(self):
+        """How long the cloud keeps a message: the TTL, or with a phone paired its history (cloud_phone_days)."""
+        return max(self.ttl, self.phone_days * 86400) if self.phones() else self.ttl
+
+    def start_pairing(self):
+        """A pairing code for Machines -> Phone from anywhere: works once, for PAIR_SECS. Only this machine and the QR
+        code know its secret."""
+        if not self.device.ready:
+            raise CloudError("this machine is not approved on the account yet")
+        now = time.time()
+        for pid in [p for p, offer in self.pairings.items() if offer["expires"] < now]:
+            del self.pairings[pid]
+        code = pair_code()
+        self.pairings[code[:4]] = {"secret": code[4:], "expires": now + PAIR_SECS}
+        return {"code": code, "ttl": PAIR_SECS}
+
+    def _pair(self, device_id, doc):
+        """A phone asked to join with a pairing code (devices/{id} with pair {id, mac}). Admitted when its MAC shows it
+        had this machine's code, which then works no more; answered in pairings/{id}, so the phone knows that the trust
+        list it gets was signed by the machine whose code it scanned."""
+        pair = doc.get("pair") if isinstance(doc.get("pair"), dict) else {}
+        pid = str(pair.get("id") or "")
+        offer = self.pairings.get(pid)
+        if offer is None or offer["expires"] < time.time():
+            return False
+        if not hmac.compare_digest(pair_mac(offer["secret"], "phone", pid, str(doc.get("pub") or "").strip()),
+                                   str(pair.get("mac") or "")):
+            self.log("a phone gave a wrong pairing code (%s)" % pid)
+            return False
+        del self.pairings[pid]
+        name = self.account.admit_phone(device_id, doc)
+        version = str(int(self.device.trust.get("version", 0)))
+        self.store.set("pairings/" + pid, {"machine": self.device_id, "version": version, "created": SERVER_TIME,
+                                           "mac": pair_mac(offer["secret"], "machine", pid, self.device.pub.strip(), version)})
+        self.log("paired the phone %s" % name)
+        for sync in self._all():
+            sync.page_sent = PAGE_UNSENT  # the phone has no page snapshot to show yet
+        return True
+
+    def page_snapshot(self):
+        """What a chat page shows besides the messages, for the hosted page (pages/{id}): the poll's roster, tasks and
+        Needs you, and the part of /api/boot it needs. Cut down to stay within a document's size."""
+        return self._page()[0]
+
+    def _page(self):
+        """(page_snapshot, it as JSON with its keys sorted): each cut measured by the one JSON it sends."""
+        hub = self.hub
+        data = hub.poll(-1, -2, 0)  # -2: never the hub's version, so it does not wait
+        for key in ("messages", "more", "now", "update", "version"):  # the phone keeps its own clock and version
+            data.pop(key, None)
+        data["needs"] = hub.needs_you()
+        data["sheet"] = hub.sheet_rows()
+        boot = hub.boot()
+        data["boot"] = {k: boot.get(k) for k in ("tag", "roles", "statuses", "need_kinds")}
+        data["machine"] = self.device.name
+        data["synced_to"] = float(self.marks.get("synced_to", 0))  # what it has received: the phone's "waits for a computer"
+        data.pop("woke", None)  # the hosted page marks no message with the agents it woke
+        # Receipts and tasks off the sheet only for the messages the phone can have: those in the cloud's window.
+        since = time.time() - self.window()
+        with hub.lock:
+            recent = {mid for mid in list(data["asks"]) + list(data["removed"])
+                      if float((hub.by_id.get(mid) or {}).get("ts") or 0) >= since}
+        data["asks"] = {k: v for k, v in data["asks"].items() if k in recent}
+        data["removed"] = [m for m in data["removed"] if m in recent]
+        text = lambda: json.dumps(data, sort_keys=True, ensure_ascii=False, default=str)  # noqa: E731
+        said = text()
+        if len(said.encode("utf-8")) > PAGE_BYTES:  # a long history: what is still open
+            open_ids = {r["id"] for r in data["sheet"] if r.get("status") != "done"}
+            data["sheet"] = [r for r in data["sheet"] if r["id"] in open_ids][:200]
+            data["progress"] = {k: v for k, v in data["progress"].items() if k in open_ids}
+            data["taken"] = {k: v for k, v in data["taken"].items() if k in open_ids}
+            data["asks"] = dict(list(data["asks"].items())[-PAGE_KEEP:])  # the newest
+            data["removed"] = data["removed"][-PAGE_KEEP:]
+            said = text()
+        if len(said.encode("utf-8")) > PAGE_BYTES:  # still too big: the board stays on the computers' pages
+            data.update(sheet=[], progress={}, taken={}, removed=[])
+            data["asks"] = {k: v for k, v in data["asks"].items() if v != "answered"}  # the receipts still moving
+            for item in data["needs"]:
+                item["text"] = str(item.get("text") or "")[:500]
+            data["needs"] = data["needs"][:50]
+            said = text()
+        return data, said  # it may still be over PAGE_BYTES (a roster of hundreds): _send_page does not write it
+
+    @staticmethod
+    def _page_signature(data):
+        """A snapshot as _send_page compares it: without each agent's last seen and token usage, which change at
+        almost every hook. What agents are doing, and their state, stay in."""
+        rows = [{k: v for k, v in r.items() if k not in ("seen", "usage")} for r in data.get("agents") or []]
+        return json.dumps(dict(data, agents=rows), sort_keys=True, ensure_ascii=False, default=str)
+
+    def _send_page(self):
+        """pages/{id}, while a phone is paired: again when the hub changed, at most every PAGE_EVERY seconds, and every
+        HEARTBEAT with nothing new, so the phone can tell when it was last on. A change of only the agents' last seen
+        or token usage goes at most every SEEN_EVERY, as _send_state does: they change at almost every hook, and the
+        free plan allows 20,000 writes a day. Returns True if a change waits."""
+        now = time.time()
+        said, sent_at, version, signature, pending = self.page_sent
+        if not self.phones():
+            if said is not None:  # the last phone left: nothing to show any more
+                self.store.delete(self.base + "pages/" + self.device_id)
+                self.page_sent = PAGE_UNSENT
+            return False
+        current = (self.hub.version, self.marks.get("synced_to", 0))
+        if current == version and not (pending and now - sent_at >= SEEN_EVERY) and now - sent_at < HEARTBEAT:
+            return False
+        if now - sent_at < PAGE_EVERY:
+            return True
+        data, text = self._page()
+        if len(text.encode("utf-8")) > PAGE_BYTES:  # the rules would refuse it: the phone keeps the last one
+            if not self.page_too_big:
+                self.page_too_big = True
+                self.log("the page snapshot for the phone is too big to send (%d bytes); the phone shows the last one"
+                         % len(text.encode("utf-8")))
+            self.page_sent = (said, sent_at, current, signature, False)
+            return False
+        self.page_too_big = False
+        new_signature = self._page_signature(data)
+        due = new_signature != signature or now - sent_at >= SEEN_EVERY
+        if text != said and due or now - sent_at >= HEARTBEAT:
+            doc = self._seal("crewchat|%s|page|%s|%%s" % (self._scope(), self.device_id), json.loads(text))
+            doc["updated"] = SERVER_TIME
+            self.store.set(self.base + "pages/" + self.device_id, doc)
+            said, sent_at, signature = text, now, new_signature
+        self.page_sent = (said, sent_at, current, signature, text != said)
+        return False
+
+    def _on_answers(self, changes):
+        """A device's answer to Needs you (answers/{id}): sealed, and signed by the device that answered. Applied here
+        if it is for this machine (or any, to leave), by a device this machine trusts, less than ANSWER_SECS old, and
+        not applied before; then deleted."""
+        now = time.time()
+        # An answer signed up to ANSWER_SECS either side of now passes the age check: after twice that, a copy of it
+        # cannot, so its id is not needed any more.
+        self.answered = {k: t for k, t in self.answered.items() if now - t < 2 * ANSWER_SECS}
+        for kind, aid, doc in changes:
+            if kind == "removed" or aid in self.answered:
+                continue
+            dev = str(doc.get("dev") or "")
+            entry = self.device.trusted(dev)
+            if not entry:
+                continue  # not a device this machine trusts (a removed phone's): refused, and deleted in housekeeping
+            try:
+                sealed = self._open("crewchat|%s|answer|%s|%%s|%s" % (self._scope(), aid, dev), doc)
+                signed = json.loads(sealed["signed"])
+                if not verify(entry["pub"], str(sealed.get("sig") or ""), sealed["signed"].encode("utf-8")):
+                    raise ValueError("its signature is not %s's" % entry.get("name", dev))
+                if signed.get("id") != aid or signed.get("by") != dev:
+                    raise ValueError("it does not match its name")
+            except Exception as e:
+                self.log("refused answer %s (%s)" % (aid, e))
+                continue
+            if signed.get("machine") not in (self.device_id, "*"):
+                continue  # another machine's
+            if abs(time.time() - float(signed.get("time") or 0)) > ANSWER_SECS:
+                self.log("refused answer %s from %s: too old" % (aid, entry.get("name", dev)))
+                continue
+            self.answered[aid] = time.time()
+            try:
+                self.store.delete(self.base + "answers/" + aid)
+            except Exception:
+                pass
+            item, body = str(signed.get("item") or ""), signed.get("body") if isinstance(signed.get("body"), dict) else {}
+            try:
+                if item == "leave":
+                    if self.chat is None and is_phone(entry):  # a phone unpairing itself
+                        self.account.remove(dev)
+                    continue
+                crewchat.answer_need(self.hub, dict(body, key=item))
+                self.log("%s answered %s from %s" % (entry.get("name", dev), item, "the phone" if is_phone(entry) else "there"))
+            except Exception as e:  # gone already, or answered on another page first
+                self.log("answer %s from %s not applied (%s)" % (item, entry.get("name", dev), e))
 
     def renew_lease(self, force=False):
         """Hold the coordinator's lease, or take it: when this machine holds it, when it has run out, or when
@@ -925,7 +1235,7 @@ class CloudSync(crewchat.ProjectLink):
             self.hub.prefix = self.device.tag
             self.hub.device = self.device.name
             self.hub.sync = self
-        since = max(time.time() - self.ttl, float(self.marks.get("synced_to", 0)) - 120)
+        since = max(time.time() - self.window(), float(self.marks.get("synced_to", 0)) - 120)
         self.unsubscribe = [
             self.store.listen(self.base + "messages", self._on_messages, since=("created", since)),
             self.store.listen(self.base + "state", self._on_state),
@@ -934,8 +1244,9 @@ class CloudSync(crewchat.ProjectLink):
             self.unsubscribe += [self.store.listen("devices", self._on_devices),
                                  self.store.listen("meta", self._on_meta)]
         self.unsubscribe.append(self.store.listen(self.base + "catchups", self._on_catchups))
+        self.unsubscribe.append(self.store.listen(self.base + "answers", self._on_answers))
         synced_to = float(self.marks.get("synced_to", 0))
-        if synced_to and time.time() - synced_to > self.ttl:  # away for longer than the cloud keeps messages
+        if synced_to and time.time() - synced_to > self.window():  # away for longer than the cloud keeps messages
             self.ask_catch_up(synced_to)
         self._republish()
         for target in (self._worker, self._ticker) + ((self._leaser,) if self.chat is None else ()):
@@ -993,7 +1304,7 @@ class CloudSync(crewchat.ProjectLink):
             lease = self.coordinator()
         except Exception:
             lease = {}
-        for device_id, entry in self.device.trust.get("devices", {}).items():
+        for device_id, entry in self.machines().items():
             if device_id == self.device_id:
                 continue
             remote = self.hub.remote.get(device_id) or {}
@@ -1009,11 +1320,11 @@ class CloudSync(crewchat.ProjectLink):
         return sorted(rows, key=lambda r: r["name"].lower())
 
     def linked_ids(self):
-        return [d for d in list(self.device.trust.get("devices", {})) if d != self.device_id]
+        return [d for d in self.machines() if d != self.device_id]
 
     def _project_link(self, hub, name):
         link = CloudSync(hub, self.store, self.device, ttl_hours=self.ttl / 3600, log=self.log, chat=name,
-                         file_max=self.file_max)
+                         file_max=self.file_max, phone_days=self.phone_days)
         link.machine = self
         return link
 
@@ -1149,10 +1460,21 @@ class CloudSync(crewchat.ProjectLink):
                         time.sleep(2)
                         continue
                     self._send_message(msg)
+                    msg = None  # sent: whatever fails next does not send it again
                 if self.device.ready and self.dirty.is_set():
                     self.dirty.clear()
                     if self._send_state():
                         self.dirty.set()
+                try:
+                    if self.device.ready and self._send_page():
+                        self.dirty.set()
+                    self.page_failing = False
+                except Exception as e:  # the phone's snapshot is tried again after PAGE_EVERY; the messages go on
+                    said, _, _, signature, _ = self.page_sent
+                    self.page_sent = (said, time.time(), None, signature, False)
+                    if not self.page_failing:
+                        self.page_failing = True
+                        self.log("could not send the page snapshot, will retry (%s)" % e)
                 if not self.online:
                     self.online = True
                     self.log("connected again")
@@ -1198,25 +1520,47 @@ class CloudSync(crewchat.ProjectLink):
         reach = [float(docs[i].get("synced_to") or 0) for i in trusted
                  if i in docs and now - float(docs[i].get("seen") or 0) < self.ttl]
         everyone_has = min(reach) if reach else 0
+        phones, window = self.phones(), self.window()
+        if phones:  # the phone's history (W13): kept for the window, whoever has read it
+            everyone_has = 0
         for doc_id, doc in self.store.list(self.base + "messages", where=("dev", self.device_id)):
             created = float(doc.get("created") or now)
-            if created <= everyone_has or now - created > self.ttl:
+            if created <= everyone_has or now - created > window:
                 self.store.delete(self.base + "messages/" + doc_id)
-        for doc_id, doc in self.store.list(self.base + "tasks", where=("dev", self.device_id)):
-            if now - float(doc.get("created") or now) > self.ttl:
-                self.store.delete(self.base + "tasks/" + doc_id)
+        self._phone_housekeeping(phones, window, now)
+        self._expire(self.base + "tasks", self.ttl, now, self.device_id)
         # A file stays for the whole retention, even once every machine has its message: it is fetched only when
         # someone opens it (Hub.open_file), which may be hours later.
-        for doc_id, doc in self.store.list(self.base + "files", where=("dev", self.device_id)):
-            if now - float(doc.get("created") or now) > self.ttl:
-                self.store.delete(self.base + "files/" + doc_id)
+        self._expire(self.base + "files", self.ttl, now, self.device_id)
         # Catch-ups: answer any waiting (the coordinator may have changed), read this machine's own, and drop
         # parts nobody read within the TTL.
         self.serve_catch_ups()
         self.read_catch_up()
-        for doc_id, doc in self.store.list(self.base + "catchup_parts", where=("dev", self.device_id)):
-            if now - float(doc.get("created") or now) > self.ttl:
-                self.store.delete(self.base + "catchup_parts/" + doc_id)
+        self._expire(self.base + "catchup_parts", self.ttl, now, self.device_id)
+
+    def _expire(self, path, max_age, now, dev=None):
+        """Delete the documents in path (only those device dev wrote, if given) created more than max_age seconds
+        ago."""
+        for doc_id, doc in self.store.list(path, where=("dev", dev) if dev else None):
+            if now - float(doc.get("created") or now) > max_age:
+                self.store.delete(path + "/" + doc_id)
+
+    def _phone_housekeeping(self, phones, window, now):
+        """What phones leave behind (W13): answers past ANSWER_SECS, codes past PAIR_SECS, and, by the coordinator,
+        phones' messages past the window and phones not opened for PHONE_IDLE_DAYS."""
+        self._expire(self.base + "answers", ANSWER_SECS, now)
+        if self.chat is None:
+            self._expire("pairings", PAIR_SECS, now)
+        if not phones or not self.coordinator().get("me"):
+            return
+        for phone in phones:
+            self._expire(self.base + "messages", window, now, phone)
+        if self.chat is None:
+            for phone, entry in phones.items():
+                doc = self.store.get("devices/" + phone) or {}
+                if now - float(doc.get("seen") or now) > PHONE_IDLE_DAYS * 86400:
+                    self.log("removing the phone %s: not opened for %d days" % (entry.get("name", phone), PHONE_IDLE_DAYS))
+                    self.account.remove(phone)
 
     # Catching up after more than the TTL (roadmap Y3) ------------------------------------------------
     # The cloud keeps a message until every machine has it, but not longer than the TTL: a machine off for longer
@@ -1301,7 +1645,14 @@ class CloudSync(crewchat.ProjectLink):
                 except Exception:
                     self.log("dropped part %d of the messages missed: it does not decrypt" % n)
                     payload = {}
+                # Settings and process notes come only from a machine this one trusts now, not from a phone (which
+                # holds the same key) or a device since removed: the other messages are only chat.
+                writer = self.device.trusted(doc.get("by", ""))
+                settings_ok = bool(writer) and not is_phone(writer)
                 for msg in payload.get("messages") or []:
+                    if isinstance(msg, dict) and msg.get("kind") in ("plan", "process") and not settings_ok:
+                        self.log("skipped message %s: settings from a device that is not a trusted machine" % msg.get("id"))
+                        continue
                     if isinstance(msg, dict) and msg.get("id"):
                         try:
                             got += bool(self.hub.ingest(msg))
@@ -1359,7 +1710,19 @@ class CloudSync(crewchat.ProjectLink):
         kid = doc.get("key_id", "")
         if kid not in self.device.keys:
             raise KeyError(kid)
+        if self.device.retired_before(kid, doc.get(WRITTEN) or time.time()):  # no time read: as if written now
+            raise CloudError("it was written with a key retired before then")
         return unseal(self.device.keys[kid], aad % kid, doc["nonce"], doc["ct"])
+
+    def _phone_refuses(self, payload):
+        """Why a phone's message is not taken (PHONE_KINDS, PHONE_FIELDS), or "" if it is. docs/phone.md: a phone posts
+        as the owner, and never starts agents or changes settings."""
+        if payload.get("from") != crewchat.OWNER:
+            return "a phone posts as the owner only"
+        if payload.get("kind") not in PHONE_KINDS:
+            return "a phone posts messages and tasks only"
+        extra = sorted(set(payload) - PHONE_FIELDS)
+        return "a phone does not send %s" % ", ".join(extra) if extra else ""
 
     # Cloud -> hub ------------------------------------------------------------------------------
     def _on_messages(self, changes):
@@ -1368,17 +1731,30 @@ class CloudSync(crewchat.ProjectLink):
                 continue
             created = float(doc.get("created") or 0)
             if doc.get("dev") != self.device_id:
+                entry = self.device.trusted(doc.get("dev"))
+                if not entry:
+                    # Not a device this machine trusts: a removed one's, or one approved a moment ago whose approval
+                    # has not reached this machine yet. Held, and tried again when the trust list changes.
+                    self._hold(doc_id, doc)
+                    continue
                 aad = "crewchat|%s|msg|%s|%%s|%s" % (self._scope(), doc_id, doc.get("dev"))
                 try:
                     payload = self._open(aad, doc)
                 except KeyError:
-                    self.held.append((doc_id, doc))  # its key is still on its way
+                    self._hold(doc_id, doc)  # its key is still on its way
+                    continue
+                except CloudError as e:
+                    self.log("dropped message %s: %s" % (doc_id, e))
                     continue
                 except Exception:
                     self.log("dropped message %s: it does not decrypt (tampered, or from an untrusted device)" % doc_id)
                     continue
                 if payload.get("id") != doc_id:
                     self.log("dropped message %s: its content does not match its name" % doc_id)
+                    continue
+                refused = self._phone_refuses(payload) if is_phone(entry) else ""
+                if refused:
+                    self.log("dropped message %s: %s" % (doc_id, refused))
                     continue
                 payload["origin"] = doc.get("dev", "")
                 try:
@@ -1388,6 +1764,11 @@ class CloudSync(crewchat.ProjectLink):
             if created > float(self.marks.get("synced_to", 0)):
                 self.marks["synced_to"] = created
                 self._save_marks()
+
+    def _hold(self, doc_id, doc):
+        """Keep a message to try again later (_retry_held): the newest HELD_MAX, so a stranger's cannot fill memory."""
+        self.held.append((doc_id, doc))
+        del self.held[:-HELD_MAX]
 
     def _retry_held(self):
         held, self.held = self.held, []
@@ -1423,6 +1804,12 @@ class CloudSync(crewchat.ProjectLink):
                 self.waiting.pop(device_id, None)
                 for sync in self._all():
                     sync._drop(device_id)
+            elif device_id != self.device_id and isinstance(doc, dict) and is_phone(doc):
+                if not self.device.trusted(device_id) and self.pairings:
+                    try:
+                        self._pair(device_id, doc)
+                    except Exception as e:
+                        self.log("could not pair the phone (%s)" % e)
             elif device_id != self.device_id and isinstance(doc, dict) and not self.device.trusted(device_id):
                 self.waiting[device_id] = {"name": str(doc.get("name") or device_id), "tag": str(doc.get("tag") or ""),
                                            "fp": str(doc.get("fp") or "")}
@@ -1445,6 +1832,13 @@ class CloudSync(crewchat.ProjectLink):
                 self._after_keys()
             elif doc_id == "coordinator":
                 self.lease = doc or {}
+            elif doc_id == "cleared" and doc and doc.get("by") != self.device_id:
+                # Remove and clear (W13) deleted the cloud's messages: what this machine had not read yet comes from
+                # the coordinator instead.
+                for sync in self._all():
+                    synced_to = float(sync.marks.get("synced_to", 0))
+                    if synced_to and synced_to < float(doc.get("at") or 0):
+                        sync.ask_catch_up(synced_to)
 
     def _after_keys(self):
         if self.device.ready:
@@ -1469,6 +1863,54 @@ def post(url, data, as_json=False):
         raise CloudError("sign-in failed at %s (HTTP %d): %s" % (url.split("?")[0], e.code, detail))
     except (urllib.error.URLError, OSError) as e:
         raise CloudError("cannot reach Google (%s)" % getattr(e, "reason", e))
+
+
+def google_consent(client, scope, timeout=300, need_browser=False):
+    """Google's consent in this machine's browser (OAuth for desktop apps, with PKCE), for `scope`: the token response.
+    Signing in (Auth.login), and letting crewchat put the hosted page on the project's Hosting (publish)."""
+    if not client.get("client_id"):
+        raise CloudError("the setup has no OAuth client; run `crewchat cloud setup` again with --oauth-client")
+    verifier = secrets.token_urlsafe(48)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)
+    got = {}
+
+    class Callback(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            if query.get("state", [""])[0] == state:
+                got.update(code=query.get("code", [""])[0], error=query.get("error", [""])[0])
+            page = b"<h3>crewchat: you are signed in. You can close this tab.</h3>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(page)))
+            self.end_headers()
+            self.wfile.write(page)
+
+    server = type("CallbackServer", (crewchat.QuickBind, HTTPServer), {})(("127.0.0.1", 0), Callback)
+    redirect = "http://127.0.0.1:%d" % server.server_address[1]
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
+        "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",
+        "scope": scope, "state": state, "code_challenge": challenge,
+        "code_challenge_method": "S256", "prompt": "select_account"})
+    print("Opening your browser to sign in with Google. If it does not open, visit:\n  %s" % url, flush=True)
+    if not webbrowser.open(url) and need_browser:  # the Machines panel: nobody here to open the address by hand
+        server.server_close()
+        raise CloudError("no browser could be opened on this machine for Google's sign-in. Run `crewchat cloud "
+                         "login` in a terminal on it: it shows the address to open")
+    deadline = time.time() + timeout
+    server.timeout = 5
+    while "code" not in got and time.time() < deadline:
+        server.handle_request()
+    server.server_close()
+    if not got.get("code"):
+        raise CloudError("sign-in did not finish (%s)" % (got.get("error") or "timed out"))
+    return post("https://oauth2.googleapis.com/token", {
+        "code": got["code"], "client_id": client["client_id"], "client_secret": client.get("client_secret", ""),
+        "redirect_uri": redirect, "grant_type": "authorization_code", "code_verifier": verifier})
 
 
 class Auth:
@@ -1515,47 +1957,7 @@ class Auth:
         client = self.config.get("oauth") or {}
         if not client.get("client_id"):
             raise CloudError("the setup has no OAuth client; run `crewchat cloud setup` again with --oauth-client")
-        verifier = secrets.token_urlsafe(48)
-        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
-        state = secrets.token_urlsafe(16)
-        got = {}
-
-        class Callback(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-
-            def do_GET(self):
-                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-                if query.get("state", [""])[0] == state:
-                    got.update(code=query.get("code", [""])[0], error=query.get("error", [""])[0])
-                page = b"<h3>crewchat: you are signed in. You can close this tab.</h3>"
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html")
-                self.send_header("Content-Length", str(len(page)))
-                self.end_headers()
-                self.wfile.write(page)
-
-        server = type("CallbackServer", (crewchat.QuickBind, HTTPServer), {})(("127.0.0.1", 0), Callback)
-        redirect = "http://127.0.0.1:%d" % server.server_address[1]
-        url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode({
-            "client_id": client["client_id"], "redirect_uri": redirect, "response_type": "code",
-            "scope": "openid email", "state": state, "code_challenge": challenge,
-            "code_challenge_method": "S256", "prompt": "select_account"})
-        print("Opening your browser to sign in with Google. If it does not open, visit:\n  %s" % url, flush=True)
-        if not webbrowser.open(url) and need_browser:  # the Machines panel: nobody here to open the address by hand
-            server.server_close()
-            raise CloudError("no browser could be opened on this machine for Google's sign-in. Run `crewchat cloud "
-                             "login` in a terminal on it: it shows the address to open")
-        deadline = time.time() + timeout
-        server.timeout = 5
-        while "code" not in got and time.time() < deadline:
-            server.handle_request()
-        server.server_close()
-        if not got.get("code"):
-            raise CloudError("sign-in did not finish (%s)" % (got.get("error") or "timed out"))
-        google = post("https://oauth2.googleapis.com/token", {
-            "code": got["code"], "client_id": client["client_id"], "client_secret": client.get("client_secret", ""),
-            "redirect_uri": redirect, "grant_type": "authorization_code", "code_verifier": verifier})
+        google = google_consent(client, "openid email", timeout, need_browser)
         firebase = post("https://identitytoolkit.googleapis.com/v1/accounts:signInWithIdp?key=" + self.config["apiKey"], {
             "postBody": "id_token=%s&providerId=google.com" % google["id_token"],
             "requestUri": "http://localhost", "returnSecureToken": True}, as_json=True)
@@ -1614,7 +2016,11 @@ def start(hub, root=None, ttl_hours=None):
         file_max = int(float(config.get("cloud_file_mb", CLOUD_FILE_MAX / 1048576)) * 1048576)
     except (TypeError, ValueError):
         file_max = CLOUD_FILE_MAX
-    sync = CloudSync(hub, store, device, ttl_hours=ttl, file_max=file_max)
+    try:
+        phone_days = float(config.get("cloud_phone_days", PHONE_DAYS))
+    except (TypeError, ValueError):
+        phone_days = PHONE_DAYS
+    sync = CloudSync(hub, store, device, ttl_hours=ttl, file_max=file_max, phone_days=phone_days)
     sync.start()
     sys.stderr.write("%s cloud sync on as %s (device %s, tag %s), account %s\n" % (
         crewchat.now_iso(), auth.email, device.name, device.tag, "ready" if device.ready else "waiting for approval"))
@@ -1760,7 +2166,186 @@ def page_op(hub, root, op, data, local):
         return approve(account, str(data.get("name") or ""), str(data.get("fingerprint") or ""))
     if op == "cloud-remove":
         return remove(account, str(data.get("name") or ""))
+    if op.startswith("cloud-phone-") or op == "cloud-publish":
+        return phone_op(hub, root, account, op, data, local)
     raise CloudError("unknown operation %s" % op)
+
+
+def firebase_project(root):
+    """This machine's cloud sync settings (firebase.json), which name its Firebase project."""
+    config = read_json(cloud_dir(root) / "firebase.json") or {}
+    if not config.get("projectId"):
+        raise CloudError("cloud sync is not set up on this machine")
+    return config
+
+
+def hosted_url(root):
+    """The hosted page's address (W13): the Firebase project's own Hosting site, on firebaseapp.com, the domain its
+    Google sign-in already allows."""
+    return "https://%s.firebaseapp.com/" % firebase_project(root)["projectId"]
+
+
+def phone_op(hub, root, account, op, data, local=True):
+    """Machines -> Phone from anywhere (W13): cloud-phone-list the paired phones and the published page, cloud-publish
+    puts the page on the project's Hosting, cloud-phone-pair shows a code, cloud-phone-remove removes a phone (clear: and
+    deletes the cloud's messages)."""
+    sync = hub.sync if isinstance(hub.sync, CloudSync) else None
+    if op == "cloud-publish":
+        if not local:
+            raise CloudError("publish at the machine itself: Google asks there, in its browser, to let crewchat deploy")
+        return publish(root)
+    if op == "cloud-phone-list":
+        docs = dict(account.store.list("devices"))
+        phones = [{"id": i, "name": e.get("name") or i, "tag": e.get("tag", ""), "fp": e.get("fp", ""),
+                   "seen": float((docs.get(i) or {}).get("seen") or 0)}
+                  for i, e in account.device.trust.get("devices", {}).items() if is_phone(e)]
+        published = read_json(cloud_dir(root) / "hosted.json") or {}
+        return {"phones": sorted(phones, key=lambda p: -p["seen"]), "url": hosted_url(root),
+                "days": sync.phone_days if sync else PHONE_DAYS, "published": published.get("build", ""),
+                "build": hosted_build()}
+    if op == "cloud-phone-pair":
+        if sync is None:
+            raise CloudError("turn cloud sync on here first: the phone pairs with a machine that is syncing")
+        offer = sync.start_pairing()
+        link = hosted_url(root) + "#pair=" + offer["code"]
+        code = offer["code"]
+        return {"link": link, "code": " ".join(code[i:i + 4] for i in range(0, len(code), 4)), "ttl": offer["ttl"],
+                "qr": crewchat.qr_matrix(link)}
+    if op == "cloud-phone-remove":
+        target_id, doc = account.find(str(data.get("name") or ""))
+        if not is_phone(account.device.trusted(target_id)) and not is_phone(doc):
+            raise CloudError("%s is not a phone: remove a machine with Remove on its row" % doc.get("name", target_id))
+        name = account.remove(target_id)
+        if data.get("clear"):
+            account.clear_window()
+            account.store.set("meta/cleared", {"at": SERVER_TIME, "by": account.device.id})
+        return {"removed": name, "cleared": bool(data.get("clear"))}
+    raise CloudError("unknown operation %s" % op)
+
+
+# The hosted page (W13) --------------------------------------------------------------------------------
+# Firebase's JavaScript SDK, compat build: fetched from Google when publishing and checked against these hashes, then
+# served from the owner's own Hosting site with the page, so the page runs only the SDK it was tested with.
+FIREBASE_SDK = "13.0.0"
+FIREBASE_FILES = {
+    "firebase-app-compat.js": "ea496cf11c04c22f4472b953b2571d9837bef6c2172742e0d12d6cf113bc29fe",
+    "firebase-auth-compat.js": "8fd505bd78e9df31526019424eea695141a083c686e01783317b3b3759db9eac",
+    "firebase-firestore-compat.js": "4631281ec75348173cb1f20dfdbff84bff3044c04de67580ffb0361c22275327",
+}
+HOSTING = "https://firebasehosting.googleapis.com/v1beta1/"
+HOSTING_SCOPE = "https://www.googleapis.com/auth/firebase.hosting"
+# Scripts from the site itself, and Google's sign-in helper, which Firebase's sign-in loads from apis.google.com.
+HOSTED_HEADERS = {
+    "Content-Security-Policy": "default-src 'none'; script-src 'self' 'unsafe-inline' https://apis.google.com; "
+    "style-src 'unsafe-inline'; connect-src 'self' https://firestore.googleapis.com https://identitytoolkit.googleapis.com "
+    "https://securetoken.googleapis.com https://www.googleapis.com https://apis.google.com; frame-src 'self' "
+    "https://accounts.google.com; img-src 'self' data: blob: https://*.googleusercontent.com; manifest-src 'self'; "
+    "worker-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "Cache-Control": "no-cache",
+}
+HOSTED_SW = b"""// The hosted page's service worker: only so that it installs as an app. Nothing is cached or fetched here.
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+"""
+
+
+def hosted_page(fake_store=""):
+    """The chat page, with the scripts that answer its /api/ requests from Firestore before its own (HOSTED_JS). The
+    browser test passes fake_store: its stand-in for Firestore, and no SDK."""
+    if fake_store:
+        head = "<script>window.CREWCHAT_FAKE_STORE=%s</script>" % json.dumps(fake_store)
+    else:
+        head = "".join('<script src="/%s"></script>' % name for name in FIREBASE_FILES)
+    page = crewchat.CHAT_PAGE
+    at = page.index("<script")
+    return (page[:at] + head + '<script src="/hosted.js"></script>' + page[at:]).encode("utf-8")
+
+
+def hosted_own_files(fake_store=""):
+    """The hosted page's files that come from crewchat itself."""
+    return {"index.html": hosted_page(fake_store), "hosted.js": HOSTED_JS.encode("utf-8"),
+            "manifest.webmanifest": crewchat.MANIFEST, "icon-192.png": crewchat.app_icon(192),
+            "icon-512.png": crewchat.app_icon(512), "icon.svg": crewchat.LOGO_FILE, "sw.js": HOSTED_SW}
+
+
+def hosted_build():
+    """What the page published now would be: changes with crewchat's page and with the pinned SDK."""
+    digest = hashlib.sha256()
+    for name, data in sorted(hosted_own_files().items()):
+        digest.update(name.encode() + b"\0" + hashlib.sha256(data).digest())
+    digest.update(json.dumps(FIREBASE_FILES, sort_keys=True).encode())
+    return digest.hexdigest()[:12]
+
+
+def fetch_sdk(name):
+    url = "https://www.gstatic.com/firebasejs/%s/%s" % (FIREBASE_SDK, name)
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError) as e:
+        raise CloudError("cannot fetch Firebase's %s from Google (%s)" % (name, getattr(e, "reason", e)))
+
+
+def hosted_files(fetch=fetch_sdk):
+    """Every file of the hosted page. The SDK's are refused unless they are exactly the pinned ones."""
+    files = hosted_own_files()
+    for name, expected in FIREBASE_FILES.items():
+        data = fetch(name)
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise CloudError("Firebase's %s is not the file crewchat was tested with: nothing was published" % name)
+        files[name] = data
+    return files
+
+
+def hosting_request(method, url, token, body=None, raw=None):
+    data = raw if raw is not None else (json.dumps(body).encode() if body is not None else None)
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/octet-stream" if raw is not None else "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            text = resp.read().decode() or "{}"
+            return json.loads(text)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode(errors="replace")[:300]
+        if e.code == 404 and "/sites/" in url and "versions" in url:
+            raise CloudError("the project has no Hosting site yet: in the Firebase console, open Build, then Hosting, "
+                             "and choose Get started (nothing to install), then Publish again")
+        raise CloudError("Firebase Hosting refused (HTTP %d): %s" % (e.code, detail))
+    except (urllib.error.URLError, OSError) as e:
+        raise CloudError("cannot reach Firebase Hosting (%s)" % getattr(e, "reason", e))
+
+
+def deploy(site, token, files, request=hosting_request):
+    """Put files on the site's Hosting as a new version and release it (Firebase Hosting's REST API): what
+    `firebase deploy --only hosting` does, for a folder of static files."""
+    version = request("POST", HOSTING + "sites/%s/versions" % site, token,
+                      {"config": {"headers": [{"glob": "**", "headers": HOSTED_HEADERS}]}})["name"]
+    packed = {"/" + name: gzip.compress(data, mtime=0) for name, data in files.items()}
+    hashes = {path: hashlib.sha256(data).hexdigest() for path, data in packed.items()}
+    out = request("POST", HOSTING + version + ":populateFiles", token, {"files": hashes})
+    needed = set(out.get("uploadRequiredHashes") or [])
+    for path, digest in sorted(hashes.items()):
+        if digest in needed:
+            request("POST", out["uploadUrl"] + "/" + digest, token, raw=packed[path])
+            needed.discard(digest)
+    request("PATCH", HOSTING + version + "?update_mask=status", token, {"status": "FINALIZED"})
+    request("POST", HOSTING + "sites/%s/releases?versionName=%s" % (site, urllib.parse.quote(version, safe="/")), token, {})
+    return version
+
+
+def publish(root, consent=google_consent, fetch=fetch_sdk, request=hosting_request):
+    """Machines -> Phone from anywhere -> Publish: Google's consent to deploy (asked each time, and not kept), then the
+    page on the project's default Hosting site."""
+    config = firebase_project(root)
+    files = hosted_files(fetch)
+    token = consent(config.get("oauth") or {}, HOSTING_SCOPE, need_browser=True)["access_token"]
+    deploy(config["projectId"], token, files, request)
+    build = hosted_build()
+    write_private(cloud_dir(root) / "hosted.json", json.dumps({"build": build, "at": time.time()}))
+    return {"build": build, "url": hosted_url(root)}
 
 
 def _cmd_cloud(args):
@@ -1890,3 +2475,614 @@ def add_parser(sub):
     p.add_argument("--again", action="store_true", help="login: sign in again even if signed in")
     p.add_argument("--fingerprint", help="approve: the fingerprint the new machine shows")
     p.set_defaults(fn=cmd_cloud)
+
+
+HOSTED_JS = r"""// crewchat's hosted page (W13): the chat page, served from the owner's own Firebase Hosting, reading and writing the
+// owner's own Firestore with no computer awake. This script runs before the chat page's own and answers its /api/
+// requests from Firestore, so the page itself is the same as a computer's. Design:
+// docs/superpowers/specs/2026-11-09-hosted-page-design.md.
+//
+// The phone is a device of the account, as a machine is (crewchat_cloud.py): an RSA-3072 key pair made here, kept in
+// IndexedDB as keys the page can use but never read out, and the account's AES-256-GCM key, unwrapped straight into
+// such a key. It pairs once with a code a machine shows, posts only as the owner, and signs its answers to Needs you.
+(() => {
+"use strict";
+const ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";  // crewchat_cloud.PAIR_ALPHABET
+const TAG_LETTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ";  // Account._free_tag
+const PSS = { name: "RSA-PSS", saltLength: 350 };  // the most an RSA-3072 key with SHA-256 allows: cryptography's MAX_LENGTH
+const PAGE_BATCH = 200;
+const HIDE_ANSWERED = 90;  // seconds an answered item stays off Needs you, while its machine catches up
+const enc = new TextEncoder(), dec = new TextDecoder();
+const FAKE = window.CREWCHAT_FAKE_STORE || "";  // the browser test's stand-in for Firestore
+
+// Bytes and text ----------------------------------------------------------------------------------
+function b64(buf) {
+  const a = new Uint8Array(buf); let s = "";
+  for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode.apply(null, a.subarray(i, i + 0x8000));
+  return btoa(s);
+}
+function unb64(text) { const s = atob(text); const a = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) a[i] = s.charCodeAt(i); return a; }
+const hex = (buf) => Array.from(new Uint8Array(buf), (b) => b.toString(16).padStart(2, "0")).join("");
+const sha256 = (text) => crypto.subtle.digest("SHA-256", enc.encode(text));
+const randomHex = (n) => hex(crypto.getRandomValues(new Uint8Array(n)));
+// Python's json.dumps(sort_keys=True, separators=(",", ":")), which escapes everything outside printable ASCII.
+const ascii = (s) => s.replace(/[\u007f-￿]/g, (c) => "\\u" + c.charCodeAt(0).toString(16).padStart(4, "0"));
+function canonical(v) {
+  if (v === null || typeof v !== "object") return ascii(JSON.stringify(v));
+  if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";
+  return "{" + Object.keys(v).sort().map((k) => ascii(JSON.stringify(k)) + ":" + canonical(v[k])).join(",") + "}";
+}
+
+// The ciphers: crewchat_cloud's seal, unseal, sign, verify, wrap and pair_mac, in Web Crypto -------------------
+async function seal(key, aad, payload) {
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce, additionalData: enc.encode(aad) }, key,
+                                         enc.encode(JSON.stringify(payload)));
+  return { nonce: b64(nonce), ct: b64(ct) };
+}
+async function unseal(key, aad, nonce, ct) {
+  const data = await crypto.subtle.decrypt({ name: "AES-GCM", iv: unb64(nonce), additionalData: enc.encode(aad) }, key, unb64(ct));
+  return JSON.parse(dec.decode(data));
+}
+function pem(spki) { return "-----BEGIN PUBLIC KEY-----\n" + b64(spki).match(/.{1,64}/g).join("\n") + "\n-----END PUBLIC KEY-----\n"; }
+const der = (text) => unb64(String(text).replace(/-----[^-]+-----/g, "").replace(/\s+/g, ""));
+async function fingerprint(pub) { return hex(await sha256(pub.trim())).slice(0, 16).match(/.{4}/g).join(" "); }
+async function verify(pub, sig, data) {
+  try {
+    const key = await crypto.subtle.importKey("spki", der(pub), { name: "RSA-PSS", hash: "SHA-256" }, false, ["verify"]);
+    return await crypto.subtle.verify(PSS, key, unb64(sig), enc.encode(data));
+  } catch (e) { return false; }
+}
+async function pairMac(secret, parts) {
+  const key = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return hex(await crypto.subtle.sign("HMAC", key, enc.encode(parts.join("|"))));
+}
+// A new key pair: made once as extractable, kept as two keys that cannot be read out (Web Crypto uses one key object
+// for OAEP or for PSS, not both), and the exported private bytes dropped.
+async function newKeys() {
+  const pair = await crypto.subtle.generateKey({ name: "RSA-OAEP", modulusLength: 3072, publicExponent: new Uint8Array([1, 0, 1]),
+                                                hash: "SHA-256" }, true, ["encrypt", "decrypt"]);
+  const pkcs8 = await crypto.subtle.exportKey("pkcs8", pair.privateKey);
+  const pub = pem(await crypto.subtle.exportKey("spki", pair.publicKey));
+  const oaep = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "RSA-OAEP", hash: "SHA-256" }, false, ["decrypt", "unwrapKey"]);
+  const pss = await crypto.subtle.importKey("pkcs8", pkcs8, { name: "RSA-PSS", hash: "SHA-256" }, false, ["sign"]);
+  new Uint8Array(pkcs8).fill(0);
+  return { pub, oaep, pss };
+}
+
+// This phone's own storage: its keys, its trust list, and the sealed documents it has read ------------------------
+const db = new Promise((resolve, reject) => {
+  const open = indexedDB.open("crewchat-hosted", 1);
+  open.onupgradeneeded = () => {
+    open.result.createObjectStore("kv");
+    open.result.createObjectStore("docs").createIndex("base", "base");
+  };
+  open.onsuccess = () => resolve(open.result);
+  open.onerror = () => reject(open.error);
+});
+async function idb(store, mode, fn) {
+  const tx = (await db).transaction(store, mode);
+  const out = fn(tx.objectStore(store));
+  await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); tx.onabort = () => reject(tx.error); });
+  return out && "result" in out ? out.result : out;
+}
+const kvGet = (key) => idb("kv", "readonly", (s) => s.get(key));
+const kvSet = (key, value) => idb("kv", "readwrite", (s) => s.put(value, key));
+async function forget() {
+  await idb("kv", "readwrite", (s) => s.clear());
+  await idb("docs", "readwrite", (s) => s.clear());
+}
+
+// The database: Firestore as the signed-in owner, or the browser test's stand-in -----------------------------
+const SERVER_TIME = { serverTime: true };
+function firebaseStore(uid) {
+  const fs = firebase.firestore();
+  const root = "users/" + uid + "/";
+  const out = (data) => Object.fromEntries(Object.entries(data).map(([k, v]) =>
+    [k, v === SERVER_TIME ? firebase.firestore.FieldValue.serverTimestamp() : v]));
+  const into = (snap) => {
+    const data = snap.data({ serverTimestamps: "estimate" }) || {};
+    for (const k of Object.keys(data)) if (data[k] && typeof data[k].toMillis === "function") data[k] = data[k].toMillis() / 1000;
+    return data;
+  };
+  return {
+    root,
+    async get(path) { const snap = await fs.doc(root + path).get(); return snap.exists ? into(snap) : null; },
+    set(path, data, merge) { return fs.doc(root + path).set(out(data), { merge: !!merge }); },
+    del(path) { return fs.doc(root + path).delete(); },
+    async list(coll) { return (await fs.collection(root + coll).get()).docs.map((d) => [d.id, into(d)]); },
+    listen(coll, callback, since) {
+      let query = fs.collection(root + coll);
+      if (since) query = query.where(since[0], ">=", firebase.firestore.Timestamp.fromMillis(since[1] * 1000));
+      return query.onSnapshot((snap) => {
+        const changes = snap.docChanges().map((c) => [c.type, c.doc.id, into(c.doc)]);
+        if (changes.length) callback(changes);
+      }, (e) => status("Firestore refused: " + e.message));
+    },
+  };
+}
+function fakeStore() {
+  const call = async (op, body) => {
+    const r = await fetch(FAKE + "/" + op, { method: "POST", body: JSON.stringify(body) });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  };
+  const out = (data) => Object.fromEntries(Object.entries(data).map(([k, v]) => [k, v === SERVER_TIME ? { ".sv": "time" } : v]));
+  return {
+    root: "users/memory/",
+    get: (path) => call("get", { path }),
+    set: (path, data, merge) => call("set", { path, data: out(data), merge: !!merge }),
+    del: (path) => call("delete", { path }),
+    list: (coll) => call("list", { coll }),
+    listen(coll, callback, since) {
+      const known = new Map();
+      let stop = false;
+      (async () => {
+        while (!stop) {
+          try {
+            const docs = new Map(await call("list", { coll }));
+            const changes = [];
+            for (const [id, doc] of docs) {
+              if (since && (doc[since[0]] || 0) < since[1]) continue;
+              const was = known.get(id), now = JSON.stringify(doc);
+              if (was !== now) changes.push([was === undefined ? "added" : "modified", id, doc]);
+              known.set(id, now);
+            }
+            for (const id of [...known.keys()]) if (!docs.has(id)) { known.delete(id); changes.push(["removed", id, {}]); }
+            if (changes.length) callback(changes);
+          } catch (e) {}
+          await new Promise((r) => setTimeout(r, 250));
+        }
+      })();
+      return () => { stop = true; };
+    },
+  };
+}
+
+// The phone's identity and what it trusts ---------------------------------------------------------------
+const H = window.crewchatHosted = { ready: false, keys: {}, projects: new Map(), answered: new Map(), waiters: new Set() };
+const CHAT = new URLSearchParams(location.search).get("chat") || "first";
+const baseOf = (chat) => chat === "first" ? "" : "spaces/" + chat + "/";
+const scope = (base) => H.store.root + base;
+
+const isPhone = (entry) => !!entry && entry.kind === "phone";
+
+// A newer trusted-device list, signed by a machine this phone trusts (a phone's signature never counts). First, after
+// pairing: the one signed by the machine whose code this phone had (pairedBy).
+async function acceptTrust(doc, pairedBy) {
+  if (!doc || typeof doc.devices !== "object") return false;
+  const version = Number(doc.version || 0);
+  if (version <= Number((H.trust || {}).version || 0)) return false;
+  const signer = pairedBy ? (doc.signer === pairedBy.machine && doc.devices[doc.signer]) : (H.trust.devices || {})[doc.signer];
+  if (!signer || isPhone(signer)) return false;
+  if (pairedBy && (!doc.devices[H.me.id] || doc.devices[H.me.id].pub.trim() !== H.me.pub.trim())) return false;
+  if (pairedBy && signer.pub.trim() !== pairedBy.pub) return false;
+  if (!await verify(signer.pub, doc.sig || "", canonical({ devices: doc.devices, version }))) return false;
+  H.trust = { devices: doc.devices, version, signer: doc.signer, sig: doc.sig };
+  await kvSet("trust", H.trust);
+  if (!H.trust.devices[H.me.id]) await removed();
+  return true;
+}
+// Account keys wrapped for this phone by a trusted machine: unwrapped straight into keys that cannot be read out.
+async function acceptKeys(doc) {
+  let fresh = false;
+  for (const [kid, wrapped] of Object.entries((doc && doc.keys) || {})) {
+    if (H.keys[kid]) continue;
+    const by = ((doc.wrapped_by || {})[kid]) || "", entry = (H.trust.devices || {})[by];
+    if (!entry || isPhone(entry) || !await verify(entry.pub, (doc.key_sigs || {})[kid] || "", H.me.id + "|" + kid + "|" + wrapped)) continue;
+    try {
+      H.keys[kid] = await crypto.subtle.unwrapKey("raw", unb64(wrapped), H.me.oaep, { name: "RSA-OAEP" }, { name: "AES-GCM" },
+                                                  false, ["encrypt", "decrypt"]);
+      fresh = true;
+    } catch (e) {}
+  }
+  if (fresh) await kvSet("keys", H.keys);
+  return fresh;
+}
+async function removed() {
+  await forget();
+  H.ready = false;
+  overlay("removed");
+}
+
+// Pairing --------------------------------------------------------------------------------------------
+function freeTag(docs) {
+  const used = new Set(docs.map(([, d]) => d.tag));
+  for (let size = 1; size <= 3; size++)
+    for (let n = 0; n < TAG_LETTERS.length ** size; n++) {
+      let tag = "", k = n;
+      for (let i = 0; i < size; i++) { tag = TAG_LETTERS[k % TAG_LETTERS.length] + tag; k = Math.floor(k / TAG_LETTERS.length); }
+      if (!used.has(tag)) return tag;
+    }
+  throw new Error("no free device tag");
+}
+const cleanCode = (text) => [...String(text || "").toUpperCase()].filter((c) => ALPHABET.includes(c)).join("");
+
+async function pair(code, name) {
+  code = cleanCode(code);
+  if (code.length !== 20) throw new Error("A pairing code has 20 letters and digits.");
+  const pid = code.slice(0, 4), secret = code.slice(4);
+  status("Making this phone's key…");
+  const keys = await newKeys();
+  const me = { id: randomHex(6), name: name || "phone", pub: keys.pub, oaep: keys.oaep, pss: keys.pss, sent: 0 };
+  me.fp = await fingerprint(me.pub);
+  me.tag = freeTag(await H.store.list("devices"));
+  H.me = me; H.trust = { devices: {}, version: 0 }; H.keys = {};
+  status("Asking your computer…");
+  const answer = new Promise((resolve) => {
+    const stop = H.store.listen("pairings", (changes) => {
+      const got = changes.find(([kind, id]) => kind !== "removed" && id === pid);
+      if (got) { stop(); resolve(got[2]); }
+    });
+    setTimeout(() => { stop(); resolve(null); }, 120000);
+  });
+  await H.store.set("devices/" + me.id, { name: me.name, tag: me.tag, pub: me.pub, fp: me.fp, kind: "phone", seen: SERVER_TIME,
+                                          pair: { id: pid, mac: await pairMac(secret, ["phone", pid, me.pub.trim()]) } });
+  const got = await answer;
+  if (!got) throw new Error("Your computer did not answer. Check the code, and that its page still shows it.");
+  const trust = await H.store.get("meta/trust");
+  const machine = trust && trust.devices && trust.devices[got.machine];
+  if (!machine || await pairMac(secret, ["machine", pid, machine.pub.trim(), String(got.version)]) !== got.mac)
+    throw new Error("The answer did not come from the computer that showed the code. Nothing was paired.");
+  if (!await acceptTrust(trust, { machine: got.machine, pub: machine.pub.trim() }))
+    throw new Error("The trusted-device list could not be checked. Nothing was paired.");
+  await acceptKeys(await H.store.get("devices/" + me.id));
+  if (!Object.keys(H.keys).length) throw new Error("The account key did not arrive. Try again with a new code.");
+  await kvSet("me", me); await kvSet("keys", H.keys);
+}
+
+// Reading the chat ------------------------------------------------------------------------------------
+function project(chat) {
+  let p = H.projects.get(chat);
+  if (!p) {
+    p = { chat, base: baseOf(chat), docs: new Map(), messages: [], byId: new Map(), seq: 0, pages: new Map(), name: "",
+          version: 1, needsCount: 0 };
+    H.projects.set(chat, p);
+  }
+  return p;
+}
+function changed(p) {
+  p.version++;
+  for (const wake of [...H.waiters]) wake();
+}
+async function open(aad, doc) {
+  const key = H.keys[doc.key_id];
+  if (!key) throw new Error("no key " + doc.key_id);
+  return unseal(key, aad.replace("%s", doc.key_id), doc.nonce, doc.ct);
+}
+// A sealed message document: kept as it came (sealed) in this phone's storage, opened for the page.
+async function takeMessage(p, id, doc, keep) {
+  if (p.byId.has(id) || !doc || !doc.ct) return;
+  let payload;
+  try {
+    payload = await open("crewchat|" + scope(p.base) + "|msg|" + id + "|%s|" + doc.dev, doc);
+  } catch (e) { return; }
+  if (payload.id !== id || p.byId.has(id)) return;
+  const sender = (H.trust.devices || {})[doc.dev];
+  if (isPhone(sender) && payload.from !== "Owner") return;  // as a machine drops it
+  const msg = Object.assign({}, payload, { seq: ++p.seq, origin: doc.dev, created: Number(doc.created || 0) });
+  p.byId.set(id, msg); p.messages.push(msg);
+  if (keep) await idb("docs", "readwrite", (s) => s.put({ base: p.base, id, doc }, p.base + "messages/" + id)).catch(() => {});
+}
+async function loadProject(p) {
+  const window_ = 7 * 86400, now = Date.now() / 1000;
+  const kept = await idb("docs", "readonly", (s) => s.index("base").getAll(p.base)).catch(() => []);
+  kept.sort((a, b) => (a.doc.created || 0) - (b.doc.created || 0) || (a.id < b.id ? -1 : 1));
+  let newest = 0;
+  for (const row of kept) {
+    if (now - Number(row.doc.created || 0) > window_) {  // the cloud keeps a week: so does this phone
+      idb("docs", "readwrite", (s) => s.delete(p.base + "messages/" + row.id)).catch(() => {});
+      continue;
+    }
+    await takeMessage(p, row.id, row.doc, false);
+    newest = Math.max(newest, Number(row.doc.created || 0));
+  }
+  changed(p);
+  H.store.listen(p.base + "messages", async (changes) => {
+    const fresh = changes.filter(([kind]) => kind !== "removed")
+      .sort((a, b) => (a[2].created || 0) - (b[2].created || 0) || (a[1] < b[1] ? -1 : 1));
+    for (const [, id, doc] of fresh) await takeMessage(p, id, doc, true);
+    changed(p);
+  }, newest ? ["created", newest - 120] : null);
+  H.store.listen(p.base + "pages", async (changes) => {
+    for (const [kind, dev, doc] of changes) {
+      if (kind === "removed") { p.pages.delete(dev); continue; }
+      try {
+        const page = await open("crewchat|" + scope(p.base) + "|page|" + dev + "|%s", doc);
+        page.updated = Number(doc.updated || 0); page.dev = dev;
+        p.pages.set(dev, page);
+        p.name = page.project || p.name;
+      } catch (e) {}
+    }
+    changed(p);
+  });
+}
+// Every project's name and how much needs the owner, for the project tabs: read once, from each space's pages.
+async function loadProjects() {
+  const spaces = await H.store.list("spaces").catch(() => []);
+  for (const [space] of spaces) {
+    const p = project(space);
+    if (p.chat === CHAT) continue;
+    for (const [dev, doc] of await H.store.list(p.base + "pages").catch(() => [])) {
+      try {
+        const page = await open("crewchat|" + scope(p.base) + "|page|" + dev + "|%s", doc);
+        p.name = page.project || p.name; p.needsCount = Math.max(p.needsCount, (page.needs || []).length);
+      } catch (e) {}
+    }
+  }
+  changed(project(CHAT));
+}
+
+// The /api/ requests of the chat page, answered here ----------------------------------------------------
+function newest(p) {
+  let best = null;
+  for (const page of p.pages.values()) if (!best || page.updated > best.updated) best = page;
+  return best || {};
+}
+function needsOf(p) {
+  const now = Date.now() / 1000, out = new Map();
+  for (const page of [...p.pages.values()].sort((a, b) => a.updated - b.updated))
+    for (const item of page.needs || []) {
+      if (now - (H.answered.get(item.key) || 0) < HIDE_ANSWERED) continue;
+      out.set(item.key, Object.assign({}, item, { _machine: page.dev }));
+    }
+  return [...out.values()];
+}
+function machinesLine(p) {
+  const now = Date.now() / 1000;
+  return [...p.pages.values()].map((page) => ({ name: page.machine, online: now - page.updated < 1800, seen: page.updated }));
+}
+function poll(p, after, version) {
+  const snap = newest(p);
+  const fresh = p.messages.filter((m) => m.seq > after);
+  const batch = after < 0 ? fresh.slice(-PAGE_BATCH) : fresh.slice(0, PAGE_BATCH);
+  const projects = [...H.projects.values()].filter((x) => x.name || x.chat === "first" || x.chat === CHAT)
+    .map((x) => ({ id: x.chat, name: x.name || (x.chat === "first" ? "crewchat" : "project"), last: x.seq,
+                   linked: true, needs: x.chat === p.chat ? needsOf(p).length : x.needsCount,
+                   ...(x.chat === "first" ? { first: true } : {}) }));
+  return {
+    version: p.version, now: Date.now() / 1000, project: p.name || snap.project || "crewchat", device: "phone",
+    messages: batch, more: after >= 0 && batch.length < fresh.length,
+    taken: snap.taken || {}, progress: snap.progress || {}, removed: snap.removed || [], asks: snap.asks || {},
+    agents: snap.agents || [], pack: snap.pack || "", crew: snap.crew || "software", update: "",
+    boot: (snap.boot || {}).tag || "hosted", chat: p.chat, rules: "", skills: [], sheet: snap.sheet || [],
+    link: { via: "hosted", machines: machinesLine(p), shared: true }, needs: needsOf(p), projects,
+  };
+}
+function boot(p) {
+  const b = newest(p).boot || {};
+  return { roles: b.roles || [], statuses: b.statuses || {}, need_kinds: b.need_kinds || {}, tag: b.tag || "hosted",
+           tools: {}, presets: {}, art: {}, models: {}, pictures: { types: [], max: 0 }, names: [], images: [],
+           max_upload: 0, releases: "" };
+}
+function waitFor(p, version, seconds) {
+  if (p.version !== version || !seconds) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = () => { H.waiters.delete(done); clearTimeout(timer); resolve(); };
+    const timer = setTimeout(done, seconds * 1000);
+    H.waiters.add(done);
+  });
+}
+async function send(p, body) {
+  const kind = ["msg", "task"].includes(body.kind) ? body.kind : "msg";
+  const text = String(body.text || "").trim();
+  if (!text) throw new Error("say something");
+  H.me.sent = (H.me.sent || 0) + 1;
+  await kvSet("me", H.me);
+  const id = H.me.tag + H.me.sent;
+  const payload = { id, ts: Date.now() / 1000, from: "Owner", to: String(body.to || "all"), text, kind };
+  for (const field of ["thread", "ask", "re", "task"]) if (body[field] !== undefined && body[field] !== null && body[field] !== "") payload[field] = String(body[field]);
+  const kid = H.current;
+  const sealed = await seal(H.keys[kid], "crewchat|" + scope(p.base) + "|msg|" + id + "|" + kid + "|" + H.me.id, payload);
+  await H.store.set(p.base + "messages/" + id, { dev: H.me.id, key_id: kid, nonce: sealed.nonce, ct: sealed.ct, created: SERVER_TIME });
+  return { id };
+}
+// An answer to Needs you, for the machine whose item it is: sealed, and signed with this phone's key.
+async function answer(p, item, machine, body) {
+  const id = H.me.tag + "-" + randomHex(4);
+  const signed = JSON.stringify({ id, by: H.me.id, machine, item, body, time: Date.now() / 1000 });
+  const sig = b64(await crypto.subtle.sign(PSS, H.me.pss, enc.encode(signed)));
+  const kid = H.current;
+  const sealed = await seal(H.keys[kid], "crewchat|" + scope(p.base) + "|answer|" + id + "|" + kid + "|" + H.me.id, { signed, sig });
+  await H.store.set(p.base + "answers/" + id, { dev: H.me.id, key_id: kid, nonce: sealed.nonce, ct: sealed.ct, created: SERVER_TIME });
+  return id;
+}
+async function needs(p, body) {
+  const key = String(body.key || "");
+  const item = needsOf(p).find((n) => n.key === key);
+  if (!item) throw new Error("that is not waiting any more");
+  const rest = Object.assign({}, body); delete rest.key;
+  await answer(p, key, item._machine, rest);
+  H.answered.set(key, Date.now() / 1000);
+  changed(p);
+  return { ok: true, sent: true };
+}
+
+const realFetch = window.fetch.bind(window);
+const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+async function api(url, init) {
+  await H.started;
+  const p = project(url.searchParams.get("chat") || CHAT);
+  try {
+    const body = init && typeof init.body === "string" ? JSON.parse(init.body) : {};
+    switch (url.pathname) {
+      case "/health": return new Response("ok\n");
+      case "/api/boot": return json(200, boot(p));
+      case "/api/poll": {
+        const version = Number(url.searchParams.get("v") || -1);
+        await waitFor(p, version, Math.min(25, Number(url.searchParams.get("wait") || 0)));
+        return json(200, poll(p, Number(url.searchParams.get("after") || -1), version));
+      }
+      case "/api/send": return json(200, await send(p, body));
+      case "/api/needs": return json(200, await needs(p, body));
+      case "/api/read": return json(200, { ok: true });
+      default:
+        return json(400, { error: "That needs a computer's own page: open crewchat on one of your computers." });
+    }
+  } catch (e) {
+    return json(400, { error: e.message || String(e) });
+  }
+}
+window.fetch = (input, init) => {
+  const url = new URL(typeof input === "string" ? input : input.url, location.href);
+  if (url.origin === location.origin && (url.pathname.startsWith("/api/") || url.pathname === "/health")) return api(url, init);
+  return realFetch(input, init);
+};
+
+// The phone's own screens: sign in, pair, and what is going on ------------------------------------------
+let box = null;
+function status(text) { const s = document.getElementById("hosted-status"); if (s) s.textContent = text; }
+function overlay(kind, error) {
+  if (!document.body) { document.addEventListener("DOMContentLoaded", () => overlay(kind, error)); return; }
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "hosted";
+    box.setAttribute("role", "dialog");
+    box.setAttribute("aria-modal", "true");
+    box.style.cssText = "position:fixed;inset:0;z-index:1000;background:var(--bg,#f4f2ed);display:grid;place-items:center;" +
+      "padding:16px;font:16px/1.5 system-ui,sans-serif;overflow:auto";
+    document.body.append(box);
+  }
+  box.hidden = false;
+  const card = document.createElement("div");
+  card.style.cssText = "max-width:420px;width:100%;display:grid;gap:12px";
+  const h = (tag, text) => { const e = document.createElement(tag); e.textContent = text; return e; };
+  card.append(h("h1", "crewchat from anywhere"));
+  const iphone = /iPhone|iPad/.test(navigator.userAgent) && !navigator.standalone && !matchMedia("(display-mode: standalone)").matches;
+  if (kind === "signin") {
+    card.append(h("p", "Sign in with the Google account your computers use for cloud sync."));
+    const b = h("button", "Sign in with Google"); b.id = "hosted-signin"; b.type = "button";
+    b.addEventListener("click", () => firebase.auth().signInWithRedirect(new firebase.auth.GoogleAuthProvider()));
+    card.append(b);
+  } else if (kind === "pair") {
+    card.append(h("p", "On a computer, open crewchat's Machines panel, choose Phone from anywhere, then Pair a phone. " +
+                       "Scan its code, or type the 20 letters and digits it shows."));
+    if (iphone) card.append(h("p", "On an iPhone, first add this page to the Home Screen (Share, then Add to Home Screen), " +
+                                   "open it from there, and type the code: the Home Screen app keeps its own storage."));
+    const form = document.createElement("form");
+    form.style.cssText = "display:grid;gap:8px";
+    const input = document.createElement("input");
+    input.id = "hosted-code"; input.autocomplete = "off"; input.setAttribute("aria-label", "Pairing code");
+    input.style.fontSize = "16px"; input.value = sessionStorage.getItem("crewchat-pair") || "";
+    const name = document.createElement("input");
+    name.id = "hosted-name"; name.value = "phone"; name.setAttribute("aria-label", "This phone's name");
+    name.style.fontSize = "16px";
+    const go = h("button", "Pair this phone"); go.type = "submit"; go.id = "hosted-pair";
+    form.append(h("label", "Code"), input, h("label", "Name, shown on your computers"), name, go);
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      go.disabled = true;
+      try {
+        await pair(input.value, name.value.trim().slice(0, 40) || "phone");
+        sessionStorage.removeItem("crewchat-pair");
+        await begin();
+      } catch (err) { status(err.message || String(err)); go.disabled = false; }
+    });
+    card.append(form);
+  } else if (kind === "removed") {
+    card.append(h("p", "This phone was removed from your account, so it can read nothing new. Pair it again from a computer."));
+    const b = h("button", "Pair again"); b.type = "button";
+    b.addEventListener("click", () => location.reload());
+    card.append(b);
+  }
+  const s = h("p", error || ""); s.id = "hosted-status"; s.setAttribute("role", "status");
+  card.append(s);
+  box.replaceChildren(card);
+}
+function hideOverlay() { if (box) box.hidden = true; }
+
+// What the computers are doing, and what this phone sent that waits for one: a line at the top of the chat.
+function renderBar() {
+  const p = project(CHAT);
+  let bar = document.getElementById("hosted-bar");
+  if (!bar) {
+    if (!document.body) return;
+    bar = document.createElement("div");
+    bar.id = "hosted-bar"; bar.setAttribute("role", "status");
+    bar.style.cssText = "position:fixed;left:0;right:0;bottom:0;z-index:50;font:13px/1.4 system-ui,sans-serif;padding:4px 12px;" +
+      "background:var(--panel,#fff);border-top:1px solid var(--line,#ddd);display:flex;gap:8px;flex-wrap:wrap;align-items:center";
+    document.body.append(bar);
+  }
+  const now = Date.now() / 1000, pages = [...p.pages.values()];
+  const awake = pages.filter((x) => now - x.updated < 1800);
+  const reached = Math.max(0, ...pages.map((x) => Number(x.synced_to || 0)));
+  const waiting = p.messages.filter((m) => m.origin === H.me.id && (!m.created || m.created > reached)).length;
+  const ago = (t) => { const s = now - t; return s < 3600 ? Math.round(s / 60) + " min" : s < 86400 ? Math.round(s / 3600) + " h" : Math.round(s / 86400) + " d"; };
+  const parts = [];
+  if (awake.length) parts.push("Awake: " + awake.map((x) => x.machine).join(", "));
+  else if (pages.length) parts.push("Your computers are asleep (last on " + ago(Math.max(...pages.map((x) => x.updated))) + " ago)");
+  else parts.push("No computer has shown this project here yet");
+  if (waiting) parts.push(waiting + (waiting === 1 ? " message waits" : " messages wait") + " for a computer to wake");
+  parts.push("History: the last 7 days");
+  const text = document.createElement("span"); text.textContent = parts.join(" · ");
+  const leave = document.createElement("button"); leave.type = "button"; leave.className = "link"; leave.id = "hosted-unpair";
+  leave.textContent = "Unpair this phone";
+  leave.addEventListener("click", async () => {
+    if (!confirm("Unpair this phone? It will read nothing more until you pair it again.")) return;
+    try { await answer(project("first"), "leave", "*", {}); } catch (e) {}
+    await forget();
+    location.reload();
+  });
+  bar.replaceChildren(text, leave);
+}
+
+// Starting --------------------------------------------------------------------------------------------
+let started;
+H.started = new Promise((resolve) => { started = resolve; });
+async function begin() {
+  if (H.begun) return;
+  H.me = await kvGet("me");
+  if (!H.me) { overlay("pair"); return; }
+  H.begun = true;
+  H.trust = await kvGet("trust") || { devices: {}, version: 0 };
+  H.keys = await kvGet("keys") || {};
+  hideOverlay();
+  H.store.set("devices/" + H.me.id, { seen: SERVER_TIME }, true).catch(() => {});  // opened: not a forgotten phone
+  H.store.listen("meta", async (changes) => {
+    for (const [kind, id, doc] of changes) {
+      if (kind === "removed") continue;
+      if (id === "trust") await acceptTrust(doc);
+      if (id === "account" && doc.key_id) H.current = doc.key_id;
+    }
+  });
+  H.store.listen("devices", async (changes) => {
+    for (const [kind, id, doc] of changes) {
+      if (id !== H.me.id) continue;
+      if (kind === "removed") { await removed(); return; }
+      await acceptKeys(doc);
+    }
+  });
+  const account = await H.store.get("meta/account");
+  H.current = (account && account.key_id) || Object.keys(H.keys).pop();
+  H.ready = true;
+  await loadProject(project(CHAT));
+  started();
+  loadProjects().catch(() => {});
+  setInterval(renderBar, 5000);
+  for (const p of H.projects.values()) p.version++;
+  renderBar();
+}
+async function main() {
+  const code = /^#pair=([A-Za-z0-9 -]+)$/.exec(location.hash);
+  if (code) {  // from the QR code: kept through Google's sign-in, and off the address bar
+    sessionStorage.setItem("crewchat-pair", cleanCode(code[1]));
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  if (FAKE) { H.store = fakeStore(); await begin(); return; }
+  const config = await (await realFetch("/__/firebase/init.json")).json();
+  config.authDomain = location.host;  // the sign-in helper on this same site, so the browser keeps its storage
+  firebase.initializeApp(config);
+  overlay("signin", "Checking your sign-in…");
+  await firebase.auth().getRedirectResult().catch((e) => status(e.message));
+  firebase.auth().onAuthStateChanged(async (user) => {
+    if (!user) { overlay("signin"); return; }
+    const uid = await kvGet("uid");
+    if (uid && uid !== user.uid) { await forget(); }
+    await kvSet("uid", user.uid);
+    H.store = firebaseStore(user.uid);
+    await begin();
+  });
+}
+main().catch((e) => overlay("pair", e.message || String(e)));
+})();
+"""

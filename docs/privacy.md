@@ -16,9 +16,15 @@ What crewchat connects to, and only these:
   encrypted on your machine before they are sent, with a key only your machines hold; Firestore
   stores the ciphertext under your Google account. You sign in with Google to your own project.
   Details: [cloud sync design](cloud-sync-design.md).
+- **Your own Firebase Hosting, if you publish the phone page.** The page your phone opens from anywhere is served by
+  your own Firebase project. The phone holds its own key and decrypts the chat itself; Google sees the ciphertext, when
+  your phone reads and writes, its IP address and browser, and that it signed in to your project. With a phone paired,
+  the cloud keeps the last 7 days of messages (encrypted) instead of 24 hours. The page's code comes from your Hosting
+  site, so whoever can change what that site serves (you, and Google as its host) is trusted as the page itself is.
+  Details: [the phone from anywhere](phone.md#from-anywhere-with-cloud-sync).
 - **Tailscale, if you link machines with it.** Your machines talk to each other over your own
   tailnet.
-- **Your browser's push service, if you turn on notifications.** With the bell on, the browser
+- **Your browser's push service, if you turn on notifications.** With notifications on (Settings › Notifications), the browser
   subscribes with its own push service (Google's, Apple's, Mozilla's or Microsoft's). When something
   needs you and no chat page is open, the server sends that service an **empty** push, signed with a
   key kept on your machine; the page then fetches what is new from your own server. Nothing from the
@@ -30,20 +36,37 @@ What crewchat connects to, and only these:
   the project's settings; the bridge token in `config.json`, the connected folders' MCP settings (kept out of git) and
   Codex's `~/.codex/config.toml`, each readable by you only; the log of what agents opened only in the server's memory.
 
-- **MCP servers you add.** With `crewchat mcp`, or in Project settings: crewchat writes each one, with its key if it has
-  one, into the MCP settings of the project's connected folders (kept out of git) and, if you tick Codex, Codex's
-  `~/.codex/config.toml`, each readable by you only; the key itself is kept in the project's `config.json` on this
-  machine and is never sent to the chat page, the chat or your other machines. Your agents' tools talk to the server
+- **MCP servers you add.** In Project settings › Integrations, or with `crewchat mcp`: crewchat writes each one, with
+  its key if it has one, into the MCP settings of the project's connected folders (kept out of git) and, if you tick
+  Codex, Codex's `~/.codex/config.toml`, each readable by you only; the key itself is kept in the project's
+  `config.json` on this machine and is never sent to the chat page, the chat or your other machines. Your linked
+  machines get the server's name and address (unless you untick it), never its key: each writes it for its own tools,
+  and waits for its key to be given there. **Add from a tool** reads the servers you set up by hand in Claude Code,
+  Cursor or Codex on this machine and lists them on the page with the names of their keys, never the keys; **Add**
+  copies one, with its key, into the project's `config.json` on this machine. Your agents' tools talk to the server
   directly. crewchat asks it only when you add it (how it signs in) and when you press Test.
 
 - **Atlassian, if you give a project a Jira site.** crewchat adds Atlassian's Jira MCP server to the agents' tools;
   each tool signs in to it and talks to it directly. If you **Sign in to Atlassian** so your tickets become tasks,
   crewchat itself asks Atlassian's server for your open tickets every few minutes, signed in through Atlassian's own
-  page; the sign-in is kept in the project's `config.json` on that machine, never sent to the chat page.
+  page; the sign-in is kept in the project's `config.json` on that machine, never sent to the chat page. With the
+  **Ticket cycle** on (Project settings › Integrations › Jira), crewchat also changes Jira through that sign-in for
+  the crew: it reads the tickets your query finds, and agents comment, make sub-tasks and move statuses only with
+  `hub_jira`, each only at its own step. Text with a secret in it (a token, a key, one of crewchat's sign-ins) is
+  refused before it reaches Jira, and what people write in a ticket reaches agents marked as their words, not your
+  instructions.
 - **Google Chat, if you add a space.** When an agent posts a pull request (or you press Test), crewchat sends that
-  post, and nothing else from the chat, to the space: by its webhook, or through Google's Chat API signed in as you
+  post, and nothing else from the chat unless you mirror the project (next), to the space: by its webhook, or through Google's Chat API signed in as you
   with your own OAuth client. The webhook addresses, the client and the sign-in are kept in the project's
   `config.json` on this machine, never given to an agent or the chat page.
+- **Google Chat, if you mirror a project into a space** (off until you turn it on, in Project settings ›
+  Integrations › Google Chat › Mirror this project into). Then the project's messages leave this machine for that space, a few lines per
+  post: every message, only messages to you, tasks, reviews and questions to you, or nothing more, as you choose. They are the
+  messages' text, who wrote them to whom, and how many files they carry (never the files). Events, plans and process
+  notes stay here. Once you sign in with Google, crewchat also reads the space's new messages every 5 seconds,
+  signed in as you (the `chat.messages.readonly` scope; `openid` tells it which account is yours), a webhook's space
+  too. Only your own messages there come into the chat, as yours, and reach agents; everyone else's are counted on
+  the card and stay in Google Chat. Turning the mirror off stops both at once.
 - **Mobile MCP, if you turn mobile devices on for an agent.** `crewchat device-proxy` runs Mobile MCP (a pinned
   version, fetched by `npx` the first time) on your machine, with its usage events turned off. What the agent sees
   on the device goes to its own AI tool, as its other work does.
@@ -60,8 +83,8 @@ What crewchat reads on your machine and keeps there:
   Java, Kotlin, JavaScript and TypeScript with the `map` extra) and which file imports which, in
   `maps/` in the project's crewchat folder. Never the code itself; it never leaves the machine
   (`crewchat map`).
-- **When each agent was working, waiting for messages or idle,** for the timelines on the analytics
-  page: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept
+- **When each agent was working, waiting for messages or idle,** for the timelines in the Activity
+  view: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept
   while `crewchat setup --activity off` keeps what agents do off the page.
 - **Token counts.** At the end of each turn of a Claude Code agent, its hook reads how many tokens
   the turn used from the session's own transcript: the model and the numbers, never the
@@ -109,11 +132,17 @@ The server reads it only inside the tool's own folder and only when a question c
 agent cannot have another file of yours read and passed on. Where the file is stays in the
 server's memory: it is not saved, synced or shown.
 
+**Public skill libraries.** The guide every agent reads links to public skill libraries (Anthropic's, Vercel's,
+OpenAI's, Google's, Hugging Face's and others). These are links only: crewchat fetches and copies nothing from them.
+An agent that opens one does so with its own tools, as it reads any web page, and asks you in the chat before the
+project keeps a skill from it.
+
 Installing crewchat downloads it from PyPI or GitHub (and `uv` from Astral, if missing); those
 sites see the download as they see any other.
 
-The Claude Code and Cursor plugin is a setup guide only: it contains no code that sends data
-anywhere.
+The Claude Code and Cursor plugin holds a setup guide, and for Claude Code the band above the prompt and the chat
+pane. They read only this machine's crewchat server (127.0.0.1), with your token from crewchat's folder, as
+`crewchat` commands do. Nothing they read leaves the machine.
 
 Questions: [open an issue](https://github.com/deepankar17/crewchat/issues), or run `crewchat feedback`,
 which opens one in your browser and sends nothing itself.

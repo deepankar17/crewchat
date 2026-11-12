@@ -210,7 +210,7 @@ history, the page works from whichever machine is on.
 
 Later, optionally: a hosted page that reads Firestore directly, so the phone works with no
 machine switched on. That needs the browser to hold the account key, so it is a separate piece
-of work.
+of work. Built since (section 15): the phone is a device with its own key, paired by a code.
 
 ## 12. Packaging
 
@@ -252,7 +252,9 @@ Firestore, including offline and reconnect cases. A smaller set runs against a r
   [firebase-setup.md](firebase-setup.md) covers it by hand and as a prompt for an agent.
 - **Retention:** 24 hours instead of 72, configurable with `cloud_ttl_hours` in config.json.
   Shorter would lose messages for a laptop closed overnight.
-- **Hosted phone page:** later.
+- **Hosted phone page:** built later, as W13 (9 Nov 2026): a phone is a device of kind `phone` that pairs by a code,
+  posts only as the owner, signs its answers to Needs you, and never changes who is trusted. With a phone paired, the
+  cloud keeps messages 7 days. How to use it: [your phone](phone.md#from-anywhere-with-cloud-sync).
 - **No Firestore transactions.** The live test showed that an ordinary signed-in user may not
   begin a transaction. Updates to the trusted-device list use a conditional write instead (write
   only if the document is unchanged since it was read; retry otherwise), which gives the same

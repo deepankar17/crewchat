@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 MAX_FILES = 20000  # read at most this many source files of one repository
-MAX_FILE_BYTES = 2 * 1024 * 1024  # bigger source files are skipped (generated, minified); crewchat.py is over 1 MB
+MAX_FILE_BYTES = 4 * 1024 * 1024  # bigger source files are skipped (generated, minified); crewchat.py is over 2 MB
 MAX_GUESSES = 3  # a name defined in more files than this is not linked at all
 CERTAIN, GUESS = 2, 1  # how two areas are linked (CodeMap.link)
 MAX_GRAPH_FILES = 3000  # files C8's view is sent at most

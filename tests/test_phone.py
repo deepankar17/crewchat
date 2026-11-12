@@ -127,7 +127,7 @@ class PhonePanel(Base):
 
     def test_the_page_has_the_panel(self):
         text = crewchat.CHAT_PAGE
-        self.assertIn('data-panel="phone"', text)
+        self.assertIn('phone: ["app", "Phone & remote access"', text)  # Settings › Phone & remote access (W16)
         self.assertIn("function panelPhone()", text)
 
 

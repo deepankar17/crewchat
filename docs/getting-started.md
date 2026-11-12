@@ -2,10 +2,12 @@
 
 This guide takes you from nothing to agents talking in a chat you can read, in about five
 minutes: install, start, open your agents, talk to them, share files, and tune how they listen.
+After the first command, everything is on the chat page: you never need a terminal again.
 
 - [1. Install](#1-install)
 - [2. Start a chat](#2-start-a-chat)
 - [3. Open your agents](#3-open-your-agents)
+- [The page](#the-page)
 - [4. Talk to them](#4-talk-to-them)
 - [Needs you](#needs-you)
 - [5. Share screenshots and files](#5-share-screenshots-and-files)
@@ -15,8 +17,9 @@ minutes: install, start, open your agents, talk to them, share files, and tune h
 - [Projects](#projects)
 - [The task sheet](#the-task-sheet)
 - [Jira, Google Chat and your own MCP servers](#jira-google-chat-and-your-own-mcp-servers)
-- [Analytics](#analytics)
+- [Activity](#activity)
 - [What agents learn: rules and skills](#what-agents-learn-rules-and-skills)
+- [crewchat inside Claude Code](#crewchat-inside-claude-code)
 - [Upgrade and uninstall](#upgrade-and-uninstall)
 
 ## 1. Install
@@ -41,29 +44,28 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 ```
 
-**Windows** (PowerShell), with uv: install it, open a new PowerShell window (so `uv` is found),
-then crewchat:
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
-
-```powershell
-uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
-```
-
-or in one line:
+**Windows** (PowerShell), in one line:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
-Windows Defender's automatic detection sometimes takes the one-line installer (a script
-downloaded and run at once) for a trojan, `Commando.A!ml`, and stops it. uv's own installer is
-widely used and trusted, and after it nothing is downloaded and run: crewchat comes from PyPI like
-any Python package. If Defender stops the one line, use uv.
+Then open a new PowerShell window and run `crewchat start`. Use this installer on Windows, also when you
+already have uv: Smart App Control blocks the `crewchat.exe` that uv makes (unsigned, and new with each
+install), and the installer adds a `crewchat.cmd` ahead of it on your PATH that runs crewchat by Python,
+so the `crewchat` command is never blocked. crewchat's hooks, its login start and **Update now** run it by
+Python too.
 
-With uv already installed, on any system, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
+Windows Defender's automatic detection sometimes takes the one line (a script downloaded and run at
+once) for a trojan, `Commando.A!ml`, and stops it. Then download the same installer and run it from
+the file:
+
+```powershell
+irm https://crewchat.dev/install.ps1 -OutFile crewchat-install.ps1
+powershell -NoProfile -ExecutionPolicy ByPass -File .\crewchat-install.ps1
+```
+
+With uv already installed, on macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
 libraries (about 70 MB): `uv tool install --refresh-package crewchat --python 3.12 crewchat`.
 
 The one-line installers:
@@ -98,7 +100,7 @@ cd ~/code/notes-app
 crewchat start
 ```
 
-<img src="images/demo-start.gif" width="760" alt="crewchat start being typed in a terminal in ~/code/notes-app: it sets up the host, starts the server and connects the folder as macbook.">
+<img src="images/demo-start.gif" width="760" alt="crewchat start being typed in a terminal in ~/code/notes-app: crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
 
 What it does, and why it is safe to run again:
 
@@ -110,18 +112,34 @@ What it does, and why it is safe to run again:
 
 The chat page opens, empty for now:
 
-<img src="images/empty-chat.png" width="760" alt="The chat page with no agents yet. On the left: a hint to use New agent or run crewchat start in the project folder, and + New agent. In the middle: Your crew's chat starts here, with New agent, Post a task and Roles.">
+<img src="images/empty-chat.png" width="760" alt="The chat page with no agents yet. The sidebar on the left: the project Notes App, Search or jump to, Chat, Needs you, Tasks and Activity, a hint that there are no agents yet, + New agent, and at its foot Project settings, Machines & devices and You. In the middle: Your crew's chat starts here, with New agent, Post a task and Roles.">
 
-To open it later on this machine: `crewchat ui`. On another device, open the chat's address and
-sign in with a code from `crewchat ui --print` ([Your phone](phone.md) shows how to reach it):
+To open it later on this machine: `crewchat ui`. Another folder joins from the page too: the project
+switcher at the top of the sidebar has **Connect a folder…** (pick the folder, tick the tools found on
+this machine, and **Approve and connect** answers what each would ask the first time there) and **New
+project…**. On another device, open the chat's address and sign in with a code
+([Your phone](phone.md) shows how to reach it):
 
 <img src="images/sign-in.png" width="480" alt="The sign-in page: run crewchat ui --print on the machine that hosts the chat and type the code it shows. A code works once, for two minutes.">
 
 ## 3. Open your agents
 
-Open Claude Code or Cursor in the connected folder. Each session joins the chat by itself the
-first time it uses a chat tool; there is nothing to set up per agent. Sessions that were already
-open before you ran `crewchat start` need a restart.
+**+ New agent**, in the sidebar, starts one: pick its folder, its tool (Claude Code, Cursor, Codex CLI,
+Gemini CLI, Qwen Code or OpenCode), and optionally a name, a role and a first task
+([New agent, from the chat page](teams.md#new-agent-from-the-chat-page)). A Claude Code or Cursor agent
+starts **in the background**, with no terminal window: its card says what it is doing, and what its tool
+asks you comes to [Needs you](#needs-you). **Run it: In a Terminal window** keeps the old way. With
+machines linked over Tailscale, **Machine** starts it on any of them
+([Several machines](multiple-machines.md)).
+
+An agent that does not start (it crashed, or has not joined after 5 minutes) waits in Needs you as a
+**Not started** card, with why and the last lines of its screen: **Try again** or **Dismiss**.
+
+Sessions you open yourself can join too. In a project made before 2.0, any Claude Code or Cursor
+session in a connected folder joins the chat by itself the first time it uses a chat tool. A new
+project takes only agents started from + New agent, until you choose **Any session opened in a
+connected folder** in **Project settings › Safety › Who can join** (or run `crewchat setup --join anyone`).
+Sessions that were already open before you ran `crewchat start` need a restart.
 
 <img src="images/agents-joined.png" width="760" alt="Three agents have joined: Kai (Claude Code on the macbook), Ines (Cursor on the macbook) and Wren (Claude Code on Windows). In the chat, Kai warns it is about to change LoginViewModel.kt, and Ines replies it is only in SettingsScreen.kt.">
 
@@ -158,9 +176,9 @@ task, and before it stops. They all join with `hub_link` like the others, show o
 tasks, and **Reopen** and **Start again** work for them. Installed one later? `crewchat start` in the folder
 again adds it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
 
-The list on the left shows each agent:
+The sidebar's **Agents** list shows each agent:
 
-<img src="images/agent-cards.png" width="300" alt="Three agents in the list on the left. Each shows its picture with its tool's badge, its name, its role, the task it holds or its status, unread messages, and a dot: green when it was heard from just now.">
+<img src="images/agent-cards.png" width="300" alt="Four agents in the sidebar: Maya, the lead, on task #9; Teo, a developer, persisting the theme; Noor, a developer in Cursor, on task #12; and Kira, QA, testing the colours. Each shows its picture with its tool's badge, its role, its task or status, and a green dot.">
 
 - its picture, with its tool's badge, and its name and role ([Teams and roles](teams.md));
 - the task it holds, or else its status line, which the agent sets itself;
@@ -172,18 +190,21 @@ chat says who is working. Only a file's name and a command's program are shown (
 subcommand for well-known tools such as `npm test` or `git commit`), never arguments or contents.
 It stays on the machine the agent runs on. `crewchat setup --activity off` keeps it off the page.
 
-Click an agent to open its settings on the left, under the list of agents: what it is doing
-(**working**, **waiting for messages**, so it answers at once, or **idle**, so it sees messages when
-its user next types), its task and last message, the tokens it used today and in all with what they
-would cost at API prices (an estimate; Claude Code agents only, `crewchat usage` for the whole crew),
-its role and listening setting, and **Message**, **Stop** or **Reopen**, and **Remove**. Click its
-picture to change it. Its name is a field: click it, type, Enter. ✕ or Esc closes it. The side
-panel on the right is for the project: **Project settings** (rules, skills, process notes, folders, machines), its
-**Roles**, **Machines**, **Browser** and **Commands** (all in **⋯**),
-and its tasks. **Chat**, **Tasks** and **Analytics**, at the top of the rail, switch the middle of the page.
+Click an agent to open its panel beside the chat: what it is doing (**working**, **waiting for
+messages**, so it answers at once, **idle**, or **waiting** for your answer), its task and last message,
+its latest commits, the tokens it used today and in all with what they would cost at API prices (an
+estimate; Claude Code agents only), its role, listening, browser and mobile devices settings, and its
+actions. An agent in the background has **Show terminal** (its screen, on the page), **Open in
+Terminal** for the rare question only its terminal can answer, **Stop**, **Reopen** (or **Restart**
+while it runs), and a mode switch (Ask, Plan, Accept edits) that reopens it in that mode; **Fork**
+starts a new Claude Code agent from a copy of its conversation. Every agent has **Message** and
+**Remove**. Click its picture to change it. Its name is a field: click it, type, Enter. ✕ or Esc
+closes the panel.
 
-**Open folder**, next to the agent's folder in its settings and next to each of the project's
-folders in the side panel (**⋯**, Project settings), opens that folder in Finder, File
+<img src="images/agent-panel.png" width="760" alt="The chat page with Maya's panel open on the right: her picture, name, Lead role, Claude Code on macbook; Now: her status, Waiting for messages, her task #9 and what she last said; Settings: role, listening, browser and mobile devices with Turn on, and permissions.">
+
+**Open folder**, next to the agent's folder in its panel and next to each of the project's
+folders in **Project settings › Folders & files**, opens that folder in Finder, File
 Explorer or your Linux file manager, on the machine that hosts the page (not the phone or laptop
 you are browsing from). Only the project's connected folders on that machine can be opened, and
 only by you; an agent on another machine has no button. On macOS a folder named as a package
@@ -195,7 +216,7 @@ An agent whose last conversation crewchat did not record (one that joined before
 track of sessions) has **Start again** instead of **Reopen**: a new session opens in a Terminal
 window in its folder and checks in as the same agent, with its name, role, picture and tasks.
 
-**+ New agent**, under the list of agents, starts a new agent session for you: its name, role and
+**+ New agent**, under the agents in the sidebar, starts a new agent session for you: its name, role and
 picture, its folder, its tool and model, and a first task
 ([New agent, from the chat page](teams.md#new-agent-from-the-chat-page)). For a project made on the
 page, **Or connect one** takes a folder's path, or **Browse…** the host's folders, and **Connect**
@@ -203,26 +224,68 @@ runs `crewchat start` in it. When you pick a tool, New agent says what it still 
 machine (installed, signed in, the folder trusted), with the command to run (**Copy**) and **Check
 again**; crewchat only reads these, and never changes them.
 
-<img src="images/agent-panel.png" width="760" alt="The chat page with an agent's settings open in the list on the left, under the crew: its picture, name, role, tool and machine; Now: status, what it is doing, its task and what it last said; Settings: role, listening and permissions; Actions: Message, Remove.">
-
-**The look.** The page uses Liquid Glass, after Apple's macOS 26 and iOS 26: the tabs, the list of
-agents, the message box, the side panel, menus and dialogs are see-through glass over a colourful
-backdrop, while messages and task cards stay solid to read. With **Reduce transparency** or
-**Increase contrast** on in your system's accessibility settings (or in a browser that cannot blur),
-every surface is solid. Each new agent gets a face of its own that suits its first name, and nobody
-in the chat wears the same one ([Pictures and colours](teams.md#pictures-and-colours)):
+Each new agent gets a face of its own that suits its first name, and nobody in the chat wears the
+same one ([Pictures and colours](teams.md#pictures-and-colours)):
 
 <img src="images/faces.png" width="760" alt="Sixteen faces crewchat made for new agents, each with its name: Maya, Teo, Priya, Arjun, Noor, Kira, Kabir, Zoe, Omar, Meera, Wren, Hugo, Diya, Levi, Yuki and Rohan, with hats, headphones, glasses and hair of their own.">
+
+## The page
+
+<img src="images/team.png" width="760" alt="The chat page: on the left the sidebar with the crewchat logo, the project Notes App, Search or jump to (⌘K), Chat, Needs you with 1, Tasks with 2 and Activity, the agents Maya (Lead), Teo and Noor (Developers) and Kira (QA) with + New agent, and Project settings, Machines & devices and You at its foot. In the middle the chat: tasks handed out by Maya, a bug Kira found and Teo fixed, and Maya's question to you.">
+
+The sidebar holds everything you use often:
+
+- **The project switcher**, at its top: every project, with a count of what needs you in each,
+  **New project…** and **Connect a folder…**.
+- **Search or jump to…** (⌘K, or Ctrl+K on Windows and Linux): see below.
+- **Chat**, **Needs you** (with its count), **Tasks** and **Activity** switch the middle of the page.
+- **Agents**: your crew, and **+ New agent**.
+- At its foot, **Project settings**, **Machines & devices**, and **You**, which opens Settings (also ⌘,).
+
+**Settings** is one page over the whole window: crewchat's own sections first (General, Appearance,
+Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy & data,
+Advanced, About), then this project's (General, Crew & roles, Safety, Integrations, Routines, Folders &
+files), then your other projects. **Find a setting** searches the words of every setting, and each
+section and card has a link of its own (`#settings/safety`, for example) to paste or bookmark.
+**Advanced** lists every crewchat command, to copy or to run there: nothing needs a terminal.
+
+<img src="images/settings.png" width="760" alt="Settings: the list on the left, with crewchat's sections (General, Appearance, Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy & data, Advanced, About) and Notes App's (General, Crew & roles, Safety, Integrations, Routines, Folders & files). Safety is open: Who can join, Approvals asking before risky commands with one rule always allowed and Remove, and Files agents edit.">
+
+**⌘K** finds any place, setting or command, actions such as **New agent** or **Link a machine**, your
+agents and projects, and messages in every project. Arrow keys move, Enter opens.
+
+<img src="images/jump.png" width="760" alt="The ⌘K box over the page, with jira typed: the Jira setting in Integrations, four crewchat tasks jira commands in Advanced, Sign-ins in Accounts, Routines and Integrations.">
+
+**Themes.** **Settings › Appearance** has 12: System (Paper by day, Ink by night, the default), Paper,
+Ink, Classic light and Classic dark (the page before 2.0, with its glass), Lagoon, Ember, Cobalt, Sage,
+Breeze, Evergreen and Evergreen dark. A theme changes colours, fonts, corners and the space between
+panels; everything stays where it is. There are also an accent colour, the text size, density and the
+headings font. Each browser keeps its own choice.
+
+<img src="images/appearance.png" width="760" alt="Settings, Appearance, in the Ink theme: the twelve themes as small previews, System, Paper, Ink (chosen), Classic light, Classic dark, Lagoon, Ember, Cobalt, Sage, Breeze, Evergreen and Evergreen dark, each with a line on how it looks.">
+
+**Resize** the sidebar, the chat and the side panel: drag the handle between two of them, or focus it
+and use the arrow keys; double-click puts it back. Drag one narrow enough and it hides, with its handle
+left to open it again. Each browser remembers the widths.
+
+On a phone the page has tabs at the bottom instead of the sidebar: [Your phone](phone.md).
 
 ## 4. Talk to them
 
 Type in the box at the bottom of the page. A message goes to everyone; start it with `@name` to
 write to one agent: type `@` and pick it from the list, or use **Reply** on one of its messages,
 or **Message** in its panel. Each message you
-send shows whether it has been read, and by whom. **Search**, at the top, shows only the messages
-that match.
+send shows whether it has been read, and by whom, and "woke the agent" when it started an idle
+agent's next turn. **Search**, at the top, shows only the messages that match; Enter searches every
+message the chat ever had, in every project.
 
-From a terminal on the host:
+- **Thread**, on any message, opens it beside the chat with its own reply box. The chat shows who
+  replied there under the first message.
+- **Needs a reply**, in the box's **+** menu, marks a message as a question. It then shows where it
+  is (sent, seen, answered), and one left for 30 minutes comes to Needs you with **Nudge** and
+  **Answer for** the agent.
+
+Or from a terminal on the host:
 
 ```bash
 crewchat say "Stop and commit what you have"
@@ -234,7 +297,7 @@ crewchat status                         # is the server running, and who is conn
 
 How a message reaches an agent, without you relaying anything:
 
-<img src="images/demo-talk.gif" width="760" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren, who reads it at once, shows what it is doing on its card, and answers in the chat.">
+<img src="images/demo-talk.gif" width="760" alt="In the message box, @Wr offers Wren from the crew; the question is sent to Wren, who reads it at once, shows what it is doing on its card in the sidebar, and answers in the chat.">
 
 ![How a message reaches an agent. 1: The agent finished its turn; its hook waits for messages. 2: You type a message on the chat page. 3: The page sends it to crewchat. 4: crewchat answers the waiting hook at once. 5: The hook gives the message to the agent. 6: The agent answers with the hub_send tool. 7: The answer appears on your page. You never copy anything between sessions.](images/diagram-talk.gif)
 
@@ -246,45 +309,71 @@ settle it among themselves:
 
 ![Post a task: the agents settle who takes it. 1: You post a task: the test that fails now and then. 2: Every agent gets it. 3: Each bids once: yes or no, and why. 4: The best placed calls hub_task take: only the first caller gets it. 5: Everyone else is told it's taken. 6: It reports back to you as it works. No double work: exactly one agent owns each task.](images/diagram-bids.gif)
 
-<img src="images/demo-task.gif" width="760" alt="Post as task is chosen in the message box's + menu, and a task typed and sent; Maya, Teo and Wren bid one after another and Maya takes it. On the task board it moves to Doing, then to Review; Needs you shows it, and Mark done in its panel moves it to Done.">
+<img src="images/demo-task.gif" width="760" alt="Post as task is chosen in the message box's + menu, and a task typed and sent; Maya, Teo and Wren bid one after another and Maya takes it. Tasks, in the sidebar, shows it In progress, then In review; Needs you shows it, Mark done in its panel moves it to Done, and the board shows it there.">
 
 With a lead, the lead takes your tasks and hands out the work instead: see
 [Teams and roles](teams.md).
 
 ## Needs you
 
-When something waits on you, it shows at the top of the list of agents, under **Needs you**, and
-the project's tab turns red (on any project, so you see it from the others too). On a phone, a red
-count in the bar at the top opens the list:
+**Needs you**, in the sidebar, is everything that waits on you, with its count there, on the
+browser tab's title and icon, and on the installed phone app's badge. Each item is a card saying who
+asks and how long ago, with its answer on it:
 
-- a **permission prompt** of a Claude Code agent, with what it wants to run or change, and
-  **Allow** and **Deny** ([below](#permission-prompts));
-- a task an agent marked **blocked**, with its question;
-- a task **in review**;
-- a **message to you** you have not seen yet (it counts as seen while the page is in front);
-- a task **given back** or **reclaimed** that nobody has taken again.
+- a **permission prompt**, with the command, file or address in full: **Allow once**, **Always
+  allow** or **Deny** ([below](#permission-prompts));
+- a **plan** a Claude Code agent made: **Review plan** or **Approve** ([below](#plans));
+- a **question** an agent asks you with its options (Claude Code's AskUserQuestion), and a box for
+  your own answer;
+- what an agent's tool asks the first time in a folder (trust it, use its MCP servers): **Approve and
+  start**; a **Not started** agent; a background session **stuck** on its terminal;
+- a task an agent marked **blocked**, with its question, and a task **in review**;
+- a **message to you** you have not seen yet, and a question that **needs a reply** left for 30 minutes;
+- an agent's first visit to a site in your browser, or a real phone it asks for: **Let agents use it**;
+- a task **given back**, **reclaimed** or **parked** that nobody has taken again, and a commit stopped by
+  another agent's file lease.
 
-The ones that hold up the most other tasks come first ("holds up 3 tasks"). Click one to open it:
-a task opens in the side panel with the agent's question and a box to answer it, or **Mark done**
-for a review. An item leaves the list once it is handled: you answered it (then it is the agent's
-turn, until it asks again or sends the task back for review), the task is done or taken, the
-message is read.
+The ones that hold up the most other tasks come first ("holds up 3 tasks"). Reply on the card, or click
+it to open the task beside the chat. An item leaves once it is handled. With more than one project,
+**This project** and **All projects** switch between this project's items and every project's, each
+labelled with its project. With machines linked over Tailscale, an agent's prompts show on every
+linked machine's page, marked with its machine.
 
-<img src="images/needs-you.png" width="760" alt="Needs you at the top of the list of agents: a blocked task with the agent's question, which holds up one other task, above a task ready for review. The blocked task is open in the side panel with the question and a box to answer it.">
+<img src="images/needs-you.png" width="760" alt="Needs you with four cards. Kira asks permission to run ./gradlew connectedAndroidTest on macbook, with Allow once, Always allow and Deny; Always allow would keep Bash(./gradlew connectedAndroidTest:*) for every agent in the project. Teo's plan, Remember the theme across restarts, 3 steps and 2 files, with Review plan and Approve. Maya's question, which theme new users should get, with two options and a box for your own answer. And Noor's task #12, in review.">
 
 ### Permission prompts
 
 When a Claude Code agent wants to do something it has not been allowed (run a command, edit a
 file), it asks in **Needs you** first: the agent, the tool, and the command, file or address in
-full. **Allow** lets it go on, **Deny** tells it you said no. Nobody answers in 10 minutes, or you
-answer in its terminal instead: the item goes and the agent asks there as before. It is asked on
-the chat page of the machine the agent runs on. `crewchat setup --permissions terminal` keeps
-every prompt in the agents' terminals. Other tools still ask in their own windows.
+full. **Allow once** lets it go on. **Always allow** keeps the rule Claude Code itself would offer
+(`Bash(npm test:*)`, or a whole MCP tool) for every agent in the project, listed in **Project
+settings › Safety › Approvals** with **Remove**. **Deny** tells it you said no, with a note if you
+like. Nobody answers in 10 minutes, or you answer in its terminal instead: the item goes and the
+agent asks there as before. `crewchat setup --permissions terminal` keeps every prompt in the agents'
+terminals.
 
-**Notifications.** The bell at the top of a project asks the browser to show a notification while
-the page is in the background: **When something needs me**, **Only messages to me**, or **Never**
-(the default). It is set for each project, in this browser. Clicking a notification opens what it
-is about. They come while the page is open, in a tab or installed as an app, and with **Web Push**
+<img src="images/permission.png" width="760" alt="A permission card: Kira asks to run Bash on macbook, ./gradlew connectedAndroidTest --tests '*ThemeSettingsTest*', with Allow once, Always allow and Deny.">
+
+**Other tools.** In **Project settings › Safety › Approvals**, Codex, Gemini CLI, Qwen Code, Cursor
+and OpenCode ask in Needs you too: before risky commands (push, deploy, delete, `rm -rf`, secrets,
+production), or before every command and edit. Always allow covers that command with more
+arguments, never one with another command chained after it.
+
+### Plans
+
+A Claude Code agent in plan mode (**Plan first** in + New agent, or the Plan mode on its card) brings
+its plan to Needs you before it changes anything. **Review plan** shows it in full, with headings,
+lists and code, beside the rest of what needs you: **Approve**, **Approve, and let it edit without
+asking**, or **Ask for changes** with a note the agent revises the plan from. The keys A and E approve,
+and J and K go to the next and the previous plan.
+
+<img src="images/plan-review.png" width="760" alt="Teo's plan open for review: on the left the four items in Needs you; in the middle the plan, Remember the theme across restarts, with its steps and files; on the right Your decision: Approve, Approve and let it edit without asking, and Ask for changes with Send back to Teo, and the keys A, E, J and K.">
+
+**Notifications.** **Settings › Notifications** asks the browser to show a notification while the
+page is in the background: **When something needs me**, **Only questions for me**, or **Never** (the
+default), for this browser, and a soft chime if you like. A permission prompt's notification has
+**Allow** and **Deny**, and a question's has **Reply**, so you can answer without opening the page
+(Android and desktop browsers). Clicking a notification opens what it is about. They come while the page is open, in a tab or installed as an app, and with **Web Push**
 also when it is closed: on a computer, and on a phone with the app on its home screen (an iPhone
 from iOS 16.4) when the page is reached at an `https` address ([Your phone](phone.md)). Nothing
 from the chat goes through the browser's push service: the push only wakes the page's service
@@ -292,13 +381,13 @@ worker, which fetches what is new from your computer.
 
 ### Agents in your browser
 
-An agent can work in your own Chrome, where you are logged in. Turn it on in **+ New agent** (Use the browser) or on
-the agent's card (Browser: Turn on).
+An agent can work in your own Chrome, where you are logged in. Turn it on in **+ New agent** (Use the browser) or in
+the agent's panel (Browser: Turn on), then **Restart** it if it is running.
 
 - **Claude Code** uses [Claude in Chrome](https://claude.com/chrome): install the extension and sign in. crewchat
   starts the agent with `--chrome` (Claude Code 2.0.73 or later).
 - **Every other tool** uses the Playwright MCP Bridge extension for Chrome. Install it, copy the token it shows, and
-  paste it in **Browser** (the project menu), then Save. crewchat adds a `browser` MCP server to each connected
+  paste it in **Settings › Machines & devices › Agents' browser**, then Save. crewchat adds a `browser` MCP server to each connected
   folder's settings for those tools; Remove takes it out again.
 
 The first time an agent opens a site, or changes something on one, you are asked in Needs you. See
@@ -307,19 +396,20 @@ The first time an agent opens a site, or changes something on one, you are asked
 ### Agents on mobile devices
 
 An agent can use an Android emulator or phone, or an iOS Simulator, to try the app it built. Turn it on in
-**+ New agent** (Use mobile devices) or on the agent's card (Mobile devices: Turn on). crewchat adds a `mobile` MCP
+**+ New agent** (Use mobile devices) or in the agent's panel (Mobile devices: Turn on). crewchat adds a `mobile` MCP
 server to the folder's settings for every tool there; it runs [Mobile MCP](https://github.com/mobile-next/mobile-mcp)
 with `npx`, so Node.js is needed, and `adb` (Android Studio) for Android or Xcode for iOS.
 
-Start an emulator or a simulator yourself first. Agents use those freely. A real phone is used only after you pick it
-in **Devices** (the project menu). See [Agents on mobile devices](teams.md#agents-on-mobile-devices).
+Start an emulator or a simulator yourself first. Agents use those freely. A real phone is used only after you let
+agents use it: when an agent first asks for it, Needs you shows **Let agents use it** or **Deny**, or pick it in
+**Settings › Machines & devices › Phones & emulators**. See [Agents on mobile devices](teams.md#agents-on-mobile-devices).
 
 ## 5. Share screenshots and files
 
 Paste a screenshot straight into the message box (Ctrl+V or Cmd+V), drop files onto it, or use
 **Attach a file** in the box's **+** menu. They wait as a row of previews until you send; × removes one.
 
-<img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question to @Wren is typed and sent; the image appears in the chat, Wren the QA agent answers what it sees and tells the developer, Teo.">
+<img src="images/demo-files.gif" width="760" alt="A screenshot is pasted into the message box and waits as a preview; a question to @Wren is typed and sent; the image appears in the chat, Wren the QA agent shows on its card that it is reading the image, answers what it sees and tells the developer, Teo.">
 
 Images appear in the chat; other files are links to download. Up to 20 MB each, 10 per message.
 A message can be just files.
@@ -334,16 +424,16 @@ terminal: `crewchat say --file crash.png --file logcat.txt "This happens on star
 
 ## 6. Open it on your phone
 
-On the computer, open the project menu (**⋯**, top right) and choose **Open on your phone**. If the chat
-has no address on your tailnet yet, **Set it up** runs Tailscale Serve for it. Then the panel shows a QR
+On the computer, open **Settings › Phone & remote access** (or ⌘K, then "phone"). If the chat
+has no address on your tailnet yet, **Set it up** runs Tailscale Serve for it. Then it shows a QR
 code: with the Tailscale app on and signed in to the same account, scan it with the phone's camera, and
 the phone opens the chat, signed in. The code works once, for two minutes (**New code** makes another);
 the address and the code are there to type instead.
 
-<img src="images/phone-panel.png" width="320" alt="The Open on your phone panel: open the Tailscale app and sign in to the same account; scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown, with New code and Copy link; then add it to the home screen.">
+<img src="images/phone-panel.png" width="520" alt="On your phone, in Settings, Phone & remote access: open the Tailscale app and sign in to the same account; scan the QR code with the phone's camera; or open the chat's tailnet address and type the code shown, with New code and Copy link; then add it to the home screen.">
 
-Add it to the phone's home screen and it opens like an app. More, and how to do it from a terminal:
-[Your phone](phone.md).
+Add it to the phone's home screen and it opens like an app, with tabs at the bottom. With cloud sync,
+a phone can open the chat from anywhere, with no computer awake. More: [Your phone](phone.md).
 
 ## Who is who
 
@@ -360,7 +450,7 @@ Write to an agent in any case: `@maya` reaches Maya.
 - **The label** of a folder (its place) defaults to the machine's name. Choose your own with
   `crewchat start --place NAME`.
 - **Renaming.** Tell an agent "call yourself backend" and it renames itself. Or click its name in its
-  panel on the chat page and type a new one, or from the host: `crewchat agent rename Maya backend`.
+  panel on the chat page and type a new one (or from a terminal: `crewchat agent rename Maya backend`).
 - **Coming back.** A resumed conversation gets its old name back.
 - **Leaving.** An agent that stays silent for a day drops off the list (`forget_hours` in
   `~/.crewchat/config.json`). **Remove** in its panel, or `crewchat agent remove NAME`, drops one at once and puts
@@ -376,7 +466,7 @@ session shows "Waiting for crewchat messages".
 
 ![When an agent is listening. 1: Its turn ends: the hook waits for messages, up to 30 minutes. 2: A message arrives: it gets to work at once. 3: Done: back to waiting. 4: Nothing for 30 minutes: it goes idle, and costs nothing. 5: When its user types, it's back at work.](images/diagram-listening.gif)
 
-To change that for one folder, run in the folder:
+**Listening**, in an agent's panel, sets it for that agent (below). To change it for one folder, run in the folder:
 
 ```bash
 crewchat listen on --minutes 55     # 1 to 55 minutes; turns waiting on for Cursor agents too
@@ -406,9 +496,12 @@ one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
 
 ## Projects
 
-Each folder you run `crewchat start` in is its own **project**: its own chat, agents, tasks,
-roles, files and rules, apart from your other projects. A new folder starts a project named after
-it; a folder whose name matches a project already here joins that one.
+Each project has its own chat, agents, tasks, roles, files and rules, apart from your other
+projects. The project switcher, at the top of the sidebar, lists them with a count of what needs
+you in each: **New project…** makes one, with the [role pack](teams.md#role-packs) its crew starts
+from, and **Connect a folder…** adds a folder to this one. From a terminal, each folder you run
+`crewchat start` in is a project: a new folder starts a project named after it, and a folder whose
+name matches a project already here joins that one.
 
 ```bash
 cd ~/code/website && crewchat start            # a new project, "website"
@@ -416,9 +509,7 @@ cd ~/code/docs && crewchat start --chat website  # another folder in the same pr
 crewchat projects                              # this machine's projects and their folders
 ```
 
-The chat page has a tab for each project at the top (a menu on a phone), marking the ones with
-messages you have not seen; **+** makes a new project, with the [role pack](teams.md#role-packs)
-its crew starts from. Agent names belong to their project: `Maya` in `website` and
+Agent names belong to their project: `Maya` in `website` and
 `Maya` in `notes-app` are two agents that never see each other. Commands act on the
 project of the folder you run them in; `--chat NAME` picks another (`crewchat say --chat website
 "..."`). Your first project stays where it was, so a machine set up before projects keeps its chat,
@@ -427,9 +518,9 @@ both and it is one chat, with one task sheet ([Several machines](multiple-machin
 
 <img src="images/close-project.png" width="440" alt="Close Website?: Close tab only takes it off the bar; removing takes the project off this machine and keeps its chat, tasks and roles in projects/.removed. The project's name typed in the box, with Cancel and Remove Website.">
 
-Each tab has an **×** (on hover, and always on the open one). **Close tab** only takes the project off the bar, in
-that browser; the **+** menu opens it again. **Remove project…** asks you to type the project's name, then takes it
-off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its chat, tasks and roles
+Each project in the switcher has an **×**. **Close tab** only takes the project off the list, in that
+browser; **Open a project**, in the same menu, brings it back. **Remove project…** asks you to type the
+project's name, then takes it off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its chat, tasks and roles
 come back if you move it out again. The first project can be closed but not removed.
 
 ## The task sheet
@@ -439,13 +530,13 @@ themselves: with nothing to do, an agent takes the top task it may (what it wait
 nobody else is in its files, and it suits its machine), says it started, works, and reports. Work
 they find (a bug, a follow-up) they add to the sheet. With a lead, the lead hands tasks out.
 
-On the chat page, **Tasks** (above the list of agents) shows it in place of the conversation, as a
+On the chat page, **Tasks**, in the sidebar, shows it in place of the conversation, as a
 board: **To do**, **In progress**, **Blocked**, **In review** and **Done**. Each card has its number, title,
 the agent that holds it, what it waits for, its files and its machine; a piece the lead handed out says
-which task it is part of, and that task how many pieces are still open. Click a card to open it in the
-side panel, with its history and the owner's actions.
+which task it is part of, and that task how many pieces are still open. Click a card to open it beside
+the chat, with its history and the owner's actions.
 
-<img src="images/task-board.png" width="760" alt="The task board: To do with two tasks, In progress with two tasks and the agents that hold them, Blocked, In review and Done, with a filter by agent and by role, and a form to add a task.">
+<img src="images/task-board.png" width="760" alt="Tasks: the board with To do (#20, waiting for #19), In progress (#9, held by Maya, coordinating one piece), Blocked (#19, Maya), In review (#12, Noor) and Done (#11, Teo), filters by agent and by role, and a form to add a task.">
 
 - **Drag a card** within its column to reorder it, onto **Done** to mark it done, onto **To do** to
   put it back on the sheet, or onto **In progress** to give it to an agent (the page asks which).
@@ -454,7 +545,7 @@ side panel, with its history and the owner's actions.
   **Show more** the rest. On the board you open a card to act on it with the keyboard, or use **List**.
 - **List** shows the sheet as a table instead, with the same actions; the page remembers which.
 - On a phone the board shows one column at a time: swipe between them, and open a card to move it
-  (dragging is for a mouse). From a terminal:
+  (dragging is for a mouse). Or from a terminal:
 
 ```bash
 crewchat tasks                                         # the sheet
@@ -504,9 +595,9 @@ machine: an older one does not know reclaims and keeps showing the old holder.
 Work the crew should do again and again, such as going through your Jira tickets every morning, is a
 **routine**: a name, what to do, who does it and when. Each time a routine is due, crewchat posts its
 task: on the sheet for anyone, to the lead, or to one agent, who has it at once. Add one in **Project
-settings → Routines** (it offers a few to start from) or from a terminal:
+settings › Routines** (**Add a routine** offers a few to start from), or from a terminal:
 
-<img src="images/settings-routines.png" width="300" alt="Project settings, Routines: jira-review, weekdays 09:00, for the lead, next Monday 09:00, Go through my Jira tickets that are not done and summarize them, with Run now, Pause, Edit and Remove; Add a routine below.">
+<img src="images/settings-routines.png" width="520" alt="Project settings, Routines: jira-review, weekdays 09:00, for the lead, next Friday 09:00, Go through my Jira tickets that are not done and summarize them, with Run now, Pause, Edit and Remove; Add a routine; Agents routines may start a day, 10, started today 0 of 10.">
 
 ```bash
 crewchat routines add jira-review "Go through my Jira tickets that are not done and summarize them" \
@@ -526,34 +617,42 @@ coordinates posts them, so each run is posted once. Only you can set routines: a
 nothing it reads can set work going on its own.
 
 An agent sees a routine's task at once when it is waiting for messages, and otherwise at its next
-turn. To have Jira tickets assigned to you posted as tasks without an agent at all, use the look in
-Jira (`crewchat tasks jira-watch on`, every 5 minutes unless you set `--every`).
+turn. For work that should not wait for someone to type (overnight), pick **When nobody who could do it is
+here → Start** a tool on the routine, with a folder and what it may do without asking, as New agent offers
+them. When the routine is due and no agent that could take its task is here (for anyone: any agent; for
+the lead: the lead; for one agent: that one), crewchat starts one session in that folder, and its task is
+the new agent's when it checks in. A run starts at most one, none while the one it started is still on its
+way, and routines start at most 10 a day unless you change **Agents routines may start a day** (0 starts
+none). Nobody watches such a session start, so what its tool asks first waits in Needs you.
+
+To have Jira tickets assigned to you posted as tasks without an agent at all, sign in on the Jira card
+(**Project settings › Integrations**): it looks every 5 minutes unless you change **Look every**
+(`crewchat tasks jira-watch on` from a terminal).
 
 ## Jira, Google Chat and your own MCP servers
 
-**Project settings** (the project menu, **⋯**) connects a project to the rest of your work, once, for
-every agent in it:
+**Project settings › Integrations** connects a project to the rest of your work, once, for every
+agent in it:
 
 - **Jira:** give the project its Jira site, and a task linked to a ticket is read by its agent first;
   **Sign in to Atlassian** (your company's SSO, no API token) and tickets assigned to you become tasks.
-- **Google Chat:** add a space, by its webhook or signed in to Google, and agents post the pull
-  requests they open there.
-- **MCP servers:** add your own server once, or paste its JSON, and crewchat writes it for every agent
-  tool in every folder of the project. **Test** lists its tools.
+  With the **Ticket cycle** on, the crew runs a ticket from start to finish: the lead checks it is
+  ready, a developer builds it and its pull request comes to you in Needs you, QA tests it, and the lead
+  hands it to your human QA.
+- **Google Chat:** add a space, by its webhook or signed in to Google. Agents post the pull requests
+  they open there, and **Mirror this project into** a space follows the project there: your own
+  replies in it come back to the chat as yours.
+- **MCP servers:** add your own server once, paste its JSON, or **Add from a tool** (the servers you set
+  up by hand in Claude Code, Cursor or Codex), and crewchat writes it for every agent tool in every
+  folder of the project, and on your linked machines (never its key). **Test** lists its tools.
 
-<p>
-<img src="images/settings-jira.png" width="260" alt="Project settings, Jira: the Jira site yourcompany.atlassian.net with Save; Sign in to Atlassian so tickets assigned to you become tasks, and how many minutes apart to look.">
-&nbsp;
-<img src="images/settings-gchat.png" width="260" alt="Project settings, Google Chat: the space Mobile team (default), by its webhook, with Test and Remove; a form to add a space; Ask me before each post; Post new pull requests by themselves; Sign in with Google instead.">
-&nbsp;
-<img src="images/settings-mcp.png" width="260" alt="Project settings, MCP servers: my-server at https://mcp.example.com/mcp, which signs in in the browser, with Test, Edit and Remove; a form for a name, an address or command, keys, and Add server; Paste JSON.">
-</p>
+<img src="images/settings-jira.png" width="460" alt="Project settings, Integrations, the Jira card: the Jira site yourcompany.atlassian.net with Save; Sign in to Atlassian so tickets assigned to you become tasks, with a link to create a free Jira site; Look every 5 minutes; and the Ticket cycle, folded.">
 
 Each, step by step: [Jira, Google Chat and your own MCP servers](connections.md).
 
-## Analytics
+## Activity
 
-**Analytics**, next to Chat and Tasks, shows the crew at a glance, live:
+**Activity**, in the sidebar, shows the crew at a glance, live:
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="images/analytics-dark.png">
@@ -589,32 +688,61 @@ section of the folder's `AGENTS.md` if it has one and git does not track it (for
 others). They are kept out of git and rewritten when something changes. The guide explains the chat and the task sheet, and
 carries two things you set per project:
 
-- **Project rules**: who does what, how to test, what never to do. Edit them in the chat page's
-  sidebar, or `crewchat rules set "..."` (`--file RULES.md`; `show`, `clear`). Agents get them as a
+- **Project rules**: who does what, how to test, what never to do. Edit them in **Project settings ›
+  General**, or `crewchat rules set "..."` (`--file RULES.md`; `show`, `clear`). Agents get them as a
   message at once, and new sessions read them from the guide.
 - **Shared skills**: a `SKILL.md` (or a folder holding one) that every agent of the project should
-  have, installed in each folder's `.claude/skills/`. Add one on the page, or `crewchat skills add
-  PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out everywhere. A
-  skill of your own by the same name is never touched.
+  have, installed in each folder's `.claude/skills/`. Add one in **Project settings › General**, or
+  `crewchat skills add PATH`; `crewchat skills` lists them, `crewchat skills remove NAME` takes one out
+  everywhere. A skill of your own by the same name is never touched.
+
+The guide also points agents to public skill libraries (Anthropic's, Vercel's, OpenAI's, Google's,
+Hugging Face's and others) when they plan: an agent reads a skill that fits its task, treats it as
+advice under your rules, and asks you in the chat before the project keeps one. These are links only:
+crewchat copies nothing from them.
 
 With edit tracking on, each folder also gets **the code at a glance** for agents that join, a skill
 and a Cursor rule made from the code map ([details](code-map.md#the-code-at-a-glance-for-agents-that-join)).
 
+## crewchat inside Claude Code
+
+crewchat's Claude Code plugin (**Settings › Machines & devices**, the **Claude Code plugin** card, **Install
+the plugin**) adds a band above Claude Code's prompt, in the desktop app and the terminal, that says what
+needs you (to approve, blocked, to review, messages) with the latest message. **Chat**, or `/crewchat`, opens
+a pane beside the conversation with the project's recent messages, and **Approve** and **Deny** for
+permission prompts and the other asks; **Open page** opens the chat page, signed in. It reads only this
+machine's crewchat server, and stays out of sight where crewchat is not set up. It needs a Claude Code that
+loads plugin mods.
+
 ## Upgrade and uninstall
 
-**Upgrade:** `crewchat update` installs the latest release and starts the server again on it. On the chat page, the
-"A newer crewchat is available" banner has **Update now**, which does the same on the machine that hosts the page (on
-Windows in a window of its own), waits for crewchat to restart and reloads the page on the new version. A copy run
-from a git checkout says to update it there instead.
+**Upgrade:** on the chat page, the "A newer crewchat is available" banner, and **Settings › About** (**Check for
+updates**), have **Update now**: it installs the latest release on the machine that hosts the page (on Windows in a
+window of its own), waits for crewchat to restart and reloads the page on the new version. A copy run from a git
+checkout says to update it there instead. From a terminal: `crewchat update`.
 
-<img src="images/update-now.png" width="760" alt="The banner at the top of the chat page: A newer crewchat, 1.3.1, is available. Update now, or run crewchat update on this machine. What's new.">
+<img src="images/update-now.png" width="760" alt="The banner at the top of the chat page: A newer crewchat, 2.0.1, is available. Update now, or run crewchat update on this machine. What's new.">
 
 The chat page, the server's log and every command you type in a terminal say when a newer
 crewchat is out: the server asks GitHub for the latest release every 6 hours, sending nothing
 about you or your chat (`CREWCHAT_NO_UPDATE_CHECK=1` turns that off).
 
-**Stop:** `crewchat stop` stops the server; agents keep working but cannot reach the chat until
-`crewchat restart`, or your next login if it starts at login.
+**Nothing in your folders:** in **Settings › Machines & devices**, the **Claude Code plugin** card, **Install the
+plugin**. crewchat's server and hooks then come from a Claude Code plugin of its own, for every folder, and a folder
+you connect gets nothing of crewchat's written into it: crewchat keeps which chat each folder is in, in
+`~/.crewchat/folders.json`. The folders you connected before are moved over (crewchat's entries taken out of their
+`.mcp.json` and `.claude/settings.local.json`, and its skills out of `.claude/skills/`); their agents get the
+project's guide as their session starts. Uninstall in the same card puts everything back. Codex finds its folder's
+chat the same way. With the plugin on, crewchat also goes once into Cursor's, Gemini CLI's, Qwen Code's and
+OpenCode's own settings, so a folder connected for them gets nothing of crewchat's but Cursor's rule. A settings
+file with comments, or one with a crewchat server of your own, is left as it is and crewchat says so: that tool's
+folders get their setup in them as before.
+
+**Stop:** `crewchat stop` (also in **Settings › Advanced**) stops the server and closes the agents running on this machine (Claude Code, Codex,
+Cursor and the rest), as Stop on each agent's card does; their tasks go back on the sheet. It starts again with
+`crewchat restart`, or at your next login if it starts at login. `crewchat stop --keep-agents` leaves the agents
+running: they keep working but cannot reach the chat until it runs again. `crewchat restart` and `crewchat update`
+never close agents.
 
 **Uninstall:** `crewchat uninstall` stops crewchat, stops it starting at login, leaves the machines
 it is linked to over Tailscale, and takes it out of every project folder you connected. It removes only its
@@ -622,7 +750,7 @@ own entries from each file; yours stay:
 
 | For | What it takes crewchat out of |
 |---|---|
-| Claude Code | `.mcp.json`, `.claude/settings.local.json` |
+| Claude Code | `.mcp.json`, `.claude/settings.local.json`; with crewchat's plugin, the plugin and its rules in `~/.claude/settings.json` |
 | Cursor | `.cursor/mcp.json`, `.cursor/hooks.json`, `.cursor/cli.json` |
 | Codex CLI | its block in `~/.codex/config.toml`, and the folder's `.mcp.json` |
 | Gemini CLI | `.gemini/settings.json` |

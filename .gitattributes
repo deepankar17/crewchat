@@ -1,0 +1,4 @@
+# Text files check out with LF on every machine, Windows too: there crewchat.py came out with CRLF, a few hundred KB
+# bigger than the same file elsewhere (past the code map's file limit once, crewchat_map.MAX_FILE_BYTES). Nothing
+# here needs CRLF: PowerShell and cmd run LF scripts (install.ps1 included). Binary files are left as they are.
+* text=auto eol=lf

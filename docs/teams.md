@@ -4,9 +4,9 @@ Agents in a crewchat can always talk to each other. Roles make them work as a te
 your tasks, splits them up and hands them out; developers build and report back; QA tests and
 sends bugs straight to the developer.
 
-<img src="images/demo-roles.gif" width="800" alt="Roles are given in each agent's settings, in the list, to three agents in turn: Maya Lead, Teo Developer, Wren QA. A task is posted with Post as task; Maya takes it. On the task board she gives a piece to Teo and one to Wren; Teo's moves to Review, then both to Done, and the whole task with them. Back in the chat, Maya reports to the owner.">
+<img src="images/demo-roles.gif" width="800" alt="Roles are given in each agent's panel, beside the chat, to three agents in turn: Maya Lead, Teo Developer, Wren QA. A task is posted with Post as task; Maya takes it. On the task board she gives a piece to Teo and one to Wren; Teo's moves to In review, then both to Done, and the whole task with them. Back in the chat, Maya reports to the owner and asks a question.">
 
-<img src="images/team.png" width="800" alt="A team at work: Maya the lead, two developers (Teo, and Noor on Cursor) and Kira for QA, each with a role badge on its card. The owner's task #9 is taken by Maya, who gave #11 to Teo (now done) and #12 to Noor (ready for review). Teo and Kira talk about a bug and its fix, and Maya reports back to the owner.">
+<img src="images/team.png" width="800" alt="A team at work on the chat page. The sidebar lists the crew: Maya the lead, two developers (Teo, and Noor on Cursor) and Kira for QA, each with a role badge and what it holds. In the chat, Maya gave #11 to Teo (done) and #12 to Noor (in review), Teo and Kira talk about a bug and its fix, and Maya reports back to the owner with a question.">
 
 - [Give an agent a role](#give-an-agent-a-role)
 - [The built-in roles](#the-built-in-roles)
@@ -21,13 +21,16 @@ sends bugs straight to the developer.
 - [Role packs](#role-packs)
 - [Your own roles](#your-own-roles)
 - [Powers and a team with sub-leads](#powers-and-a-team-with-sub-leads)
+- [A lead adds and removes agents](#a-lead-adds-and-removes-agents)
+- [A lead parks a task that waits on you](#a-lead-parks-a-task-that-waits-on-you)
+- [QA sends work back with proof](#qa-sends-work-back-with-proof)
 - [A worked example](#a-worked-example)
 - [Limits](#limits)
 
 ## Give an agent a role
 
-On the chat page, click the agent and pick its **Role** in its settings, under the list of agents. Or from a terminal on
-the host:
+On the chat page, click the agent in the sidebar and pick its **Role** in its panel, beside the chat. Or from a
+terminal on the host:
 
 ```bash
 crewchat role claude-macbook lead
@@ -37,10 +40,10 @@ crewchat role claude-windows none        # take the role away
 ```
 
 The agent receives the role's instructions as a message from you, and its hook hands it over at
-once. Everyone sees the role: as a badge in the list and on its messages, and in `hub_agents`
+once. Everyone sees the role: as a badge in the sidebar and on its messages, and in `hub_agents`
 (`cursor-macbook [developer]: …`).
 
-<img src="images/role-cards.png" width="300" alt="Four agents in the list with role badges, Lead, Developer, Developer and QA, each with the task it holds or its status.">
+<img src="images/role-cards.png" width="300" alt="Four agents in the sidebar with role badges, Lead, Developer, Developer and QA, each with the task it holds or its status and a green dot.">
 
 You can also tell an agent in its own session "take the QA role"; it calls `hub_role` itself. The
 chat shows who set each role.
@@ -236,7 +239,7 @@ times since they were approved, git shows their files largely rewritten since th
 nobody reported them working for 90 days. Such a note is flagged once, and the lead is asked to check it; crewchat
 only flags, never retires a note by itself.
 
-The chat page lists every note under **Process notes**, next to the shared skills: its state, this project's or
+The chat page lists every note under **Process notes**, in **Project settings › General** next to the shared skills: its state, this project's or
 all projects', who approved it, what agents reported, whether it may be out of date or is unused, and **Approve**
 (a proposed one) and **Retire**. The menu there sets who approves the project's notes.
 
@@ -245,11 +248,11 @@ command: **Make it a command** on the page, or `crewchat processes promote NAME 
 commands first. Parameters are names in capitals, written `{VERSION}` in the commands. Agents then run all of them,
 in order, from their folder, in their own shell: `crewchat run NAME VERSION=1.2.0`. It stops at the first that fails
 and says which. The server only tells them what to run; it never runs anything. Every change to a command's note,
-whoever writes it, needs your approval again, and Needs you shows the new commands exactly as they would run. The
-Commands panel (**⋯**, Commands) lists the project's commands.
+whoever writes it, needs your approval again, and Needs you shows the new commands exactly as they would run. A note
+that is a command says so in its line under **Process notes** (`crewchat run NAME VERSION=…`).
 
 The analytics view's **What the crew has learned** shows how much the notes are used
-([Analytics](getting-started.md#analytics)).
+([Activity](getting-started.md#activity)).
 
 **Versions.** A note changes by a new version. Agents keep the approved one until the new one is approved; the
 older versions stay in the log. **Retire** a note to stop giving it to agents.
@@ -281,7 +284,7 @@ you. A task you gave straight to one agent reports to you, even when there is a 
 
 ## New agent, from the chat page
 
-**+ New agent**, under the list of agents (or in the message box's **+** menu), starts a new agent
+**+ New agent**, under the crew in the sidebar (or in the message box's **+** menu, or ⌘K), starts a new agent
 session for you, in four steps:
 
 <img src="images/add-agent-form.png" width="420" alt="New agent, step 1 of 4, Workspace: the project folder notes-app, Or connect one, and the machine. Cancel, Next and Start.">
@@ -290,8 +293,9 @@ What is required comes first; the last two steps are optional. **Start** works f
 folder and a ready tool are set, so with a folder connected, **+ New agent** then **Start** opens an agent with its
 defaults. Enter in a field goes on to the next step.
 
-1. **Workspace:** the project folder. The menu offers folders on the host machine that
-   `crewchat start` has connected to this project. To use another, type its path under **Or
+1. **Workspace:** the project folder, and the **Machine** it runs on: this one or one
+   [linked to it](multiple-machines.md#agents-on-your-other-machines). The menu offers folders on that machine
+   that are connected to this project. To use another, type its path under **Or
    connect one**, or **Browse…** the host's folders (and make a **New folder** there), then
    **Connect**: it runs `crewchat start` in that folder for you. A folder that is not there yet
    offers **Create it and connect**.
@@ -300,7 +304,9 @@ defaults. Enter in a field goes on to the next step.
    its default), and what it may do **without asking** (below). Under the tool, New
    agent says what it still needs on this machine and in that folder: installed, signed in, and
    what it asks once there (whether you trust the folder, crewchat's hooks). A step to take first
-   comes with the command to run in a terminal (**Copy**), then **Check again**.
+   comes with the command to run in a terminal (**Copy**), then **Check again**. **Run it**: **In the background,
+   with no window** (Claude Code and Cursor, the default) or **In a Terminal window**. Claude Code also has **Plan
+   first**: it plans before it changes anything, and its plan comes to Needs you.
 3. **Identity** (optional): a name (for example `docs-writer`; 🎲 picks a first name nobody has; empty, it gets
    a first name of its own), a role, and a picture and colour. A role fills in its colour and tool, and a picture
    only if it is a role of your own that you gave one: with a built-in role, the new agent gets a
@@ -309,10 +315,11 @@ defaults. Enter in a field goes on to the next step.
 
 <img src="images/add-agent-briefing.png" width="420" alt="New agent, step 4 of 4, Briefing (optional): First task: Write a user guide for the settings screen, with the new dark theme; Extra instructions. Cancel, Back and Start.">
 
-**Start**: a terminal window opens on the host with the new session. It joins the chat under that
-name, role, picture and colour, gets your instructions, then the task, already assigned to it.
+**Start**: the session starts in the background (or in a Terminal window, as you chose). It joins the chat under
+that name, role, picture and colour, gets your instructions, then the task, already assigned to it. Its card says
+what it is doing: working, idle, waiting, or stuck on a question in its terminal.
 
-<img src="images/demo-add-agent.gif" width="760" alt="+ New agent opens the four steps: the name Iris and the Docs role, which brings its picture; the project folder; Claude Code, allowed to edit files; and a first task. Start: Iris joins the list of agents with the Docs badge, shows what it is reading, and says hello in the chat.">
+<img src="images/demo-add-agent.gif" width="760" alt="+ New agent opens its four steps: the project folder, already picked; Claude Code, allowed to edit files; the name Iris and the Docs role; and a first task. Start: Iris joins the agents in the sidebar with the Docs badge and its task, shows what it is reading, and says hello in the chat.">
 
 What happens when you press **Start**:
 
@@ -351,27 +358,38 @@ ask|edits|auto|all` (`--accept-edits` still means `edits`).
 
 Things to know:
 
-- **It opens on the machine that hosts the page.** On a phone, it opens on the computer you are
-  connected to. Starting an agent on another linked machine is not possible yet.
+- **It starts on the machine you pick.** On a phone, that is the computer you are connected to, unless you
+  pick a linked one.
 - **When it needs a permission you did not give, it asks.** A Claude Code agent asks in **Needs you**
-  on the page, with **Allow** and **Deny** ([Permission prompts](getting-started.md#permission-prompts)),
-  then in its window if nobody answers; other tools ask in their windows.
-- **Answer its first questions in its window.** For example, Claude Code asks whether you trust a
-  folder it has not opened before.
+  on the page, with **Allow once**, **Always allow** and **Deny** ([Permission prompts](getting-started.md#permission-prompts)),
+  then in its terminal if nobody answers in 10 minutes. Codex, Gemini CLI, Qwen Code, Cursor and OpenCode ask there
+  too when **Project settings › Safety › Approvals** is on; else in their own windows.
+- **Its first questions come to Needs you.** What Claude Code asks the first time in a folder (trust it, use the MCP
+  servers its `.mcp.json` lists) is one card: **Approve and start**. An agent that crashes, exits, or has not
+  joined 5 minutes after it started waits in Needs you as a **Not started** card, with why and its last lines:
+  **Try again** or **Dismiss**.
 - **The session gets only a one-time key** on its command line. Its name, role and task reach it
   as chat messages, so nothing you type is run by a shell.
 
 ## Stop, reopen or switch an agent's model
 
-Each agent's panel on the chat page says where its session runs: **in the Claude app**, **in
-Terminal**, or **closed** (and since when). Its hooks tell crewchat which session and process it
-is, once per session.
+Each agent's panel on the chat page says where its session runs: **in the background** (and whether it is
+working, idle, waiting, or stuck on a question in its terminal), **in the Claude app**, **in Terminal**, or
+**closed** (and since when). Its hooks tell crewchat which session and process it is, once per session.
 
+- **Show terminal** (an agent in the background) shows its terminal's screen on the page; for a Cursor agent, the
+  steps it took. **Open in Terminal** opens the session in a Terminal window, for the rare question only its
+  terminal can answer.
 - **Stop** ends its session (after you confirm). It stays on the list; what it held goes back on
   the sheet.
-- **Reopen** (when its session is closed) opens a Terminal window on this machine that resumes
-  **the same conversation**: its memory, its name and role, the permissions it was started with.
-  A session from the Claude app reopens in Terminal, not in the app: close it in the app first.
+- **Reopen** (when its session is closed) resumes **the same conversation**: its memory, its name and role, the
+  permissions it was started with. An agent that ran in the background reopens there; one from a Terminal window
+  reopens in a new one. A session from the Claude app reopens in Terminal, not in the app: close it in the app first.
+- **Restart** (a running agent, after you turned its browser or mobile devices on) stops its session and reopens
+  the same conversation with the new settings.
+- **Switch mode…** (Claude Code: Ask, Plan, Accept edits) reopens the same conversation in that mode.
+- **Fork** (Claude Code) starts a new agent from a copy of its conversation, in its folder, with its role and
+  permissions.
 - **Reconnect** (when its window is still open but it sleeps: past its listening time it reads the
   chat only at your next prompt there) closes that window and reopens the same conversation in a
   new one, listening to the chat again. Its tasks stay its own.
@@ -385,14 +403,16 @@ is, once per session.
 
 Reopen works for Claude Code, Codex CLI (`codex resume`), Gemini CLI, Qwen Code (`--resume`) and
 OpenCode (`--session`; crewchat's plugin sends it the prompt to carry on). Switch model is for Claude
-Code; a Cursor agent has Stop, and you open it again in Cursor. These act on agents of the machine
-that hosts the page. Each agent is also asked to
+Code; a Cursor agent has Stop, and you open it again in Cursor. An agent on a
+[linked machine](multiple-machines.md) has Stop, Reopen, Show terminal and the mode switch on its card too; Open in
+Terminal and its settings stay on its own machine. `crewchat stop` ends every agent session on its machine, as
+Stop does (`crewchat stop --keep-agents` leaves them running). Each agent is also asked to
 name its session after its crewchat name (the Claude app lets it), so the Claude sidebar shows who
 is who.
 
 ## Pictures and colours
 
-Each agent has a picture in the list, in its panel and next to its messages: by default a face of
+Each agent has a picture in the sidebar, in its panel and next to its messages: by default a face of
 its own (below), with a small badge for its tool. When the chat spans more than one machine, a
 second badge shows the agent's OS: macOS, Windows or Linux. Initials, on the tool's colour (Claude
 Code orange, Cursor near-black, and so on), are one of the pictures you can choose instead.
@@ -466,13 +486,13 @@ crewchat roles export --file roles.json                  # all of them, to keep 
 crewchat roles import roles.json                         # into another project (--chat NAME)
 ```
 
-On the chat page, **⋯ > Roles** opens them in the side panel: open one to read its
+On the chat page, **Project settings › Crew & roles** lists them: open one to read its
 instructions, **Edit**, **Duplicate**, **Export** or **Delete** it, or start a **New agent** with
 it; **New role**, **Import**, **Export**, **Start over from a pack** and **Save as a pack** are
-there too. **+** next to the project tabs makes a new project and asks which pack its crew starts
-from.
+there too. **New project…**, in the project switcher at the top of the sidebar, makes a new project and asks which
+pack its crew starts from.
 
-<img src="images/roles-panel.png" width="320" alt="The Roles panel: the pack, Software team, with Start over from a pack and Save as a pack; the project's roles, Lead, Developer, QA, Reviewer, Docs and Advisor, each with its picture and how many agents have it; New role, Import and Export.">
+<img src="images/roles-panel.png" width="760" alt="Settings, Crew and roles for Notes App: the pack, Software team, with Start over from a pack and Save as a pack; the project's roles as a tree, Lead with Developer, QA, Reviewer, Docs and Advisor under it, each with its picture, the start of its instructions and how many agents have it; New role, Import and Export.">
 
 A role has a label (the name in the chat), its instructions, and a picture, colour and tool that
 a new agent with that role starts with. Roles are stored in the project's `config.json` on the
@@ -497,8 +517,9 @@ A role can carry **powers**: what its agents may do besides their own work.
 | `notes` | Approve process notes, as the lead does |
 | `code` | Use `hub_code`: who changed a file, and splitting a task |
 | `advise` | Answer `hub_ask` questions and give verdicts before done (only you give a role with it) |
+| `crew` | Add agents to the crew and remove them (`hub_crew`, [below](#a-lead-adds-and-removes-agents)) |
 
-The packs' Lead has `assign`, `areas`, `notes` and `code`; the Advisor has `advise` and `code`; the other roles have
+The packs' Lead has `assign`, `areas`, `notes`, `code` and `crew`; the Advisor has `advise` and `code`; the other roles have
 none. Any role you write can have them, so a "Tech lead" or "Producer" works like the lead.
 
 Roles can also sit in a **tree**: each role says which role it **reports to**. A role that reports to no role works
@@ -512,7 +533,7 @@ crewchat roles tree
 ```
 
 ```
-Lead (lead) [assign, areas, notes, code]
+Lead (lead) [assign, areas, notes, code, crew]
   Frontend lead (frontend-lead) [assign, areas]
     Developer (developer)
   QA (qa)
@@ -530,11 +551,65 @@ Lead (lead) [assign, areas, notes, code]
 - Deleting a role moves the roles under it up to the role it reported to. A loop, a role that is not there, or a
   second top lead is refused.
 
-On the chat page, **⋯ > Roles** shows the roles as a tree; a role's **Edit** has **Reports to** and **Powers**.
+On the chat page, **Project settings › Crew & roles** shows the roles as a tree; a role's **Edit** has **Reports to** and **Powers**.
 Exported roles keep both. On linked machines the tree is shared: when you change roles with crewchat running, the
 powers and Reports to of every role go to the other machines, and the newest change wins. A role only one machine
 has still counts on the others (an agent there can report to it). A change made with `crewchat roles` while the
 server is stopped is shared at the next change made with it running.
+
+## A lead adds and removes agents
+
+Give a role the **Adds and removes agents** power (`crew`) and its agent can grow the crew while it works: when a
+ticket or task has pieces that can go in parallel and nobody free can take them, it starts a developer or a QA agent
+for them, and removes it when the work is done. The packs' Lead has the power (and so does a project's Lead whose
+powers you never changed); untick it on the role to take it away. A lead without it that is asked for more agents is
+told to ask you, and you get a note saying which role to tick in **Crew & roles**.
+
+- `hub_crew action=add role=developer task="..." jira=PROJ-123` starts an agent the way **+ New agent** does: on the
+  lead's own machine, in its folder (or another folder connected there, with `folder`), with the lead's tool, model,
+  Claude Code account and permissions, in the background where the tool can. Its first task comes from the lead, so it
+  reports to the lead, and is linked to the Jira ticket when one is named.
+- Within the limit, the lead does not ask you: each add and removal is in the activity, and the agent's card says who
+  added it. A lead may have **4** agents it added at a time; set the number (0 to 10) on the role's page, under
+  **Agents it adds**. An agent still starting counts.
+- The lead gives an agent the browser (`browser=true`: it works in your Chrome, as **Use the browser** does) or the
+  mobile devices (`mobile=true`: the emulators and simulators, and the real devices you picked) when its work needs
+  them, for example a QA agent testing a web page or an app. Left out, it gets the browser only if the lead has it,
+  and no devices. The browser's sites and the devices' apps follow your rules as for any agent.
+- An added agent never gets "Do anything" permissions unless you tick **May give them "Do anything"**: a lead that
+  has them starts its agents with the strongest mode short of it.
+- The lead may give any role but the top lead's and the advisor's; a sub-lead, only the roles below its own.
+- `hub_crew action=remove name=<agent>` stops the agent's session, puts what it held back on the sheet and takes it
+  off the roster. A lead removes only agents it added; you remove any from its card.
+- `hub_crew action=list` shows the lead's agents, what each holds, and how many more it may add.
+- An added agent that has held no task and done nothing for 30 minutes is pointed out to its lead once, so it gives
+  it work or removes it. If the lead has gone, you are told instead.
+- When the tool asks questions the first time in a folder, they wait for you in Needs you, as for **+ New agent**.
+- `crewchat agent add` and `crewchat agent remove`, run by an agent crewchat started, count as that agent's
+  `hub_crew`, with the same rules: an agent cannot use the command line to act as you.
+
+## A lead parks a task that waits on you
+
+When a task has waited 30 minutes for your answer (a task marked blocked, a question sent with **Needs a reply**,
+or a permission card), its lead is told and can park it with `hub_task park`. The task goes back in the open queue
+with the question kept, its agent stops and gets other work, and nobody takes it until you answer.
+
+- Parked tasks are in **Needs you**, each with its question and a box to answer it.
+- Your answer stays on the task, and the lead is told. Whoever carries on with the task gets the question and your
+  answer.
+- Set the time on the Lead role's **Agents it adds** card, in **Project settings › Crew & roles**: **Park after
+  (min)**, 0 for never.
+
+## QA sends work back with proof
+
+When a test fails, QA sends the task back to its developer with `hub_task` return: the steps, what went wrong and
+screenshots. The developer is woken to fix it, then sends it back to QA to test again.
+
+- With `live`, QA's browser page or emulator goes with the task as it is, kept for the developer so nobody else takes
+  it. On another linked machine the page's address goes, and the browser there is kept.
+- After three rounds the task goes to the lead, or to you.
+- Developers are told to open the site or app and check their own change before they hand it over. `hub_agents`
+  shows who has the browser or mobile devices on.
 
 ## A worked example
 
@@ -562,7 +637,7 @@ in them with your logins. crewchat keeps it under your control:
 
 - **One driver at a time** on each machine. Another agent's browser call is refused with who holds it and for which
   task. The browser is let go when the holder's task goes to review or done or back on the sheet (whoever moves it),
-  from the Browser panel (Let go), or after 10 minutes without a browser call. A call that is refused does not take it.
+  from **Settings › Machines & devices › Agents' browser** (Let go), or after 10 minutes without a browser call. A call that is refused does not take it.
 - **Sites.** Opening a site that is not allowed asks you in Needs you: **Allow the site** or **Deny**. So does
   landing on one by a link, a form or a redirect: the agent's next browser call there, a read too, waits for your
   answer (a click then asks about the change too). After a Deny the agent is refused there without asking you again,
@@ -571,7 +646,7 @@ in them with your logins. crewchat keeps it under your control:
   (`jenkins.mycorp.com`); on your own machine it is its host and port (`localhost:3000`), as each port there is
   another server. crewchat's own page is never used by agents, whatever is allowed.
 - **Changes.** The first click, typing, form or script on a site asks once for that task: **Allow for this task** or
-  **Deny**. After that the agent goes on there until the task is done (an agent with no task is asked each time). On a **trusted** site (Browser panel: Trust) it
+  **Deny**. After that the agent goes on there until the task is done (an agent with no task is asked each time). On a **trusted** site (Agents' browser: Trust) it
   never asks. Nobody answers in 10 minutes: it is a no (10 minutes in all for one call, however many questions it asks).
 - **Tasks.** A task's panel can say it **Needs the browser**; then only an agent with the browser on takes it, on
   every linked machine (each its own agents, with its own Chrome). While
@@ -583,7 +658,7 @@ in them with your logins. crewchat keeps it under your control:
   one call at a time. After each call it asks the browser which page it is on, so a page's own text cannot pass for
   its address, and a link, a form or a redirect that leaves an allowed site is caught at the agent's next call. Pages
   you open yourself are seen at that next call too. `crewchat hooks refresh` moves an older bridge over.
-- The **Browser** panel (project menu) shows who drives, on which site, the bridge token (set or not, never shown),
+- **Settings › Machines & devices › Agents' browser** shows who drives, on which site, the bridge token (set or not, never shown),
   the allowed and trusted sites, and what agents opened and what you answered (since the server started).
 
 These checks stop mistakes and pages that try to lead an agent astray. They do not stop an agent that sets out to get
@@ -596,7 +671,10 @@ may read the page they are on, but not open a site or change anything. The bridg
 another session of the same tool is refused it (Claude in Chrome asks in Chrome itself). A Playwright server of your own (without
 crewchat's token) is left alone. A call that takes the page to a site that is not allowed has already run when the
 browser says so; the agent is told, and its next call there asks you. Claude in Chrome is Anthropic's own extension:
-Claude Code's calls to it are checked by hooks, from the tab list Chrome gives after each call. Cursor gives a tool call about 60 seconds and
+Claude Code's calls to it are checked by hooks, from the tab list Chrome gives after each call. A call crewchat allows
+runs without a second question from Claude Code, and a screenshot the agent saves with `save_to_disk` can be shared
+from where Claude in Chrome put it. A mobile screenshot an agent saves outside its project goes to a private
+folder crewchat makes for it, and is shared from there the same way. Cursor gives a tool call about 60 seconds and
 has no setting for more: a question to you that takes longer ends that call in Cursor (the call is not run later),
 and the agent asks again.
 
@@ -608,10 +686,12 @@ phones and iOS Simulators through `crewchat device-proxy`, which runs [Mobile MC
 under your control as it does the browser:
 
 - **One driver per device.** Another agent's call on a device is refused with who holds it and for which task; it can
-  use another device. A device is let go when its holder's task moves on, from the Devices panel (Let go), or after
+  use another device. A device is let go when its holder's task moves on, from **Settings › Machines & devices ›
+  Phones & emulators** (Let go), or after
   10 minutes without a call on it.
 - **Emulators and simulators are test devices.** Every app is allowed there and no change asks.
-- **Real phones hold your accounts.** Agents use one only after you pick it in the Devices panel (Let agents use it).
+- **Real phones hold your accounts.** Agents use one only after you let them: the first time an agent asks for it,
+  Needs you shows **Let agents use it** or **Deny**, and **Phones & emulators** has the same switch.
   There, opening an app that is not allowed, or ending up in one (a link, a share sheet), asks you in Needs you:
   **Allow the app** or **Deny**. The first tap or typing in an app that is not trusted asks once for that task. An app
   the agent installs is allowed. The home screen and the system's own screens never ask.
@@ -621,7 +701,7 @@ under your control as it does the browser:
 - **Tasks.** A task's panel can say it **Needs a mobile device**; then only an agent with mobile devices on takes it.
   While it holds a device the agent posts short progress notes with a screenshot; after 5 minutes without one,
   crewchat reminds it.
-- The **Devices** panel (project menu) shows the devices this machine sees (adb's, and booted Simulators on a Mac),
+- **Settings › Machines & devices › Phones & emulators** shows the devices this machine sees (adb's, and booted Simulators on a Mac),
   which real ones agents may use, who holds each and the app in front, the allowed and trusted apps, and what agents
   did and what you answered (since the server started).
 - **Readiness.** + New agent checks npx, adb and an online Android device, and on a Mac Xcode's tools and a booted

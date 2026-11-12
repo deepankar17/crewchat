@@ -13,3 +13,10 @@ condition = "AND"
 paths = ['''^site/config\.json$''']
 regexTarget = "line"
 regexes = ['''"cf_beacon_token"''']
+
+[[allowlists]]
+description = "SHA-256 checksums of the Firebase SDK files the hosted page loads (FIREBASE_FILES): public hashes, not keys"
+condition = "AND"
+paths = ['''^crewchat_cloud\.py$''', '''^crewchat\.py$''']
+regexTarget = "line"
+regexes = ['''^\s*"firebase-[a-z-]+\.js": "[0-9a-f]{64}",?$''']

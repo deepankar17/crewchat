@@ -1,7 +1,302 @@
 # Changelog
 
-## Unreleased
+## 2.0.0 (2026-11-13)
 
+A new chat page. The tabs and the ⋯ menu are gone: a sidebar holds the project switcher, Chat, Needs you, Tasks,
+Activity and the crew, and everything else is on one Settings page (You, at the sidebar's foot, or ⌘,). Where the old
+panels went: Machines, Devices and the agents' browser are tabs of Settings › Machines & devices; the phone is Phone &
+remote access; Roles is this project's Crew & roles; Approvals, Google Chat, Jira, MCP servers and Routines are in this
+project's sections; the commands are under Advanced. ⌘K finds any of them. Links to the old panels (#machines, #roles and the rest) still open the right section
+in 2.0. Agents start without terminal windows, can run on any linked machine, and what their tools ask is answered on
+the page.
+
+- **Reopen no longer leaves an agent on a question nobody sees.** A background agent reopened from its card (or by
+  your message, or with Reconnect) could sit on Claude Code's "New MCP server found" question, from a `.mcp.json` in a
+  folder above its own, which crewchat did not look at. crewchat now reads those too, and before reopening an agent in
+  the background it asks you in Needs you; Approve answers it and reopens the agent.
+- **Agents answer the agent who asked.** An agent asked a question by another agent could answer the owner instead,
+  and the asker kept waiting. The agents' instructions now say to reply to whoever asked, and when an agent sends a
+  message while another agent's question to it is still open, crewchat tells it who is waiting and how to answer them.
+  Its guide also says to find its own message in the chat history before saying something was already sent. When an
+  agent passes on your request to another, the answer goes only to the agent who passed it on, which tells you, so
+  you no longer get it twice.
+- **A reply in a thread is easy to see, and the thread opens roomy.** Under a message with replies, the chat now shows
+  who replied there with their faces ("Bea replied", or "3 replies from you, Yara and Bea"), when, and the last
+  reply's first line; a click opens the thread. The thread opens with the side panel to itself, wider than before,
+  each message with its sender's face and name, and full screen on a phone. Before, it said only "1 reply" and could
+  open small under an agent's settings.
+- **Agents share short facts they found out.** Besides process notes with steps, an agent can now record a fact of
+  one or two lines (`hub_process propose`, note kind `fact`), such as "the login tests fail while the VPN is on". Once
+  approved like a note, every agent's guide lists it. An agent taking a task in its files gets it whole, and so does an
+  agent given a role it names, or one editing one of its files (once). A tester sending a task back is asked whether
+  what failed is worth a fact.
+- **A reopened agent's hooks reach the chat again.** Claude Code runs a reopened or restarted agent under a new
+  session id, and its hooks could not take over the agent's link key, which the first session held. Its permission
+  prompts then waited in its terminal, not as Allow cards, and it was woken only now and then. The Reopen's prompt
+  names the key, and the new session now takes it over.
+- **A reopened background agent shows as running and wakes.** crewchat now also reads Claude Code's own record of the
+  agent's process. While that process runs, the card shows it running (idle or working) even when Claude Code's
+  list says it is done, and a message wakes it when it is idle. Reopen and Restart stop the session it ran in before
+  they start the new one, so no idle copy is left behind.
+- **An agent's card changes as soon as its state does.** Driving it now and Let go (the agent holding this machine's
+  browser), and Restart or Reopen after you turn its browser or mobile devices on, only showed after a reload: the card
+  was not drawn again while the button you had just pressed kept the focus, and taking the browser or its hold going
+  idle told no page. Both now show at once. Typing in the card's name, or choosing its role, still keeps it as it is.
+- **A reopened background agent is woken again.** After Reopen or Restart, crewchat now takes the session the agent
+  really runs in (its id, process and inbox) from Claude Code itself, not from its hooks, which could keep naming the
+  old one. The agent's card stays right after a reload, and new messages wake it.
+- **A new agent that does not start says why.** An agent started from + New agent, the CLI, a routine, a lead or
+  another of your machines that crashed, exited or stopped before it joined the chat, or has not joined 5 minutes after
+  it started, now waits in Needs you as a "Not started" card: why (its exit code, or that it has not joined), and the
+  last lines of its background screen or Cursor's steps. Try again starts the same agent again; Dismiss drops the card.
+  The chat says it too, and the card shows on your linked machines' pages. Before, the page only said
+  "started a new agent", and nothing joined.
+- **Needs you on every linked machine.** With machines linked over Tailscale, an agent's permission prompts, plans,
+  questions, browser and device approvals, and a background agent's trust and stuck cards showed only on the page of
+  the machine it runs on. They now show on every linked machine's page, marked with the machine, and Allow or Deny
+  there goes back to that machine; the card clears everywhere once answered. Each machine can keep them to itself in
+  its Machines panel. Open in Terminal, and an agent's settings, stay on its own machine.
+- **No progress-note reminder after one quick look.** An agent that took one screenshot of a device (or one look in
+  the browser) and went on to other work was told 5 minutes later that it had been working on the device without a
+  progress note. The reminder now goes by how long the agent has actually been using the device or browser since its
+  last note. The hold still lets go after 10 minutes without a call, as before.
+- **A commit shows in the chat once.** An agent's commit could show twice in its task's thread: git runs the
+  post-commit hook again for each commit a rebase rewrites (newer git no longer marks those), and an amend is a new
+  commit too. A rewritten, amended or remade commit (same agent, task and message) now keeps the card it had, and a card for a commit another linked
+  machine already showed is not added again.
+- **The crewchat logo is back.** The logo and the name sit at the top of the sidebar again, and Paper and Ink (the
+  default) now use the logo's blue as their accent instead of clay, and one font for headings and text.
+- **Each project has its own icon.** Instead of its first letter, a project wears a small drawing and a colour,
+  picked from its name (a notes project gets a note, an app a phone, a website a globe) or, failing that, at random
+  but always the same for that name.
+- **Settings › About.** crewchat's name and logo, its website, the version on this machine, links to the source and
+  release notes, and a Check for updates button (with Update now when a newer release is out).
+- **The sign-in page matches.** It wears Paper by day and Ink by night with the logo's blue, like the chat page.
+- **Restart applies the browser to a running agent.** Turning the browser or mobile devices on for an agent that
+  runs said they would work "from its next start or Reopen", but a running agent's card has no Reopen. Its card now
+  has Restart, which stops its session and reopens its own conversation with the new settings (Claude in Chrome
+  included), and the setting says "once it restarts" until it does. An agent that is not running still has Reopen.
+- **Each chat keeps its own MCP servers in Codex.** Codex has one settings file for the whole machine
+  (~/.codex/config.toml), and every chat wrote its owner's servers into the same block there, so a second chat or a
+  test home (CREWCHAT_HOME) replaced or took out another chat's servers. Each chat home now has a block of its own,
+  named by its home, and changes and removes only that one. The block from before is taken over by the default home.
+- **Answer an agent's questions in Needs you.** When a Claude Code agent asks you a multiple-choice question (its
+  AskUserQuestion tool), Needs you now shows a Question card with the question and its options, and a box for your own
+  answer, instead of a Stuck card that sent you to its terminal. Your answer goes straight back to the agent. If nobody
+  answers in 10 minutes, it asks in its terminal as before.
+- **Always allow on every permission card.** Claude Code's permission cards in Needs you now have Allow once, Always
+  allow and Deny, like the other tools' cards. Always allow keeps the rule Claude Code itself would offer (for example
+  `Bash(npm test:*)` or a whole MCP tool) in Project settings › Approvals, for every agent in the project, until you
+  Remove it. A browser change card can always allow changes on its site, and a device change card in its app.
+  A permission card now shows its whole command, and the lead (and the agent's row) sees that an agent is waiting for
+  your answer instead of "working".
+- **Lagoon reads again.** Its cream task cards and white messages wore the dark page's light text: a task's text
+  and who has it, @mentions, Thread and Reply, and a thread's replies were hard to read. They are dark now, and the
+  done and blocked pills read in every theme. Ink, Breeze and Evergreen dark had a few mentions and pills below
+  WCAG AA too; a browser test now checks them in all 12 themes.
+- **The crew runs a Jira ticket from start to finish.** In Project settings, Jira, Ticket cycle:
+  - Each new ticket your query finds goes to the lead, who checks it against a ready checklist, and asks in the ticket
+    (naming your human QA) when details are missing.
+  - A developer builds it on a sub-task, and the pull request comes to you in Needs you (and Google Chat): Approve, or
+    Request changes.
+  - QA tests it locally in rounds, with bugs back to the developer.
+  - The lead hands the ticket to your human QA.
+
+  Agents change Jira only with the new `hub_jira` tool, and only their own step. A comment comes only from whoever's
+  turn it is or their lead, text with a secret in it (a token, a key, one of crewchat's sign-ins) is refused before it
+  reaches Jira, and what people write in a ticket reaches agents marked as their words, not your instructions. The
+  cycle and its settings are on every linked machine; the coordinating one takes tickets in and moves them on.
+- **No Jira site yet? The Jira card says where to get one.** Atlassian's sign-in can't finish for an account with no
+  Jira Cloud site (its Site list is empty). The card, and the page a failed sign-in comes back to, now link to
+  Atlassian's free Jira plan.
+- **A lead adds and removes agents (C10).** The Lead has the new "Adds and removes agents" power (give it to any role) and can
+  start developer or QA agents to work on a ticket's pieces in parallel (`hub_crew add`, with the Jira ticket linked),
+  and remove them when the work is done. The lead gives one your Chrome or the emulators when its work needs them. They start on the lead's machine with its tool, model and account, at most 4
+  at a time (you set the number), never with "Do anything" unless you allow it, and without asking you within the
+  limit. An added agent with no work for 30 minutes is pointed out to its lead.
+- **A lead parks a task that waits on you (C11).** When a task has waited 30 minutes for your answer (a task marked
+  blocked, a question with Needs a reply, or a permission card), its lead is told and can park it (`hub_task park`):
+  the task goes back in the open queue with the question kept, its agent stops and gets other work, and nobody takes it
+  until you answer. Parked tasks are in Needs you; your answer stays on the task, the lead is told, and whoever carries
+  on gets the question and your answer. Set the time (0 for never) on the Lead role's "Agents it adds" card.
+- **QA sends work back with proof, and can hand over the page or emulator.** When a test fails, QA sends the task
+  back to its developer (`hub_task` return) with the steps, what went wrong and screenshots, and the developer is
+  woken to fix it, then sends it back to QA to test again. With `live`, QA's browser page or emulator goes with it as
+  it is, kept for the developer so nobody else takes it; on another linked machine the page's address goes, and the
+  browser there is kept. After three rounds the task goes to the lead, or to you. Developers are told to open the
+  site or app and check their own change first, and `hub_agents` shows who has the browser or mobile devices on.
+- **Emulators and simulators are no longer taken for phones, and a phone asks in Needs you.** Mobile MCP names an
+  Android emulator by its AVD name (Vibe_Samsung, not emulator-5554); when crewchat's own look at its device list did
+  not answer, an emulator or a simulator was refused as a real device. The list the agent asks for now says what each
+  device is too, crewchat waits longer for its own, and a device it still cannot tell is not called a phone. A real
+  device agents may not use yet now asks in Needs you: **Let agents use it** or **Deny**, instead of a refusal that
+  sent you to Settings.
+- **Agents look in public skill libraries when they plan.** The guide every agent reads points to the skill
+  libraries of Anthropic, Vercel, OpenAI, Google, Hugging Face and others: an agent reads a skill that fits its
+  task, treats it as advice under your rules, and asks you in the chat before the project keeps one. Links only:
+  crewchat copies nothing from them.
+- **A routine starts an agent when nobody is there (T4).** On a routine in Project settings › Routines, pick "When
+  nobody who could do it is here: Start" a tool, a folder and what it may do without asking. When it is due and no
+  agent that could take its task is here, crewchat starts one session (in the background where the tool can) and the
+  task is the new agent's, so overnight work does not wait for someone to type. One per run, and at most 10 a day
+  unless you change "Agents routines may start a day".
+- **Your MCP servers reach your linked machines, and come from your tools.** A server added in Project settings ›
+  MCP servers now goes to the project's linked machines too, each writing it for its own tools, but never its key: a
+  machine without it says "needs its key on this machine" until you give it there, and one without the server's
+  command says so when you add an agent. **Add from a tool** offers the servers you set up by hand in Claude Code,
+  Cursor or Codex (without their keys), so one set up in one tool reaches all of them.
+- **`crewchat stop` closes the agents too.** Stopping crewchat now ends the session of every agent running on this
+  machine (its Claude Code, Codex, Cursor, Gemini CLI or other command line tool), as Stop on its card does, and says
+  which it closed. `crewchat stop --keep-agents` leaves them running, as before. `crewchat restart` and
+  `crewchat update` still leave agents alone.
+- **One odd process number no longer hides every agent's process (macOS).** An agent's record with a process number
+  macOS's `ps` refuses ("process id too large") made it print nothing for any agent, so every agent looked stopped and
+  `crewchat stop` closed none. The server now reads the whole process list when that happens.
+- **A sidebar instead of tabs and menus (W16, first part).** The chat page has a sidebar: the project switcher at its
+  top (every project, New project, Connect a folder), then Chat, Needs you, Tasks and Activity (the analytics), the
+  crew with New agent, and at its foot Project settings, Machines & devices and You (notifications, roles, your
+  phone, the browser, devices and commands). Needs you is a place of its own, counted in the sidebar. An agent's
+  details open in a panel beside the chat. The ⋯ menu and the project tabs are gone.
+- **Needs you answered on the card.** Each item in Needs you is a card saying who asks and how long ago, with its
+  answer on it: reply to a message there, or Allow, Deny and the rest. A plan's card has Review plan, which opens the
+  plan in full beside everything else that needs you, with Approve, Approve and let it edit without asking, and Ask for
+  changes; the keys A and E approve, and J and K go to the next and the previous plan.
+- **One Settings page.** You, at the sidebar's foot, or ⌘, opens Settings over the whole window: crewchat's own
+  sections first (General, Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy
+  & data, Advanced), then this project's (General, Crew & roles, Safety, Integrations, Routines, Folders & files) and
+  your other projects. Find a setting searches every setting's words, and each one has a link of its own. The commands
+  are under Advanced, and nothing needs a terminal. Links to the old panels (#machines, #roles and the rest) still
+  open the right section, in 2.0.
+- **⌘K: search or jump to anything.** ⌘K (Ctrl+K on Windows and Linux), or the search box at the sidebar's top,
+  finds every place, setting and command, actions such as New agent or Link a machine, your agents and projects, and
+  messages in every project. Arrow keys move, Enter opens.
+- **Themes.** Settings › Appearance: System (Paper by day, Ink by night, the new default), Paper, Ink, Classic light
+  and Classic dark (the page as it was, with its glass), Lagoon, Ember, Cobalt, Sage, Breeze, Evergreen and Evergreen
+  dark. A theme changes colours, fonts, corners and the space between panels; everything stays where it is. Also an
+  accent colour, text size, density and the headings font. Each browser keeps its own choice.
+- **Resize the sidebar, the chat and the side panel.** Drag the handle between two of them, or focus it and use the
+  arrow keys; double-click puts it back. Drag one narrow enough and it hides, with its handle left to open it again.
+  The Settings list resizes the same way, and each browser remembers the widths.
+- **The page on a phone.** Chat, Needs you, Tasks, Agents and More are tabs at the bottom, and what needs you is
+  said over the chat. Answers on a Needs you card have buttons big enough for a thumb. More opens Settings as one list,
+  this project's sections first, each row saying what it is set to now ("Appearance: Ink, comfortable", "Safety: Agents
+  you start, asks before risky commands"). An agent's panel lists its latest commits too.
+- **Needs you from every project in one list.** With more than one project, Needs you has This project and All
+  projects. All projects lists every project's open items, each labelled with its project, and each is answered on its
+  card as in its own project. The sidebar still counts this project's. Each browser remembers the choice.
+- **crewchat inside Claude Code.** The crewchat plugin now adds a band above Claude Code's prompt, in the desktop app
+  and the terminal, that says what needs you (to approve, blocked, to review, messages) with the latest message. Chat,
+  or `/crewchat`, opens a pane beside the conversation with the project's recent messages and Approve and Deny for
+  permission prompts and the other asks; Open page opens the chat page signed in. It reads only this machine's crewchat
+  server, with the owner's token, and stays out of sight where crewchat is not set up. Needs a Claude Code that loads
+  plugin mods.
+- **Connect a project without a terminal.** Projects menu → Connect a folder…: pick the folder, tick the tools found
+  on this machine, and see what each would ask the first time there (trust this folder, use its MCP servers, run
+  crewchat's hooks). Approve and connect answers them in each tool's own settings, so Claude Code, Gemini CLI, Qwen
+  Code and Codex start there with no question in a terminal (Codex still asks once to review crewchat's hooks).
+- **Nothing written into your folders, for Claude Code.** Machines panel → Claude Code plugin → Install the plugin:
+  crewchat's server and hooks come from a Claude Code plugin of its own, and a folder you connect gets nothing of
+  crewchat's in it. The folders connected before are moved over, and Uninstall puts everything back. Codex finds its
+  folder's chat the same way.
+- **Nothing written into your folders, for Cursor, Gemini CLI, Qwen Code and OpenCode either (W19).** With the
+  plugin on, crewchat goes once into each tool's own settings, and its server and hooks there stand aside in a folder
+  that is not connected. A folder connected for them gets nothing of crewchat's but Cursor's rule, and the folders
+  connected before move over with their setup (crewchat's other servers, which hold keys, go with it). A settings file
+  with comments, or one with a crewchat server of your own, is left as it is and crewchat says so: that tool's
+  folders get their setup in them as before. crewchat's leftover hooks and tool rules in a folder whose tool no longer
+  has crewchat there are taken out (W18), so they no longer run for nothing at every turn.
+- **Agents on your other machines, and saved crews.** + New agent can start an agent on any machine linked to this
+  one: pick it under Machine, and its tools and folders show. What its tool asks first there is one card in the
+  dialog. An agent on a linked machine has Stop, Reopen, Show terminal and the mode switch on its card, and Fork starts
+  a new Claude Code agent from a copy of its conversation. Save crew, Start saved crew and Stop all bring the same
+  agents back after a reboot, each on its own machine. A machine's Machines panel can turn this off for it.
+- **The Jira sign-in uses Atlassian's new MCP server and asks for Jira only.** Atlassian is removing its legacy MCP
+  sign-in in March 2027; Sign in on the Jira card now goes to the new one, and Atlassian's page asks about Jira alone
+  instead of Jira and Confluence. A sign-in you already have keeps working; sign in again to move it over.
+- **A message wakes an idle Claude Code agent, however long it has been idle.** Before, an agent heard the chat only
+  while its Stop hook waited after a turn, 30 minutes by default. Now a message to it by name, or any message from
+  you, starts its next turn through Claude Code's own messaging between sessions. The page says "woke the agent" under
+  the message. Other agents' messages wake it at most your limit of turns in a row. Needs Claude Code 2.1.224 or later,
+  on macOS or Linux.
+- **Commits linked to their task, and file leases.** A commit an agent makes for its task gets `Crewchat-Task` and
+  `Crewchat-Chat` trailers and shows in the task's thread, with Why: the task, your decisions on it and its messages.
+  An agent leases files with `hub_task`'s `lease` (paths or globs, for some minutes; it ends with the task). The
+  lease shows on its task, with Release. Another agent's commit that touches leased files is stopped, and shows in
+  Needs you with Ask the holder and Release. crewchat's git hooks run only for agents it started, and chain with the
+  hooks a repository has (husky, pre-commit), which keep running as before.
+- **The chat from anywhere.** With cloud sync, your phone opens the chat with no computer awake and no Tailscale: a
+  page on your own Firebase Hosting, end-to-end encrypted. Publish it and pair the phone from Machines → Phone from
+  anywhere: scan the code, sign in with Google. The phone reads the last 7 days, sends (what you send waits for a
+  computer to wake) and answers Needs you with answers signed by its own key. Remove a phone, or remove it and clear
+  what the cloud keeps, from the same panel. A phone posts messages and tasks only, and a removed phone posts nothing.
+- **An agent sets up your Firebase project.** In Machines → Link with cloud sync, pick where your database lives and
+  press Set it up with an agent: a Claude Code agent makes the project in your Chrome, where you are signed in to
+  Google, and asks you in Needs you before it changes anything in Google's consoles.
+- **New tokens never start with "-".** One token in 64 did, and `crewchat stdio --url URL --token TOKEN` read it as an
+  option and exited with "expected one argument", so the client saw a server that never answered. Tokens made from now
+  on start with a letter, digit or "_"; one made earlier works with `--token=TOKEN`.
+- **The agent settings no longer wait 15 seconds on a broken adb.** The "Mobile devices" checklist gives up on adb and
+  simctl after 5 seconds, as the Devices panel does.
+- **Agents without terminal windows.** + New agent starts a Claude Code agent in the background, with no window. Its
+  card says what it is doing (working, idle, waiting, stuck), and has Show terminal (its screen, on the page), Open in
+  Terminal for the rare question only its terminal can answer, Stop, Reopen, and a mode switch (Ask, Plan, Accept
+  edits) that reopens it in that mode. What Claude Code asks the first time in a folder (trust it, use the MCP servers
+  its `.mcp.json` lists) is one card in Needs you: Approve and start. A session stuck on its terminal shows in Needs you
+  too. "Run it: In a Terminal window" keeps the old way. A Cursor agent in the background answers its messages one
+  turn at a time, and Show terminal lists its steps.
+- **Every background agent is recorded as itself.** Claude Code runs each background session in a process it started
+  ahead of time, with the settings of whichever agent started its background service first, so a second agent's hooks
+  took the first one's link key or none: it had no Stop or Show terminal, `crewchat stop` missed it, messages did not
+  wake it, and Mobile MCP refused its calls. Hooks now take the key from the agent's own start prompt. An agent the
+  page recorded no session for keeps its Start again button even while it last said it was working.
+  An agent started from the page has its session recorded as it links, not after its first turn.
+  An agent that moves into a worktree stays linked: its hooks keep their chat when the worktree's copy of the
+  folder's settings names another.
+  When crewchat starts, it removes the worktrees its own agents left once their work is merged and their session
+  has ended. It never touches one you made, one a session still works in, or one with files git ignores.
+  A Cursor agent in the background has the chat crewchat made for it as its session, so each message starts its
+  next turn (it answered once and then heard nothing).
+  A restart keeps what you chose for an agent: its browser, mobile devices, model, account and that it runs in
+  the background (Start again opened a background Cursor agent in a window after a restart).
+  An agent started in a Terminal window gets the chat's own `CREWCHAT_HOME`, so its hooks report to that chat, not
+  to the one in `~/.crewchat`.
+- **Follow and answer a project from Google Chat.** In Project settings → Google Chat, **Mirror this project into** a
+  space sends it every message, only messages to you, tasks, reviews and questions to you, or nothing more. Your own
+  messages there, and your replies in its threads, come back to the chat as yours and reach the agents (start with
+  `@name` for one agent); nobody else's do. Replies need the Google sign-in with read access, a webhook space too: the
+  card says so and has the button. Off until you turn it on.
+- **Only crewchat's own agents join a new project.** A Claude Code or Cursor session you open yourself in a connected
+  folder no longer asks to join the chat: in a new project only agents started from + New agent take part. Projects
+  from before keep letting any session join until you switch them in Project settings → Who can join (or with
+  `crewchat setup --join own`).
+- **Threads.** Thread on any message opens it in a panel with its own reply box; the main chat shows "2 replies" under
+  the first message instead of the side discussion. Agents reply in a thread with `hub_send`'s `thread`, and see
+  replies marked as in a thread and questions marked as needing a reply. They search all history with `hub_history`'s
+  `q`.
+- **The Devices panel opens in seconds when adb is broken.** A machine whose adb server cannot start made the panel
+  wait 15 seconds for the phone list; listing devices now gives up after 5.
+- **Search all history.** Typing in the search box still filters what the chat shows; Enter now searches every message
+  the chat ever had, in every project, and opens the results in a panel. A result shows its message in the chat, or
+  opens its project.
+- **Questions that need a reply.** Send a message to an agent with + → Needs a reply, or an agent sends one with `ask`.
+  The message then shows where it is: sent, handed over, seen, answered. The receiver is reminded while it works, and
+  a question left for 30 minutes shows in Needs you with Nudge and Answer for them.
+- **Approve other tools' commands on the page.** In Project settings, Approvals makes Codex, Gemini CLI, Qwen Code,
+  Cursor and OpenCode ask in Needs you before risky commands (push, deploy, delete, `rm -rf`, secrets, production) or
+  before every command and edit. Answer Allow once, Always allow (kept as a rule, listed with Remove), or Deny with a
+  note. Always allow covers that command with more arguments, never one with another command chained after it. With Approvals on, a command is refused rather than run unasked if crewchat can't be reached.
+- **A message reaches a working agent after its next step.** A message to an agent by name, or any message from you, goes
+  into its turn after its next tool call, instead of waiting for the turn to end, which could be many minutes. Other
+  agents' chatter still waits for the end of the turn. Claude Code, Codex, Gemini CLI and Qwen Code.
+- **What needs you shows on the tab and the app icon.** The tab's title and icon carry the count of what needs you, and
+  the installed phone app shows it as a badge. A permission prompt's notification has Allow and Deny, and a question's
+  has Reply, so you can answer without opening the page (Android and desktop browsers).
+- **Review an agent's plan on the page.** When a Claude Code agent finishes planning, Needs you shows its plan as a plan
+  (headings, lists, code), not raw JSON cut at 2,000 characters. Approve it so the agent edits without asking, approve
+  it asking before each edit, or Request changes with a note the agent revises the plan from. Any Deny can carry a
+  note too.
+- **Start a Claude Code agent in plan mode from the page.** + New agent has "Plan first": it plans before it
+  changes anything, and its plan comes to Needs you, with no terminal step.
 - **Removing a project works on Windows.** It failed with "Access is denied": the project's databases were still
   open, and Windows cannot move a folder with an open file in it. They are closed first, and a move that a virus
   scanner holds up for a moment is tried again.

@@ -2,14 +2,15 @@
 only the app in front of each. mobile_launch_app brings its package to the front; a tap goes to args["goes_to"] when
 given (a link, a share sheet); mobile_get_foreground_app answers as Mobile MCP 1.0.16 does ("Foreground app: NAME
 (PACKAGE), activity: CLASS"), with the app's own name, which FAKE_NAME sets (an app names itself); mobile_batch_commands
-runs its steps as Mobile MCP does; mobile_list_available_devices lists FAKE_DEVICES (JSON), or one Android
-emulator; other tools say args["text"]. FAKE_LOG=<path> appends each call's tool name there;
-FAKE_ENV=<path> writes the telemetry and URL settings it was started with; FAKE_FRONT=none makes it unable to say."""
+runs its steps as Mobile MCP does; mobile_save_screenshot writes a PNG at saveTo and says where; mobile_list_available_devices lists FAKE_DEVICES (JSON), or one Android
+emulator (with FAKE_LIST_ONCE only the first time, then an error); other tools say args["text"]. FAKE_LOG=<path>
+appends each call's tool name there; FAKE_ENV=<path> writes the telemetry and URL settings it was started with; FAKE_FRONT=none makes it unable to say."""
 import json
 import os
 import sys
 
 front = {}  # device -> package in front
+lists = [0]  # device lists asked for
 log = os.environ.get("FAKE_LOG")
 if os.environ.get("FAKE_ENV"):
     with open(os.environ["FAKE_ENV"], "w") as f:
@@ -35,8 +36,15 @@ def run(name, args):
         front[device] = args.get("goes_to") or front.get(device, "com.android.launcher3")
         return "Clicked on screen"
     if name == "mobile_list_available_devices":
+        lists[0] += 1
+        if os.environ.get("FAKE_LIST_ONCE") and lists[0] > 1:
+            return None  # mobilecli did not answer this time
         return json.dumps({"devices": json.loads(os.environ.get("FAKE_DEVICES") or "null") or [
             {"id": "emulator-5554", "name": "Pixel 9", "platform": "android", "type": "emulator", "state": "online"}]})
+    if name == "mobile_save_screenshot":
+        with open(args["saveTo"], "wb") as f:
+            f.write(b"\x89PNG\r\n\x1a\n")
+        return "Screenshot saved to: %s" % args["saveTo"]
     return args.get("text", "")
 
 
@@ -68,4 +76,6 @@ for line in sys.stdin:
                     {"device": args.get("device")}, **(step.get("arguments") or {})))))
             reply(mid, text("\n".join(out)))
         else:
-            reply(mid, text(run(name, args)))
+            said = run(name, args)
+            reply(mid, text(said) if said is not None else dict(text("Error: mobilecli devices timed out"),
+                                                                 isError=True))

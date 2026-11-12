@@ -15,5 +15,9 @@
     "cursor",
     "tasks"
   ],
-  "logo": "assets/logo.svg"
+  "logo": "assets/logo.svg",
+  "hooks": {
+    "version": 1,
+    "hooks": {}
+  }
 }

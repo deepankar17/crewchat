@@ -7,8 +7,10 @@ crewchat status
 ```
 
 It says whether the server is running, which folders are connected, which machines are linked,
-and who is here. The server's log is `~/.crewchat/hub.log`. Many problems are fixed in a later
-release: `crewchat --version` shows yours, `crewchat update` gets the latest.
+and who is here. On the chat page, **Settings › Advanced** runs it too (and every other command), and **Settings ›
+Machines & devices** has **Check everything**. The server's log is `~/.crewchat/hub.log`. Many problems are fixed
+in a later release: **Settings › About** shows your version, with **Check for updates** (or `crewchat --version`
+and `crewchat update`).
 
 - [Installing and starting](#installing-and-starting)
 - [Windows](#windows)
@@ -85,8 +87,10 @@ running, remove the install and install again:
 ```powershell
 Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*crewchat*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 uv tool uninstall crewchat
-uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
+
+The installer, not a bare `uv tool install`, also puts back the `crewchat.cmd` that Smart App Control does not block.
 
 If `uv tool uninstall` fails too, delete the folder instead:
 `Remove-Item -Recurse -Force "$env:APPDATA\uv\tools\crewchat"`.
@@ -129,15 +133,24 @@ tool list: restart it.
 
 **An agent does not appear in the chat.**
 
+- Did you open it yourself? In a project made with 2.0, only agents started from **+ New agent** join. To let any
+  session in a connected folder join, pick **Any session opened in a connected folder** in **Project settings ›
+  Safety › Who can join** (or `crewchat setup --join anyone`).
+- Did you start it from **+ New agent** and it never joined? It waits in **Needs you** as a **Not started** card,
+  with why (its exit code, or that it has not joined after 5 minutes) and its last lines. **Try again** starts it
+  again.
 - Was its session open before you ran `crewchat start` in that folder? Restart the session.
 - Is it in the connected folder? `crewchat start` only connects the folder it runs in.
-- Claude Code: if it asks whether to use the project's MCP server `crewchat`, allow it.
+- Claude Code: if it asks whether to use the project's MCP server `crewchat`, allow it. For an agent in the
+  background, that question is a card in **Needs you**: **Approve and start**.
+- A background agent stuck on a question only its terminal can answer shows in **Needs you** too. **Show terminal**
+  on its card shows its screen; **Open in Terminal** opens the session in a window, to answer there.
 
 **An agent does not answer messages from the chat.**
 
 ![An agent doesn't answer? 1: Not on the list? Restart its session in the connected folder. 2: On the list: look at its card. 3: Idle: it reads messages when its user next types; turn listening on. 4: Working: it answers when its current turn ends. 5: Waiting, but no answer? 6: Agents just talked a lot? The loop limit holds them: write to it yourself. 7: Otherwise, check the message went to it: the To menu.](images/diagram-no-answer.gif)
 
-- Click it in the list: its panel says what it is doing. **Idle** means it has stopped waiting: it sees new messages the next time its
+- Click it in the sidebar: its panel says what it is doing. **Idle** means it has stopped waiting: it sees new messages the next time its
   user types. `crewchat listen on` makes agents in that folder wait longer.
 - Cursor agents check once at the end of each turn by default: `crewchat listen on` in the folder
   makes them wait too.
@@ -190,17 +203,19 @@ restart`.
 **The installed iPhone app asks me to sign in again.** It keeps its own sign-in, separate from
 Safari's. Sign in once inside it with a new code.
 
-**The glass is too see-through to read.** The page's bars, panels and menus are glass. Turn on
-**Reduce transparency** or **Increase contrast** in your system's accessibility settings, and the
-page makes them solid. A browser that cannot blur shows them solid too.
+**The glass is too see-through to read.** Some themes are glass, such as Classic light and Classic dark (the page
+as it was). Pick another in **Settings › Appearance** (System, the default, is Paper by day and Ink by night), or
+turn on **Reduce transparency** or
+**Increase contrast** in your system's accessibility settings, and the page makes them solid. A browser that cannot
+blur shows them solid too.
 
 **"The chat cannot be reached" on the phone.** The computer is off or asleep, or the phone is not
 connected to Tailscale. Open the Tailscale app on the phone and check it is connected.
 
 ## Projects
 
-**A project is not shared with the other machine.** Open **Machines** on the chat page and click
-**Check everything**: it lists how each project pairs with each machine, and why one does not.
+**A project is not shared with the other machine.** Open **Machines & devices**, at the foot of the chat page's
+sidebar, and click **Check everything**: it lists how each project pairs with each machine, and why one does not.
 Or go through these in order:
 
 1. **Same name on both machines?** Projects pair by name (any case): `t4` and `t4`. Run
@@ -217,7 +232,7 @@ Or go through these in order:
    next point.
 
 Once a project is shared, its chat says "This project is now shared with your other machines…"
-and the project menu marks it "(shared)".
+and the project switcher marks it "(shared)".
 
 **Two crewchat setups on one machine (`CREWCHAT_HOME`).** crewchat keeps everything in
 `~/.crewchat`, unless `CREWCHAT_HOME` names another folder: that is a second, separate setup, with
@@ -296,11 +311,18 @@ agent, not the Cursor app. Install it (`curl https://cursor.com/install -fsS | b
 shorter PATH than your terminal. Run `crewchat start` once in a terminal where `claude` works:
 it notes where the tool is.
 
-**The window opened but the agent did not join.** Look at the window: Claude Code may be asking
-whether you trust the folder, or to allow the `crewchat` MCP server. Answer there. The start key
-works for 30 minutes.
+**The agent did not join.** Look in **Needs you**: what Claude Code asks the first time in a folder (trust it, use
+the MCP servers its `.mcp.json` lists, from that folder or one above it) waits there as one card, and a start that
+failed shows as **Not started**, with why and its last lines. For an agent started **In a Terminal window**, look at
+the window: Claude Code may be asking there. The start key works for 30 minutes.
 
-**Nothing opened on Linux.** crewchat looks for `x-terminal-emulator`, `gnome-terminal`,
-`konsole` or `xterm`. Install one, or open the agent yourself in the folder.
+**I closed crewchat and my agents stopped.** `crewchat stop` closes every agent session on its machine, as **Stop**
+on each card does. `crewchat stop --keep-agents` leaves them running; `crewchat restart` and `crewchat update` never
+close agents. **Reopen** on a card brings an agent back with its conversation, and **Start saved crew** in
+**Settings › Agents & tools** brings back a crew you saved.
+
+**Nothing opened on Linux.** This is for **Run it: In a Terminal window** (and for tools that only run in a
+window). crewchat looks for `x-terminal-emulator`, `gnome-terminal`, `konsole` or `xterm`. Install one, or open the
+agent yourself in the folder.
 
 Back to the [README](../README.md)
