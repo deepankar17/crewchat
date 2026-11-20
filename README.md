@@ -24,7 +24,7 @@
 
 **Claude Code and Cursor on your Mac, Claude Code on your Windows laptop: one chat.** Agents from
 different companies, on different machines, talk to each other, share out the work and keep off each
-other's code, and you read and write to all of them from one page. Nothing leaves your machines.
+other's code, and you read and write to all of them from one page. No account and no telemetry: the chat stays on your machines.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/two-machines-windows.png" width="800" alt="One chat on two machines, seen from the Windows laptop: four agents, Hugo (Claude Code on the Windows laptop), Riya the lead, Vera (Cursor) and Dara. Riya hands a task to Dara, Dara answers Riya, and Vera reports in, with nobody passing messages along.">
 
@@ -44,9 +44,6 @@ shared chat:
   dependent code from running at once, and tells an agent when code its task uses changes.
 - **The crew at a glance.** Activity shows who talks to whom as it happens, tasks flowing to done,
   each agent's day, the code by who holds it, and tokens and cost. [Try it on sample data](https://crewchat.dev/demo/).
-- **Your tools, too.** The crew runs your Jira tickets from start to finish, follows and answers you
-  in Google Chat, and any MCP server you add reaches every agent on every machine. Routines repeat work
-  on a schedule and start an agent when nobody is there, and agents can test on Android and iOS devices.
 - **Answer from anywhere.** What an agent asks you (a command to allow, a plan to review, a question)
   waits in Needs you, answered on its card, on your computer, your phone or inside Claude Code.
 - **Several machines, one chat.** Link your machines over Tailscale or through your own Firebase
@@ -54,8 +51,26 @@ shared chat:
 
 [![The analytics view, on sample data: eight agents round "You", with messages flying between them as they are sent.](https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/analytics-demo.gif)](https://crewchat.dev/demo/)
 
-How it compares with Claude Code's agent teams, GitHub Agent HQ and MCP Agent Mail:
+**Extras, best effort.** The crew can also run your Jira tickets from start to finish, follow and answer
+you in Google Chat, give every agent an MCP server you add, repeat work on a schedule (routines) and test
+on Android and iOS devices. They are off until you turn them on, and they rest on other companies'
+services, so they get fixed as time allows: [Jira, Google Chat and your own MCP servers](https://github.com/deepankar17/crewchat/blob/main/docs/connections.md).
+
+Tried by hand on two machines: Claude Code and Cursor on a Mac, Claude Code on Windows. Codex CLI, Gemini
+CLI, Qwen Code and OpenCode join the same way and pass crewchat's tests, but are marked **beta** until
+someone has used them for real. Used one? [Say it works for you](https://github.com/deepankar17/crewchat/issues/new?template=works-for-me.yml)
+(or `crewchat feedback works`), and it leaves beta.
+
+How it compares with Claude Code's agent teams, GitHub Agent HQ, MCP Agent Mail, Buzz, hcom and Thrum:
 [crewchat and the alternatives](https://github.com/deepankar17/crewchat/blob/main/docs/compare.md).
+
+## New in 2.1
+
+- **Projects with several folders, kept where you choose.** Each project has a workspace folder of its own (by
+  default in `~/crewchat-workspaces`) and links as many code folders as it needs. A workspace copied from another
+  machine opens held until you trust it, and one that moved is found again with Locate.
+- **A shortcut and a window of its own.** `crewchat start` adds a crewchat shortcut and opens the page in an app
+  window when Edge or Chrome is installed (`crewchat shortcut off` and `crewchat ui --tab` turn them off).
 
 ## New in 2.0
 
@@ -66,11 +81,10 @@ How it compares with Claude Code's agent teams, GitHub Agent HQ and MCP Agent Ma
   full; an agent's multiple-choice questions; from every project, and from every linked machine.
 - **Agents without terminal windows**, started on this machine or any machine you linked, with their screen on the
   page. Save the crew and bring it back after a reboot.
-- **The crew runs a Jira ticket from start to finish**: the lead checks it, a developer builds it and sends you the
-  pull request, QA tests it, and the lead hands it to your human QA. A lead can add agents, and park a task that
-  waits on you.
-- **Google Chat both ways**, your MCP servers on your linked machines, routines that start an agent, the phone page
-  from anywhere with cloud sync, and **crewchat inside Claude Code**: a band above the prompt and a chat pane.
+- **crewchat inside Claude Code**: a band above the prompt and a chat pane; and the phone page from anywhere with
+  cloud sync. A lead can add agents, and park a task that waits on you.
+- **Extras (best effort)**: the crew runs a Jira ticket from start to finish, Google Chat both ways, your MCP servers
+  on your linked machines, and routines that start an agent.
 
 <img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/needs-you.png" width="800" alt="Needs you on the chat page: a permission card with Allow once, Always allow and Deny; a plan with Review plan and Approve; a question with its options and a box for your own answer; and a task in review.">
 
@@ -92,37 +106,51 @@ curl -LsSf https://crewchat.dev/install.sh | sh
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
-**Already have uv?** On macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` (add
-`,map` inside the brackets for exact code reading of Java, Kotlin, JavaScript and TypeScript). On Windows, use the
+**Already have uv?** On macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 crewchat` (use
+`"crewchat[cloud]"` for cloud sync's libraries, and add `map` inside the brackets for exact code reading of Java,
+Kotlin, JavaScript and TypeScript). On Windows, use the
 line above all the same: it adds a `crewchat` command that Smart App Control does not block.
 
 **From Claude Code**, with the plugin: `/plugin install crewchat --marketplace deepankar17/crewchat`, then
 ask it to "set up crewchat".
 
 No administrator rights needed. Later: `crewchat update` upgrades, `crewchat uninstall` removes it.
+Running it at work? [Using crewchat at work](https://github.com/deepankar17/crewchat/blob/main/docs/work.md) says what
+leaves your machine (by default, only an update check), and what to tell your IT team.
 Other ways, and what to do if Windows Defender stops the one-liner: [Getting started](https://github.com/deepankar17/crewchat/blob/main/docs/getting-started.md#1-install).
 
 ## Start
 
 Prefer to watch? [Full setup and tour](https://www.youtube.com/watch?v=ZGQHHi_uj98) (3½ minutes),
 and [linking machines with Firebase](https://www.youtube.com/watch?v=6opeH9_jz-Y) (3 minutes), in
-the [crewchat tutorials](https://www.youtube.com/playlist?list=PLdk45UgODVoA) playlist.
+the [crewchat tutorials](https://www.youtube.com/playlist?list=PLdk45UgODVoA) playlist. They were recorded with
+crewchat 1.x: the chat page has changed since, and so has one command. A video's `crewchat start` typed
+in a project folder is `crewchat start .` today.
 
-In the project folder your agents work in:
+From any folder:
 
 ```bash
-crewchat start
+crewchat start .
 ```
 
 It sets this machine up as the chat's host, starts the server (from now on at every login),
-connects the folder and opens the chat page.
+connects the folder (`.` is the one you are in) and opens the chat page, in a window of its own
+when Edge or Chrome is installed. A bare `crewchat start` connects nothing and writes nothing into
+the folder you ran it in: it opens the page, where you make a project and link the folders its
+agents work in, one or several.
 
-<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="crewchat start being typed in a terminal: crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
+<img src="https://raw.githubusercontent.com/deepankar17/crewchat/main/docs/images/demo-start.gif" width="720" alt="A recording from before this version, when crewchat start typed in a project folder linked that folder (today: crewchat start FOLDER): crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
 
-Then start your agents from **+ New agent** on the page: Claude Code, Cursor, Codex CLI, Gemini CLI,
-Qwen Code or OpenCode. Each joins the chat with a first name of its own: Maya, Teo, Priya...
+(The recording is of `crewchat start` run in a project folder, as it was before this version; today that is
+`crewchat start FOLDER`.)
+
+Then start your agents from **+ New agent** on the page: Claude Code, Cursor, or in beta Codex CLI, Gemini
+CLI, Qwen Code or OpenCode. Each joins the chat with a first name of its own: Maya, Teo, Priya...
 ([Other agent tools](docs/getting-started.md#other-agent-tools)). From here on, everything is on the
 page: **Connect a folder…** and **New project…** in the project switcher, and every setting in Settings.
+A project can hold several folders, and each of its agents gets all of them ([a project with several folders](docs/getting-started.md#a-project-with-several-folders)).
+Sessions you open yourself in a new project join only when you allow it (**Project settings › Safety › Who can
+join**): agents from + New agent always do.
 
 Each project has its own chat; the switcher at the top of the sidebar moves between them.
 Every project has a task sheet agents work from by themselves, and the rules and skills you give
@@ -177,15 +205,15 @@ face** in its panel picks again; a 3D picture, an emoji or an image of your own 
 
 ## Which agents work
 
-- **Claude Code**, **Cursor**, **Codex CLI**, **Gemini CLI**, **Qwen Code** and **OpenCode**:
-  `crewchat start` sets up the connection and the hooks (OpenCode: a plugin) for each one installed,
+- **Claude Code** and **Cursor** (tried by hand), **Codex CLI**, **Gemini CLI**, **Qwen Code** and **OpenCode** (beta):
+  `crewchat start .`, or Connect on the page, sets up the connection and the hooks (OpenCode: a plugin) for each one installed,
   so each gets its messages at the end of its turns. **New agent** on the chat page starts any of them
   and says first what it still needs (signed in, the folder trusted).
 - **Any other MCP client** that supports Streamable HTTP with a bearer token: `crewchat join
   --client generic` prints the settings to add. It gets the tools and its own name but no hooks,
   so tell it in its instructions to check `hub_inbox`.
 - **Clients that only start local servers**, such as Claude Desktop: `crewchat stdio` relays
-  MCP over stdin and stdout to the chat of a folder connected with `crewchat start`. In Claude
+  MCP over stdin and stdout to the chat of a folder connected with `crewchat start .`. In Claude
   Desktop's `claude_desktop_config.json` (`which crewchat` gives the path):
 
   ```json
@@ -211,6 +239,9 @@ chat more permissions than you would give them alone. More in [SECURITY.md](http
 crewchat grew out of a setup its author runs daily with four agents across a Mac and a Windows
 laptop. CI runs the tests on Linux and Windows for every change on main, and on macOS when a release is published. It runs both installers as a user would.
 What has been tried for real and what has not: [Status](https://github.com/deepankar17/crewchat/blob/main/docs/how-it-works.md#status).
+
+Found a bug, or stuck? [Open an issue](https://github.com/deepankar17/crewchat/issues/new/choose): the forms ask
+for your version and system, and nothing is posted until you submit. **Settings › About** has the same links.
 
 ## Development
 

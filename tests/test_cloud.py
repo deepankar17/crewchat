@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 TMP = tempfile.mkdtemp(prefix="crewchat-cloud-test-")
 os.environ.setdefault("CREWCHAT_HOME", str(Path(TMP) / "unused"))
+os.environ["CREWCHAT_NO_SHORTCUT"] = "1"  # no test, nor a child process of one, makes a real shortcut
 
 import crewchat  # noqa: E402
 import crewchat_cloud as cloud  # noqa: E402
@@ -539,10 +540,10 @@ class Sync(unittest.TestCase):
                    message="the lead to show on the second machine")
         piece = self.a.hub.assign(lead, dev, "Build it")
         wait_until(lambda: self.b.hub.taken.get(piece["id"]) == dev, message="the assignment")
-        _, to = self.b.hub.update(dev, piece["id"], "done", "Built")
+        _, to = self.b.hub.update(dev, piece["id"], "done", "Built\nDecisions: none\nLeft over: none")
         self.assertEqual(to, lead)
         wait_until(lambda: self.a.hub.progress.get(piece["id"], {}).get("status") == "done", message="the update")
-        self.assertIn("Built", [m["text"] for m in self.a.hub.inbox(lead, 0, True)])
+        self.assertIn("Built", [m["text"].split("\n")[0] for m in self.a.hub.inbox(lead, 0, True)])
 
     def test_read_receipts_cross_machines(self):
         win_agent = self.b.agent()
@@ -589,6 +590,21 @@ class Sync(unittest.TestCase):
             self.a.hub.take(agent, task["id"])
         self.a.link.online = True
         wait_until(lambda: self.b.has("written offline"), timeout=20, message="the offline message")
+
+    def test_messages_written_while_sync_was_off_all_reach_the_cloud_even_past_memory(self):
+        # R9 (review of 14 Nov): the backlog was read from memory only, so after a long spell offline the messages
+        # that memory no longer held never reached Firestore. Now it is read back from messages.jsonl.
+        self.a.sync.stop()  # cloud sync off: written here only
+        before = len(self.store.list("messages"))
+        texts = ["written with sync off %d" % i for i in range(12)]
+        with mock.patch.object(crewchat, "KEEP_MESSAGES", 5), mock.patch.object(cloud, "REPUBLISH_PAGE", 4):
+            for text in texts:
+                self.a.say("all", text)
+            with self.a.hub.lock:
+                self.assertFalse(any(m["text"] == texts[0] for m in self.a.hub.messages))  # out of memory
+            self.a.sync = cloud.CloudSync(self.a.hub, self.a.link, self.a.device, log=lambda text: None).start()
+            wait_until(lambda: len(self.store.list("messages")) >= before + len(texts), timeout=20,
+                       message="every message written with sync off to reach the cloud")
 
     def test_a_machine_off_for_three_days_gets_every_message_through_the_coordinator(self):
         # Roadmap Y3, done when: a machine off for three days, longer than the cloud keeps messages, gets every
@@ -1606,3 +1622,71 @@ def tearDownModule():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LockedRules(unittest.TestCase):
+    """2.0.1: the Firestore rules can name the owner's account, so no other Google account gets into the project."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="rules-", dir=TMP))
+        patch = mock.patch.dict(os.environ, {"CREWCHAT_HOME": str(self.root)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def run_rules(self, **flags):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cloud._cmd_cloud(argparse.Namespace(action="rules", **dict({"uid": None, "any": False}, **flags)))
+        return out.getvalue(), err.getvalue()
+
+    def sign_in(self, uid):
+        (self.root / "cloud").mkdir(parents=True, exist_ok=True)
+        (self.root / "cloud" / "firebase.json").write_text(json.dumps({"projectId": "p", "apiKey": "k"}))
+        (self.root / "cloud" / "auth.json").write_text(json.dumps({"uid": uid, "refresh_token": "r"}))
+
+    def test_the_open_rules_are_unchanged_and_the_locked_ones_name_the_accounts(self):
+        self.assertEqual(cloud.rules(), cloud.RULES)
+        self.assertNotIn("request.auth.uid in", cloud.RULES)
+        locked = cloud.rules(["AbC123", "x-y_z"])
+        self.assertIn("request.auth.uid == uid\n        && request.auth.uid in ['AbC123', 'x-y_z'];", locked)
+        self.assertIn("allow create, update: if owner(uid) && small();", locked)  # the size limits stay
+        for bad in ("a'b", "a b", "x" * 129):  # a uid goes into the rules' text: nothing else may
+            with self.assertRaises(cloud.CloudError):
+                cloud.rules([bad])
+
+    def test_before_sign_in_cloud_rules_prints_the_open_rules_and_says_to_lock_them_after(self):
+        out, err = self.run_rules()
+        self.assertEqual(out, cloud.RULES)
+        self.assertIn("crewchat cloud login", err)
+
+    def test_on_a_signed_in_machine_cloud_rules_locks_the_project_to_its_account(self):
+        self.sign_in("Owner42")
+        out, err = self.run_rules()
+        self.assertEqual(out, cloud.rules(["Owner42"]))
+        self.assertEqual(err, "")
+        self.assertEqual(self.run_rules(any=True)[0], cloud.RULES)
+        self.assertEqual(self.run_rules(uid=["Owner42", "Other7"])[0], cloud.rules(["Owner42", "Other7"]))
+
+    def test_sign_in_hands_back_the_rules_locked_to_the_account(self):
+        crewchat.save_config({"project": "Demo"}, self.root)
+        auth = mock.Mock(signed_in=True, uid="Owner42", email="me@example.com")
+        with mock.patch.object(cloud, "need_crypto"), mock.patch.object(cloud, "Auth", return_value=auth), \
+                mock.patch.object(cloud, "firestore_store", return_value=(mock.Mock(), auth)), \
+                mock.patch.object(cloud, "Device") as device, mock.patch.object(cloud, "Account") as account:
+            device.return_value.configure_mock(exists=True, name="mac", tag="m1", fp="FP")
+            account.return_value.register.return_value = "founded"
+            out = cloud.login(self.root)
+        self.assertEqual(out["rules"], cloud.rules(["Owner42"]))
+        self.assertIn("crewchat cloud rules", out["lock"])
+
+
+class AddCloudLibraries(unittest.TestCase):
+    """2.0.1: the plain install leaves cloud sync's libraries out; the errors say how to add them to this copy."""
+
+    def test_an_installer_copy_is_told_to_update_with_cloud(self):
+        e = ModuleNotFoundError("No module named 'google'", name="google")
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=True):
+            self.assertIn("crewchat update --cloud", cloud.firestore_import_error(e))
+            self.assertNotIn("CREWCHAT_LEAN", cloud.firestore_import_error(e))
+        with mock.patch.object(crewchat, "installed_by_installer", return_value=False):
+            self.assertIn('pip install "crewchat[cloud]"', cloud.firestore_import_error(e))

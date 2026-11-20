@@ -15,7 +15,7 @@ class Projects(unittest.TestCase):
         cls.test2 = cls.m.dir / "test2"
         cls.test2.mkdir()
         subprocess.run(["git", "init", "-q", str(cls.test2)], check=True)
-        cls.out = cls.m.cli("start", "--no-service", "--no-open", cwd=cls.test2)
+        cls.out = cls.m.cli("start", cls.test2, "--no-service", "--no-open")
         cls.a = cls.m.agent()
         cls.a.link()
         cls.b = cls.m.agent(folder=cls.test2)
@@ -146,7 +146,7 @@ class TaskSheet(unittest.TestCase):
             # It finds more work and puts it on the sheet.
             dev.call("hub_task", action="add", title="Index the users table", depends=first, areas="db/indexes/")
             self.assertIn("Index the users table", m.cli("tasks"))
-            dev.call("hub_task", action="update", id=first, status="done", note="schema in place")
+            dev.call("hub_task", action="update", id=first, status="done", note="schema in place\nDecisions: none\nLeft over: none")
             # The lead hands out the next one; the developer hears it at the end of its turn.
             m.owner.role(lead.name, "lead")
             dev.stop_hook()
@@ -189,7 +189,7 @@ class UpgradeToProjects(unittest.TestCase):
         self.assertRegex(listing, r"(?m)^Demo( \(here\))?  \[--chat demo\]$")
         other = m.dir / "other"
         other.mkdir()
-        self.assertIn('Created the project "other"', m.cli("start", "--no-service", "--no-open", cwd=other))
+        self.assertIn('Created the project "other"', m.cli("start", other, "--no-service", "--no-open"))
         self.assertIn(a.name, m.cli("agents"))
 
 

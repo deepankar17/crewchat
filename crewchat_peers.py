@@ -40,6 +40,12 @@ NEEDS_EVERY = 1.0  # seconds: the pulls work out what waits on the owner here (N
 MISSING_WAIT = 30  # seconds before asking again a member that has no project by this name
 INVITE_TTL = 600
 CONFIRM_WAIT = 10  # seconds a member waits for the remover to confirm a key change
+PROTO = 1  # the link's protocol: raised when a change needs every member to understand it
+MIN_PROTO = 0  # the oldest protocol this machine still talks to (0: crewchat before PROTO, which sends none)
+CLOCK_WARN = 5  # seconds apart at which the Machines panel says a member's clock is off
+MOVE_RECHECK = 60  # seconds before a refused change of a member's address is checked again
+TELL_BACKOFF = (30, 60, 120, 300, 600)  # seconds between tries to tell a member that missed a key change
+TELL_FOR = 7 * 24 * 3600  # how long a missed key change is retried
 OFFLINE_AFTER = 2  # failed pulls in a row before a member shows as offline
 BACKOFF = (1, 2, 5, 10, 20, 30)
 MAX_BATCH = 500
@@ -86,6 +92,7 @@ class Mesh:
         self.path = self.root / "peers.json"
         self.lock = threading.RLock()
         self.data = {}
+        self.skews = {}  # member id -> seconds its clock is ahead of this one's, from its last pull (memory only)
         if self.path.exists():
             try:  # on Windows the server may be replacing it this moment
                 self.data = crewchat.retry_on_windows(lambda: json.loads(self.path.read_text(encoding="utf-8")))
@@ -305,6 +312,7 @@ class PeerSync(crewchat.ProjectLink):
         self.removed_me = False
         self._coordinator, self._term = None, 0  # who this machine last saw coordinating, and how many changes
         self._needs_seen = None  # (hub version, when, the items): what _pulled_needs last worked out
+        self._moves = {}  # (member id, new address) -> (when checked, the address kept): refused moves (H5)
 
     def coordinator(self, exclude=()):
         """Which machine coordinates now (roadmap Y1): the owner's preferred machine if this one can reach it,
@@ -376,7 +384,10 @@ class PeerSync(crewchat.ProjectLink):
             state = self.state_of(mid, now)
             rows.append(dict(self.info_of(mid), id=mid, name=m.get("name", ""), tag=m.get("tag", ""), state=state,
                              seen=float(remote.get("updated") or 0), coordinator=mid == coordinator,
-                             address=m.get("url", "")))
+                             address=m.get("url", ""),
+                             # until it answers this machine's key again (linked again, or it heard after all)
+                             refused=float((self.mesh.data.get("refused") or {}).get(mid) or 0) > float(remote.get("updated") or 0),
+                             clock=round(self.skew(mid)) if abs(self.skew(mid)) >= CLOCK_WARN else 0))
         return sorted(rows, key=lambda r: r["name"].lower())
 
     def reach(self, mid, timeout=5):
@@ -420,7 +431,16 @@ class PeerSync(crewchat.ProjectLink):
                     self.mesh.data.setdefault("claims", {}).setdefault(self._key(task), agent)
         for mid in self.mesh.members():
             self._watch(mid)
+        if self.chat is None and self.mesh.data.get("telling"):
+            self._start_telling()
         return self
+
+    def _start_telling(self):
+        with self.mesh.lock:
+            if getattr(self, "_teller", None) is not None:
+                return
+            self._teller = threading.Thread(target=self._keep_telling, name="crewchat-peer-tell", daemon=True)
+            self._teller.start()
 
     def stop(self):
         self.stopped.set()
@@ -552,7 +572,7 @@ class PeerSync(crewchat.ProjectLink):
     # Talking to members ----------------------------------------------------------------------
     def _call(self, member, path, body, timeout=PULL_WAIT + 20, key=None, raw=False):
         """POST to another member; its JSON answer, or with raw its bytes."""
-        body = dict(body, sender=dict(self.mesh.me, id=self.device_id))
+        body = dict(body, sender=dict(self.mesh.me, id=self.device_id), proto=PROTO)
         if self.chat is not None:
             body["chat"] = self.chat
         req = urllib.request.Request(
@@ -583,6 +603,13 @@ class PeerSync(crewchat.ProjectLink):
                 if self.chat is not None and out.get("chat") != self.chat:
                     # An older crewchat answers with its first project whatever we ask: not ours.
                     raise PeerError("no project %s there" % self.chat, 404)
+                too_old = self._too_old(out)
+                if too_old:
+                    raise PeerError(too_old, 426)
+                try:  # its clock against ours, at the moment it answered (V2): leases it sets are read with it
+                    self.mesh.skews[mid] = float(out["now"]) - time.time()
+                except (KeyError, TypeError, ValueError):
+                    pass
             except PeerError as e:
                 if self.stopped.is_set():
                     return
@@ -687,13 +714,20 @@ class PeerSync(crewchat.ProjectLink):
 
     def _apply(self, mid, member, out):
         removed = out.get("removed") or {}
+        if self.device_id in removed:
+            # A member that took this machine as removed refuses it (403), and that is how it learns. A pull's answer
+            # that says so instead is not believed: a removed machine could unlink a member that missed its removal
+            # (round-3 re-review).
+            self.log("ignored news from %s that this machine was removed: it still answered" % member.get("name", mid))
+            removed = {k: v for k, v in removed.items() if k != self.device_id}
+        removed = self._really_gone(removed, mid)
         if self.chat is not None:
             self.shared_with.add(mid)
         else:  # membership is the machine's link's business
             if self.device_id in removed:
                 self._removed()
                 return
-            for new in self.mesh.merge(out.get("members") or {}, removed):
+            for new in self.mesh.merge(self._vetted(out.get("members") or {}, speaker=mid), removed):
                 self._member_joined(new, self.mesh.members().get(new, {}).get("name", new))
             theirs, mine = out.get("preferred"), self.mesh.data.get("preferred") or {}
             if isinstance(theirs, dict) and float(theirs.get("at") or 0) > float(mine.get("at") or 0):
@@ -753,6 +787,9 @@ class PeerSync(crewchat.ProjectLink):
     def peer_request(self, path, token, device, body):
         """A request from another member (or, for /peer/join, a machine with a code).
         Returns (HTTP status, JSON object)."""
+        too_old = self._too_old(body)
+        if too_old:
+            return 426, {"error": too_old, "proto": PROTO, "min_proto": MIN_PROTO}
         if path == "/peer/join":
             return self._join(body)
         if not self.mesh.key_ok(token):
@@ -770,14 +807,22 @@ class PeerSync(crewchat.ProjectLink):
                                                     "/peer/needs"):
             return 404, {"error": "unknown request"}
         sender = body.get("sender") if isinstance(body.get("sender"), dict) else {}
-        if self.chat is None and device and sender.get("id") == device:
-            for new in self.mesh.merge({device: sender}):
+        # A key change is confirmed at the address this machine already had for its sender, never one it brings.
+        if self.chat is None and device and sender.get("id") == device and path != "/peer/rekey":
+            for new in self.mesh.merge(self._vetted({device: sender}, speaker=device)):
                 self._member_joined(new, sender.get("name", new))
         if path == "/peer/pull":
             if self.chat is not None and device:
                 self.shared_with.add(device)  # it asks for this project, so it has it too
                 self._wake(device).set()
-            return 200, self._pull(body)
+            out = self._pull(body)
+            # The pull may have waited while the asker was removed or the key changed: what was written meanwhile
+            # is not for it. Answered as a request made now would be.
+            if device in self.mesh.data.get("removed", {}):
+                return 403, {"error": "this machine was removed from the chat"}
+            if not self.mesh.key_ok(token):
+                return 409, {"error": "the key changed; waiting for the news of it"}
+            return 200, out
         if path == "/peer/relay":  # another member's messages, for one that cannot reach it now (Y3)
             try:
                 since = int(body.get("since") or 0)
@@ -849,8 +894,16 @@ class PeerSync(crewchat.ProjectLink):
             if len(secret) < 32:
                 return 400, {"error": "bad key"}
             removed = body.get("removed") if isinstance(body.get("removed"), dict) else {}
-            if not self._remover_confirms(device, secret, removed):
+            between = [str(k) for k in body.get("between") or [] if isinstance(k, str)][:16]
+            if self._really_gone(removed, device, between) != removed:
+                return 403, {"error": "a machine named as removed still answers with a newer key"}
+            confirmed = self._remover_confirms(device, secret, removed)
+            if confirmed is False:
                 return 403, {"error": "the machine that changed the key did not confirm it"}
+            if not confirmed:
+                # Not confirmed now (it did not answer in time, or its address is unverified): the sender tries
+                # again later, so a member that missed a real removal is not left on the old key (re-review 14 Nov).
+                return 503, {"error": "the machine that changed the key did not confirm it; try again later"}
             self.mesh.rekey(secret, removed)
             for gone in removed:
                 self.hub.drop_remote(gone)
@@ -863,18 +916,180 @@ class PeerSync(crewchat.ProjectLink):
             return 200, {"ok": True}
         return 404, {"error": "unknown request"}
 
+    def _too_old(self, answer):
+        """Why the other side of a request or a pull is too old to talk to, or "". A machine before PROTO sends none."""
+        try:
+            theirs = int((answer or {}).get("proto") or 0)
+        except (TypeError, ValueError):
+            theirs = 0
+        if theirs >= MIN_PROTO:
+            return ""
+        return ("that machine runs a crewchat too old for this one (link protocol %d, this one needs %d or later): "
+                "update it with `crewchat update`" % (theirs, MIN_PROTO))
+
+    def skew(self, mid):
+        """How many seconds a member's clock is ahead of this machine's (behind if negative), as its last pull said."""
+        return self.mesh.skews.get(mid, 0.0)
+
+    def _vetted(self, members, speaker=None):
+        """Members as another machine describes them, with a changed address taken only when the address this
+        machine has for that member no longer answers as it (review 14 Nov, H5). Every member holds the shared key
+        and names itself in a header, so without this any member could point another member's entry at itself,
+        then answer the confirmation of a key change it forged (_remover_confirms). When the old address does not
+        answer at all, only the member itself (`speaker`) is followed to a new one: another member's word is not
+        enough while the machine it speaks of is asleep (audit, 14 Nov)."""
+        known = self.mesh.members()
+        out = {}
+        for mid, info in (members or {}).items():
+            if not isinstance(info, dict) or mid not in known or mid == self.device_id:
+                out[mid] = info
+                continue
+            old, new = known[mid].get("url") or "", clean_url(info.get("url"))
+            if not new or not old or new == old:
+                out[mid] = info
+                continue
+            out[mid] = dict(info, url=self._moved_to(mid, old, new, itself=(mid == speaker)))
+        return out
+
+    def _moved_to(self, mid, old, new, itself=True):
+        """The address to keep for member `mid` when someone says it moved from `old` to `new`: what the
+        machine at `old` says of itself if it still answers there, else `new` (it moved)."""
+        now = time.time()
+        when, kept = self._moves.get((mid, new), (0, None))
+        if kept is not None and now - when < MOVE_RECHECK:
+            return kept
+        try:
+            answer = self._call({"url": old}, "/peer/pull", {"since": 1 << 62, "decided": 1 << 62, "wait": 0},
+                                timeout=CONFIRM_WAIT)
+        except PeerError as e:
+            # 401, 403 or 409: a crewchat answers there. It may be the member itself with a key this machine has
+            # not got yet (409: a removal this machine missed), so it has not moved, as far as anyone can tell
+            # (re-review 14 Nov: a removed machine could take the remover's place this way).
+            if not e.status and itself:  # nothing answers there: it moved, if it says so itself
+                self._unverified(mid, new)
+                return new
+            return old
+        itself = (answer.get("members") or {}).get(mid) if isinstance(answer, dict) else None
+        if not isinstance(itself, dict):
+            return new  # another machine answers there now
+        said = clean_url(itself.get("url")) or old
+        with self.mesh.lock:
+            (self.mesh.data.get("unverified") or {}).pop(mid, None)  # it answered at its address as itself
+        if said != new:
+            self._moves[(mid, new)] = (now, said)
+            self.log("kept %s's address: it still answers at %s, not %s" % (itself.get("name") or mid, said, new))
+        return said
+
+    def _really_gone(self, removed, speaker, between=()):
+        """The removals in `removed` (news from `speaker`) that hold here. A member named as removed that answers this
+        machine's key with 409 holds a newer key: it changed the key itself, so it was not removed, and the news came
+        from a machine removed by it (round-2 re-review: a removed machine could cut off the remover this way).
+        Unless it takes one of `between`, the keys the speaker held after this machine's and before the new one: then
+        this machine only missed an earlier change, and the speaker is ahead of that member (audit, round 3; a removed
+        machine does not know the key it was removed with). Only names this machine has not taken as removed already
+        are asked; one that does not answer counts. A pull's answer is asked once in ten minutes, not on every pull."""
+        known = self.mesh.data.get("removed") or {}
+        members = self.mesh.members()
+        seen = self.__dict__.setdefault("_gone_seen", {})
+        kept = {}
+        for gone, when in (removed or {}).items():
+            member = members.get(gone)
+            if gone in known or member is None or gone == speaker or gone == self.device_id:
+                kept[gone] = when
+                continue
+            memo = seen.get((gone, str(when)))
+            if not between and memo and time.time() - memo[1] < 600:
+                if memo[0]:
+                    kept[gone] = when
+                continue
+            seen[(gone, str(when))] = (self._named_is_behind(member, speaker, between), time.time())
+            if seen[(gone, str(when))][0]:
+                kept[gone] = when
+        return kept
+
+    def _named_is_behind(self, member, speaker, between):
+        """Is `member`, named as removed by `speaker`, not ahead of this machine's key (see _really_gone)?"""
+        try:
+            self._call(member, "/peer/pull", {"since": 1 << 62, "decided": 1 << 62, "wait": 0}, timeout=CONFIRM_WAIT)
+        except PeerError as e:
+            if e.status == 409:
+                for key in reversed(list(between)):
+                    try:
+                        self._call(member, "/peer/pull", {"since": 1 << 62, "decided": 1 << 62, "wait": 0},
+                                   timeout=CONFIRM_WAIT, key=key)
+                        return True
+                    except PeerError as again:
+                        if again.status == 403:  # it takes that key, and already knows it was removed
+                            return True
+                self.log("refused news from %s that %s was removed: %s holds a newer key"
+                         % ((self.mesh.members().get(speaker) or {}).get("name", speaker), member.get("name"),
+                            member.get("name")))
+                return False
+        return True
+
+    def _unverified(self, mid, url):
+        """Note an address taken only on the word of a request that names itself `mid`, while nothing answered at the
+        old one: anyone with the key could have sent it, so a key change that this address confirms is refused
+        (_remover_confirms) until the member answers as itself somewhere it was known."""
+        with self.mesh.lock:
+            self.mesh.data.setdefault("unverified", {})[mid] = url
+
+    def _keep_telling(self):
+        """Tell the members that missed a key change (remove) until each has heard it, or a week has passed."""
+        attempt = 0
+        while not self.stopped.is_set():
+            with self.mesh.lock:
+                telling = dict(self.mesh.data.get("telling") or {})
+                if not telling:
+                    self._teller = None
+                    return
+            self.stopped.wait(TELL_BACKOFF[min(attempt, len(TELL_BACKOFF) - 1)])
+            attempt += 1
+            if self.stopped.is_set():
+                return
+            members = self.mesh.members()
+            for mid, news in telling.items():
+                member = members.get(mid)
+                done = member is None or time.time() - float(news.get("since") or 0) > TELL_FOR
+                if not done:
+                    try:
+                        self._call(member, "/peer/rekey", {"secret": news["secret"], "removed": news["removed"],
+                                                           "between": news.get("between") or []},
+                                   timeout=15, key=news["old"])
+                        done = True
+                        self.log("told %s of the key change it missed" % member["name"])
+                    except PeerError as e:
+                        done = e.status in (401, 403)  # it holds a newer key, or was removed itself (503: try again)
+                        if e.status == 403:  # it refused: it may hold a key a removed machine gave it (round-4 re-review)
+                            with self.mesh.lock:
+                                self.mesh.data.setdefault("refused", {})[mid] = time.time()
+                                self.mesh.save()
+                            self.log("%s refused the key change: it may hold the key of a machine that was removed. "
+                                     "Link it again (crewchat peers leave on it, then a new invite)" % member["name"])
+                if done:
+                    with self.mesh.lock:  # a newer removal while this one was on its way is still to tell
+                        pending = self.mesh.data.get("telling") or {}
+                        if (pending.get(mid) or {}).get("secret") == news.get("secret"):
+                            pending.pop(mid, None)
+                            self.mesh.save()
+
     def _remover_confirms(self, device, secret, removed):
         """A key change is real only when the member that sent it removed someone else, and, asked at the
-        address this machine has for it, already takes the new key. Every member holds the shared key, so the
+        address this machine has for it, already takes the new key. True, False, or None when it cannot be told now
+        (no answer, or its address is unverified): the sender asks again. Every member holds the shared key, so the
         key alone cannot tell the remover from a removed machine that missed the news (review, 5 Nov)."""
         remover = self.mesh.members().get(device)
         if remover is None or not removed or device in removed or self.device_id in removed:
             return False
+        if (self.mesh.data.get("unverified") or {}).get(device) == remover.get("url"):
+            self.log("refused a key change: %s's address was taken while it could not be checked" % remover["name"])
+            return None  # not now: asked again once its address is checked
         try:
             self._call(remover, "/peer/pull", {"since": 1 << 62, "decided": 1 << 62, "wait": 0},
                        timeout=CONFIRM_WAIT, key=secret)
-        except PeerError:
-            return False
+        except PeerError as e:
+            # It said no (401, 403, 409), or could not say now (no answer, a 5xx while it restarts, 429): asked again.
+            return False if e.status in (401, 403, 409) else None
         return True
 
     def _join(self, body):
@@ -937,7 +1152,8 @@ class PeerSync(crewchat.ProjectLink):
         if older:
             own, agents, key, info = older, hub.local_state(), "", self.my_info()  # "": the roster comes again next pull
             needs = self._needs()
-        out = {"messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
+        out = {"proto": PROTO, "min_proto": MIN_PROTO, "now": time.time(),
+               "messages": own, "v": key, "agents": agents, "removed": self.mesh.data.get("removed", {}),
                "preferred": self.mesh.data.get("preferred"), "needs": needs}
         if self.chat is None:  # this machine's version, OS and projects (M1, M2): the machine's link only; null while
             out["info"] = info  # it is not known yet (an older crewchat sends no "info" at all)
@@ -1014,6 +1230,17 @@ class PeerSync(crewchat.ProjectLink):
                 told.append(member["name"])
             except PeerError:
                 missed.append(member["name"])
+                with self.mesh.lock:  # tried again later: a member asleep now must still hear of it (H5)
+                    telling = self.mesh.data.setdefault("telling", {})
+                    before = telling.get(other) or {}  # it missed an earlier change too: it still holds that key
+                    # The keys after the one it holds: they show it a member named in this news is behind the sender.
+                    between = list(before.get("between") or []) + ([before["secret"]] if before.get("secret") else [])
+                    telling[other] = {"old": before.get("old", old), "secret": secret, "between": between[-16:],
+                                      "removed": dict(before.get("removed") or {}, **{mid: gone["tag"]}),
+                                      "since": before.get("since", time.time())}
+        if missed:
+            self.mesh.save()
+            self._start_telling()
         self.log("removed %s" % gone["name"])
         return told, missed
 
@@ -1314,15 +1541,15 @@ def _cmd_peers(args):
 
     if action in ("invite", "join") and not crewchat.server_up(config):
         # Before a code is made or used: the other machine would count this one in, and it could not start.
-        raise PeerError("the server is not running here. Start it with `crewchat start` in your project "
-                        "folder, then run this again%s." % ("; the code still works" if action == "join" else ""))
+        raise PeerError("the server is not running here. Start it with `crewchat start` (`crewchat start FOLDER` links "
+                        "a folder too), then run this again%s." % ("; the code still works" if action == "join" else ""))
     if action == "invite":
         first = not mesh.exists
         out = server_call("peers-invite", name=args.name, url=args.url)
         if first:
             print("Started a chat between your machines, with this one (%s) as the first member." % out["me"])
-        print("On the other machine, after installing crewchat and running `crewchat start` in its project")
-        print("folder, run this within %d minutes (the code works once):" % (INVITE_TTL // 60))
+        print("On the other machine, after installing crewchat and running `crewchat start`, run this")
+        print("within %d minutes (the code works once):" % (INVITE_TTL // 60))
         print()
         print("  " + out["command"])
         print()
@@ -1365,7 +1592,8 @@ def _cmd_peers(args):
             print("Nothing changed.")
             return
         out = server_call("peer-remove", id=mid)
-        print("Removed %s and changed the shared key." % args.target)
+        print("Removed %s and changed the shared key. If it was lost or stolen, also remove it from your tailnet "
+              "(Tailscale's admin console), so it cannot reach your machines' servers at all." % args.target)
         if out.get("missed"):
             print("Not reachable just now, so left behind until they join again: %s" % ", ".join(out["missed"]))
 

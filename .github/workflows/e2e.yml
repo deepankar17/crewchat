@@ -1,0 +1,40 @@
+name: e2e
+
+# The end-to-end tests on the public repository, where Linux runners are free (owner, 14 Nov 2026): weekly, and by hand
+# on any branch or tag: gh workflow run e2e --repo deepankar17/crewchat --ref <branch or tag>
+# Never in crewchat-dev, whose Actions minutes run out (its default branch is dev, so its schedule would start there).
+# GitHub turns a schedule off after 60 days without activity in the repository: start it again from the Actions tab.
+
+on:
+  schedule:
+    - cron: "41 5 * * 2"  # Tuesdays
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    if: github.repository == 'deepankar17/crewchat'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          # With the tags. The upgrade tests start from 0.9 releases, which the public history (from 1.0.0) lacks: they skip.
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: "3.13"
+      - run: python -m pip install websocket-client cryptography uv
+      # Ubuntu 24.04 does not give an unprivileged user Chrome's sandbox, so the tests' Chrome runs without it.
+      - name: Chrome for the chat-page tests
+        run: |
+          printf '#!/bin/sh\nexec %s --no-sandbox "$@"\n' "$(command -v google-chrome)" > "$RUNNER_TEMP/chrome"
+          chmod +x "$RUNNER_TEMP/chrome"
+          echo "CREWCHAT_CHROME=$RUNNER_TEMP/chrome" >> "$GITHUB_ENV"
+      # Fails, not passes, when the chat-page or installer tests were skipped for want of Chrome or uv.
+      - run: python e2e/ci.py
+        env:
+          CREWCHAT_E2E_NO_OLD_TAGS: "1"  # the public history starts at 1.0.0: the upgrade tests' 0.9 tags are not in it

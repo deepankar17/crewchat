@@ -4,10 +4,13 @@ Start with:
 
 ```bash
 crewchat status
+crewchat doctor
 ```
 
-It says whether the server is running, which folders are connected, which machines are linked,
-and who is here. On the chat page, **Settings › Advanced** runs it too (and every other command), and **Settings ›
+`status` says whether the server is running, which folders are connected, which machines are linked,
+and who is here. `doctor` checks crewchat's folder, settings, tokens and messages, and says what to do for each
+problem, and checks each project folder (not found, held, open on another machine, on a network drive); it sends
+nothing and names no secret, project or folder, so you can paste it into an issue. On the chat page, **Settings › Advanced** runs it too (and every other command), and **Settings ›
 Machines & devices** has **Check everything**. The server's log is `~/.crewchat/hub.log`. Many problems are fixed
 in a later release: **Settings › About** shows your version, with **Check for updates** (or `crewchat --version`
 and `crewchat update`).
@@ -29,7 +32,7 @@ and `crewchat update`).
 connection was closed`.** Something on that network (a firewall, or the provider) cuts the connection to the
 installer's address. The installers come from crewchat.dev; older guides fetch them from
 `raw.githubusercontent.com`, which some networks block. Use the command in [1. Install](getting-started.md#1-install),
-or, with uv, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"`, which needs only PyPI.
+or, with uv, `uv tool install --refresh-package crewchat --python 3.12 crewchat`, which needs only PyPI.
 
 **`crewchat: command not found` after installing.** The command is in `~/.local/bin`, which a new
 terminal finds. Open a new terminal. In zsh, `rehash` also works. If it is still not found, add
@@ -50,16 +53,23 @@ terminal finds. Open a new terminal. In zsh, `rehash` also works. If it is still
 **`NameError: name 'base_events' is not defined`, or "Windows Smart App Control blocked a file of
 this Python".** Smart App Control refuses the unsigned Python that uv installs; Google's library
 for cloud sync is the first thing that needs the blocked file. Install the signed Python from
-python.org and move crewchat onto it:
+python.org, then run crewchat's installer again: with Smart App Control on, or evaluating the PC, it
+uses that Python (3.12, or any python.org Python 3.10 or later). With Smart App Control on and no
+signed Python, the installer stops before installing and prints this command.
 
 ```powershell
 winget install -e --id Python.Python.3.12
-crewchat stop
-uv tool install --reinstall --python-preference only-system --python 3.12 "crewchat[cloud]"
-crewchat service restart
 ```
 
-Open a new PowerShell window after the `winget` line. To check the result:
+Open a new PowerShell window, then:
+
+```powershell
+$env:CREWCHAT_SYSTEM_PYTHON = "1"
+powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
+```
+
+(`CREWCHAT_SYSTEM_PYTHON` makes it use that Python even where it cannot tell Smart App Control is on.) This is
+the one recipe for every Smart App Control message below. To check the result:
 `& "$env:APPDATA\uv\tools\crewchat\Scripts\python.exe" -c "import asyncio, google.cloud.firestore; print('ok')"`.
 
 **`Program 'crewchat.exe' failed to run: An Application Control policy has blocked this file`.**
@@ -71,10 +81,9 @@ instead, ahead of it on your PATH. Run the installer again to get it:
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
-Open a new PowerShell window after it, then `crewchat start`. Until then, run crewchat by Python:
-`& "$env:APPDATA\uv\tools\crewchat\Scripts\python.exe" "$env:APPDATA\uv\tools\crewchat\Lib\site-packages\crewchat.py" start`.
-If Windows blocks that `python.exe` too, uv installed its own unsigned Python: move crewchat onto
-python.org's Python as the entry above says.
+Open a new PowerShell window after it, then `crewchat start .` in your project folder. Until then, run crewchat by Python:
+`& "$env:APPDATA\uv\tools\crewchat\Scripts\python.exe" "$env:APPDATA\uv\tools\crewchat\Lib\site-packages\crewchat.py" start .` in that folder.
+If Windows blocks that `python.exe` too, uv installed its own unsigned Python: follow the recipe above.
 
 **Reinstalling fails with `failed to remove directory ... Scripts: Access is denied`.** crewchat is
 still running from that folder, so Windows keeps its files open. Stop it first: `crewchat stop`.
@@ -98,9 +107,9 @@ If `uv tool uninstall` fails too, delete the folder instead:
 **`crewchat service stop` is not a command.** Stopping is `crewchat stop`; starting again is
 `crewchat restart`, or `crewchat service restart` when crewchat starts at log on.
 
-**`crewchat start` in a new folder stops with `PermissionError: [WinError 5] Access is denied`.**
+**`crewchat start .` in a new folder stops with `PermissionError: [WinError 5] Access is denied`.**
 A virus scanner or the search indexer held the new project's files for a moment. Fixed in 0.11.2:
-`crewchat update`, then `crewchat start` again.
+`crewchat update`, then `crewchat start .` again in that folder.
 
 **`no project called .new-xxxxxxxx here`.** A `crewchat start` that failed on an older version left
 a half-made project behind. Fixed in 0.11.3: `crewchat update`. On an older version, delete it:
@@ -109,6 +118,20 @@ a half-made project behind. Fixed in 0.11.3: `crewchat update`. On an older vers
 **`crewchat service install` cannot use Task Scheduler.** Without administrator rights crewchat
 starts from your startup programs instead, and says so. That works the same; it only needs you to
 log on.
+
+## macOS
+
+**"Background Items Added" appears after `crewchat start`.** That is macOS telling you crewchat's login service
+(`io.crewchat.hub`) will start the chat when you log in. `crewchat service uninstall` removes it; the chat then runs
+only while you start it.
+
+**The chat does not come back after a restart.** `launchctl list | grep crewchat` shows whether the service is
+loaded; `crewchat service install` writes it again.
+
+**The crewchat app in Applications does nothing.** It runs the Python crewchat was installed with. After an update
+that moved it, `crewchat hooks refresh` makes the app again (`crewchat update` does this for you);
+`crewchat shortcut on` makes it by hand. The page opens in a Chrome or Edge window, so look under that browser's Dock
+icon.
 
 ## Updating
 
@@ -139,8 +162,9 @@ tool list: restart it.
 - Did you start it from **+ New agent** and it never joined? It waits in **Needs you** as a **Not started** card,
   with why (its exit code, or that it has not joined after 5 minutes) and its last lines. **Try again** starts it
   again.
-- Was its session open before you ran `crewchat start` in that folder? Restart the session.
-- Is it in the connected folder? `crewchat start` only connects the folder it runs in.
+- Was its session open before that folder was connected? Restart the session.
+- Is it in a connected folder? `crewchat start .` in it (or Connect on the page) connects only that folder; a
+  bare `crewchat start` connects none.
 - Claude Code: if it asks whether to use the project's MCP server `crewchat`, allow it. For an agent in the
   background, that question is a card in **Needs you**: **Approve and start**.
 - A background agent stuck on a question only its terminal can answer shows in **Needs you** too. **Show terminal**
@@ -195,6 +219,13 @@ restart`.
 
 ## The chat page and your phone
 
+**The page says `421` or "not under this name".** Since 2.1.0 the server answers only under its own names
+(`localhost`, its IP addresses, `.local` and `.ts.net` names, linked machines), so a web page elsewhere cannot reach it
+through a name it points at your machine. If you reach crewchat through a proxy or a name of your own, set it with
+`crewchat url https://that.name`, or list it in `CREWCHAT_HOSTS` (several, separated by commas) before the server
+starts.
+
+
 **"That code is wrong or has expired."** A sign-in code works once, for two minutes. Run
 `crewchat ui --print` again for a new one.
 
@@ -237,14 +268,14 @@ and the project switcher marks it "(shared)".
 **Two crewchat setups on one machine (`CREWCHAT_HOME`).** crewchat keeps everything in
 `~/.crewchat`, unless `CREWCHAT_HOME` names another folder: that is a second, separate setup, with
 its own port, projects and links (useful for trying cloud sync without touching your real chat).
-Every command uses the setup `CREWCHAT_HOME` points to, so a plain `crewchat start` connects the
+Every command uses the setup `CREWCHAT_HOME` points to, so `crewchat start .` connects the
 folder to `~/.crewchat`, not to the second one. For a while, set it once in that terminal:
 
 ```bash
 export CREWCHAT_HOME=~/.crewchat-test
 ```
 
-For good, keep one setup per machine. A folder belongs to one setup at a time: `crewchat start` in
+For good, keep one setup per machine. A folder belongs to one setup at a time: `crewchat start .` in
 it moves it to the setup that command uses, and sessions already open there keep talking to the
 old one until they restart.
 
@@ -253,6 +284,13 @@ folder has since moved to another project or setup. Restart the session in the f
 
 ## Several machines
 
+**"that machine runs a crewchat too old for this one" (426).** Linked machines say which link protocol they speak.
+Run `crewchat update` on the machine named, then it links again by itself.
+
+**Machines shows "clock N s ahead" or "behind".** That machine's clock is off by 5 seconds or more. crewchat corrects
+file leases for it, but fix the clock (turn on automatic time in the system settings) so times in the chat line up.
+
+
 **Over Tailscale: `crewchat peers invite` says Tailscale is not signed in or Serve did not
 start.** Open Tailscale and sign in. The first time, Tailscale asks you to allow Serve for your
 account: follow the link it prints, then run the command again.
@@ -260,9 +298,14 @@ account: follow the link it prints, then run the command again.
 **A linked machine shows as offline in `crewchat peers status`.** It is switched off, asleep, not
 connected to Tailscale, or its crewchat server is not running. It catches up when it is back.
 
-**"wrong key … join again with a new code".** The machine was off when another machine was
-removed and the shared key changed. Run `crewchat peers leave` on it, then
-`crewchat peers invite` on a linked machine and join again.
+**"the key changed; waiting for the news of it" (409).** This machine was off when another machine
+was removed and the shared key changed. Nothing to do: the machine that removed it keeps telling it
+the new key, for up to a week, and it carries on once that arrives. Both machines need 2.1.0 or
+later; on an older one, update it (`crewchat update`).
+
+**"wrong key … join again with a new code".** The machine missed a key change for longer than a
+week, or was removed itself. Run `crewchat peers leave` on it, then `crewchat peers invite` on a
+linked machine and join again.
 
 **Taking a task fails with "cannot reach …".** Over Tailscale, the machine a task was posted on
 settles it, or the coordinator while that machine is off: this means neither could be reached. Try
@@ -298,17 +341,17 @@ when the connection is back. The log says `cannot send, will retry`.
 **No folders to choose from, or "No folder on this machine is in this project yet".** The menu
 lists this machine's folders in the project that is open on the page. Connect one in New agent
 itself (**Or connect one**: type a path, or **Browse…**, then **Connect**), or in a terminal in the
-folder: `crewchat start --chat NAME` (or `crewchat start` in a new folder named like the project).
+folder: `crewchat start --chat NAME` (or `crewchat start .` in a new folder named like the project).
 With two setups on the machine, use the setup that serves the page (see
-[Two crewchat setups](#projects)). Folders connected before version 0.8 need `crewchat start` once
+[Two crewchat setups](#projects)). Folders connected before version 0.8 need `crewchat start .` once
 more.
 
 **Cursor shows as "not installed" in the tool menu.** The chat page starts Cursor's command-line
 agent, not the Cursor app. Install it (`curl https://cursor.com/install -fsS | bash`), then run
-`crewchat start` once in a terminal where `cursor-agent` works.
+`crewchat start .` once in a project folder, in a terminal where `cursor-agent` works.
 
 **"Claude Code is not installed here, or crewchat cannot find it."** The server may run with a
-shorter PATH than your terminal. Run `crewchat start` once in a terminal where `claude` works:
+shorter PATH than your terminal. Run `crewchat start .` once in a project folder, in a terminal where `claude` works:
 it notes where the tool is.
 
 **The agent did not join.** Look in **Needs you**: what Claude Code asks the first time in a folder (trust it, use
@@ -324,5 +367,11 @@ close agents. **Reopen** on a card brings an agent back with its conversation, a
 **Nothing opened on Linux.** This is for **Run it: In a Terminal window** (and for tools that only run in a
 window). crewchat looks for `x-terminal-emulator`, `gnome-terminal`, `konsole` or `xterm`. Install one, or open the
 agent yourself in the folder.
+
+## Still stuck
+
+[Open an issue](https://github.com/deepankar17/crewchat/issues/new/choose) with what you did, what you saw
+and the output of `crewchat status`, or run `crewchat feedback bug`: it opens the form with your version filled in.
+One person maintains crewchat, so an answer can take a few days.
 
 Back to the [README](../README.md)

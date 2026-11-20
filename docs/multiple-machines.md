@@ -13,8 +13,8 @@ agents, and the machines are linked: over Tailscale, or through your own Firebas
 
 ## Choose how to link
 
-On every machine, first [install crewchat](getting-started.md#1-install) and run `crewchat start` in
-the project folder. Then open **Machines & devices**, at the foot of the chat page's sidebar (or **Settings ›
+On every machine, first [install crewchat](getting-started.md#1-install) and run `crewchat start .` in
+the project folder (or `crewchat start`, then link the folder on the page). Then open **Machines & devices**, at the foot of the chat page's sidebar (or **Settings ›
 Machines & devices**, the **Machines** tab). It shows both ways side by side, with what each machine still needs,
 and links them in a few clicks:
 
@@ -92,6 +92,10 @@ crewchat peers status            # who is linked, and who is reachable now
 crewchat peers remove laptop     # drop a machine; the shared key changes so it is shut out
 crewchat peers leave             # unlink this machine
 ```
+
+Removing a lost or stolen machine? Also remove it from your tailnet in Tailscale's admin console, so it
+cannot reach your other machines at all, and keep this machine on until **Machines** shows that every member
+has the new key. Why: [SECURITY.md](../SECURITY.md).
 
 How it works: each server asks every other one for news, with long-polls that wait until there is
 something new, so messages arrive within a moment. A machine that was off catches up on what it

@@ -28,7 +28,7 @@ its core.
 | `crewchat_map.py` | The code map: files, definitions and imports of the project's code (standard library) |
 | `plugin/` | The Claude Code and Cursor plugin: the setup skill, and the Claude Code mod (`plugin/hooks/register.js`) that draws the band above the prompt and the chat pane |
 | `install.sh`, `install.ps1` | The one-line installers: `install.sh` for macOS and Linux, `install.ps1` for Windows (PowerShell) |
-| `tests/` | The unit tests, well over a thousand: `test_crewchat.py` (one machine, most of them), `test_peers.py` and `test_cloud.py` (several machines), `test_map.py` (the code map), `test_mcp_servers.py`, `test_crew.py` (a lead adding agents), `test_park.py` (parking tasks), `test_phone.py`, `test_conversation.py` (the advisor's excerpt), `test_desktop_mod.py` (the Claude Code mod, run in Node when it is installed), `test_durability.py`, `test_workflows.py` (GitHub Actions run only for main), and smaller ones |
+| `tests/` | The unit tests, well over a thousand: one machine's server by area (`test_crewchat.py`, `test_page.py`, `test_tasks_roles.py`, `test_launching.py`, `test_machines_browser.py`, `test_notes_lifecycle.py`, `test_jira_gchat.py`, `test_devices_routines.py`, `test_start_welcome.py`, `test_project_folders.py`, all on the fixture in `crewchat_fixture.py`), `test_peers.py` and `test_cloud.py` (several machines), `test_map.py` (the code map), `test_mcp_servers.py`, `test_crew.py` (a lead adding agents), `test_park.py` (parking tasks), `test_phone.py`, `test_conversation.py` (the advisor's excerpt), `test_desktop_mod.py` (the Claude Code mod, run in Node when it is installed), `test_durability.py`, `test_workflows.py` (GitHub Actions run only for main), and smaller ones |
 | `e2e/` | End-to-end tests, about 200: real servers, agents' hooks, the chat page in Chrome, linked machines, the installer, security, load, and the benchmark (`bench.py`) |
 
 `crewchat.py` reads top to bottom in parts, each opening with a comment that names it: the shared
@@ -64,7 +64,8 @@ python3 -m unittest discover -s e2e -v
 The chat-page tests need Google Chrome and `pip install websocket-client`, and the installer tests
 need `uv`; each is skipped without them. `CREWCHAT_BIN=/path/to/crewchat` tests an installed copy
 instead of this checkout, `CREWCHAT_LOAD=80` sends more messages in the load test, and
-`CREWCHAT_E2E_KEEP=1` keeps the throwaway folder for a look afterwards. Cloud sync needs a real
+`CREWCHAT_E2E_KEEP=1` keeps the throwaway folder for a look afterwards, and `CREWCHAT_CHROME=/path/to/chrome`
+uses another Chrome for the chat-page tests. Cloud sync needs a real
 Firebase project, so it is covered by `tests/test_cloud.py` with a stand-in store; Windows is not
 covered here. `tests/test_desktop_mod.py` runs the Claude Code mod in Node, and is skipped without it.
 
@@ -100,5 +101,7 @@ The guides are in `docs/`.
 
 ## Reporting bugs
 
-Open an issue with what you ran, what you expected and what happened. For anything
-security-sensitive, see [SECURITY.md](SECURITY.md) instead.
+Open an issue with one of the forms (`crewchat feedback` or Settings › About fills in your version and system): what
+you ran, what you expected and what happened. For anything security-sensitive, see [SECURITY.md](SECURITY.md) instead.
+
+crewchat has one maintainer, who reads every issue and replies as time allows.

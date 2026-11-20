@@ -2,7 +2,14 @@
 
 Cloud sync lets machines that are signed in to the same Google account share one crewchat,
 with no host machine and no Tailscale. It runs through **your own** Firebase project, set up
-once. This page covers that setup two ways:
+once. A project serves one Google account: the rules below lock it to yours, so nobody else can
+sign in to it or use its quota. Anyone else who wants cloud sync sets up a project of their own.
+
+Cloud sync's libraries (about 70 MB) are not in the plain install. Add them on each machine that
+syncs, with `crewchat update --cloud` (or `pip install "crewchat[cloud]"` if you installed with
+pip). Updates keep them.
+
+This page covers the setup two ways:
 
 - [By hand](#by-hand), in about ten minutes.
 - [With an agent](#with-an-agent): give the prompt below to Claude (or any agent that can use
@@ -47,8 +54,9 @@ before they reach Firestore, so whoever administers the project cannot read them
 
 3. Click **Publish**.
 
-The rules let each Google account read and write only its own data, with size limits on writes.
-If the editor will not let you type, click **Develop and Test**, close the panel that opens, then
+These first rules let each Google account read and write only its own data, with size limits on
+writes. Your account can only be named in them once it has signed in, so you lock them to it in
+[step 7](#7-on-every-machine). If the editor will not let you type, click **Develop and Test**, close the panel that opens, then
 click inside the rules and try again.
 
 ### 4. Turn on Google sign-in
@@ -78,9 +86,9 @@ click inside the rules and try again.
 3. Application type: **Desktop app**. Name: `crewchat cli`. Click **Create**.
 4. In the dialog that follows, click **Download JSON** and save it as `oauth-client.json`.
    The secret in it is shown only once.
-5. Open **OAuth consent screen** (or **Audience**). If the app is in **Testing**, either add your
-   Google account under **Test users**, or click **Publish app**. crewchat only asks for your
-   name and email, so publishing needs no review.
+5. Open **OAuth consent screen** (or **Audience**). Leave the app in **Testing** and add your
+   Google account under **Test users**. Do not click **Publish app**: in Testing, only the test
+   users can sign in.
 
 ### 7. On every machine
 
@@ -92,7 +100,18 @@ crewchat service restart          # or restart `crewchat serve`
 
 ![crewchat cloud setup, login and restart on the first machine](images/demo-cloud-setup.gif)
 
-The first machine founds the account. Each later machine prints a fingerprint and waits; approve
+The first machine founds the account. Now lock the project to your account, once: run
+
+```bash
+crewchat cloud rules
+```
+
+on that machine, and publish what it prints in Firestore's **Rules** tab, as in step 3. On a
+signed-in machine the rules name your account, so no other Google account gets in, even one that
+somehow signs in to your project. The Machines panel shows the same rules after **Sign in with
+Google**.
+
+Each later machine prints a fingerprint and waits; approve
 it from a machine that is already set up, after checking the fingerprint matches:
 
 ```bash
@@ -153,11 +172,12 @@ Use my browser, where I am already signed in to Google.
    of type "Desktop app" named "crewchat cli". From the dialog, save the client ID and secret to
    ~/.crewchat/oauth-client.json as {"installed": {"client_id": ..., "client_secret": ...}},
    with file permissions 600. The secret is shown only once.
-8. Check the OAuth consent screen / Audience: if it is in Testing, add my Google account as a
-   test user.
+8. Check the OAuth consent screen / Audience: leave it in Testing and add my Google account as a
+   test user. Do not click Publish app.
 9. Run: crewchat cloud setup --web-config ~/.crewchat/firebase-web.json --oauth-client ~/.crewchat/oauth-client.json
    Then tell me to run `crewchat cloud login` myself (it opens a Google sign-in I must approve),
-   and, for my phone, to press Publish the page in Settings › Machines & devices (Google asks me there too).
+   then to publish what `crewchat cloud rules` prints in Firestore › Rules (it locks the project to my
+   account), and, for my phone, to press Publish the page in Settings › Machines & devices (Google asks me there too).
 
 Rules for you:
 - Never paste the OAuth client secret into this chat or any message, and never commit it.
@@ -172,7 +192,8 @@ Rules for you:
 
 | Symptom | Likely cause |
 |---|---|
-| `Firestore refused: check the security rules` | The rules from step 3 are not published, or the machine signed in to a different Google account than the others |
+| `Firestore refused: check the security rules` | The rules from step 3 are not published, or the machine signed in to a different Google account than the others (the locked rules from step 7 let in only yours) |
+| `cloud sync needs the cryptography library` or `Google's Firestore library` | This install has no cloud sync libraries: `crewchat update --cloud` |
 | `sign-in failed ... redirect_uri_mismatch` | The OAuth client is not of type **Desktop app** |
 | `access_denied` or "app not verified" during sign-in | Your account is not a test user while the app is in Testing (step 6.5) |
 | A machine stays "waiting for approval" | Run `crewchat cloud approve NAME` on a machine that is already approved |

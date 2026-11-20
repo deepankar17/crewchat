@@ -112,7 +112,7 @@ class TwoMachines(unittest.TestCase):
         self.dev.call("hub_task", action="update", id=tid, status="in_progress", note="stopping running processes first")
         for m in (self.mac, self.win):
             m.owner.wait_for("stopping running processes first", kind="update", to="Owner")
-        self.dev.call("hub_task", action="update", id=tid, status="done", note="installer fixed")
+        self.dev.call("hub_task", action="update", id=tid, status="done", note="installer fixed\nDecisions: none\nLeft over: none")
         self.mac.owner.wait_for("installer fixed", kind="update", to="Owner")
         self.assertNotIn("installer fixed", self.lead.stop_hook())
         self.mac.owner.role(self.lead.name, "none")
@@ -130,7 +130,7 @@ class TwoMachines(unittest.TestCase):
         self.assertIn("[TASK, assigned to you, part of #%s]" % job, got)
         self.dev.call("hub_task", action="update", id=piece, status="in_progress", note="starting the download page")
         self.assertIn("starting the download page", eventually(self.lead.stop_hook, what="the lead to hear"))
-        self.dev.call("hub_task", action="update", id=piece, status="done", note="download page live")
+        self.dev.call("hub_task", action="update", id=piece, status="done", note="download page live\nDecisions: none\nLeft over: none")
         heard = eventually(self.lead.stop_hook, what="the lead to hear it is done")
         self.assertIn("download page live", heard)
         self.assertIn("%s is free" % self.dev.name, heard)
@@ -260,7 +260,7 @@ class SharedProjects(unittest.TestCase):
                 folder = m.dir / "t2"
                 folder.mkdir()
                 H.subprocess.run(["git", "init", "-q", str(folder)], check=True)
-                self.assertIn('Created the project "t2"', m.cli("start", "--no-service", "--no-open", cwd=folder))
+                self.assertIn('Created the project "t2"', m.cli("start", folder, "--no-service", "--no-open"))
                 folders[m.name] = folder
             x = mac.agent(folder=folders["mac"])
             y = win.agent(folder=folders["win"])

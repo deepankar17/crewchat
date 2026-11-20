@@ -1,5 +1,6 @@
 """A feedback channel without telemetry (review finding 7): `crewchat feedback` opens a GitHub issue form with
 the version and system filled in, and sends nothing itself."""
+import os
 import re
 import sys
 import unittest
@@ -10,6 +11,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+os.environ["CREWCHAT_NO_SHORTCUT"] = "1"  # no test, nor a child process of one, makes a real shortcut
 import crewchat  # noqa: E402
 
 FORMS = ROOT / ".github" / "ISSUE_TEMPLATE"
@@ -21,6 +23,12 @@ class Feedback(unittest.TestCase):
             text = (FORMS / form).read_text(encoding="utf-8")
             ids = set(re.findall(r"^\s+id: (\S+)$", text, re.M))
             self.assertTrue({"version", "system"} <= ids, (kind, ids))
+
+    def test_every_issue_uses_a_form_and_says_who_answers(self):
+        self.assertIn("blank_issues_enabled: false", (FORMS / "config.yml").read_text(encoding="utf-8"))
+        for form in set(crewchat.FEEDBACK_KINDS.values()):
+            self.assertIn("one maintainer", (FORMS / form).read_text(encoding="utf-8"), form)
+        self.assertIn("one maintainer", (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8"))
 
     def test_the_link_names_the_form_version_and_system(self):
         url = crewchat.feedback_url("bug")

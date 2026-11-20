@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_crewchat import TMP, Base, crewchat  # noqa: E402  (the shared server fixture)
+from crewchat_fixture import TMP, Base, crewchat  # noqa: E402  (the shared server fixture)
 
 LEAD_POWERS = ["assign", "areas", "notes", "code", "crew"]
 
@@ -61,6 +61,48 @@ class LeadAddsAgents(unittest.TestCase):
 
     def events(self, word):
         return [m["text"] for m in self.hub.messages if m["kind"] == "event" and word in m["text"]]
+
+    def test_the_lead_reopens_an_agent_that_reports_to_it(self):
+        # Owner, 17 Nov: when reopening does not happen by itself, the lead brings its agent back (hub_crew reopen), in
+        # the background only: a lead never opens a window on the owner's screen.
+        dev = self.agent("Dev1")
+        self.hub.agents[dev]["session"] = {"app": "background", "tool": "claude", "folder": self.folder,
+                                           "id": "s-dev", "pid": 999999}
+        opened = []
+        with mock.patch.object(self.hub, "_reopen_plan", lambda name, model=None: ({"app": "background"}, self.folder,
+                                                                                   ["claude"], "k", {})), \
+                mock.patch.object(self.hub, "_open_again", lambda name, *a, **kw: opened.append((name, kw.get("who")))):
+            self.assertIn("Dev1 is reopening in the background", self.call(self.lead, action="reopen", name="Dev1"))
+        self.assertEqual(opened, [("Dev1", self.lead)])
+        self.hub.agents[dev]["session"]["app"] = "terminal"  # its own window: the owner reopens that
+        with self.assertRaises(crewchat.HubError):
+            self.call(self.lead, action="reopen", name="Dev1")
+        with self.assertRaises(crewchat.HubError):
+            self.call(self.lead, action="reopen", name="Nobody")
+
+    def test_a_closed_agent_with_bypass_or_auto_is_the_owner_s_to_reopen(self):
+        """Round 10 (Security): the owner chose Bypass for a running agent, warned; a lead waking it again once it
+        closed, by hub_crew reopen or by a message, would run it unasked with no step by the owner."""
+        dev = self.agent("Dev1")
+        self.hub.agents[dev]["session"] = {"app": "background", "tool": "claude", "folder": self.folder,
+                                           "id": "s-dev", "pid": 999999}
+        opened = []
+        with mock.patch.object(self.hub, "_reopen_plan", lambda name, model=None: ({"app": "background"}, self.folder,
+                                                                                   ["claude"], "k", {})), \
+                mock.patch.object(self.hub, "_open_again", lambda name, *a, **kw: opened.append(name)), \
+                mock.patch.object(self.hub, "_closed_in_background", lambda agent: True):
+            for mode in ("all", "auto"):
+                self.hub.agents[dev]["permissions"] = mode
+                with self.assertRaises(crewchat.HubError) as e:
+                    self.call(self.lead, action="reopen", name="Dev1")
+                self.assertIn("only Owner reopens it", str(e.exception))
+                self.hub.waking.pop(dev, None)
+                self.hub._reopen_for(dev, 10 ** 9, by=self.lead)  # a lead's message to it
+            self.assertEqual(opened, [])
+            self.assertTrue(self.events("only you reopen it, from its card"))
+            self.hub.waking.pop(dev, None)
+            self.hub._reopen_for(dev, 10 ** 9, by=crewchat.OWNER)  # the owner's own message still reopens it
+            self.assertEqual(opened, ["Dev1"])
 
     def test_the_lead_adds_a_developer_who_gets_its_task_from_the_lead(self):
         out = self.call(self.lead, action="add", role="developer", name="Dev1", task="Fix the login form",

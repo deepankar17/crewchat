@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_crewchat import Base, crewchat  # noqa: E402  (the shared server fixture)
+from crewchat_fixture import Base, crewchat  # noqa: E402  (the shared server fixture)
 
 try:
     import numpy

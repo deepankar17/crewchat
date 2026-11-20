@@ -28,6 +28,12 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# The tests act as the owner in a terminal. Run inside an AI agent's session (Claude Code's shell sets CLAUDECODE), the
+# owner commands they run would wait for the owner's leave on the page (roadmap O1): crewchat's own list, kept here too.
+AGENT_SESSION_ENV = ("CREWCHAT_LINK_KEY", "CLAUDECODE", "CURSOR_AGENT", "GEMINI_CLI", "QWEN_CODE", "CODEX_SANDBOX",
+                     "CODEX_SANDBOX_NETWORK_DISABLED", "OPENCODE")
+for _name in AGENT_SESSION_ENV:
+    os.environ.pop(_name, None)
 TMP = Path(tempfile.mkdtemp(prefix="crewchat-e2e-")).resolve()
 HOOK_STATE = TMP / "hook-state"  # the hooks keep per-session state in the temp folder
 HOOK_STATE.mkdir()
@@ -98,8 +104,12 @@ class Machine:
         subprocess.run(["git", "init", "-q", str(self.folder)], check=True)
         self.port = free_port()
         self.env = dict(os.environ, CREWCHAT_HOME=str(self.home), TMPDIR=str(HOOK_STATE),
+                        CREWCHAT_NO_SHORTCUT="1",  # a test never makes a real shortcut (and its USERPROFILE etc. are in its own folder too)
                         CREWCHAT_NO_UPDATE_CHECK="1",  # dozens of servers: GitHub's limit; see test_lifecycle
                         HOME=str(self.dir / "user-home"),  # never the real login service or settings
+                        USERPROFILE=str(self.dir / "user-home"),  # Windows' home: the shortcut's Desktop
+                        APPDATA=str(self.dir / "user-home" / "AppData" / "Roaming"),
+                        LOCALAPPDATA=str(self.dir / "user-home" / "AppData" / "Local"),
                         TEMP=str(HOOK_STATE), TMP=str(HOOK_STATE))
         for var in ("CLAUDE_PROJECT_DIR", "CREWCHAT_PROJECT", "CREWCHAT_LISTEN"):
             self.env.pop(var, None)
@@ -139,8 +149,7 @@ class Machine:
         eventually(self.up, what="%s's server to answer" % self.name)
 
     def server_pids(self):
-        out = subprocess.run(["pgrep", "-f", "serve --log %s" % (self.home / "hub.log")], capture_output=True, text=True)
-        return [int(p) for p in out.stdout.split()]
+        return process_ids("serve --log %s" % (self.home / "hub.log"))
 
     def kill(self, hard=True):
         """Stop this machine's server as a crash (hard) or a normal quit would."""
@@ -197,6 +206,19 @@ class Machine:
             self.kill(hard=True)
         except AssertionError:
             pass
+
+
+def process_ids(pattern):
+    """The ids of the running processes whose command line contains pattern: pgrep on macOS and Linux, the process
+    table through PowerShell on Windows (where pgrep does not exist)."""
+    if os.name == "nt":
+        env = dict(os.environ, CREWCHAT_E2E_PATTERN=pattern)
+        script = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine.Contains("
+                  "$env:CREWCHAT_E2E_PATTERN) } | ForEach-Object { $_.ProcessId }")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True, env=env)
+        return [int(p) for p in out.stdout.split() if p.isdigit()]
+    out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    return [int(p) for p in out.stdout.split()]
 
 
 class Agent:

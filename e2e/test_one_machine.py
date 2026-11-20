@@ -219,7 +219,7 @@ class OneMachine(unittest.TestCase):
         folder = self.m.dir / "quiet-folder"
         folder.mkdir()
         H.subprocess.run(["git", "init", "-q", str(folder)], check=True)
-        self.m.cli("start", "--no-service", "--no-open", cwd=folder)
+        self.m.cli("start", folder, "--no-service", "--no-open")
         self.assertIn("off", self.m.cli("hooks", "off", cwd=folder))
         quiet = self.m.agent(folder=folder)
         self.assertEqual(quiet.hook("prompt"), "")
@@ -318,7 +318,8 @@ class OneMachine(unittest.TestCase):
         tid = self.m.owner.task("all", "update the README")
         a.call("hub_task", action="take", id=tid)
         for status in ("in_progress", "blocked", "review", "done"):
-            a.call("hub_task", action="update", id=tid, status=status, note="now " + status)
+            a.call("hub_task", action="update", id=tid, status=status,
+                   note="now " + status + ("\nDecisions: none\nLeft over: none" if status == "done" else ""))
             self.m.owner.wait_for("now " + status, kind="update", to="Owner", status=status)
         self.assertEqual(self.m.owner.poll()["progress"][tid]["status"], "done")
         with self.assertRaises(ToolError):
@@ -367,7 +368,7 @@ class Team(unittest.TestCase):
         # The developer confirms first, and the lead hears it.
         self.dev.call("hub_task", action="update", id=piece, status="in_progress", note="adding a Switch to SettingsScreen")
         self.assertIn("adding a Switch", self.lead.stop_hook())
-        self.dev.call("hub_task", action="update", id=piece, status="done", note="toggle works")
+        self.dev.call("hub_task", action="update", id=piece, status="done", note="toggle works\nDecisions: none\nLeft over: none")
         lead_sees = self.lead.stop_hook()
         self.assertIn("toggle works", lead_sees)
         self.assertIn("%s is free" % self.dev.name, lead_sees)
@@ -482,7 +483,7 @@ class Files(unittest.TestCase):
 
     def test_an_agent_shares_a_file_from_the_project(self):
         report = self.m.folder / "report.txt"
-        report.write_text("all green\n")
+        report.write_bytes(b"all green\n")  # bytes: text mode writes \r\n on Windows
         self.a.call("hub_send", to="Owner", text="results", files=[str(report)])
         msg = self.m.owner.wait_for("results", **{"from": self.a.name})
         self.assertEqual(msg["files"][0]["name"], "report.txt")

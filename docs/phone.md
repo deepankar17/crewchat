@@ -9,6 +9,17 @@ says what needs you ("4 things need you: a command, a plan, a question"): tap it
 The phone talks to one of your computers running crewchat, so it needs a private route to it.
 The easiest is Tailscale.
 
+> **Android or iPhone, free, in three steps**
+>
+> 1. Install [Tailscale](https://tailscale.com/download) on the computer and on the phone, and sign in to both with
+>    the same account (the personal plan is free).
+> 2. On the computer's chat page: **Settings › Phone & remote access**, then **Set it up**. It shares the chat on your
+>    tailnet only, and shows a QR code.
+> 3. Scan the QR code with the phone's camera. It opens the chat signed in; install it from the browser's menu
+>    (Android: **Install app**; iPhone: Share → **Add to Home Screen**).
+>
+> Nothing else to set up: no Firebase, no account with crewchat. The rest of this page is the detail.
+
 <p>
 <img src="images/phone-sign-in.png" width="260" alt="The sign-in page on a phone: type the code from crewchat ui --print, then Sign in. A note explains Add to Home Screen.">
 &nbsp;

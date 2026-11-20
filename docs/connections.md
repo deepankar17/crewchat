@@ -37,6 +37,19 @@ it, and its tools still ask before they change anything in Jira. Codex keeps one
 so add it there yourself: `codex mcp add atlassian --url https://mcp.atlassian.com/v2/mcp`. A server named
 `atlassian` that you set up yourself is left as it is.
 
+### crewchat's own Jira tools
+
+Once you sign in to Atlassian on the Jira card, every agent of a project with a Jira site gets two of crewchat's
+tools, with no setup in its own tool:
+
+- `hub_jira_read`: one ticket by its key, or the tickets a JQL search finds. What people wrote in them reaches the agent
+  marked as their words, not your instructions.
+- `hub_jira_write`: a comment on a ticket, or a new ticket. **Each one waits for your Allow in Needs you,** with the
+  whole comment or ticket on the card; Deny, with a note if you like, sends nothing. The comment is signed with the
+  agent's name, and the change is posted in the chat.
+
+A held project gets neither until you trust it.
+
 ### Tickets assigned to you become tasks
 
 <img src="images/settings-jira.png" width="460" alt="The Jira card in Project settings, Integrations: the Jira site yourcompany.atlassian.net with Save; Sign in to Atlassian so tickets assigned to you become tasks, with a link to create a free Jira site; Look every 5 minutes; and the Ticket cycle, closed.">
@@ -114,6 +127,21 @@ The cycle and its settings are on every linked machine; the one that coordinates
 
 Turning the cycle on adds Jira changes to what the sign-in asks for, so **Sign in again** once. An agent that has gone
 quiet on its turn is reminded after 2 hours, and the ticket comes to you after a day.
+
+## GitHub
+
+Add a GitHub token on the GitHub card (Global settings › Integrations) and every agent gets `hub_github_read`: your
+open pull requests and issues, or one pull request with its description. It only reads; crewchat sends nothing to
+GitHub but those requests.
+
+- **Use a fine-grained token with read access only:** on GitHub, Settings › Developer settings › Fine-grained tokens,
+  the repositories you want, and *Pull requests: Read* and *Issues: Read*. A classic token with `repo` lets agents
+  read every repository you can.
+- **The token is this machine's,** kept in `~/.crewchat/config.json` for every project here, never shown to an agent
+  or the chat page, and refused like crewchat's own tokens if an agent tries to read or share it. Each linked machine
+  has its own. A token in a project folder copied from elsewhere is never used.
+- **A held project** (copied from elsewhere, not trusted yet) has no GitHub tool until you trust it.
+- What pull requests and issues say reaches agents marked as other people's words, not your instructions.
 
 ## Google Chat
 

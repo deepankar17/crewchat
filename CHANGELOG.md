@@ -1,5 +1,294 @@
 # Changelog
 
+## 2.1.0 (2026-11-17)
+
+**Before you upgrade**
+
+- **A bare `crewchat start` no longer connects the folder you are in.** It starts the server and opens the page on
+  its welcome screen. To connect a folder, run `crewchat start .` there (or name the folder). Scripts that run a bare
+  `crewchat start` in a project need the dot.
+- **Owner commands run by an agent now ask you first.** `crewchat say`, `crewchat task` and the rest, started inside
+  an AI agent's session (Claude Code, Cursor, Codex and the others set a variable crewchat looks for, as does running
+  them yourself through an agent's `!` shell), wait for Allow on the chat page or your phone. Run them in your own
+  terminal to skip the card.
+- **Servers and routines that came from another linked machine wait for you once** on each machine, in Needs you,
+  before they run there. So does every later change to what they run.
+- **Other names for this machine get HTTP 421.** The server answers only under `localhost`, its IP addresses, `.local`
+  and `.ts.net` names, the address set with `crewchat url`, and linked machines. Reach it through a proxy or name of
+  your own? Set it with `crewchat url`, or list it in `CREWCHAT_HOSTS`.
+- **A fresh install leaves out cloud sync's libraries.** Using cloud sync already? `crewchat update` keeps them. New to
+  it: `crewchat update --cloud`.
+- **Agents' hooks now refuse reading** crewchat's folder itself, and `peers.json`, `push.json`, `config.json`,
+  `folders.json`, `state.json` and the `cloud/` folder in it, as they do the token files.
+- **Update every linked machine.** Machines on 2.0.0 still link with this one, but the fixes to removing a machine
+  and to changing a machine's address hold only between machines on 2.1.0 or later.
+- **`crewchat start` adds a crewchat shortcut** (Start menu and desktop on Windows, an app in `~/Applications` on
+  macOS, an applications-menu entry on Linux) the first time it runs. Don't want it? `crewchat shortcut off`, or set
+  `CREWCHAT_NO_SHORTCUT=1` before you upgrade.
+- **The page opens in a window of its own** (Edge or Chrome, no address bar) instead of a browser tab. `crewchat ui
+  --tab`, or `"window": "tab"` in `config.json`, keeps the tab.
+- **Removing a project no longer moves its folder into `projects/.removed/`.** The folder stays where it is, and Open
+  a workspace brings the project back.
+- **Going back to 2.0.0** (`CREWCHAT_VERSION=2.0.0` with the installer): projects you created or opened in a workspace
+  folder outside crewchat's own folder don't show there; the first project and those in `projects/` do.
+
+### Projects with several folders
+
+Projects with several folders, started from the page. A project can work in more than one folder, each project has a
+workspace folder of its own, and `crewchat start` no longer makes a project out of whatever folder you run it in.
+
+- **`crewchat start` with no folder links nothing.** It sets the machine up if needed, starts the server and opens the
+  page; it writes nothing into the folder you ran it in, so it is safe from any folder (an administrator prompt
+  included). `crewchat start FOLDER` connects that folder, as `crewchat start` in it did; `--chat`, `--project` and
+  `--place` without a folder still connect the current one. A new project shows a welcome screen (create a project,
+  link its folders, open the chat), its name reads "New project: link a folder to start" until it has a folder, and
+  + New agent waits for one.
+- **Every agent of a project gets all of its folders.** An agent starts in one folder and is given the project's other
+  folders on that machine with its tool's own option: `--add-dir` for Claude Code, Cursor's agent and Codex CLI,
+  `--include-directories` for Gemini CLI and Qwen Code (when the tool's help lists it); a tool without one works in
+  its main folder, and New agent says so. When a folder is linked or taken out, running agents' cards say "Folders
+  changed: Reopen to use ..."; a folder that is not there is left out and said ("... was not found; started without
+  it", in the first message, or, when an agent is reopened, in a note from crewchat when it links). Each folder's guide lists the project's folders on the machine, and the record of who edited a file now covers
+  the project's other linked folders.
+- **A workspace folder for each project.** New project asks for the folder (default `crewchat-workspaces/NAME` in your
+  home); it must be empty or new, and crewchat warns when it is inside a linked folder, a git repository or a synced
+  folder, as it holds the project's tokens. It holds the whole project, with a `crewchat-project.json`. `workspaces.json`
+  in crewchat's folder lists every workspace; projects made before are listed where they are, and nothing moves.
+- **Not found: Locate and Forget.** A workspace whose folder is gone stays on the list as "Not found: PATH". Locate
+  takes its new place (held until you trust it); Forget takes it off the list and deletes nothing.
+- **Open a workspace.** From the welcome screen, the project switcher or `crewchat projects open FOLDER`. A workspace
+  this machine took off its list itself opens as it was; any other opens held: its routines start no agent, its MCP
+  servers are not written into folders, its approval rules allow nothing without asking and its folders get crewchat's
+  own guide only, until you press Trust it. Tokens another project here has too, or that this machine did not give, are
+  issued anew. Folders the workspace lists for this machine that this machine has not linked to it are offered, not
+  linked.
+- **Remove a project.** `Remove project…` (or `crewchat projects remove NAME`) stops its agents here, unlinks its
+  folders (crewchat's own entries only) and takes it off the list; its workspace folder stays, and Open brings it
+  back. The checkbox "Also delete the workspace folder" deletes only what crewchat keeps there, and is refused, with
+  the names, when the folder holds anything else. The machine's first project cannot be removed. A removed project's
+  folder is no longer moved into `projects/.removed/`.
+- **The page opens in a window of its own.** With Edge or Chrome on the machine, `crewchat start` and `crewchat ui`
+  open it without an address bar or tabs; `crewchat ui --tab`, or `"window": "tab"` in `config.json`, keeps a tab.
+- **A crewchat shortcut.** `crewchat start` adds one (Start menu and desktop on Windows, an app on macOS, an
+  applications-menu entry on Linux) that starts crewchat through Python, with no console window and no new program file.
+  `crewchat shortcut on|off|status` manages it, `crewchat uninstall` removes it, and `CREWCHAT_NO_SHORTCUT=1` makes
+  crewchat write none (the tests set it).
+- **A workspace folder that does not answer** (a network share that is offline) no longer holds up the page:
+  crewchat waits half a second for it, then goes on with what it last saw.
+
+- **One word for each thing.** The page and the messages say *project* for what you open and chat in, *project folder* for a
+  project's home folder, and *workspace* for crewchat's own top folder (where it keeps its files). "Open a workspace…"
+  is "Open a project…", and "Connect a folder" says it connects a folder with multiple projects or a single project folder.
+
+- **A new project can take a removed project's name.** Removing a project keeps its folder, so a new project of the same
+  name was refused as "not empty". Now the folder's old chat files (and only crewchat's own) are moved beside it as
+  `NAME.earlier-TIME`, and the new project starts empty.
+
+- **The chat window opens in the browser profile you choose.** `crewchat ui --profile Work` (the profile's name, as Chrome
+  or Edge shows it) is remembered; without it the window opens in the browser's last-used profile, as before.
+- **The Atlassian sign-in page has a Back to crewchat button** that brings the chat's tab forward and closes this one.
+- **An agent's terminal is always there in its panel.** Clicking an agent shows its screen (for a background agent, read
+  from Claude Code's log) and keeps it up to date every few seconds, instead of a button that shows it once.
+
+### Trust
+
+- **Trust a held workspace on the page only.** The server no longer takes Trust with the owner token, so the hold
+  stops an agent that does not have the token (the commands that use it wait for your Allow card); a held workspace with no folder offers no New
+  agent until you trust it and link one; `crewchat uninstall` run inside an agent's session asks you first.
+- **One machine at a time per workspace.** Open and Locate refuse a workspace another machine's crewchat has open
+  (a share or a synced copy would have two servers writing one chat), a machine that wakes to find another has opened
+  one of its workspaces tells you in the chat, and New project warns about a network drive.
+- **A workspace folder's tokens are guarded like the crewchat home's.** Agents' hooks refuse its tokens, its
+  settings, a search of the whole folder, and edits to the list of workspaces and held workspaces.
+- **Agents act as you only when you allow it.** A command that runs as you, started inside an AI agent's session,
+  puts a card in Needs you with the whole command (and, for `crewchat mcp add --json`, the server it read) and runs
+  only when you press Allow, on this machine's page or your phone, never from a linked machine. Agents' hooks refuse
+  reading crewchat's files with keys in them, and a file an agent shares is checked for every key crewchat keeps.
+  These are soft blocks; SECURITY.md says where they stop.
+- **A server or routine from another machine waits for you on each machine.** An MCP server or a routine you add
+  on one linked machine used to be turned on at once on all of them, so an agent that could post as you on one
+  machine could get a command run on every other. Now it waits in Needs you on each other machine ("From another
+  machine"), showing the command or address, the names of its keys, the tools it is for, or a routine's task,
+  schedule and the agent it starts, and runs nothing there until you approve it on that machine's own page. A
+  change to what it runs asks again; pausing a routine does not. A server's "runs without asking" is never carried
+  to another machine: tick it there if you want it. Servers and routines that already came from another machine
+  before this update wait for your approval once too.
+- **Removing a linked machine holds.** A machine that was asleep when you removed another one hears of it when it is
+  back: the machine that removed someone keeps telling it, for up to a week, and asks again when the change could not
+  be confirmed. A removed machine can no longer take over, or cut off, the machine that removed it, and a linked
+  machine can no longer move another member's address to itself. One gap is left while the machine that removed it
+  is off (SECURITY.md): so also remove a lost machine from your tailnet, as **Remove** now says.
+- **The server answers only under its own names**, so a web page that points its own name at your machine cannot reach
+  it from your browser (DNS rebinding). The lockout after wrong codes counts the address `tailscale serve` adds, not
+  one the client writes itself.
+- **Cloud sync can be locked to your own Google account.** After `crewchat cloud login`, `crewchat cloud rules` prints
+  rules that name your account, and the Machines panel shows them after Sign in with Google: publish them once, and no
+  other account gets in, even one that somehow signs in. The setup guide now says to leave the sign-in screen in
+  Testing rather than publish it, and that anyone else who wants cloud sync sets up a Firebase project of their own.
+- **crewchat no longer writes its token into a file git may track when git cannot answer** (git not installed, too
+  slow, or a repository it refuses). In a folder that is in a repository, it now leaves the file alone and says why.
+- **Starting a Cursor agent from the page says it starts trusting the folder** (`--trust`).
+- **A closed agent you gave Bypass or Auto permissions** is reopened only by you, never by its lead (by `hub_crew
+  reopen` or a message); the chat says so.
+- **GitHub reads are said in the chat**, as Jira's are. A Google Chat post you allow after its space went, or after
+  the project was held, is not sent.
+- **The hooks' shared temporary folder** is used only while it is this user's own and private; otherwise they keep
+  their state in `~/.cache/crewchat-hooks`.
+- An agent whose Jira change or Google Chat post waits for you is told that no message within 11 minutes (crewchat
+  restarted, say) means nothing was sent.
+
+### Fixes
+
+- **A removed machine no longer gets the next messages.** Its pull, already waiting when it was removed, was answered
+  with what was written after; now it is refused, as a new one is.
+- **A bare `crewchat start` says when a newer crewchat is out,** as a start in a folder does.
+- **The shortcut follows crewchat** when uv rebuilds it on another Python (it failed with no message), and the Mac
+  app shows crewchat's icon.
+- **On a phone, a workspace not found** is in the project menu: it opens Locate, with Forget beside it.
+- **The installers say Python may download first**, and on macOS and Linux, when nothing installs, it shows PyPI's
+  error, not the last fallback's. Codex's settings are changed under a lock other processes see.
+- **A project's folder name keeps Hindi and Tamil letters whole.** The default folder for a new project turned vowel
+  signs into `-` ("हिंदी" became "ह--द-").
+- **Hooks run in PowerShell when Python's path has a space** (`C:\Users\Rahul Kumar\...`): the command uses the
+  path's short name instead of quotes, which PowerShell read as a string.
+- **Claude Code on Windows gets every message at the prompt,** also those with an emoji or a Hindi letter: they were
+  printed in Windows' code page, which has neither, and lost. Messages are now marked as read only once shown.
+- **A line of the message log cut short** (a power cut, a full disk) no longer swallows the next message or gives
+  its number out again.
+- **A linked machine that missed two removals still takes the second,** and one whose remover was busy (restarting)
+  is asked again instead of being left on the old key.
+- **New agent finds Claude Code installed with nvm, Volta or bun,** and reads its options even when the server was
+  started at login without Node on its PATH.
+- **Hindi, Chinese and other non-Latin text no longer stops crewchat's hooks on Windows.** The hooks read what the
+  tool sent in Windows' code page, which cannot read many of those characters, and silently did nothing. They now
+  read it as UTF-8.
+- **Search finds Hindi words whole.** Vowel signs used to split a word ("नमस्ते" searched as "नमस" and "त"); the
+  search index is built again once, on the first search after the update. A letter with a nukta (ज़) is found however
+  it was typed, in old messages too.
+- **Sharing a chat with another machine no longer drops lines from the message log.** The one time crewchat rewrites
+  `messages.jsonl`, it skipped any line it could not read. It now copies them as they are, writes the new log to disk
+  before it takes the old one's place, and keeps the old log as `messages.jsonl.bak`.
+- **Cloud sync sends every message written while it was off,** not only the last 2,000 that the server holds in memory.
+- **MCP servers are written one change at a time.** A shared server's change no longer holds up the chat while
+  crewchat writes it into every folder, and two changes (from you, from another machine, a folder just connected)
+  never write a folder at the same time.
+- **Linked machines say when one is too old for the others,** with `crewchat update` as the fix, and **a file lease
+  set on a machine whose clock is off now lasts as long as it says** on the others. The Machines panel shows a clock
+  that is 5 seconds or more off.
+- **`hub.log` no longer grows for ever:** at 5 MB it moves to `hub.log.1`, and one older log is kept.
+- **Two writes of the same file at once no longer fail** (each uses its own temporary file), a failed write leaves no
+  temporary file behind, disconnecting a folder takes the browser bridge's entry and token out too, and
+  `crewchat uninstall` goes on past a folder whose settings are not valid JSON.
+
+### Jira and GitHub for every agent
+
+- **`hub_jira_read`:** with the owner signed in to Atlassian, every agent reads the project's tickets (one by its key,
+  or a JQL search), without the ticket cycle.
+- **`hub_jira_write`:** an agent comments on a ticket or makes a new one, **after your Allow** in Needs you for each,
+  signed with its name and posted in the chat. If you answer after 40 seconds, the agent gets the outcome as a message;
+  if the project is held or signed out before you answer, nothing is sent.
+- A Google Chat post that waits for your Post works the same way: the agent hears the outcome as a message.
+- **GitHub:** add a token on the GitHub card and every agent reads your open pull requests and issues, or one pull
+  request (`hub_github_read`). The token is this machine's, never shown to agents, and guarded like crewchat's own;
+  use a fine-grained, read-only one.
+- What tickets and pull requests say reaches agents marked as other people's words. A held project gets none of these
+  tools until you trust it.
+- **A new Jira ticket wakes someone.** It becomes the lead's task, which reopens a closed lead. With no lead, it goes on
+  the sheet as before, and with nobody here at all, the agent you chose on the Jira card is started for it, within the
+  routines' daily cap.
+
+### Asking and talking
+
+- **`hub_question`:** any agent can ask you to choose, with options and the one it recommends, as a card in Needs you.
+- **Slash commands in the message box.** Type `/` for `/task`, `/needs`, `/tasks`, `/activity`, `/agent`, `/stop`,
+  `/reopen`, `/jira`, `/project`, `/settings` and `/help`. `//` sends a message that starts with `/`.
+- **Enter sends in every reply box,** and Shift+Enter starts a new line.
+- **The lead's message reopens its idle agent,** and the lead can reopen one itself with `hub_crew`.
+- **Agents write short, in points:** the point first, a few one-line bullets, options on their own lines.
+- **An agent's panel:** Permissions is a dropdown of every mode, and the Terminal card is the one place its screen
+  shows, saying why when it cannot be read. A background agent falls back to a Terminal window when it must, and an
+  idle one is no longer called stuck.
+- **A reopened agent whose folder was linked again** comes back as itself.
+- **On a phone, only what works from a phone shows:** Open in Terminal, Open folder, mobile devices and the settings
+  that act on the machine (Integrations, Machines & devices, Folders & files, Advanced) are left out.
+
+### Seeing what agents did
+
+- **A step trace of each agent's tool calls.** The tool's name and a few safe words, never its arguments, kept on
+  this machine for 30 days (none when activity is off). `crewchat trace` shows them by run, or writes JSON lines or
+  OTLP JSON.
+
+### Tasks that move through stages
+
+- **A task can run as a set of stages,** each for a role: `crewchat tasks stages ID "build:developer > test,docs;
+  test:qa > review | flaky > build; docs:writer > review; review:lead after test,docs"`. Stages can run side by side,
+  wait for others with `after`, and branch on the outcome an agent writes (`outcome:NAME` at the start of its done
+  note); a failed stage goes back where it came from. crewchat hands the task on at each step,
+  and a stage that keeps going round, or has no agent for its role, goes to the lead or to you. The task's card shows
+  where it is, and its panel lists every stage. Linked machines need this version to take part.
+- **A task closes with a wrap-up:** an agent's done (or review) note says what was done against "Done when", then
+  `Decisions:` and `Left over:` lines. A done without one is refused. The card marks it and the panel shows it.
+- **crewchat asks for a process note when the trace shows repeated trouble:** a command several agents keep running,
+  or a file edited again and again across tasks. It asks the lead (or you) once; the note is written and approved as
+  every note is, and crewchat never changes a note, prompt or rule itself.
+
+### The page
+
+- **Needs your input:** an agent that waits for you (a permission prompt, a question, its browser or device) shows an
+  amber pill with what it waits for, and its dot turns amber. A working agent's dot is blue in the agents list.
+- **Routines on a schedule you build:** When also takes a cron expression (this machine's time, at most every 5
+  minutes), and a builder under When makes one from plain choices and says it in words. Each routine has Duplicate, a
+  project may have 500, and there are four ready-made ones: jira-monitor, jira-ticket-analyzer, bug-triage and ci-watch.
+- **Questions in the page itself:** Remove, Stop, Reopen and the rest ask in the page's own box, light or dark and on
+  the phone, with the action on its button, instead of the browser's pop-up.
+- **A Projects page and a new sidebar:** a card per project with search and New project, the project switcher with
+  a + on hover, a Global settings gear, and Integrations (Jira, GitHub, Google Chat) as cards in Global settings. The
+  sidebar lists all projects or one project, never both; Global settings shows only crewchat's own sections, and a
+  project's settings are in its menu.
+- **The page opens the project you used last,** not the welcome screen.
+- **A bell for notifications and sound:** its menu turns each on or off, and it rings while the sound is on.
+- **Links and Jira ticket keys are clickable** in messages and in Needs you.
+- **Dropdowns take the theme's colours,** and the window's browser profile can be chosen in Settings.
+- **Open a project has a Browse button** and a folder picker, as Connect a folder has.
+- **A Google Workspace preset** fills the MCP server form for Google's Workspace tools.
+- **On Windows the app window uses your default browser** when it is Edge or Chrome, and Edge, then Chrome, otherwise.
+- **An empty chat points at New agent,** the one filled button there, with focus, and a link for help.
+- **Send feedback from the page:** Settings › About, and the welcome screen, open the bug, idea and "works for me"
+  forms on GitHub, with your crewchat version and system already filled in.
+- **New agent marks Codex CLI, Gemini CLI, Qwen Code and OpenCode as beta** until they have been tried by hand.
+- **Screen readers no longer read out every message in the chat,** only messages to you (also a crew message with
+  @you) and what newly needs you.
+- **Easier to see:** the keyboard focus ring in every theme, and offline dots and the To do column in most themes.
+- **Typing in Hindi, Japanese or Chinese:** Enter that picks a word in the input method no longer sends or searches
+  (Safari too), and **@you** shows however it was typed.
+- **Ctrl+K on Windows and Linux** where the page said ⌘K, on any keyboard layout, and the project's "General"
+  settings are now **Rules & skills**.
+- **The phone says once what needs you:** the Needs you tab's count, and the line above the header only while
+  something is new. Each tab has its own icon, and Tasks opens as a list with its help behind (i).
+- **The page's question box names its button** for the questions whose first word is not the action: Approve,
+  Replace, Link, Fork, Make it a command.
+- **`/agent` in a held or new project** says why there is no New agent, instead of doing nothing.
+
+### Install and docs
+
+- **A smaller install.** The installers and the plain `crewchat` package leave out cloud sync's libraries (about
+  70 MB); the chat and linking over Tailscale do not need them. `crewchat update --cloud` adds them, and the Machines
+  panel, the server log and `crewchat link` say so when cloud sync is wanted without them. A machine that already has
+  them, or has cloud sync set up, keeps them. `CREWCHAT_CLOUD=1` asks the installer for them, and `CREWCHAT_LEAN=1`
+  still leaves them out.
+- **Windows with Smart App Control** (on, or in evaluation): the installer uses python.org's signed Python when it is
+  installed, and stops before installing, with the one command that gets it, when Smart App Control needs it and it is
+  missing. One recipe covers every Smart App Control message. It prefers Python 3.12, takes any signed Python 3.10 or
+  later, and says so when Smart App Control is still evaluating.
+- **`crewchat doctor`:** checks crewchat on this machine (Python, version, folder and free space, settings, tokens,
+  messages, the server's version, start at login) and says what to do for each problem. It sends nothing and shows no
+  secret, so its report can go into an issue as it is.
+- **`crewchat doctor` checks every project folder too:** one not found, one held, one open on another machine, one on a
+  network drive, and lines of its messages that cannot be read.
+- `crewchat doctor`'s report names no project or folder, so it can go into a public issue as it is.
+- **Checksums:** each GitHub release carries `SHA256SUMS` for its files; SECURITY.md says how to check a download.
+- **New guide: Using crewchat at work** (`docs/work.md`): what leaves the machine, a no-cloud setup, what to tell IT.
+
 ## 2.0.0 (2026-11-13)
 
 A new chat page. The tabs and the ⋯ menu are gone: a sidebar holds the project switcher, Chat, Needs you, Tasks,

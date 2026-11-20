@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 
 TMP = tempfile.mkdtemp(prefix="crewchat-peers-")
 os.environ.setdefault("CREWCHAT_HOME", str(Path(TMP) / "unused-home"))
+os.environ["CREWCHAT_NO_SHORTCUT"] = "1"  # no test, nor a child process of one, makes a real shortcut
 
 import crewchat  # noqa: E402
 import crewchat_peers as peers  # noqa: E402
@@ -128,6 +129,28 @@ def status_of(url, body, token=None, device=""):
 class JoiningAfterCloudSync(unittest.TestCase):
     """The owner's Windows laptop, 20 Oct: `crewchat cloud logout` takes effect only when the server restarts. A join
     before then used the one-time code, so the Mac counted the laptop in, and then the laptop could not link."""
+
+    def test_the_owner_is_told_a_bare_start_runs_the_server(self):
+        """A bare `crewchat start` sets a machine up and starts its server, and links no folder: no message here says
+        to run it "in a project folder"."""
+        home = Path(tempfile.mkdtemp(prefix="start-said-", dir=TMP))
+        crewchat.save_config({"project": "Demo", "port": 1}, home)
+        args = argparse.Namespace(action="invite", name=None, url=None)
+        with mock.patch.dict(os.environ, {"CREWCHAT_HOME": str(home)}), \
+                mock.patch.object(crewchat, "server_up", return_value=False):
+            with self.assertRaises(peers.PeerError) as e:
+                peers._cmd_peers(args)
+        self.assertIn("Start it with `crewchat start`", str(e.exception))
+        self.assertIn("`crewchat start FOLDER`", str(e.exception))
+        self.assertNotIn("project folder", str(e.exception))
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CREWCHAT_HOME": str(home)}), \
+                mock.patch.object(crewchat, "server_up", return_value=True), \
+                mock.patch.object(peers, "server_call", return_value={"me": "mac", "command": "crewchat peers join X Y"}), \
+                mock.patch("sys.stdout", out):
+            peers._cmd_peers(args)
+        self.assertIn("after installing crewchat and running `crewchat start`, run this", out.getvalue().replace("\n", " "))
+        self.assertNotIn("project folder", out.getvalue().replace("\n", " "))
 
     def test_the_server_says_it_still_runs_cloud_sync(self):
         root = Path(tempfile.mkdtemp(prefix="ready-", dir=TMP))
@@ -761,10 +784,31 @@ class Projects(unittest.TestCase):
         self.assertIn("not-here", crewchat.load_config(self.b.root)["dismissed_projects"])
 
     def test_an_older_member_shows_without_info(self):
-        mid = next(i for i, m in self.a.sync.mesh.members().items() if m["name"] == "beta")
-        member = self.a.sync.mesh.members()[mid]
-        self.a.sync._apply(mid, member, {"agents": []})  # what a crewchat before 1.1 answers: no info
-        row = self.row(self.a, "beta")
+        link = self.a.sync
+        mid = next(i for i, m in link.mesh.members().items() if m["name"] == "beta")
+        member = link.mesh.members()[mid]
+        # alpha's own puller hears beta's real info at every pull: held off while this checks, from a moment it is not
+        # inside _apply (it asks again, or has an answer to apply), so none it began earlier writes over this one.
+        puller, real_call, real_apply = "crewchat-peer-" + mid, link._call, link._apply
+        quiet, outside = threading.Lock(), threading.Event()
+
+        def call(*args, **kwargs):
+            if threading.current_thread().name == puller:
+                outside.set()
+            return real_call(*args, **kwargs)
+
+        def apply(*args):
+            outside.set()
+            with quiet:
+                return real_apply(*args)
+        with quiet:
+            link._call, link._apply = call, apply
+            try:
+                eventually(outside.is_set, what="alpha's puller for beta to be between answers")
+                real_apply(mid, member, {"agents": []})  # what a crewchat before 1.1 answers: no info
+                row = self.row(self.a, "beta")
+            finally:
+                del link._call, link._apply
         self.assertEqual((row["version"], row["projects"]), ("", []))
 
     def test_a_project_with_the_same_name_is_one_chat(self):
@@ -847,46 +891,65 @@ class Projects(unittest.TestCase):
         entry = crewchat.create_project("busy", self.a.root)
         link = self.a.hub.sync
         hub = crewchat.Projects(self.a.root).get(entry["id"]).hub  # a hub not linked yet
+        # Linked under a name no project here has: the running server links "busy" itself within a moment of its
+        # next request (a pull from beta), and whichever came first would start the one link this counts.
         started = []
         real_start = peers.PeerSync.start
 
         def counted(sync):
-            started.append(sync)
+            if sync.hub is hub:  # not the server's own link of "busy", which may start meanwhile
+                started.append(sync)
             time.sleep(0.05)  # widen the window two callers could slip through
             return real_start(sync)
-        peers.PeerSync.start = counted
-        try:
-            threads = [threading.Thread(target=link.share, args=(hub, "busy")) for _ in range(8)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        finally:
-            peers.PeerSync.start = real_start
-        self.assertEqual(len(started), 1, "one link started, not %d" % len(started))
-        self.assertIs(link.projects["busy"], hub.sync)
-        self.assertEqual(len(link.projects["busy"].threads), len(peers.Mesh(self.a.root).members()))
-        # Unsharing lets it go entirely: it can be linked again (as after a rename).
-        link.unshare("busy")
-        self.assertIsNone(hub.sync)
-        self.assertIsNotNone(link.share(hub, "busy-renamed"))
-        link.unshare("busy-renamed")
+        # The server's own share_projects, which runs whenever it notices the list changed, unshares a link whose
+        # name is no project here, as it should: none runs while this one is counted and checked.
+        with crewchat.SHARE_LOCK:
+            peers.PeerSync.start = counted
+            try:
+                threads = [threading.Thread(target=link.share, args=(hub, "busy-once")) for _ in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+            finally:
+                peers.PeerSync.start = real_start
+            self.assertEqual(len(started), 1, "one link started, not %d" % len(started))
+            self.assertIs(link.projects["busy-once"], hub.sync)
+            self.assertEqual(len(link.projects["busy-once"].threads), len(peers.Mesh(self.a.root).members()))
+            # Unsharing lets it go entirely: it can be linked again (as after a rename).
+            link.unshare("busy-once")
+            self.assertIsNone(hub.sync)
+            self.assertIsNotNone(link.share(hub, "busy-renamed"))
+            link.unshare("busy-renamed")
 
     def test_an_older_crewchat_that_knows_no_projects_is_not_mixed_in(self):
         b_other = self.hub(self.b, "other")
-        crewchat.create_project("other", self.a.root)
-        self.a.projects.all()
-        a_other = self.hub(self.a, "other")
-        # beta answers like an older crewchat: with its first project, whatever is asked.
+        # beta answers like an older crewchat: with its first project, whatever is asked. Before alpha has the project:
+        # a pull already waiting inside the real _pull would answer as this crewchat does, with "chat".
         sync = b_other.sync
         saved = sync._pull
-        sync._pull = lambda body: {k: v for k, v in saved(body).items() if k != "chat"}
+        answered, handled = threading.Event(), threading.Event()
+
+        def old(body):
+            if answered.is_set():
+                handled.set()  # alpha asks again, so it has dealt with the answer that carried the message
+            out = {k: v for k, v in saved(body).items() if k != "chat"}
+            if any(m["text"] == "from an old machine" for m in out["messages"]):
+                answered.set()
+            return out
+        sync._pull = old
         try:
+            crewchat.create_project("other", self.a.root)
+            self.a.projects.all()
+            a_other = self.hub(self.a, "other")
             b_other.send(crewchat.OWNER, "all", "from an old machine")
-            time.sleep(1.5)
+            eventually(handled.is_set, what="alpha to get beta's answer with the message, and to ask again")
             self.assertFalse(any(m["text"] == "from an old machine" for m in a_other.messages))
         finally:
             sync._pull = saved
+        # Answered as this crewchat does, it is the same chat: the message was left out for the answer, nothing else.
+        eventually(lambda: any(m["text"] == "from an old machine" for m in a_other.messages),
+                   what="the message once beta answers with the project")
 
 
 class SharingEdges(unittest.TestCase):
@@ -1008,11 +1071,17 @@ class SharingEdges(unittest.TestCase):
         projects.primary.hub = Fake()
         projects.primary.hub.sync = link = FakeLink()
 
-        def project(name):
+        class FakeHub:  # what share_projects asks of a project's hub: held or paused (9b), as the product's Hub says it
+            on_hold = property(crewchat.Hub.on_hold.fget)
+
+            def __init__(self, held=False):
+                self.held, self.paused = held, False
+
+        def project(name, held=False):
             one = Fake()
-            one.name, one.hub = name, Fake()
+            one.name, one.hub = name, FakeHub(held)
             return one
-        projects.others = {"x": project("x")}
+        projects.others = {"x": project("x"), "held": project("held", held=True)}  # a held one is not shared
         first = threading.Thread(target=crewchat.share_projects, args=(projects,))
         first.start()
         time.sleep(0.1)
@@ -1488,6 +1557,36 @@ class OfflineAndRemoval(unittest.TestCase):
             for m in (a, b, c):
                 m.stop()
 
+    def test_a_pull_waiting_when_its_machine_is_removed_gets_nothing_written_after(self):
+        """e2e on the Mac and Windows, 16 Nov: a removed machine's pull, already waiting with the old key, was answered
+        with the owner's next message, so the removed laptop still showed it."""
+        a = Machine("keep").found()
+        c = Machine("go").join(a)
+        try:
+            mesh_c = peers.Mesh(c.root)
+            key, c_id = mesh_c.data["secret"], mesh_c.me["id"]
+            c.stop()  # only the pull below asks
+            first = post(a.url + "/peer/pull", {"wait": 0, "proto": peers.PROTO}, key, c_id)
+            since, version = max([m.get("seq", 0) for m in a.hub.messages] + [0]), first["v"]
+            answer = {}
+
+            def pull():
+                try:
+                    answer["out"] = post(a.url + "/peer/pull", {"wait": 10, "since": since, "v": version, "proto": peers.PROTO},
+                                         key, c_id)
+                except urllib.error.HTTPError as e:
+                    answer["status"] = e.code
+            waiting = threading.Thread(target=pull)
+            waiting.start()
+            time.sleep(1)  # the pull is waiting now
+            peers.admin(a.hub, a.root, "peer-remove", {"id": c_id})
+            a.hub.send(crewchat.OWNER, "all", "after the removal")
+            waiting.join(15)
+            self.assertNotIn("after the removal", json.dumps(answer.get("out")))
+            self.assertEqual(answer.get("status"), 403)
+        finally:
+            a.stop()
+
     def test_a_removed_machine_cannot_use_the_old_key_to_get_back_in(self):
         """Multi-role review, 5 Nov: the old key worked for 10 minutes after a removal, and the "removed" check
         trusted the caller's own device header. So the removed machine could pull as someone else, or send
@@ -1536,6 +1635,299 @@ class OfflineAndRemoval(unittest.TestCase):
             for m in (a, b):
                 m.stop()
 
+    def test_a_member_cannot_move_another_members_address_to_itself(self):
+        """Review 14 Nov, H5: every member holds the key and names itself in a header, so one member could tell
+        another that the remover now lives at its own address, then confirm a key change it forged itself."""
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        c = Machine("sly").join(a)
+        try:
+            key, a_id = peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).me["id"]
+            eventually(lambda: peers.Mesh(b.root).find("sly"), what="stay to hear of sly")
+            lie = {"id": a_id, "name": "keep", "tag": "A", "url": c.url}
+            self.assertEqual(status_of(b.url + "/peer/pull", {"wait": 0, "sender": lie}, key, a_id), 200)
+            self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], a.url)
+            # The same lie passed on in a pull's member list is not taken either.
+            sly = peers.Mesh(b.root).find("sly")
+            b.sync._apply(sly, peers.Mesh(b.root).members()[sly], {"members": {a_id: lie}})
+            self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], a.url)
+            forged = "f" * 43
+            self.assertEqual(status_of(b.url + "/peer/rekey", {"secret": forged, "removed": {"y" * 16: "Z"}}, key, a_id),
+                             403)
+            self.assertEqual(peers.Mesh(b.root).data["secret"], key)
+        finally:
+            for m in (a, b, c):
+                m.stop()
+
+    def test_a_member_cannot_move_an_asleep_member_to_itself(self):
+        """Audit 14 Nov: when the old address does not answer, another member's word that it moved is not taken,
+        or a member could wait for the remover to sleep and then answer for it."""
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        c = Machine("sly").join(a)
+        try:
+            eventually(lambda: peers.Mesh(b.root).find("sly"), what="stay to hear of sly")
+            a_id, old = peers.Mesh(a.root).me["id"], peers.Mesh(b.root).members()[peers.Mesh(a.root).me["id"]]["url"]
+            a.stop()
+            sly = peers.Mesh(b.root).find("sly")
+            lie = {"id": a_id, "name": "keep", "tag": "A", "url": c.url}
+            b.sync._apply(sly, peers.Mesh(b.root).members()[sly], {"members": {a_id: lie}})
+            self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], old)
+        finally:
+            for m in (a, b, c):
+                m.stop()
+
+    def test_a_removed_machine_cannot_take_the_removers_place_with_a_member_that_missed_it(self):
+        """Re-review 14 Nov: the remover answers the old key with 409, which was read as "it moved". A removed machine
+        then pointed a lagging member's entry for the remover at itself and confirmed a key of its own."""
+        with mock.patch.object(peers, "TELL_BACKOFF", (3600,)):
+            a = Machine("keep").found()
+            b = Machine("stay").join(a)
+            c = Machine("go").join(a)
+            machines = [a, b, c]
+            try:
+                eventually(lambda: peers.Mesh(b.root).find("go"), what="stay to hear of go")
+                old_key, a_id = peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).me["id"]
+                port, root = b.port, b.root
+                b.stop()
+                peers.admin(a.hub, a.root, "peer-remove", {"id": peers.Mesh(a.root).find("go")})
+                b = machines[1] = Machine("stay", port=port, root=root)
+                b.sync = peers.start(b.hub, b.root)
+                lie = {"id": a_id, "name": "keep", "tag": "A", "url": c.url}
+                status_of(b.url + "/peer/pull", {"wait": 0, "sender": lie}, old_key, a_id)
+                self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], a.url)
+                forged = "f" * 43
+                self.assertEqual(status_of(b.url + "/peer/rekey", {"secret": forged, "removed": {"y" * 16: "Z"},
+                                                                   "sender": lie}, old_key, a_id), 403)
+                self.assertEqual(peers.Mesh(b.root).data["secret"], old_key)
+                self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], a.url)
+            finally:
+                for m in machines:
+                    m.stop()
+
+    def test_a_removed_machine_cannot_cut_off_its_remover_from_a_member_that_missed_it(self):
+        """Round-2 re-review: a removed machine told a lagging member that the remover was removed (in a pull's
+        answer, or a key change of its own). The remover answers that member's old key with 409: it holds a newer
+        key, so it was not removed, and the news is refused."""
+        with mock.patch.object(peers, "TELL_BACKOFF", (3600,)):
+            a = Machine("keep").found()
+            b = Machine("stay").join(a)
+            c = Machine("go").join(a)
+            machines = [a, b, c]
+            try:
+                eventually(lambda: peers.Mesh(b.root).find("go"), what="stay to hear of go")
+                old_key, a_id = peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).me["id"]
+                c_id = peers.Mesh(c.root).me["id"]
+                port, root = b.port, b.root
+                b.stop()
+                peers.admin(a.hub, a.root, "peer-remove", {"id": c_id})
+                b = machines[1] = Machine("stay", port=port, root=root)
+                b.sync = peers.start(b.hub, b.root)
+                with mock.patch.object(b.sync, "_remover_confirms", return_value=True):  # even if go confirms itself
+                    self.assertEqual(status_of(b.url + "/peer/rekey", {"secret": "f" * 43, "removed": {a_id: "Z"}},
+                                               old_key, c_id), 403)
+                self.assertEqual(peers.Mesh(b.root).data["secret"], old_key)
+                self.assertIn(a_id, peers.Mesh(b.root).members())
+                b.sync._apply(c_id, {"name": "go"}, {"removed": {a_id: time.time()}, "members": {}})  # go's pull says it
+                self.assertIn(a_id, peers.Mesh(b.root).members())
+                self.assertNotIn(a_id, peers.Mesh(b.root).data.get("removed") or {})
+            finally:
+                for m in machines:
+                    m.stop()
+
+    def test_a_member_that_missed_two_removals_still_takes_the_second(self):
+        """Audit, round 3: a member asleep through two removals asked the second removed machine with its key from
+        before the first; that machine answered 409, as the remover would, and the key change was refused, leaving the
+        member on the old key for good. The teller now sends the keys in between, which the removed machine takes."""
+        with mock.patch.object(peers, "TELL_BACKOFF", (3600,)):
+            a = Machine("keep").found()
+            b = Machine("stay").join(a)
+            c = Machine("one").join(a)
+            d = Machine("two").join(a)
+            machines = [a, b, c, d]
+            try:
+                eventually(lambda: peers.Mesh(b.root).find("two"), what="stay to hear of two")
+                a_id, c_id, d_id = (peers.Mesh(m.root).me["id"] for m in (a, c, d))
+                b_id = peers.Mesh(b.root).me["id"]
+                port, root = b.port, b.root
+                b.stop()
+                peers.admin(a.hub, a.root, "peer-remove", {"id": c_id})
+                peers.admin(a.hub, a.root, "peer-remove", {"id": d_id})
+                news = peers.Mesh(a.root).data["telling"][b_id]
+                self.assertEqual(sorted(news["removed"]), sorted([c_id, d_id]))
+                b = machines[1] = Machine("stay", port=port, root=root)
+                b.sync = peers.start(b.hub, b.root)
+                self.assertEqual(status_of(b.url + "/peer/rekey", {"secret": news["secret"], "removed": news["removed"],
+                                                                   "between": news["between"]}, news["old"], a_id), 200)
+                self.assertEqual(peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).data["secret"])
+                self.assertNotIn(d_id, peers.Mesh(b.root).members())
+            finally:
+                for m in machines:
+                    m.stop()
+
+    def test_a_remover_busy_now_is_asked_again_not_taken_as_no(self):
+        """Round-3 re-review: a 5xx or 429 from a remover that is restarting counted as its "no", so the member that
+        missed the change stayed on the old key for good. Only 401, 403 and 409 are a no."""
+        a = Machine("keep").found()
+        try:
+            members = {"zz": {"name": "z", "url": "http://x"}}
+            for status, said in ((503, None), (500, None), (429, None), (403, False), (401, False), (409, False)):
+                with mock.patch.object(a.sync, "_call", side_effect=peers.PeerError("x", status=status)), \
+                        mock.patch.object(a.sync.mesh, "members", return_value=members):
+                    self.assertIs(a.sync._remover_confirms("zz", "s" * 43, {"yy": "t"}), said, status)
+        finally:
+            a.stop()
+
+    def test_a_pulls_answer_cannot_say_this_machine_was_removed(self):
+        """Round-3 re-review: a removed machine could unlink a member by naming it as removed in a pull's answer. A
+        real removal reaches the member as a 403; the pull's word alone is ignored."""
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        try:
+            a_id, b_id = peers.Mesh(a.root).me["id"], peers.Mesh(b.root).me["id"]
+            b.sync._apply(a_id, {"name": "keep"}, {"removed": {b_id: time.time()}, "members": {}})
+            self.assertFalse(b.sync.removed_me)
+        finally:
+            for m in (a, b):
+                m.stop()
+
+    def test_a_key_change_not_confirmed_now_is_told_again(self):
+        """Round-2 re-review: a key change refused because the remover could not be asked was taken as told, so the
+        lagging member stayed on the old key for good. It answers 503 now, and the teller tries again."""
+        a = Machine("keep").found()
+        try:
+            mesh = a.sync.mesh
+            with mesh.lock:
+                mesh.data["telling"] = {"zz": {"secret": "s1", "removed": {}, "old": "k0", "since": time.time()}}
+            tries = []
+
+            def call(member, path, body, timeout=0, key=None):
+                tries.append(path)
+                raise peers.PeerError("not confirmed", status=503)
+            with mock.patch.object(peers, "TELL_BACKOFF", (0,)), \
+                    mock.patch.object(a.sync, "_call", side_effect=call), \
+                    mock.patch.object(mesh, "members", return_value={"zz": {"name": "z", "url": "http://x"}}):
+                a.sync.stopped.clear()
+                t = threading.Thread(target=a.sync._keep_telling, daemon=True)
+                t.start()
+                eventually(lambda: len(tries) >= 2, what="the key change to be told again")
+                a.sync.stopped.set()
+                t.join(5)
+            self.assertIn("zz", mesh.data.get("telling") or {})
+        finally:
+            a.stop()
+
+    def test_a_member_that_refuses_the_key_change_is_shown(self):
+        """Round-4 re-review: a member that refused the remover's news (it may hold a removed machine's key) was dropped
+        from the telling in silence. The Machines panel now says it refused, and how to link it again."""
+        a = Machine("keep").found()
+        try:
+            mesh = a.sync.mesh
+            with mesh.lock:
+                mesh.data["telling"] = {"zz": {"secret": "s1", "removed": {}, "old": "k0", "since": time.time()}}
+            members = {"zz": {"name": "z", "url": "http://x"}}
+            with mock.patch.object(peers, "TELL_BACKOFF", (0,)), \
+                    mock.patch.object(a.sync, "_call", side_effect=peers.PeerError("refused", status=403)), \
+                    mock.patch.object(mesh, "members", return_value=members):
+                a.sync.stopped.clear()
+                t = threading.Thread(target=a.sync._keep_telling, daemon=True)
+                t.start()
+                t.join(10)
+                self.assertIn("zz", mesh.data.get("refused") or {})
+                self.assertTrue([r for r in a.sync.machines_status() if r["id"] == "zz"][0]["refused"])
+                a.hub.remote["zz"] = {"updated": time.time() + 1}  # it answers this machine's key again
+                self.assertFalse([r for r in a.sync.machines_status() if r["id"] == "zz"][0]["refused"])
+        finally:
+            a.stop()
+
+    def test_an_address_taken_while_it_could_not_be_checked_confirms_no_key_change(self):
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        sly = Machine("sly")
+        try:
+            key, a_id = peers.Mesh(b.root).data["secret"], peers.Mesh(a.root).me["id"]
+            a.stop()  # asleep: nothing answers at its address
+            lie = {"id": a_id, "name": "keep", "tag": "A", "url": sly.url}
+            status_of(b.url + "/peer/pull", {"wait": 0, "sender": lie}, key, a_id)
+            self.assertEqual(peers.Mesh(b.root).members()[a_id]["url"], sly.url)  # a real move looks the same
+            with mock.patch.object(b.sync, "_call", return_value={}):  # whatever answers there agrees
+                self.assertEqual(status_of(b.url + "/peer/rekey", {"secret": "f" * 43, "removed": {"y" * 16: "Z"}},
+                                           key, a_id), 503)
+            self.assertEqual(peers.Mesh(b.root).data["secret"], key)
+        finally:
+            for m in (a, b, sly):
+                m.stop()
+
+    def test_a_newer_removal_is_not_lost_while_an_older_one_is_told(self):
+        """Audit 14 Nov: the teller dropped a member's entry after telling it, even when a newer removal had
+        replaced the entry meanwhile."""
+        a = Machine("keep").found()
+        try:
+            mesh = a.sync.mesh
+            sent = {"secret": "s1", "removed": {}, "old": "k0", "since": time.time()}
+            with mesh.lock:
+                mesh.data["telling"] = {"zz": dict(sent)}
+            told = []
+
+            def call(member, path, body, timeout=0, key=None):
+                told.append(body["secret"])
+                if len(told) > 1:  # later tries: the member is asleep again
+                    raise peers.PeerError("asleep")
+                with mesh.lock:  # a second removal lands while the first is on its way
+                    mesh.data["telling"]["zz"] = dict(sent, secret="s2")
+                return {}
+            with mock.patch.object(peers, "TELL_BACKOFF", (0,)), \
+                    mock.patch.object(a.sync, "_call", side_effect=call), \
+                    mock.patch.object(mesh, "members", return_value={"zz": {"name": "z", "url": "http://x"}}):
+                a.sync.stopped.clear()
+                t = threading.Thread(target=a.sync._keep_telling, daemon=True)
+                t.start()
+                eventually(lambda: "s1" in told, what="the first removal to be told")
+                a.sync.stopped.set()
+                t.join(5)
+            self.assertEqual(told[0], "s1")
+            self.assertIn("zz", mesh.data.get("telling") or {}, "the newer removal was dropped untold")
+        finally:
+            a.stop()
+
+    def test_a_member_that_really_moved_is_followed(self):
+        a = Machine("keep").found()
+        b = Machine("stay").join(a)
+        try:
+            key, b_id = peers.Mesh(a.root).data["secret"], peers.Mesh(b.root).me["id"]
+            moved = "http://127.0.0.1:9"  # nothing answers at b's old address once it is off
+            b.stop()
+            post(a.url + "/peer/pull", {"wait": 0, "sender": {"id": b_id, "name": "stay", "tag": "B", "url": moved}},
+                 key, b_id)
+            self.assertEqual(peers.Mesh(a.root).members()[b_id]["url"], moved)
+        finally:
+            a.stop()
+
+    def test_a_machine_asleep_during_a_removal_hears_of_it_when_back(self):
+        """Review 14 Nov, H5: a removal told each member once. One that was asleep kept the old key, and with it the
+        removed machine stayed in. The remover now tries again until it hears."""
+        with mock.patch.object(peers, "TELL_BACKOFF", (0.2,)):
+            a = Machine("keep").found()
+            b = Machine("stay").join(a)
+            c = Machine("go").join(a)
+            machines = [a, b, c]
+            try:
+                eventually(lambda: peers.Mesh(b.root).find("go"), what="stay to hear of go")
+                port, root = b.port, b.root
+                b.stop()
+                out = peers.admin(a.hub, a.root, "peer-remove", {"id": peers.Mesh(a.root).find("go")})
+                self.assertEqual(out["told"], [])
+                b = machines[1] = Machine("stay", port=port, root=root)
+                b.sync = peers.start(b.hub, b.root)
+                new_key = peers.Mesh(a.root).data["secret"]
+                eventually(lambda: peers.Mesh(b.root).data["secret"] == new_key, timeout=20,
+                           what="stay to get the new key")
+                self.assertIsNone(peers.Mesh(b.root).find("go"))
+                eventually(lambda: not peers.Mesh(a.root).data.get("telling"), what="keep to stop telling")
+            finally:
+                for m in machines:
+                    m.stop()
+
     def test_leaving(self):
         a = Machine("host").found()
         b = Machine("leaver").join(a)
@@ -1547,6 +1939,51 @@ class OfflineAndRemoval(unittest.TestCase):
             self.assertIsNone(b.hub.sync)
             eventually(lambda: not peers.Mesh(a.root).members(), what="host to drop the leaver")
             self.assertFalse(a.sees(agent))
+        finally:
+            a.stop()
+            b.stop()
+
+
+class ProtocolAndClocks(unittest.TestCase):
+    """Review 14 Nov: no protocol version on the link, and leases read with the receiver's clock (V2)."""
+
+    def test_a_machine_too_old_for_the_link_is_told_to_update(self):
+        a = Machine("new").found()
+        b = Machine("other").join(a)
+        try:
+            key, b_id = peers.Mesh(a.root).data["secret"], peers.Mesh(b.root).me["id"]
+            out = post(a.url + "/peer/pull", {"wait": 0, "proto": peers.PROTO}, key, b_id)
+            self.assertEqual(out["proto"], peers.PROTO)
+            self.assertAlmostEqual(out["now"], time.time(), delta=5)
+            with mock.patch.object(peers, "MIN_PROTO", peers.PROTO + 1):
+                try:
+                    post(a.url + "/peer/pull", {"wait": 0, "proto": peers.PROTO}, key, b_id)
+                    self.fail("a too old machine was answered")
+                except urllib.error.HTTPError as e:
+                    self.assertEqual(e.code, 426)
+                    self.assertIn("crewchat update", json.loads(e.read().decode())["error"])
+                self.assertIn("crewchat update", a.sync._too_old({"proto": peers.PROTO}))
+            self.assertEqual(a.sync._too_old({}), "")  # a crewchat before PROTO sends none, and is still welcome
+        finally:
+            a.stop()
+            b.stop()
+
+    def test_a_lease_from_a_machine_whose_clock_is_ahead_is_read_in_this_ones_time(self):
+        a = Machine("here").found()
+        b = Machine("ahead").join(a)
+        try:
+            b_id = peers.Mesh(b.root).me["id"]
+            eventually(lambda: b_id in a.sync.mesh.skews, what="here to hear ahead's clock")
+            self.assertLess(abs(a.sync.skew(b_id)), 5)
+            a.sync.mesh.skews[b_id] = 3600.0  # its clock is an hour ahead
+            now = time.time()
+            with a.hub.lock:
+                a.hub._lease_effect({"id": "b-1", "from": "claude-ahead", "origin": b_id, "ts": "x", "areas": "app/",
+                                     "until": "%.0f" % (now + 3600 + 600)})
+                until = a.hub.leases["b-1"]["until"]
+            self.assertAlmostEqual(until, now + 600, delta=5)
+            row = next(r for r in a.sync.machines_status() if r["id"] == b_id)
+            self.assertEqual(row["clock"], 3600)
         finally:
             a.stop()
             b.stop()
@@ -1642,9 +2079,14 @@ class LinkInfo(unittest.TestCase):
                     hub._changed()
                     hub.lock.notify_all()
                 t.join(peers.NEEDS_EVERY + 2)
-            self.assertFalse(t.is_alive())
-        self.assertEqual([n["key"] for n in out["needs"]], ["permission:p1"])  # it came within NEEDS_EVERY
-        self.assertLessEqual(len(built), 3)
+                self.assertFalse(t.is_alive())
+                # A pull woken by an earlier change may carry the list kept from before (a slow machine); the item
+                # reaches a pull within NEEDS_EVERY all the same.
+                deadline, got = time.time() + peers.NEEDS_EVERY + 2, out
+                while "permission:p1" not in [n["key"] for n in got.get("needs") or []] and time.time() < deadline:
+                    got = sync._pull({"since": hub.next_seq, "wait": 1, "v": got.get("v", first["v"])})
+        self.assertEqual([n["key"] for n in got["needs"]], ["permission:p1"])
+        self.assertLessEqual(len(built), 4)  # not once per change (11 of them)
 
     def test_the_panel_and_the_command_line_say_the_same(self):
         # Release review (C8): the Machines panel and `crewchat peers status` each worked out a machine's state.

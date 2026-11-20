@@ -18,6 +18,7 @@ Timings are noisy (more so on CI runners): compare medians, on the same machine.
 """
 import argparse
 import hashlib
+import os
 import json
 import shlex
 import statistics
@@ -70,8 +71,13 @@ def forget_alive(agent):
 
 
 def rss_mb(pid):
-    """A process's resident memory in MB (ps: macOS and Linux), or 0 where that cannot be read."""
+    """A process's resident memory in MB (ps: macOS and Linux; PowerShell: Windows), or 0 where that cannot be read."""
     try:
+        if os.name == "nt":
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "(Get-Process -Id %d).WorkingSet64" % int(pid)],
+                                 capture_output=True, text=True, timeout=10)
+            return int(out.stdout.strip()) / 2 ** 20
         out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=10)
         return int(out.stdout.strip()) / 1024
     except (OSError, ValueError):
@@ -156,11 +162,11 @@ def state_writes(agents=5, rounds=20):
             if task:
                 tid = crewchat.call_tool(hub, None, task, {"action": "add", "title": "t%d" % r}, owner=True).split("#")[1].split()[0]
                 crewchat.call_tool(hub, sid, task, {"action": "take", "id": tid})
-                crewchat.call_tool(hub, sid, task, {"action": "update", "id": tid, "status": "done", "note": "ok"})
+                crewchat.call_tool(hub, sid, task, {"action": "update", "id": tid, "status": "done", "note": "ok\nDecisions: none\nLeft over: none"})
             else:  # before P2: the task tools of their own
                 tid = crewchat.call_tool(hub, None, "hub_task_add", {"title": "t%d" % r}, owner=True).split("#")[1].split()[0]
                 crewchat.call_tool(hub, sid, "hub_take", {"id": tid})
-                crewchat.call_tool(hub, sid, "hub_update", {"id": tid, "status": "done", "note": "ok"})
+                crewchat.call_tool(hub, sid, "hub_update", {"id": tid, "status": "done", "note": "ok\nDecisions: none\nLeft over: none"})
         time.sleep(getattr(crewchat, "SAVE_DELAY", 0) + 0.5)
     finally:
         crewchat.write_json = real

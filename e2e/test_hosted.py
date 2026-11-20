@@ -24,6 +24,7 @@ from harness import eventually
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("CREWCHAT_HOME", str(H.TMP / "hosted-unused"))
+os.environ["CREWCHAT_NO_SHORTCUT"] = "1"  # no test, nor a child process of one, makes a real shortcut
 
 try:
     import websocket  # noqa: F401

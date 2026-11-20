@@ -2,30 +2,22 @@
 #
 #   powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 #
-# Installs uv (Astral's Python installer) if it is missing, then crewchat with cloud sync, in its
-# own environment with its own Python. Nothing needs administrator rights. Run it again to upgrade.
+# Installs uv (Astral's Python installer) if it is missing, then crewchat, in its own environment
+# with its own Python. Nothing needs administrator rights. Run it again to upgrade. Cloud sync's
+# libraries are left out unless asked for or already in use here.
 #
 # Settings, as environment variables:
-#   $env:CREWCHAT_VERSION = "2.0.0"   install this release ("main" for the latest code)
-#   $env:CREWCHAT_LEAN = "1"          leave out cloud sync (about 70 MB of libraries)
+#   $env:CREWCHAT_VERSION = "2.1.0"   install this release ("main" for the latest code)
+#   $env:CREWCHAT_CLOUD = "1"         add cloud sync's libraries (about 70 MB); kept on upgrade once added
+#   $env:CREWCHAT_LEAN = "1"          leave them out even on a machine that has them (CREWCHAT_CLOUD wins)
 #   $env:CREWCHAT_SOURCE = "PATH"     install from a local checkout (for testing this script)
+#   $env:CREWCHAT_SYSTEM_PYTHON = "1" use python.org's Python 3.12 (as when Smart App Control is on)
 # Native programs report failure through $LASTEXITCODE, checked after each one. ("Stop" would
 # also turn uv's progress output into errors in Windows PowerShell 5.1.)
 $ErrorActionPreference = "Continue"
 
-$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "2.0.0" }
+$Version = if ($env:CREWCHAT_VERSION) { $env:CREWCHAT_VERSION } else { "2.1.0" }
 $Repo = "https://github.com/deepankar17/crewchat"
-
-# Where to install from, in order: PyPI, the release's package file on GitHub, its source archive
-# (releases before 0.9.10 are not on PyPI, and before 0.9.7 have no package file).
-$Name = if ($env:CREWCHAT_LEAN) { "crewchat" } else { "crewchat[cloud]" }
-if ($env:CREWCHAT_SOURCE) { $Specs = @("$Name @ $($env:CREWCHAT_SOURCE)") }
-elseif ($Version -eq "main") { $Specs = @("$Name @ $Repo/archive/refs/heads/main.zip") }
-else {
-    $Specs = @("$Name==$Version",
-               "$Name @ $Repo/releases/download/v$Version/crewchat-$Version-py3-none-any.whl",
-               "$Name @ $Repo/archive/refs/tags/v$Version.zip")
-}
 
 $Uv = (Get-Command uv -ErrorAction SilentlyContinue).Source
 if (-not $Uv) {
@@ -40,6 +32,31 @@ if (-not $Uv) {
     Remove-Item Env:UV_NO_MODIFY_PATH
     $Uv = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
     if (-not (Test-Path $Uv)) { throw "uv did not install; see https://docs.astral.sh/uv/getting-started/installation/" }
+}
+
+# Cloud sync's libraries (about 70 MB) only when asked for, or when this machine already has them or
+# has cloud sync set up, so an upgrade does not take them away.
+$CrewchatDir = if ($env:CREWCHAT_HOME) { $env:CREWCHAT_HOME } else { Join-Path $env:USERPROFILE ".crewchat" }
+$ToolDir = (& $Uv tool dir 2>$null | Out-String).Trim()
+if (-not $ToolDir) { $ToolDir = Join-Path $env:APPDATA "uv\tools" }
+$OldPython = Join-Path $ToolDir "crewchat\Scripts\python.exe"
+$Cloud = [bool]$env:CREWCHAT_CLOUD
+if (-not $Cloud -and -not $env:CREWCHAT_LEAN) {
+    if (Test-Path (Join-Path $CrewchatDir "cloud\firebase.json")) { $Cloud = $true }
+    elseif (Test-Path $OldPython) {
+        & $OldPython -c "import cryptography, google.cloud.firestore" *> $null
+        $Cloud = $LASTEXITCODE -eq 0
+    }
+}
+# Where to install from, in order: PyPI, the release's package file on GitHub, its source archive
+# (releases before 0.9.10 are not on PyPI, and before 0.9.7 have no package file).
+$Name = if ($Cloud) { "crewchat[cloud]" } else { "crewchat" }
+if ($env:CREWCHAT_SOURCE) { $Specs = @("$Name @ $($env:CREWCHAT_SOURCE)") }
+elseif ($Version -eq "main") { $Specs = @("$Name @ $Repo/archive/refs/heads/main.zip") }
+else {
+    $Specs = @("$Name==$Version",
+               "$Name @ $Repo/releases/download/v$Version/crewchat-$Version-py3-none-any.whl",
+               "$Name @ $Repo/archive/refs/tags/v$Version.zip")
 }
 
 # A running crewchat (the server, or an agent's hook waiting for messages) keeps its program
@@ -57,9 +74,44 @@ if ($Running.Count -gt 0) {
     Start-Sleep -Seconds 2
 }
 
-Write-Host "Installing crewchat $Version..."
+# Smart App Control blocks the unsigned Python uv brings (review of 14 Nov): when it is on, or when
+# CREWCHAT_SYSTEM_PYTHON is set, use python.org's signed Python 3.12. While it only evaluates (2), it may turn itself
+# on later, so the signed Python is used then too when it is installed. On, with no signed Python: stop before
+# downloading anything, and say how to get it (re-review, 14 Nov).
+$UvPython = @("--python", "3.12")
+$Sac = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name VerifiedAndReputablePolicyState -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+if ($Sac -eq 1 -or $Sac -eq 2 -or $env:CREWCHAT_SYSTEM_PYTHON) {
+    $Signed = ""
+    # python.org's 3.12, else its newest 3.10 or later (the py launcher lists python.org's installs)
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        foreach ($Want in @("-3.12", "-3")) {
+            $Signed = (& py $Want -c "import sys; print(sys.executable if sys.version_info >= (3, 10) else '')" 2>$null | Select-Object -First 1)
+            if ($Signed -match '[\\/]uv[\\/]python[\\/]') { $Signed = "" }  # one uv downloaded is not signed (as uv_managed)
+            if ($Signed) { break }
+        }
+    }
+    $Why = if ($Sac -eq 1) { "Smart App Control is on" } elseif ($env:CREWCHAT_SYSTEM_PYTHON) { "CREWCHAT_SYSTEM_PYTHON is set" } else { "Smart App Control is evaluating this PC" }
+    if ($Signed -and (Test-Path "$Signed".Trim())) {
+        Write-Host "${Why}: crewchat uses the signed Python at $Signed"
+        $UvPython = @("--python-preference", "only-system", "--python", "$Signed".Trim())
+    } elseif ($Sac -eq 1 -or $env:CREWCHAT_SYSTEM_PYTHON) {
+        Write-Host "${Why}, and it blocks the Python uv would download. First install python.org's signed Python:"
+        Write-Host ""
+        Write-Host "  winget install -e --id Python.Python.3.12"
+        Write-Host ""
+        Write-Host "then open a new PowerShell window and run this installer again: it uses that Python."
+        throw "crewchat was not installed: Smart App Control needs python.org's signed Python first (see above)"
+    } else {
+        Write-Host "Smart App Control is evaluating this PC. If Windows turns it on later, it blocks the Python uv"
+        Write-Host "downloads and crewchat stops. To be safe now, install python.org's signed Python and run this again:"
+        Write-Host "  winget install -e --id Python.Python.3.12"
+    }
+}
+
+Write-Host "Installing crewchat $Version (uv downloads Python 3.12 first if this PC has none it can use, so the first"
+Write-Host "install can take a minute or two)..."
 foreach ($Spec in $Specs) {
-    & $Uv tool install --force --refresh-package crewchat --python 3.12 $Spec
+    & $Uv tool install --force --refresh-package crewchat @UvPython $Spec
     if ($LASTEXITCODE -eq 0) { break }
     Write-Host "Trying another source..."
 }
@@ -113,7 +165,7 @@ if ($Restart) {
     if ($LASTEXITCODE -eq 0) {
         Write-Host "Started the crewchat server again."
     } else {
-        Write-Host "The crewchat server was stopped for the upgrade: start it again with crewchat start."
+        Write-Host "The crewchat server was stopped for the upgrade: start it again with crewchat restart."
     }
 }
 
@@ -139,6 +191,7 @@ function Show-Logo([string]$Ver) {
 Show-Logo ($Installed -replace '^crewchat ', '')
 Write-Host ""
 Write-Host "Installed $Installed."
+if (-not $Cloud) { Write-Host "Cloud sync's libraries are not included; to add them later: crewchat update --cloud" }
 if (-not (($env:Path -split ";") -contains $Bin)) {
     $env:Path = "$Bin;$env:Path"
     Write-Host "Open a new terminal if the crewchat command is not found."
@@ -147,12 +200,12 @@ if ($Blocked) { $env:Path = "$Shims;$env:Path" }  # before the blocked crewchat.
 Write-Host ""
 Write-Host "Start a chat: open a terminal in your project folder and run"
 Write-Host ""
-Write-Host "  crewchat start"
+Write-Host "  crewchat start ."
 Write-Host ""
 if ($Blocked) {
     # The new PATH reaches only terminals opened after this: the others still find the blocked crewchat.exe.
     Write-Host "Use a new terminal window (close every tab of Windows Terminal): one opened before this install still"
-    Write-Host "finds the blocked crewchat.exe. Or, in that one, run: $Shims\crewchat.cmd start"
+    Write-Host "finds the blocked crewchat.exe. Or, in that one, run: $Shims\crewchat.cmd start ."
     Write-Host ""
 }
 Write-Host 'Later: `crewchat update` upgrades it, `crewchat uninstall` removes it.' 

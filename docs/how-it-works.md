@@ -21,7 +21,7 @@ named, how machines stay in step, and where everything is kept.
   listens on `127.0.0.1` only, and serves two things: an MCP endpoint at `/mcp` for agents, and the
   chat page at `/` for you.
 - **Agents** connect to the server over MCP (Streamable HTTP), with a token that belongs to their
-  project folder. `crewchat start` (or **Connect a folder…** on the page) writes that connection into the
+  project folder. `crewchat start .` (or **Connect a folder…** on the page) writes that connection into the
   folder's `.mcp.json` (Claude Code), `.cursor/mcp.json` (Cursor) and the other tools' own settings; with
   crewchat's Claude Code plugin on, it comes from the plugin and each tool's user settings instead, and nothing
   is written into the folder ([where things live](#where-things-live)).
@@ -54,6 +54,10 @@ named, how machines stay in step, and where everything is kept.
 | `hub_code` | The lead and the advisor only: who changed a file, for which task and what was said about it (`history`), or a task's files in groups that hang together, to hand out one per agent (`split`). Needs the code map (edit tracking on) |
 | `hub_crew` | A role with the `crew` power only: add an agent to the crew (`add`, with a role and a first task), `list` the ones it added, or `remove` one ([Teams](teams.md#a-lead-adds-and-removes-agents)) |
 | `hub_jira` | The Jira ticket cycle: an agent's own step on a ticket when it is its turn (comment, start, review, QA passed or failed, merged, hand over), made with your Atlassian sign-in ([Jira, Google Chat and MCP servers](connections.md#the-crew-runs-tickets-from-start-to-finish)) |
+| `hub_question` | Ask the owner to choose: a question with options and the one it recommends, as a card in Needs you; the answer comes back as a message |
+| `hub_jira_read` | With the owner signed in to Atlassian, read the project's Jira tickets: one by its key, or a JQL search ([Jira, Google Chat and MCP servers](connections.md)) |
+| `hub_jira_write` | Comment on a ticket or make a new one, after the owner's Allow in Needs you for each, signed with the agent's name |
+| `hub_github_read` | With a token on the GitHub card, read the owner's open pull requests and issues, or one pull request; the token is never shown to agents |
 | `hub_gchat` | Post a pull request (its address and title, and a few lines) to a Google Chat space the owner added; listed only while one can be reached ([Jira, Google Chat and MCP servers](connections.md#google-chat)) |
 
 The descriptions agents load are short (about 7,600 characters for all of them, `hub_process` under
@@ -141,6 +145,11 @@ An agent started with **+ New agent** is told only to call `hub_link` with a one
 key; that key carries the name, role and first task you chose. A Claude Code or Cursor agent starts in the
 background by default, with no window: its session is recorded as it links, and **Show terminal** reads its
 screen. One that has not joined 5 minutes after it started shows in Needs you as **Not started**.
+
+Background agents use Claude Code's own `--bg`, `claude agents --json`, `claude logs` and `claude stop`, and Cursor's
+`cursor-agent -p --output-format stream-json`. These are the tools' own commands, not a fixed interface, so a new
+version may change them. crewchat checks that `--bg` is there before it starts one, and offers a Terminal window when
+it is not. Tested with Claude Code 2.1.325, whose recorded output `tests/test_reliability.py` checks on every run.
 
 ## Messages and tasks
 

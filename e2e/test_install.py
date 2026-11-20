@@ -27,11 +27,15 @@ class Install(unittest.TestCase):
         # uv alone, not the folder it is in: that may hold the owner's own crewchat, which the
         # installer would then take for the one it updates.
         (self.home / "uv-only").mkdir()
-        os.symlink(UV, str(self.home / "uv-only" / "uv"))
+        if os.name == "nt":  # a symlink needs a privilege Windows does not give every account: a copy instead
+            shutil.copy2(UV, str(self.home / "uv-only" / os.path.basename(UV)))
+        else:
+            os.symlink(UV, str(self.home / "uv-only" / "uv"))
         self.env = dict(os.environ, HOME=str(self.home), UV_TOOL_DIR=str(self.home / "uv-tools"),
                         UV_TOOL_BIN_DIR=str(self.home / "bin"), UV_CACHE_DIR=uv_dir("cache", "dir"),
                         UV_PYTHON_INSTALL_DIR=uv_dir("python", "dir"), CREWCHAT_HOME=str(self.home / ".crewchat"),
-                        PATH=":".join([str(self.home / "bin"), str(self.home / "uv-only"), "/usr/bin", "/bin"]))
+                        PATH=os.pathsep.join([str(self.home / "bin"), str(self.home / "uv-only")] + (
+                            [] if os.name == "nt" else ["/usr/bin", "/bin"])))
         self.exe = self.home / "bin" / "crewchat"
 
     def install(self, source, lean=False):
@@ -45,6 +49,10 @@ class Install(unittest.TestCase):
     def checkout(self, tag):
         folder = H.TMP / ("src-" + tag)
         if not folder.exists():
+            # The public repo's history starts at 1.0.0, and a shallow clone may have no tags: say so, not a git error.
+            if subprocess.run(["git", "-C", str(H.ROOT), "rev-parse", "-q", "--verify", "refs/tags/" + tag],
+                              capture_output=True).returncode:
+                raise unittest.SkipTest("the old release %s is not in this clone (git fetch --tags)" % tag)
             folder.mkdir()
             archive = subprocess.run(["git", "-C", str(H.ROOT), "archive", tag], capture_output=True, check=True).stdout
             subprocess.run(["tar", "-x", "-C", str(folder)], input=archive, check=True)
@@ -57,9 +65,11 @@ class Install(unittest.TestCase):
         version = subprocess.run([str(self.exe), "--version"], capture_output=True, text=True).stdout
         self.assertIn(H.subprocess.run([H.sys.executable, str(H.ROOT / "crewchat.py"), "--version"],
                                        capture_output=True, text=True).stdout.strip(), version)
-        # Cloud sync's libraries came with it.
+        # A plain install (2.0.1): crewchat's modules, without cloud sync's libraries, and it says how to add them.
         py = next((self.home / "uv-tools" / "crewchat" / "bin").glob("python3*"))
-        subprocess.run([str(py), "-c", "import cryptography, crewchat_cloud, crewchat_map, crewchat_peers"], check=True)
+        subprocess.run([str(py), "-c", "import crewchat_cloud, crewchat_map, crewchat_peers"], check=True)
+        self.assertNotEqual(subprocess.run([str(py), "-c", "import cryptography"], capture_output=True).returncode, 0)
+        self.assertIn("crewchat update --cloud", out)
         # Run a chat with the installed command, as a person would.
         os.environ["CREWCHAT_BIN"] = str(self.exe)
         try:

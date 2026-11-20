@@ -16,8 +16,8 @@ import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import test_crewchat  # noqa: E402  (the shared server fixture; by its module, so its tests are not run again here)
-from test_crewchat import ROOT, TMP, Base, crewchat  # noqa: E402
+import test_crewchat  # noqa: E402  (for its Hooks; by its module, so its tests are not run again here)
+from crewchat_fixture import ROOT, TMP, Base, crewchat  # noqa: E402
 
 PLUGIN = ROOT / "plugin"
 MOD = PLUGIN / "hooks" / "register.js"

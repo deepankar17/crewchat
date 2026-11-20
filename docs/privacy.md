@@ -12,6 +12,9 @@ What crewchat connects to, and only these:
   the latest crewchat release. Nothing from your chat or your machine goes in the request, though
   GitHub, like any web server, sees your IP address and the request's User-Agent.
   `CREWCHAT_NO_UPDATE_CHECK=1` turns it off.
+- **GitHub, if you add a token** on the GitHub card. When an agent uses `hub_github_read`, the server asks GitHub's
+  API, with your token, for your open pull requests or issues, or one pull request. Nothing is sent but those
+  requests; the token stays in this machine's `config.json`.
 - **Your own Firebase project, if you turn on cloud sync.** Messages, tasks, agent lists and shared files (up to 5 MB) are
   encrypted on your machine before they are sent, with a key only your machines hold; Firestore
   stores the ciphertext under your Google account. You sign in with Google to your own project.
@@ -52,7 +55,8 @@ What crewchat connects to, and only these:
   page; the sign-in is kept in the project's `config.json` on that machine, never sent to the chat page. With the
   **Ticket cycle** on (Project settings › Integrations › Jira), crewchat also changes Jira through that sign-in for
   the crew: it reads the tickets your query finds, and agents comment, make sub-tasks and move statuses only with
-  `hub_jira`, each only at its own step. Text with a secret in it (a token, a key, one of crewchat's sign-ins) is
+  `hub_jira`, each only at its own step. Signed in, any agent can also read the project's tickets (`hub_jira_read`)
+  and ask to comment or make a ticket (`hub_jira_write`), which waits for your Allow. Text with a secret in it (a token, a key, one of crewchat's sign-ins) is
   refused before it reaches Jira, and what people write in a ticket reaches agents marked as their words, not your
   instructions.
 - **Google Chat, if you add a space.** When an agent posts a pull request (or you press Test), crewchat sends that
@@ -86,6 +90,10 @@ What crewchat reads on your machine and keeps there:
 - **When each agent was working, waiting for messages or idle,** for the timelines in the Activity
   view: only those states and when they changed, kept on this machine in `events.sqlite`. Not kept
   while `crewchat setup --activity off` keeps what agents do off the page.
+- **Each agent's tool calls, step by step** (`crewchat trace`): the time, the tool's name and the same few words the
+  page shows (a file's name, a command's program), never the call's arguments or what it returned. Kept on this
+  machine in `events.sqlite` for 30 days; not kept while `crewchat setup --activity off`. Exported only to a file you
+  name.
 - **Token counts.** At the end of each turn of a Claude Code agent, its hook reads how many tokens
   the turn used from the session's own transcript: the model and the numbers, never the
   conversation. They go to this machine's chat (or the one the folder is connected to), are added

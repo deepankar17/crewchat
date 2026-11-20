@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 TMP = tempfile.mkdtemp(prefix="crewchat-conv-test-")
 os.environ["CREWCHAT_HOME"] = str(Path(TMP) / "home")
+os.environ["CREWCHAT_NO_SHORTCUT"] = "1"  # no test, nor a child process of one, makes a real shortcut
 
 import crewchat  # noqa: E402  (after CREWCHAT_HOME is set)
 

@@ -239,6 +239,12 @@ times since they were approved, git shows their files largely rewritten since th
 nobody reported them working for 90 days. Such a note is flagged once, and the lead is asked to check it; crewchat
 only flags, never retires a note by itself.
 
+**Notes from repeated trouble.** A few times a day crewchat also reads the last week of the step trace
+(`crewchat trace`) and the edits for trouble that keeps coming back and that no note covers yet: one command (not
+the ones agents use to look around, such as `git` or `ls`) that two or more agents ran 30 times or more, or one file edited 15 times or more across three or more tasks. It asks the
+lead (you, without a lead) to write down what to know as a process note, once per finding in 30 days. crewchat only
+counts and asks: it writes no note itself, and the note is approved as every note is.
+
 The chat page lists every note under **Process notes**, in **Project settings › General** next to the shared skills: its state, this project's or
 all projects', who approved it, what agents reported, whether it may be out of date or is unused, and **Approve**
 (a proposed one) and **Retire**. The menu there sets who approves the project's notes.
@@ -297,7 +303,7 @@ defaults. Enter in a field goes on to the next step.
    [linked to it](multiple-machines.md#agents-on-your-other-machines). The menu offers folders on that machine
    that are connected to this project. To use another, type its path under **Or
    connect one**, or **Browse…** the host's folders (and make a **New folder** there), then
-   **Connect**: it runs `crewchat start` in that folder for you. A folder that is not there yet
+   **Connect**: it connects that folder for you, as `crewchat start FOLDER` does. A folder that is not there yet
    offers **Create it and connect**.
 2. **Engine:** the tool (Claude Code, Cursor's agent, Codex CLI, Gemini CLI, Qwen Code or OpenCode;
    one that is not installed shows as such), its model (Claude Code: Fable, Opus, Sonnet, Haiku, or
@@ -463,7 +469,7 @@ and commits, or agents, tasks and files). Roles and packs belong to each machine
 shared with another machine uses that machine's own.
 
 ```bash
-crewchat start --pack youtube        # a new project, with the YouTube channel's roles
+crewchat start ~/code/channel --pack youtube   # a new project, with the YouTube channel's roles
 crewchat roles packs                 # every pack, yours too
 crewchat roles pack business         # start this project's roles over from a pack
 crewchat roles save-pack studio --label "My studio"   # keep this project's roles as a pack
@@ -610,6 +616,40 @@ screenshots. The developer is woken to fix it, then sends it back to QA to test 
 - After three rounds the task goes to the lead, or to you.
 - Developers are told to open the site or app and check their own change before they hand it over. `hub_agents`
   shows who has the browser or mobile devices on.
+
+## Tasks with stages
+
+Give a task stages and crewchat moves it from agent to agent for you. Each stage has a name and the role whose agent
+does it (up to 12 stages).
+
+- **In order:** `crewchat tasks stages 12 build:developer,test:qa,review:lead`.
+- **As a graph,** in quotes, one stage per part: `NAME:ROLE [after A,B] [> NEXT,NEXT] [| OUTCOME > STAGE]`. For
+  example `"build:developer > test,docs; test:qa > review | flaky > test; docs:writer > review; review:lead after
+  test,docs | changes > build"`: after build, test and docs run at the same time, review starts once both passed, and
+  the reviewer can send it back to build. A stage with no `>` ends its branch, and so does `> end`.
+
+How it runs:
+
+- When the agent at a stage says done, the task goes to an agent with each next stage's role, who is told what to do,
+  what comes next and who works on it at the same time. The one who did a stage before gets it again.
+- An agent picks another outcome by starting its done note with `outcome:NAME` (`outcome:changes rename the button`).
+- `hub_task` return with what failed sends it back to the stage it came from (or where the stage's `| fail >` says).
+- A stage about to run a fourth time goes to the lead, or you, instead. So does a stage whose role no agent has.
+- An agent who gives the task back leaves its stage open for the next agent with that role who takes it. A stage
+  at work alongside others cannot be given back: say blocked, and the lead or you give it to someone.
+- When the last stages pass, that done is the task's done, with the advisor check and anything else done needs.
+- `crewchat tasks stages 12 off` takes them off. A task in the Jira ticket cycle has that cycle's stages instead.
+- The task's card shows where it is, and its panel lists every stage.
+
+## A task closes with a wrap-up
+
+An agent's done (or ready-for-review) note says what was done against the task's "Done when", then a `Decisions:` line
+and a `Left over:` line, so whoever picks up next knows what was settled and what is still open. crewchat refuses a
+done without them. The task's card marks the wrap-up and its panel shows it.
+
+When the step trace shows repeated trouble (a command several agents keep running, or a file edited again and again
+across tasks), crewchat asks the lead, or you, once for a [process note](#process-notes). The note is written and
+approved like any other; crewchat never changes a note, prompt or rule itself.
 
 ## A worked example
 

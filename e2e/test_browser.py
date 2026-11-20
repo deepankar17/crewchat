@@ -7,6 +7,7 @@ The "Add an agent" form is only opened and closed: starting it would open a real
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -24,7 +25,19 @@ try:
 except ImportError:
     websocket = None
 
-CHROME = {"darwin": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}.get(sys.platform, "google-chrome")
+# CREWCHAT_CHROME names another Chrome, such as the e2e workflow's, which runs it without its sandbox.
+CHROME = os.environ.get("CREWCHAT_CHROME") or {
+    "darwin": "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"}.get(sys.platform, "google-chrome")
+
+
+def stop_tree(proc):
+    """Stop a process and everything it started. On Windows the launcher's terminate() leaves Chrome's own processes
+    running, so they are ended with taskkill /T."""
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        proc.terminate()
+    proc.wait(10)
 
 
 class Chrome:
@@ -32,8 +45,10 @@ class Chrome:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))
             self.port = s.getsockname()[1]
+        # Its own profile folder: a Chrome still open on a shared one would take this start over and exit at once.
+        self.profile = tempfile.mkdtemp(prefix="chrome-", dir=H.TMP)
         self.proc = subprocess.Popen([CHROME, "--headless=new", "--remote-debugging-port=%d" % self.port,
-                                      "--remote-allow-origins=*", "--user-data-dir=%s" % (H.TMP / "chrome"),
+                                      "--remote-allow-origins=*", "--user-data-dir=%s" % self.profile,
                                       "--no-first-run", "about:blank"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         pages = eventually(lambda: json.load(urllib.request.urlopen("http://127.0.0.1:%d/json" % self.port)),
                            what="Chrome to start")
@@ -92,8 +107,7 @@ class Chrome:
 
     def close(self):
         self.ws.close()
-        self.proc.terminate()
-        self.proc.wait(10)
+        stop_tree(self.proc)
 
 
 class Signed(unittest.TestCase):
@@ -165,11 +179,13 @@ class NewPage(Signed):
         # W16: the sidebar has the project's places, the crew, and at its foot the settings and You; nothing behind ⋯.
         c = self.chrome
         c.until("!!%s" % self.card(), what="the agent in the sidebar")
-        self.assertEqual(c.js("[...document.querySelectorAll('#rail .places .place')].map(b => b.firstChild.textContent.trim())"),
-                         ["Chat", "Needs you", "Tasks", "Activity"])
-        self.assertEqual(c.js("[...document.querySelectorAll('#rail .rail-foot .place')].map(b => b.textContent.trim().split('\\n')[0])"
-                              ".map(t => t.replace(/^\\W+/, '').split(' notifications')[0].trim())"),
-                         ["Project settings", "Machines & devices", "You"])
+        # One project open (#219): the way back to all projects, its places and its settings; the list is hidden.
+        self.assertEqual(c.js("[...document.querySelectorAll('#rail .places .place')].filter(b => b.offsetParent)"
+                              ".map(b => b.firstChild.textContent.trim())"),
+                         ["← All projects", "Chat", "Needs you", "Tasks", "Activity", "Project settings"])
+        # The foot: the bell and the gear (Global settings); Project settings is in the project's menu above
+        self.assertFalse(c.js("!!document.querySelector('#rail .rail-foot .foot-project')"))
+        self.assertEqual(c.js("$('bell').getAttribute('aria-label')"), "Global settings")
         self.assertIsNone(c.js("document.getElementById('space-menu')"))  # the ⋯ menu is gone
         self.assertEqual(c.js("$('agents-count').textContent"), "1")
         for view, shown in (("needs", "needs-you"), ("tasks", "tasks"), ("analytics", "analytics"), ("chat", "log")):
@@ -181,8 +197,8 @@ class NewPage(Signed):
         c.click("#view-needs")
         c.until("!$('needs-none').hidden", what="nothing needs you, said so")
         c.click("#view-chat")
-        c.click('#rail [data-panel="project"]')
-        c.until("!$('settings').hidden && $('settings-title').textContent === 'General'"
+        c.click('#rail [data-pm="settings"]')
+        c.until("!$('settings').hidden && $('settings-title').textContent === 'Rules & skills'"  # its first section (V4)
                 " && document.querySelector('#settings-nav [aria-current=page]').dataset.settings === 'project'", what="Project settings")
         c.js("closePanel()")
         self.assertEqual(c.errors, [])
@@ -341,22 +357,29 @@ class NewPage(Signed):
         c.click("#bell")
         c.until("!$('settings').hidden && $('settings-title').textContent === 'General'", what="Settings from You")
         nav = "[...document.querySelectorAll('#%s [data-settings]')].map(b => b.firstChild.textContent)"
-        self.assertEqual(c.js(nav % "settings-app"), ["General", "Appearance", "Notifications", "Agents & tools", "Machines & devices",
-                                                       "Phone & remote access", "Accounts", "Privacy & data", "Advanced", "About"])
-        self.assertEqual(c.js(nav % "settings-projects"), ["General", "Crew & roles", "Safety", "Integrations", "Routines",
-                                                            "Folders & files"])
-        self.assertIn("Demo", c.js("$('settings-projects').textContent"))
+        self.assertEqual(c.js(nav % "settings-app"), ["General", "Appearance", "Notifications", "Integrations", "Machines & devices",
+                                                       "Phone & remote access", "Privacy & data", "Advanced", "About"])
+        self.assertEqual(c.js(nav % "settings-projects"), ["Rules & skills", "Crew & roles", "Safety", "Routines", "Folders & files"])
+        self.assertTrue(c.js("$('settings-projects').hidden"))  # Global settings: crewchat's sections only (#238)
         shown = "[...document.querySelectorAll('#settings-main .card[id]')].filter(x => x.offsetParent).map(x => x.id)"
         for kind, cards in (("safety", ["join-card", "approvals-card", "edits-card"]),
-                            ("integrations", ["jira-card", "mcp-card", "gchat-card"]), ("routines", ["routines-card"]),
+                            ("integrations", []),  # the Integrations grid; a card shows only when opened
+                            ("routines", ["routines-card"]),
                             ("folders", ["folders-card"]), ("project", ["link-card", "setup"]),
-                            ("notifications", ["notify-card"]), ("agents", ["new-agent-card", "crew-card"]),
-                            ("accounts", ["accounts-card"]), ("privacy", ["privacy-card"])):
+                            ("notifications", ["notify-card"]), ("crew", None),
+                            ("privacy", ["privacy-card"])):
             c.js("document.querySelector('#settings-nav [data-settings=%s]').click()" % kind)
             c.until("location.hash === '#settings/%s'" % kind, what=kind)
-            self.assertEqual(c.js(shown), cards, kind)
-        c.js("openPanel('accounts')")  # Accounts says whether crewchat is signed in to Atlassian on this machine
-        c.until("$('accounts-jira').textContent === 'Not signed in.'", what="the Atlassian sign-in's state in Accounts")
+            if cards is None:  # Crew & roles: New agent and Saved crew moved here from Agents & tools (#209), with the roles
+                self.assertTrue({"new-agent-card", "crew-card"} <= set(c.js(shown)), c.js(shown))
+            else:
+                self.assertEqual(c.js(shown), cards, kind)
+        # The Jira card says whether crewchat is signed in to Atlassian on this machine (Accounts' line went with #210;
+        # setting it threw, so the card showed the TypeError and kept Sign out).
+        c.js("openPanel('integrations'); document.querySelector('[data-integ=jira-card]').click()")
+        c.until("!$('jira-card').hidden && $('jira-login').textContent === 'Sign in to Atlassian'", what="the Atlassian sign-in's state")
+        self.assertTrue(c.js("$('jira-logout').hidden"))
+        self.assertNotIn("null", c.js("$('jira-watch-note').textContent"))
         # Machines & devices: three tabs.
         c.js("openPanel('machines')")
         c.until("!!document.querySelector('#settings-body .m-me')", what="Machines")
@@ -377,7 +400,7 @@ class NewPage(Signed):
         self.assertEqual(c.js("$('settings-find').value"), "")
         c.type_into("#settings-find", "google")
         c.js("findSetting()")
-        self.assertIn("Google Chat", c.js("$('settings-results').innerText"))
+        self.assertIn("Integrations", c.js("$('settings-results').innerText"))  # its grid has the Google Chat tile (#203)
         self.assertTrue(c.js("document.querySelector('#settings-nav [data-settings=privacy]').classList.contains('dim')"))
         c.type_into("#settings-find", "zebra crossing")
         c.js("findSetting()")
@@ -689,8 +712,10 @@ class NewPage(Signed):
             self.assertFalse(c.js("document.body.classList.contains('rail-open')"))
             places = c.js("[...document.querySelectorAll('#settings-nav [data-settings]')].filter(b => b.offsetParent)"
                           ".sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top).map(b => b.firstChild.textContent)")
-            self.assertEqual(places[:6], ["General", "Crew & roles", "Safety", "Integrations", "Routines", "Folders & files"])
-            self.assertIn("Appearance", places[6:])
+            self.assertEqual(places[:4], ["Rules & skills", "Crew & roles", "Safety", "Routines"])
+            self.assertIn("Appearance", places[4:])
+            for machine_only in ("Integrations", "Folders & files", "Machines & devices", "Advanced"):  # #227
+                self.assertNotIn(machine_only, places)
             self.assertEqual(c.js("getComputedStyle($('settings-main')).display"), "none")
             c.js("document.querySelector('#settings-nav [data-settings=safety]').click()")
             c.until("$('settings-title').textContent === 'Safety' && getComputedStyle($('settings-nav')).display === 'none'",
@@ -757,7 +782,6 @@ class NewPage(Signed):
             self.assertEqual(of("appearance"), "Ink, comfortable")
             self.assertEqual(of("notifications"), "On, when something needs you")
             self.assertEqual(of("machines"), "This machine only")
-            self.assertRegex(of("agents"), r"^\d+ agents?$")
             self.assertRegex(of("general"), r"^\d+ projects?")
             self.assertRegex(of("project"), r"\d+ shared skills?")
             self.assertRegex(of("crew"), r"^\d+ roles")
@@ -783,7 +807,7 @@ class NewPage(Signed):
             c.until("!$('settings').hidden && $('settings-title').textContent === 'Integrations'", what="the linked section")
             c.until("$('jira-card').classList.contains('flash')", what="the linked card marked")
             for old, title in (("machines", "Machines & devices"), ("roles", "Crew & roles"), ("commands", "Advanced"),
-                               ("phone", "Phone & remote access"), ("project", "General")):
+                               ("phone", "Phone & remote access"), ("project", "Rules & skills")):
                 c.js("closePanel(); location.hash = '#%s'" % old)  # an old panel's name, for one release
                 c.until("!$('settings').hidden && $('settings-title').textContent === %s" % json.dumps(title), what=old)
                 c.js("closePanel()")
@@ -997,13 +1021,15 @@ class NewPage(Signed):
             const saved = state.agents;
             const base = state.agents[0];
             const row = (name, extra) => Object.assign({}, base, {agent: name, remote: false, permissions: "ask"}, extra);
-            const bg = {app: "background", since: state.now, tool: "claude", reopen: true, attach: true, modes: ["ask", "plan", "edits"]};
+            const bg = {app: "background", since: state.now, tool: "claude", reopen: true, attach: true,
+                        modes: ["ask", "plan", "edits", "auto", "all"]};
             state.agents = [row("bg-one", {session: Object.assign({}, bg, {running: true, state: "waiting", waiting: "permission prompt"})}),
                             row("bg-closed", {session: Object.assign({}, bg, {running: false, state: "done"})})];
             const look = (n) => { openPanel("agent", n); const b = $("agent-pane-body");
               return {buttons: [...b.querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent),
                       text: b.innerText, selects: [...b.querySelectorAll("select")].map(s => s.getAttribute("aria-label")),
-                      modes: [...(b.querySelector("select[aria-label^='Switch bg-one']") || {options: []}).options].map(o => o.text)}; };
+                      modes: [...(b.querySelector("select[aria-label='Permissions for bg-one']") || {options: []}).options].map(o => o.text),
+                      picked: (b.querySelector("select[aria-label='Permissions for bg-one']") || {}).value}; };
             const out = {running: look("bg-one"), closed: look("bg-closed")};
             closeAgent(); state.agents = saved; renderAgents(true);
             renderNeeds([
@@ -1018,12 +1044,15 @@ class NewPage(Signed):
             return Object.assign(out, {needs});
         })()""")
         self.assertIn("Running in the background · Waiting on permission prompt", out["running"]["text"])
-        for button in ("Show terminal", "Open in Terminal", "Stop"):
+        for button in ("Open in Terminal", "Stop"):
             self.assertIn(button, out["running"]["buttons"])
-        self.assertIn("Switch bg-one's mode", out["running"]["selects"])
-        self.assertEqual(out["running"]["modes"], ["Switch mode…", "Ask (now)", "Plan", "Accept edits"])
+        self.assertNotIn("Show terminal", out["running"]["buttons"])  # its Terminal card shows the screen
+        self.assertIn("Permissions for bg-one", out["running"]["selects"])
+        self.assertEqual(out["running"]["modes"], ["Asks first", "Plans first", "Edits files without asking",
+                                                   "Judges what is safe", "Anything, without asking"])
+        self.assertEqual(out["running"]["picked"], "ask")
         self.assertIn("Reopen", out["closed"]["buttons"])
-        self.assertIn("Show terminal", out["closed"]["buttons"])
+        self.assertNotIn("Show terminal", out["closed"]["buttons"])
         self.assertNotIn("Open in Terminal", out["closed"]["buttons"])
         self.assertIn("Trust the files in /w/site", out["needs"]["text"])
         self.assertIn("jira", out["needs"]["text"])
@@ -1091,7 +1120,7 @@ class NewPage(Signed):
         # next start or Reopen", but its card had no Reopen. Now it has Restart, which posts op restart, and says so.
         c = self.chrome
         c.until("state.agents.length > 0", what="the agents")
-        out = c.js("""(() => {
+        out = c.js("""(async () => {
             const saved = state.agents, base = state.agents[0];
             const bg = {app: "background", since: state.now, tool: "claude", reopen: true, attach: true,
                         modes: ["ask", "plan", "edits"], state: "idle", waiting: ""};
@@ -1108,10 +1137,11 @@ class NewPage(Signed):
             window.sent = []; window.realFetch = window.realFetch || window.fetch;
             window.fetch = (url, opts) => { window.sent.push([String(url), opts && opts.body || ""]);
                                             return Promise.resolve(new Response('{"ok": true}', {status: 200})); };
-            window.asked = ""; window.confirm = (q) => { window.asked = q; return true; };
+            window.asked = ""; window.ask = async (q) => { window.asked = q; return true; };
             [...$("agent-pane-body").querySelectorAll("button")].find(x => x.textContent === "Restart").click();
+            await new Promise((done) => setTimeout(done, 50));  // it asks first, in the page's own box: then it posts
             out.asked = window.asked;
-            window.fetch = window.realFetch; window.confirm = () => true;
+            window.fetch = window.realFetch; window.ask = async () => true;
             out.sent = window.sent.filter(([u]) => u.includes("/api/agent")).map(([u, b]) => JSON.parse(b));
             closeAgent(); state.agents = saved; renderAgents(true);
             return out;
@@ -1192,10 +1222,10 @@ class NewPage(Signed):
               return [...$("agent-pane-body").querySelectorAll("button")].filter(x => !x.disabled).map(x => x.textContent); };
             const out = {linked: look("far-linked"), cloud: look("far-cloud")};
             closeAgent(); state.agents = saved; renderAgents(true);
-            out.crew = ["crew-save", "crew-start", "crew-stop"].map((id) => !!$(id) && $("crew-card").contains($(id)) && $("crew-card").dataset.section === "agents");
+            out.crew = ["crew-save", "crew-start", "crew-stop"].map((id) => !!$(id) && $("crew-card").contains($(id)) && $("crew-card").dataset.section === "crew");
             return out;
         })()""")
-        for button in ("Stop", "Fork", "Show terminal"):
+        for button in ("Stop", "Fork"):
             self.assertIn(button, out["linked"])
         self.assertNotIn("Open in Terminal", out["linked"])  # its window would open on the other machine
         self.assertNotIn("Stop", out["cloud"])  # cloud sync carries no requests
@@ -1292,7 +1322,7 @@ class NewPage(Signed):
         listed = self.m.cli("mcp", "list")
         self.assertIn("my-server", listed)
         self.assertNotIn("e2e-key", listed)
-        c.js("window.confirm = () => true; [...$('mcp-list').querySelectorAll('button')].find(b => b.textContent === 'Remove').click()")
+        c.js("window.ask = async () => true; [...$('mcp-list').querySelectorAll('button')].find(b => b.textContent === 'Remove').click()")
         c.until("!$('mcp-list').textContent.includes('my-server')", what="the server removed")
         self.assertEqual(c.errors, [])
 
@@ -1323,7 +1353,7 @@ class NewPage(Signed):
              "$('mcp-where').dispatchEvent(new Event('input'))")
         self.assertFalse(c.js("$('mcp-share').checked"))
         c.js("$('mcp-where').value = ''; $('mcp-share').checked = true")
-        c.js("window.confirm = () => true; [...$('mcp-list').querySelectorAll('li')].find(li => "
+        c.js("window.ask = async () => true; [...$('mcp-list').querySelectorAll('li')].find(li => "
              "li.textContent.includes('e2e-from-cursor')).querySelectorAll('button')[2].click()")
         c.until("!$('mcp-list').textContent.includes('e2e-from-cursor')", what="the server removed")
         self.assertEqual(c.errors, [])
@@ -1344,6 +1374,7 @@ class NewPage(Signed):
         c.until("$('gchat-mirror-note').textContent.startsWith('Posting only')", what="the mirror on, posting only")
         self.assertIn("Replies from Google Chat need sign-in with Google (read messages)",
                       c.js("$('gchat-mirror-note').textContent"))
+        c.js("showIntegration('gchat-card')")  # the Google Chat card opens from its tile
         c.js("$('gchat-mirror-signin').click()")
         self.assertTrue(c.js("$('gchat-signin').open && document.activeElement === $('gchat-client')"))
         c.js("$('gchat-send').value = 'owner'; $('gchat-send').dispatchEvent(new Event('change'))")
@@ -1403,7 +1434,7 @@ class NewPage(Signed):
         c.until("$('settings-title').textContent === 'Designer'", what="the new role's panel")
         self.assertIn("You design the screens.", c.js("$('settings-body').innerText"))
         c.until("state.roles.some(r => r.name === 'designer')", what="the role in the page's list")
-        c.js("window.confirm = () => true")
+        c.js("window.ask = async () => true")
         c.js("[...$('settings-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
         c.until("$('settings-title').textContent === 'Crew & roles' && !$('settings-body').innerText.includes('Designer')",
                 what="the role gone")
@@ -1436,7 +1467,7 @@ class NewPage(Signed):
         self.assertEqual(order[0], "Lead")
         c.js("openPanel('role', 'ux-lead')")
         c.until("$('settings-title').textContent === 'UX lead'", what="its panel")
-        c.js("window.confirm = () => true")
+        c.js("window.ask = async () => true")
         c.js("[...$('settings-body').querySelectorAll('button')].find(b => b.textContent === 'Delete').click()")
         c.until("$('settings-title').textContent === 'Crew & roles' && !$('settings-body').innerText.includes('UX lead')",
                 what="the role gone")
@@ -1446,7 +1477,7 @@ class NewPage(Signed):
         c = self.chrome
         c.click("#view-tasks")
         c.js("$('as-list').click()")
-        self.addCleanup(c.js, "$('as-board').click(); showView('chat'); window.confirm = () => true")
+        self.addCleanup(c.js, "$('as-board').click(); showView('chat'); window.ask = async () => true")
         # Add with no title says what is missing, and puts the cursor there.
         c.js("$('t-title').value = ''; $('task-form').requestSubmit()")
         self.assertIn("Write the task first", c.js("$('tasks-note').textContent"))
@@ -1464,16 +1495,37 @@ class NewPage(Signed):
         mid = c.js("state.sheet.find(r => r.title === 'Write the release notes').id")
         off = "[...document.querySelectorAll('#sheet button')].find(b => b.title === 'Take task %s off the sheet')" % mid
         # × asks first, as every action that cannot be undone here does.
-        c.js("window.asked = ''; window.confirm = (q) => { window.asked = q; return false; }")
+        c.js("window.asked = ''; window.ask = async (q) => { window.asked = q; return false; }")
         c.js(off + ".click()")
         self.assertIn("off the sheet?", c.js("window.asked"))
         self.assertTrue(c.js("state.sheet.some(r => r.id === %s)" % json.dumps(mid)))  # said no: still there
-        c.js("window.confirm = () => true")
+        c.js("window.ask = async () => true")
         c.js(off + ".click()")
         c.until("!state.sheet.some(r => r.id === %s)" % json.dumps(mid), what="the task off the sheet")
         # Its card in the chat says so, instead of "Open".
         card = "state.nodes.get(%s)[1].querySelector('.state').textContent" % json.dumps(mid)
         c.until("%s === 'Off the sheet'" % card, what="the card to say it is off the sheet")
+        self.assertEqual(c.errors, [])
+
+    def test_the_page_asks_in_its_own_box(self):
+        """Path to 10 (UX): Remove, Stop and the rest ask in the page's own box, not the browser's confirm()."""
+        c = self.chrome
+        c.js("window.answered = 'none'; ask('Remove the skill lint from every folder of this project?')"
+             ".then(v => window.answered = v); 0")
+        c.until("$('ask-dialog').open", what="the question box")
+        self.assertEqual(c.js("[$('ask-go').textContent, $('ask-go').classList.contains('danger'), $('ask-input').hidden]"),
+                         ["Remove", True, True])
+        self.assertEqual(c.js("document.activeElement.id"), "ask-cancel")  # Enter does not remove
+        c.js("$('ask-cancel').click()")
+        c.until("window.answered === false && !$('ask-dialog').open", what="Cancel answers no")
+        c.js("askText('A name for the pack:', 'Mine').then(v => window.answered = v); 0")
+        c.until("$('ask-dialog').open && $('ask-input').value === 'Mine'", what="the box with its field")
+        c.js("$('ask-input').value = 'Release crew'; $('ask-form').requestSubmit()")
+        c.until("window.answered === 'Release crew'", what="the text typed")
+        c.js("tell('Not removed: it is in use.').then(() => window.answered = 'told'); 0")
+        c.until("$('ask-dialog').open && $('ask-cancel').hidden", what="a notice has one button")
+        c.js("$('ask-go').click()")
+        c.until("window.answered === 'told' && !$('ask-dialog').open")
         self.assertEqual(c.errors, [])
 
     def test_searching_from_the_board_shows_the_chat(self):
@@ -1522,7 +1574,7 @@ class NewPage(Signed):
         try:
             c.js("openPanel('routines')")
             c.until("$('routines-list').innerText.includes('jira-review')", what="the routine in Project settings")
-            self.assertIn("Run now Pause Edit Remove", c.js("$('routines-list').innerText"))
+            self.assertIn("Run now Pause Edit Duplicate Remove", c.js("$('routines-list').innerText"))
             self.assertEqual(c.errors, [])
         finally:
             self.m.cli("routines", "remove", "jira-review")
@@ -1727,8 +1779,8 @@ class NewPage(Signed):
                 Notification.permission = 'default';""")
         c.js("openPanel('notifications')")  # Settings › Notifications (W16)
         c.js("document.querySelector('[data-notify=all]').click()")
-        c.until("Notification.permission === 'granted' && !$('bell').classList.contains('off')", what="the bell on")
-        self.assertEqual(c.js("$('you-note').textContent"), "notifications on")
+        c.until("Notification.permission === 'granted' && !$('notify-btn').classList.contains('off')", what="the bell on")
+        self.assertEqual(c.js("$('notify-btn').getAttribute('aria-label')"), "Notifications: when something needs you, sound off")  # #235
         c.js("closePanel()")
         tid = c.js("postJSON('/api/task', {op: 'add', title: 'Pick a colour for the login button'}).then(r => r.id)")
         self.agent.call("hub_task", action="take", id=tid)
@@ -1808,7 +1860,7 @@ class NewPage(Signed):
              " [...n.querySelectorAll('button')].find(b => b.textContent === 'Send').click(); })()" % card)
         self.assertIn("Re #%s: Staging first" % tid, eventually(self.agent.stop_hook, what="the agent to get the answer"))
         c.until("!$('needs-list').innerText.includes('Staging or prod vault?')", what="the card to go")
-        self.agent.call("hub_task", action="update", id=tid, status="done", note="Rotated")
+        self.agent.call("hub_task", action="update", id=tid, status="done", note="Rotated\nDecisions: none\nLeft over: none")
         c.click("#view-chat")
         self.assertEqual(c.errors, [])
 
@@ -2079,12 +2131,18 @@ class NewPage(Signed):
         c.type_into("#text", "@%s Ready to ship the outbox?" % self.agent.name)
         c.js("$('send').click()")
         node = "[...document.querySelectorAll('#log .msg')].find(e => e.innerText.includes('Ready to ship the outbox?'))"
-        c.until("!!%s && %s.querySelector('.receipt').textContent === 'Needs a reply · sent'" % (node, node), what="sent")
+        c.until("!!%s && %s.querySelector('.receipt').textContent.startsWith('Needs a reply · sent')" % (node, node), what="sent")
         self.assertTrue(c.js("$('ask-chip').hidden"))  # one message only
         self.assertIn("Ready to ship the outbox?", self.agent.stop_hook())
-        c.until("%s.querySelector('.receipt').textContent === 'Needs a reply · handed over'" % node, what="handed over")
+        # Handed over, or already seen: in a full run the agent's cursor can pass the ask by the next poll, and the
+        # receipt goes from sent straight to seen (hub.ask_states). " · woke the agent" may follow either (W2).
+        reached = "/^Needs a reply · (handed over|seen, not answered yet)/.test(%s.querySelector('.receipt').textContent)" % node
+        try:
+            c.until(reached, what="handed over")
+        except AssertionError:
+            raise AssertionError("the receipt reads %r" % c.js("%s.querySelector('.receipt').textContent" % node))
         self.agent.call("hub_send", to="Owner", text="Yes, once CI is green.")
-        c.until("%s.querySelector('.receipt').textContent === 'Answered'" % node, what="answered")
+        c.until("%s.querySelector('.receipt').textContent.startsWith('Answered')" % node, what="answered")
         self.assertEqual(c.errors, [])
 
     def test_an_agents_receipt_and_reply_count_sit_under_its_bubble(self):
@@ -2314,8 +2372,8 @@ class NewPage(Signed):
         c.until("$('launch').open && $('l-folder').options.length > 0", what="the dialog and its folders")
         self.assertIn("notes-app", c.js("$('l-folder').innerText"))
         step = "[...document.querySelectorAll('#launch .step')].findIndex(f => !f.hidden)"
-        self.assertEqual(c.js(step), 0)  # the workspace first (U8)
-        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Workspace")
+        self.assertEqual(c.js(step), 0)  # the folder first (U8)
+        self.assertEqual(c.js("document.querySelector('#l-steps li.on').textContent"), "Folder")  # #191's wording
         self.assertEqual(c.js("[$('l-back').hidden, $('l-next').hidden, $('l-start').hidden]"), [True, False, False])
         self.assertFalse(c.js("$('l-start').disabled"))  # a folder and a tool: it can start from here
         c.js("$('l-template').value = 'qa'; $('l-template').dispatchEvent(new Event('change'))")
@@ -2440,8 +2498,9 @@ class NewPage(Signed):
         c.type_into("#p-name", "Cooking channel")
         c.js("$('p-pack').value = 'youtube'")
         c.js("$('project-form').requestSubmit()")
-        c.until("location.search.includes('chat=cooking-channel') && $('project').textContent === 'Cooking channel'",
-                what="the new project's page")
+        # An empty project says what to do in place of its name (the project-folders spec, 13 Nov).
+        c.until("location.search.includes('chat=cooking-channel') && "
+                "$('project').textContent === 'New project: link a folder to start'", what="the new project's page")
         c.js("$('tab-add').open = true")
         c.until("[...document.querySelectorAll('#tabs .tab')].length === 2", what="a row for each project")
         c.until("state.crew === 'general' && state.roles.some(r => r.title === 'Producer')", what="the YouTube pack")
@@ -2454,6 +2513,8 @@ class NewPage(Signed):
         tabs = "[...document.querySelectorAll('#tabs .tab .pname')].map(t => t.textContent)"
         self.addCleanup(c.js, "$('tab-add').open = false")
         c.js("postJSON('/api/projects', {op: 'create', name: 'Scratch pad'})")
+        # A message makes it a project in use, shown under its name (an empty one says to link a folder instead).
+        c.js("postJSON('/api/send?chat=scratch-pad', {to: 'all', text: 'a first note'})")
         c.open(c.js("location.href"))  # a new project shows on the next answer that changes; this page sees it now
         c.until("%s.includes('Scratch pad')" % tabs, what="a tab for the new project")
         # Close tab: off the bar, still in the + menu, and back on the bar once opened from there.
@@ -2728,16 +2789,17 @@ class NewPage(Signed):
                 code = self.m.cli("ui", "--print").split(": ")[1].split()[0]
                 c.open(self.m.url + "/login?code=" + code.replace("-", ""))
                 c.until("location.pathname === '/' && !!%s" % self.card(), what="signed in again")
-            # Something that needs the owner: a tap on the header's count opens Needs you (U3, W16).
+            # Something that needs the owner: the Needs you tab counts it, and a tap opens it (U3, W16; one phone alert
+            # since V4, 14 Nov: the tab's count, no second one in the header).
             stuck = self.m.owner.task("all", "Pick the default theme")
             self.agent.call("hub_task", action="take", id=stuck)
             self.agent.call("hub_task", action="update", id=stuck, status="blocked", note="Follow the system setting?")
-            c.until("!$('needs-open').hidden && getComputedStyle($('needs-open')).display !== 'none'", what="the count")
-            self.assertIn("Needs you:", c.js("$('needs-open').getAttribute('aria-label')"))
-            c.click("#needs-open")
-            c.until("!$('needs-you').hidden && document.activeElement === $('needs-you')", what="Needs you")
+            c.until("$('tab-needs').textContent === '1'", what="the count")
+            self.assertEqual(c.js("getComputedStyle($('needs-open')).display"), "none")
+            c.js("document.querySelector('#tabbar [data-tab=needs]').click()")
+            c.until("!$('needs-you').hidden", what="Needs you")
             self.assertIn("Pick the default theme", c.js("$('needs-list').textContent"))
-            self.agent.call("hub_task", action="update", id=stuck, status="done", note="Follows the system")
+            self.agent.call("hub_task", action="update", id=stuck, status="done", note="Follows the system\nDecisions: none\nLeft over: none")
             c.js("showView('chat'); setDrawer(false)")
             c.click("#rail-open")
             c.until("$('rail').getBoundingClientRect().left >= 0", what="the drawer to open")
@@ -2777,7 +2839,7 @@ class NeedsYouEveryProject(Signed):
         side = cls.m.dir / "side-gig"
         side.mkdir()
         subprocess.run(["git", "init", "-q", str(side)], check=True)
-        cls.m.cli("start", "--no-service", "--no-open", cwd=side)
+        cls.m.cli("start", side, "--no-service", "--no-open")  # a bare start links nothing (40ef2d9)
         cls.other = cls.m.agent(folder=side)
         cls.other.link()
         cls.other.stop_hook()
@@ -2989,8 +3051,7 @@ class MobileBridge:
 
     def close(self):
         self.proc.stdin.close()
-        self.proc.terminate()
-        self.proc.wait(10)
+        stop_tree(self.proc)
         self.proc.stdout.close()
 
 
@@ -3056,10 +3117,11 @@ class Machines(unittest.TestCase):
         self.chrome.type_into("input[name=code]", code)
         self.chrome.js("document.querySelector('form').submit()")
         self.chrome.until("location.pathname === '/' && !!document.getElementById('log')", what="the chat page")
-        self.chrome.js("window.confirm = () => true")  # Remove and Unlink ask first
+        self.chrome.js("window.ask = async () => true")  # Remove and Unlink ask first
 
     def open_panel(self):
-        self.chrome.click('[data-panel="machines"]')
+        self.chrome.until("typeof openPanel === 'function'", what="the page's script")  # it may still be loading
+        self.chrome.js("openPanel('machines')")  # Global settings › Machines & devices (no sidebar button since #204)
         self.chrome.until("!!document.querySelector('#settings:not([hidden]) .m-me')", what="Settings › Machines & devices")
 
     def machine_states(self):
@@ -3126,6 +3188,7 @@ class Machines(unittest.TestCase):
 
 
 @unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+@unittest.skipUnless((H.ROOT / "site" / "build.py").exists(), "the website is not in the public repo")
 class PublicDemo(unittest.TestCase):
     """Roadmap X3: crewchat.dev/demo, the analytics view on its sample data with no crewchat server, served with the
     headers firebase.json gives the site (a policy that allows no inline script or style)."""
@@ -3207,6 +3270,126 @@ class UpdateNoticeOnThePage(unittest.TestCase):
                 chrome.close()
             m.stop()
             github.close()
+
+
+@unittest.skipUnless(websocket and os.path.exists(CHROME), "needs Google Chrome and websocket-client")
+class ProjectFoldersOnThePage(Signed):
+    """Project folders (PF-B to PF-D, #178), as the owner uses them on the page: New project's folder warning, a
+    workspace from elsewhere opened held and trusted, Remove with its folder deleted, and a workspace not found
+    located or forgotten from a phone. On a machine of its own: these add and remove projects."""
+
+    def setUp(self):
+        self.area = self.m.dir / ("workspaces-%s" % self._testMethodName[-12:])
+        self.area.mkdir()
+        self.chrome.size(1280, 900)
+        self.chrome.open(self.m.url + "/")
+        self.chrome.until("!!document.getElementById('log') && (state.projects || []).length > 0", what="the page")
+
+    def make(self, name, folder):
+        """A project in its own workspace folder, made as the page's New project makes it (confirmed)."""
+        made = self.chrome.js("postJSON('/api/projects', {op: 'create', name: %s, folder: %s, confirm: true})"
+                              % (json.dumps(name), json.dumps(str(folder))))
+        self.assertTrue((folder / "crewchat-project.json").exists(), made)
+        return made["id"]
+
+    def go(self, pid):
+        self.chrome.open(self.m.url + "/?chat=" + pid)
+        self.chrome.until("!!document.getElementById('log') && (state.projects || []).some(p => p.id === %s)"
+                          % json.dumps(pid), what="the project's page")
+
+    def test_new_project_warns_about_a_folder_in_a_repository_then_creates_it(self):
+        c = self.chrome
+        repo = self.area / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        c.click("#new-project")
+        c.until("$('project-dialog').open", what="New project")
+        c.until("$('p-folder').value.includes('crewchat-workspaces')", what="the default folder")
+        c.type_into("#p-name", "Bluebird")
+        c.type_into("#p-folder", str(repo / "Bluebird"))
+        c.click("#p-create")
+        c.until("!$('p-warn').hidden", what="the warning")
+        self.assertIn("git repository", c.js("$('p-warn-list').innerText"))
+        self.assertFalse((repo / "Bluebird").exists())  # nothing made before the owner says so
+        c.click("#p-anyway")
+        c.until("location.search.includes('chat=')", what="the new project's page")
+        self.assertTrue((repo / "Bluebird" / "crewchat-project.json").exists())
+        self.assertEqual(c.errors, [])
+
+    def test_a_workspace_from_elsewhere_opens_held_and_trust_lifts_it(self):
+        c = self.chrome
+        pid = self.make("Copyme", self.area / "Copyme")
+        copy = self.area / "Copyme-copy"
+        shutil.copytree(str(self.area / "Copyme"), str(copy))  # as if it came from another machine
+        c.js("openWorkspace()")
+        c.until("$('open-dialog').open", what="Open a project")
+        c.type_into("#open-path", str(copy))
+        c.click("#open-go")
+        c.until("!!openedNow", what="opened")
+        opened = c.js("openedNow.id")
+        self.assertNotEqual(opened, pid)  # a copy gets its own id
+        self.go(opened)
+        c.until("!$('held-banner').hidden && !$('held-card').hidden", what="the held banner and card")
+        self.assertTrue(c.js("$('add-agent').disabled"))  # held, no folder: no agent yet
+        for width, dark in ((1280, False), (390, True)):
+            c.size(width, 844, mobile=width < 500, dark=dark)
+            self.assertLessEqual(c.js("document.documentElement.scrollWidth"), width)
+            self.assertEqual(self.shown_though_hidden(), [])
+        c.size(1280, 900)
+        c.click("#held-trust")
+        c.until("$('held-banner').hidden && !$('held-done').hidden", what="trusted")
+        self.assertIn("Trusted.", c.js("$('held-done').textContent"))
+        self.go(opened)
+        self.assertTrue(c.js("$('held-banner').hidden"))  # and after a reload too
+        self.assertEqual(c.errors, [])
+
+    def test_remove_with_the_box_ticked_deletes_the_workspace(self):
+        c = self.chrome
+        ws = self.area / "Gone"
+        pid = self.make("Gone", ws)
+        self.go(pid)
+        c.js("askClose(state.projects.find(p => p.id === %s), CHAT)" % json.dumps(pid))
+        c.until("$('close-dialog').open", what="the close dialog")
+        c.click("#close-remove")
+        c.until("!$('remove-part').hidden", what="what removing does")
+        self.assertFalse(c.js("$('remove-delete').checked"))  # never ticked until the owner ticks it
+        self.assertIn(str(ws), c.js("$('remove-path').textContent"))
+        c.click("#remove-delete")
+        c.type_into("#remove-name", "Gone")
+        c.click("#close-remove")
+        eventually(lambda: not ws.exists(), 15, "the project folder deleted")
+        c.until("!location.search.includes(%s)" % json.dumps("chat=" + pid), what="off the removed project's page")
+        c.until("(state.projects || []).length > 0", what="the page after the move")
+        self.assertNotIn(pid, c.js("state.projects.map(p => p.id)"))
+        self.assertEqual(c.errors, [])
+
+    def test_a_workspace_not_found_is_located_or_forgotten_from_a_phone(self):
+        c = self.chrome
+        moved, lost = self.make("Moved", self.area / "Moved"), self.make("Lost", self.area / "Lost")
+        (self.area / "Moved").rename(self.area / "Moved-now")
+        (self.area / "Lost").rename(self.area / "Lost-away")
+        c.size(390, 844, mobile=True)
+        c.open(self.m.url + "/")
+        c.until("(state.missing || []).length === 2", what="both not found")
+        self.assertEqual(c.js("[...$('projects').querySelectorAll('optgroup option')].map(o => o.value).sort()"),
+                         ["missing:" + lost, "missing:" + moved])
+        here = c.js("$('projects').value")
+        c.js("(() => { const s = $('projects'); s.value = %s; s.dispatchEvent(new Event('change')); })()" % json.dumps("missing:" + moved))
+        c.until("$('locate-dialog').open", what="Locate, from the phone's menu")
+        self.assertEqual(c.js("$('projects').value"), here)  # the menu stays on this project
+        c.type_into("#locate-path", str(self.area / "Moved-now"))
+        c.click("#locate-go")
+        c.until("!(state.missing || []).some(m => m.id === %s)" % json.dumps(moved), what="located")
+        c.js("$('locate-dialog').open && $('locate-dialog').close()")
+        c.js("(() => { const s = $('projects'); s.value = %s; s.dispatchEvent(new Event('change')); })()" % json.dumps("missing:" + lost))
+        c.until("$('locate-dialog').open", what="Locate for the lost one")
+        c.click("#locate-forget")
+        c.until("$('forget-dialog').open && !$('locate-dialog').open", what="Forget, from Locate")
+        c.click("#forget-go")
+        c.until("!(state.missing || []).length", what="forgotten")
+        self.assertTrue((self.area / "Lost-away" / "crewchat-project.json").exists())  # nothing deleted
+        self.assertLessEqual(c.js("document.documentElement.scrollWidth"), 390)
+        self.assertEqual(c.errors, [])
 
 
 if __name__ == "__main__":

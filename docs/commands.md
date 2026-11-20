@@ -24,8 +24,20 @@ stop or uninstall are never run from the page, so a stray tap on a phone cannot 
 
 ### `crewchat start [FOLDER]`
 
-Host a chat on this machine if there is none yet, start the server, connect the folder (default:
-the current one) and open the chat page. Safe to run again.
+Host a chat on this machine if there is none yet, start the server, connect FOLDER (`.` for the
+one you are in; with none, nothing is connected and the page opens on its welcome screen) and open the
+chat page. Safe to run again.
+
+- **`crewchat start`**, with no folder, links nothing. It writes nothing into the folder you ran it in (no project, no
+  hooks, no `.mcp.json`, no guide), so it is safe from any folder, an administrator prompt included. On a machine that
+  is not set up yet it sets the machine up first (the port, the owner's sign-in), without naming a project after the
+  folder. Run again, it only opens the page. Create a project and link its folders on the page
+  ([Getting started](getting-started.md#a-project-with-several-folders)).
+- **`crewchat start FOLDER`** (`.` for the one you are in) connects that folder, as before: to the project `--chat` names, or to a new project named
+  after the folder. `--chat`, `--project` or `--place` without a folder connect the current one.
+- **`crewchat start --chat NAME`** puts the folder in the project NAME (made if there is none).
+
+On a first start, and again when the shortcut is missing, `start` also adds the [crewchat shortcut](#crewchat-shortcut-onoffstatus).
 
 | Option | |
 |---|---|
@@ -42,14 +54,35 @@ the current one) and open the chat page. Safe to run again.
 
 Link this machine with your others. Without an argument it explains both ways and asks.
 
-### `crewchat ui [--print]`
+### `crewchat ui [--print] [--tab] [--profile NAME]`
 
-Open the chat page, signed in as you. `--print` shows a sign-in code instead, to type on another
-device (it works once, for two minutes).
+Open the chat page, signed in as you. On a machine with Microsoft Edge or Google Chrome the page opens in a window of
+its own (no address bar, no tabs); with neither it opens in your default browser. `--tab` opens a tab of the default
+browser instead; `"window": "tab"` in `config.json` does that every time. `crewchat start` opens the page the same
+way. `--print` shows a sign-in code instead, to type on another device (it works once, for two minutes).
+`--profile NAME` opens the window in one of the browser's profiles (its name, such as Work, or its folder); it is
+remembered. `--profile ''` forgets it. Without one, Chrome opens the window in its last-used profile.
+
+### `crewchat shortcut on|off|status`
+
+A **crewchat** shortcut that starts the chat without a terminal: Start menu and desktop on Windows, an app in
+`~/Applications` on macOS, an entry in the applications menu on Linux. It runs crewchat through the Python you have
+(no new program file), with no console window on Windows. `crewchat start` adds it once; `off` takes it away and
+`crewchat start` does not add it again; `on` brings it back (and tries again if it could not be made); `status` says
+which. `crewchat uninstall` removes it. `CREWCHAT_NO_SHORTCUT=1` makes crewchat write none.
 
 ### `crewchat status`
 
 Is the server running, its addresses, connected folders, linked machines, and who is here.
+
+### `crewchat doctor [--json]`
+
+Checks crewchat on this machine and says what to do for each problem: Python, the version, crewchat's folder (can be
+written, free space), `config.json`, the tokens (readable by you only), lines of `messages.jsonl` that cannot be read,
+`state.json`, the server (running, and on this version), start at login, and cloud sync or linked machines when they
+are on. It also checks every project folder: one not found, one held, one open on another machine, one on a network
+drive, and lines of its messages that cannot be read. It sends nothing, and shows no token, key, message, project or
+folder name, so you can paste it into a public issue as it is. It exits with 1 when something must be fixed.
 
 ### `crewchat feedback [bug|idea|works] [--print]`
 
@@ -70,7 +103,7 @@ only what you submit on that page reaches GitHub. `--print` shows the link inste
 | `crewchat restart [--project NAME] [--port N] [--no-service]` | Start the server again, or restart a running one. It says which it did. Takes `start`'s server options: `--project` and `--port` set up a machine not set up yet, a new `--port` moves the server, `--no-service` runs it until you log out |
 | `crewchat resume` | After an upgrade (the installers run it): start the server again, and set it to start at login unless you turned that off |
 | `crewchat update [--version X]` | Install the latest release (or X) and restart the server on it |
-| `crewchat uninstall [--yes] [--purge]` | Remove crewchat: server, login start, its hooks in your folders, the program. Asks before deleting your chats (`--purge`: delete them) |
+| `crewchat uninstall [--yes] [--purge]` | Remove crewchat: server, login start, the shortcut, its hooks in your folders, the program. Asks before deleting your chats (`--purge`: delete them) |
 
 ## Talking and agents
 
@@ -122,6 +155,8 @@ only what you submit on that page reaches GitHub. `--print` shows the link inste
 | Command | |
 |---|---|
 | `crewchat projects` | This machine's projects and their folders |
+| `crewchat projects open FOLDER` | Open a workspace folder from before (it holds `crewchat-project.json`): it goes on this machine's list and loads, and its folders here are linked again. One this machine has not had before opens held until you trust it on the page ([details](getting-started.md#open-a-workspace-again)) |
+| `crewchat projects remove NAME [--delete-folder] [--yes]` | Remove a project from this machine: its agents here are stopped, its folders unlinked (crewchat's own entries only) and it comes off the list; its workspace folder stays. `--delete-folder` also deletes the workspace folder, but only what crewchat keeps there, and not if it holds anything else (it names it). It asks you to type the project's name first; `--yes` skips that. The machine's first project cannot be removed |
 | `crewchat start --chat NAME` | Put this folder in the project NAME (made if there is none); without it, a new folder starts a project named after itself |
 | `--chat NAME` | On `say`, `agents`, `agent`, `role`, `roles`, `places`, `place`, `invite`, `ui`, `status`, `rules`, `skills`, `mcp`, `processes`, `tasks`, `routines`: act on that project, not the one of the folder you are in |
 | `crewchat rules` | Print the project's guide for its agents |
@@ -136,8 +171,10 @@ only what you submit on that page reaches GitHub. `--print` shows the link inste
 | `crewchat tasks` | The task sheet |
 | `crewchat edits [auto\|on\|off] [--days N]` | Which files this project's agents edit (paths inside the project, kept on this machine): auto keeps them for a software team; with no option, the files edited lately |
 | `crewchat map [PATH] [--importers\|--defs]` | The code map of this project's folders, kept while edit tracking is on: with no path, what it holds and the commit it was built from; with a path, the files it uses, the files that use it (`--importers`), or its classes and functions (`--defs`) |
+| `crewchat trace [--days N] [--agent NAME] [--format text\|jsonl\|otlp] [--output FILE]` | Each agent's tool calls, step by step (the tool and a few safe words, never its arguments), kept on this machine for 30 days. `--format jsonl` writes a step a line; `--format otlp` writes OpenTelemetry trace data (OTLP JSON) that a tracing tool such as Jaeger, Grafana Tempo or Langfuse can read. crewchat sends it nowhere: to load it into your own collector, run `curl -X POST -H "Content-Type: application/json" --data @trace.json http://localhost:4318/v1/traces`. A call's span lasts until the agent's next call, as hooks see a call only after it ran |
 | `crewchat usage [on\|off] [--days N]` | Tokens this project's Claude Code agents used, per agent, day and task, with an estimate of the cost at API prices; or stop or start counting them |
 | `crewchat tasks add TEXT [--depends IDS] [--areas PATHS] [--where MACHINE] [--to AGENT]` | Put a task on the sheet |
+| `crewchat tasks stages ID STAGES\|off` | The stages a task goes through, each done by an agent with that role: in order (`build:developer,test:qa,review:lead`), or a graph in quotes, a stage per part, `NAME:ROLE [after A,B] [> NEXT,NEXT] [\| OUTCOME > STAGE]`, with stages that run at once, a stage that waits for others, and outcomes an agent picks with `outcome:NAME`. A failed stage goes back where it came from; a stage about to run a fourth time goes to the lead or you; the last stage's done is the task's done |
 | `crewchat tasks areas ID accept\|PATHS` | A task's files: accept the folders crewchat suggested from what its holder changed, or set them |
 | `crewchat tasks assign ID AGENT` | Give a task to an agent |
 | `crewchat tasks move ID up\|down\|top` | Reorder |
@@ -153,7 +190,7 @@ only what you submit on that page reaches GitHub. `--print` shows the link inste
 | `crewchat gchat client FILE` / `gchat login [out]` / `gchat spaces` / `gchat add NAME` | Sign in to Google with your own Desktop app OAuth client, list your spaces, add one by its name |
 | `crewchat gchat default NAME` / `gchat ask on\|off` / `gchat auto on\|off` / `gchat test [NAME]` | The default space, ask before each post, post new pull requests by themselves, post a test |
 | `crewchat routines` / `routines templates` | The project's routines, work the crew does again and again on a schedule ([details](getting-started.md#routines)), and ready-made ones to start from |
-| `crewchat routines add NAME TEXT --when WHEN [--to lead\|AGENT]` | A routine: each time it is due (`every 2h`, `weekdays 09:00`, `mon,thu 17:30`), its task is posted for anyone, the lead or one agent |
+| `crewchat routines add NAME TEXT --when WHEN [--to lead\|AGENT]` | A routine: each time it is due (`every 2h`, `weekdays 09:00`, `mon,thu 17:30`, or a cron expression such as `"*/30 9-18 * * 1-5"`), its task is posted for anyone, the lead or one agent |
 | `crewchat routines set\|pause\|resume\|run\|remove NAME` | Change a routine, pause it, turn it on again, post its task now, or remove it |
 
 ## Project folders
@@ -245,6 +282,6 @@ Other settings in `~/.crewchat/config.json`:
 | `pack` | The pack the project's roles start from (`crewchat roles pack` sets it) |
 | `packs` | Packs you saved (`crewchat roles save-pack`), offered to every project |
 
-`CREWCHAT_HOME` moves `~/.crewchat` elsewhere.
+`CREWCHAT_HOME` moves `~/.crewchat` elsewhere. `CREWCHAT_NO_SHORTCUT=1` makes crewchat write no shortcut (the tests set it, so that nothing they start makes one).
 
 Back to the [README](../README.md)

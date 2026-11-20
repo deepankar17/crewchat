@@ -156,7 +156,8 @@ files (roadmap Y2 to Y4). No machine is assumed to be always on, so the role mov
 - **What it does, and does not.** Only those three jobs. It never orders or numbers messages: those stay
   leaderless (section 8), so a hand-over never loses or reorders the chat.
 - **Cloud sync:** a lease, `meta/coordinator` `{device, term, expires, preferred}`. The holder renews it
-  about every 30 seconds for 90; any approved machine that is online takes it once it has run out, with a
+  about every 100 seconds for 300 (`LEASE_RENEW`, `LEASE_SECS` in `crewchat_cloud.py`), to keep Firestore writes
+  low; any approved machine that is online takes it once it has run out, with a
   conditional write (the same one task claims use), so two never both take it. The term goes up each
   time the lease changes hands. A machine that stops cleanly lets its lease run out at once.
 - **Tailscale:** there is no referee, so every machine applies the same rule to the members it can reach:
@@ -190,17 +191,11 @@ pay-as-you-go plan costs on the order of a few hundred rupees a month for 100 pe
 
 ## 10. Security rules
 
-Already published on `crewchat-ae908`:
-
-```
-match /users/{uid}/{document=**} {
-  allow read, write: if request.auth != null && request.auth.uid == uid;
-}
-```
-
-To add: size limits and required fields on message documents, so one account cannot fill the
-database, and no listing of other accounts. The rules get their own tests, run against a
-separate test project.
+`crewchat cloud rules` prints the rules for your own Firebase project, and the Machines panel shows
+them after Sign in with Google. They let in only your account's uid (no other account, even one that
+signs in to the project), keep each account to its own documents, and limit the size of what one
+write can hold (`small()` in `crewchat_cloud.py`), so one machine cannot fill the database. Publish
+them once in the Firebase console; `tests/test_cloud.py` checks what they allow.
 
 ## 11. The owner's chat page
 

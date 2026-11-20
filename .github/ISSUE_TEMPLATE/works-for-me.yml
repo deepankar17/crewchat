@@ -4,6 +4,10 @@ labels: [works-for-me]
 body:
   - type: markdown
     attributes:
+      value: >-
+        crewchat has one maintainer, who reads every issue and replies as time allows.
+  - type: markdown
+    attributes:
       value: crewchat sends nothing home, so a note like this is how the author learns what to keep and what to fix. A line or two is plenty.
   - type: input
     id: tools

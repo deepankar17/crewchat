@@ -1,6 +1,9 @@
 """Starting up when something is in the way: a server that cannot start, a join before the server runs."""
 import os
-import pty
+try:
+    import pty  # a terminal: Unix only
+except ImportError:  # Windows has no termios
+    pty = None
 import socket
 import subprocess
 import unittest
@@ -26,6 +29,7 @@ class Start(unittest.TestCase):
         finally:
             m.stop()
 
+    @unittest.skipUnless(pty, "needs a Unix terminal (pty)")
     def test_joining_before_the_server_runs_keeps_the_code(self):
         a, b = H.Machine("desk3"), H.Machine("laptop3")
         try:
@@ -40,7 +44,7 @@ class Start(unittest.TestCase):
             self.assertIn("the code still works", out)
             self.assertNotIn(b.name, a.peers_status())  # the desk did not count it in
             self.assertFalse((b.home / "peers.json").exists())
-            started = b.cli("start", "--no-service", "--no-open")
+            started = b.cli("start", b.folder, "--no-service", "--no-open")  # the folder: a bare start links nothing
             self.assertIn("joins the chat by itself", started)  # the harness lets any session join (--join anyone)
             b.wait_up()
             b.cli("peers", "join", target, code, "--url", b.url, "--name", b.name)
@@ -65,6 +69,7 @@ def at_a_terminal(machine, args, answer):
         os.close(follower)
 
 
+@unittest.skipUnless(pty, "needs a Unix terminal (pty)")
 class Unlinking(unittest.TestCase):
     def test_leaving_at_a_terminal_asks_first_and_names_the_machine(self):
         a, b = H.Machine("desk4"), H.Machine("laptop4")

@@ -1,11 +1,14 @@
 """The GitHub Actions workflows run only for main (owner, 19 Oct 2026): pushes to main and pull requests into it,
-plus releases, the schedule and a manual start, which GitHub runs from main. Never for pushes to, or pull requests
-into, other branches (dev, task branches)."""
+plus releases, the schedule and a manual start, which GitHub runs from the default branch. Never for pushes to, or
+pull requests into, other branches (dev, task branches). A pull request trigger may name its event types, as the e2e
+gate's does to re-check an edited description (owner, 14 Nov 2026). The end-to-end tests run on the public repo only,
+weekly and by hand, where Linux runners are free."""
 import os
 import re
 import shutil
 import subprocess
 import tempfile
+import sys
 import unittest
 from pathlib import Path
 
@@ -80,7 +83,70 @@ class Workflows(unittest.TestCase):
             for event, lines in triggers(path.read_text(encoding="utf-8")).items():
                 self.assertIn(event, ALLOWED, "%s: %s" % (path.name, event))
                 if event in BRANCH_EVENTS:
-                    self.assertEqual(lines, ["branches: [main]"], "%s: %s must be limited to main" % (path.name, event))
+                    self.assertEqual([l for l in lines if not re.match(r"^types: \[[a-z_, ]+\]$", l)],
+                                     ["branches: [main]"], "%s: %s must be limited to main" % (path.name, event))
+
+    def test_a_pull_request_may_name_its_types_but_not_other_branches(self):
+        # The rule above, on the shapes it must tell apart.
+        def ok(block):
+            lines = triggers("on:\n" + block)["pull_request"]
+            return [l for l in lines if not re.match(r"^types: \[[a-z_, ]+\]$", l)] == ["branches: [main]"]
+        self.assertTrue(ok("  pull_request:\n    branches: [main]\n    types: [opened, edited]\n"))
+        self.assertFalse(ok("  pull_request:\n    branches: [main, dev]\n    types: [opened]\n"))
+        self.assertFalse(ok("  pull_request:\n    types: [opened]\n"))
+
+    def test_the_e2e_tests_run_weekly_and_by_hand_on_the_public_repo_only(self):
+        # Owner, 14 Nov 2026: crewchat-dev's private minutes run out, the public repo's Linux runners are free.
+        flow = (WORKFLOWS / "e2e.yml").read_text(encoding="utf-8")
+        self.assertEqual(sorted(triggers(flow)), ["schedule", "workflow_dispatch"])
+        jobs = re.findall(r"^  ([\w-]+):\n((?:    [^\n]*\n|\n)*)", flow.split("\njobs:\n", 1)[1], re.M)
+        self.assertTrue(jobs)
+        for name, block in jobs:
+            self.assertIn("    if: github.repository == 'deepankar17/crewchat'\n", block, name)
+            self.assertRegex(block, r"timeout-minutes: \d+", name)
+        self.assertIn("python e2e/ci.py", flow)
+        self.assertIn("CREWCHAT_CHROME=", flow)
+        # The public repo has no tag before v1.0.0: the upgrade tests skip there, and say why, rather than fail.
+        install = (WORKFLOWS.parents[1] / "e2e" / "test_install.py").read_text(encoding="utf-8")
+        self.assertIn('"rev-parse", "-q", "--verify", "refs/tags/" + tag', install)
+        self.assertIn('raise unittest.SkipTest("the old release %s is not in this clone', install)
+        self.assertIn('CREWCHAT_E2E_NO_OLD_TAGS: "1"', flow)
+
+    def test_no_workflow_puts_what_a_stranger_wrote_into_a_script(self):
+        """A pull request's title, description or branch name goes in through env:, never into run: text."""
+        risky = re.compile(r"\$\{\{\s*github\.(?:event\.(?:pull_request|issue|comment|review|head_commit)\.(?:title|body|message)"
+                           r"|head_ref|event\.pull_request\.head\.ref)")
+        for path in workflow_files():
+            text = path.read_text(encoding="utf-8")
+            for n, line in enumerate(text.splitlines(), 1):
+                if risky.search(line):
+                    self.assertRegex(line, r"^\s+[A-Z_]+: \$\{\{", "%s:%d: pass it through env:" % (path.name, n))
+
+    def test_an_e2e_run_that_skipped_chrome_or_uv_fails(self):
+        sys.path.insert(0, str(WORKFLOWS.parents[1] / "e2e"))
+        try:
+            import ci
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(ci.missing([]), [])
+        self.assertEqual(ci.missing([("t", "the inbox is a named pipe there"), ("t", "needs uv")]), ["needs uv"])
+        self.assertEqual(ci.missing([("a", "needs Google Chrome and websocket-client")] * 2 +
+                                    [("b", "needs Chrome, websocket-client and cryptography")]),
+                         ["needs Chrome, websocket-client and cryptography", "needs Google Chrome and websocket-client"])
+        # A run that records the e2e gate must not skip the upgrade tests for want of an old tag; the public run may.
+        tag = ("t", "the old release v0.9.2 is not in this clone (git fetch --tags)")
+        self.assertEqual(ci.missing([tag]), [tag[1]])
+        self.assertEqual(ci.missing([tag], old_tags=False), [])
+
+    def test_a_release_carries_its_checksums_and_pypi_gets_only_packages(self):
+        """Path to 10 (Security): SHA256SUMS is attached to every release, and made outside dist/, which the PyPI job
+        uploads whole (a stray file there fails the upload)."""
+        text = (WORKFLOWS / "release-assets.yml").read_text(encoding="utf-8")
+        self.assertIn("(cd dist && sha256sum *.whl *.tar.gz) > SHA256SUMS", text)
+        self.assertIn("for f in dist/*.whl dist/*.tar.gz SHA256SUMS; do", text)
+        self.assertNotIn("> dist/SHA256SUMS", text)
+        security = (WORKFLOWS.parents[1] / "SECURITY.md").read_text(encoding="utf-8")
+        self.assertIn("sha256sum -c SHA256SUMS", security)
 
     def test_actions_are_pinned_to_a_commit(self):
         """A tag like @v4 can be moved to other code; a commit cannot. The version is kept in a comment."""

@@ -1,0 +1,11 @@
+[
+  {
+    "pid": 4242,
+    "cwd": "/home/user/project",
+    "kind": "interactive",
+    "startedAt": 1794672632047,
+    "sessionId": "00000000-0000-4000-8000-000000000001",
+    "name": "user-90",
+    "status": "busy"
+  }
+]

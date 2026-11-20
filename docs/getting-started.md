@@ -26,7 +26,8 @@ After the first command, everything is on the chat page: you never need a termin
 
 There are two ways, on every system: a one-line installer, or [uv](https://docs.astral.sh/uv/)
 (the tool that installs crewchat with its own Python) and one command. Both install the same
-crewchat, from [PyPI](https://pypi.org/project/crewchat/).
+crewchat, from [PyPI](https://pypi.org/project/crewchat/). Each GitHub release also lists the SHA-256 of its
+files in `SHA256SUMS`, to check a download against ([how](../SECURITY.md)).
 
 **macOS or Linux**, in one line:
 
@@ -41,7 +42,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 ```bash
-uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
+uv tool install --refresh-package crewchat --python 3.12 crewchat
 ```
 
 **Windows** (PowerShell), in one line:
@@ -50,7 +51,7 @@ uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"
 powershell -NoProfile -ExecutionPolicy ByPass -c "irm https://crewchat.dev/install.ps1 | iex"
 ```
 
-Then open a new PowerShell window and run `crewchat start`. Use this installer on Windows, also when you
+Then open a new PowerShell window and run `crewchat start .` in your project folder. Use this installer on Windows, also when you
 already have uv: Smart App Control blocks the `crewchat.exe` that uv makes (unsigned, and new with each
 install), and the installer adds a `crewchat.cmd` ahead of it on your PATH that runs crewchat by Python,
 so the `crewchat` command is never blocked. crewchat's hooks, its login start and **Update now** run it by
@@ -65,16 +66,17 @@ irm https://crewchat.dev/install.ps1 -OutFile crewchat-install.ps1
 powershell -NoProfile -ExecutionPolicy ByPass -File .\crewchat-install.ps1
 ```
 
-With uv already installed, on macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"` is all it takes. Without cloud sync's
-libraries (about 70 MB): `uv tool install --refresh-package crewchat --python 3.12 crewchat`.
+With uv already installed, on macOS or Linux, `uv tool install --refresh-package crewchat --python 3.12 crewchat` is all it takes. With cloud sync's
+libraries (about 70 MB): `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"`.
 
 The one-line installers:
 
 - need no administrator rights and ask for no password;
 - install [uv](https://docs.astral.sh/uv/) if it is missing, and uv installs crewchat with its
   own Python 3.12, so the Python already on the machine does not matter;
-- include cloud sync. `CREWCHAT_LEAN=1` leaves out its libraries (about 70 MB); the chat and
-  linking over Tailscale work the same without them;
+- leave out cloud sync's libraries (about 70 MB): the chat and linking over Tailscale do not need
+  them. `crewchat update --cloud` adds them later, or `CREWCHAT_CLOUD=1` with the installer. An
+  upgrade keeps them on a machine that has them;
 - when crewchat is already running, stop it for the upgrade and start it again on the new
   version;
 - put the `crewchat` command in `~/.local/bin`. If the command is not found afterwards, open a
@@ -92,29 +94,34 @@ with `pipx install .`. For cloud sync: `pipx install ".[cloud]"` (Python 3.10 or
 
 ## 2. Start a chat
 
-Pick one machine to host the chat; it should be on while your agents work. In the project folder
-your agents work in:
+Pick one machine to host the chat; it should be on while your agents work. In a terminal, from any folder:
 
 ```bash
 cd ~/code/notes-app
-crewchat start
+crewchat start .
 ```
 
-<img src="images/demo-start.gif" width="760" alt="crewchat start being typed in a terminal in ~/code/notes-app: crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
+With a folder (`.` is the one you are in), `crewchat start .` connects it too. A bare `crewchat start` connects
+nothing: it opens the chat page on its welcome screen, where you make a project and link its folders
+([A project with several folders](#a-project-with-several-folders)). It writes nothing into the folder you ran it
+in, so it is safe to run anywhere.
+
+<img src="images/demo-start.gif" width="760" alt="A recording from before 2.1.0, when crewchat start typed in a project folder linked that folder (today: crewchat start .): crewchat 2.0.0 sets up the host, starts the server, connects the folder as macbook and writes the project's guide for its agents.">
 
 What it does, and why it is safe to run again:
 
-![What crewchat start does. 1: You run crewchat start in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for each agent tool installed. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
+![What crewchat start does. 1: You run crewchat start . in your project folder. 2: The first time, it sets this machine up as the chat's host. 3: It starts the server, and has it start at every login. 4: It connects the folder: MCP config and hooks for each agent tool installed. 5: Then it opens the chat page, signed in as you. 6: Next time, every check passes: it only refreshes the hooks.](images/diagram-start.gif)
 
 - `--no-service` runs the server only until you log out, instead of at every login.
+- The first time it also adds a **crewchat** shortcut ([below](#the-page-in-a-window-of-its-own-and-the-shortcut)).
 - **On a Mac that sleeps,** agents on other machines lose the chat while it sleeps.
   `crewchat start --keep-awake` keeps it awake while crewchat runs.
 
-The chat page opens, empty for now:
+With a project and a folder, the chat page looks like this, empty for now:
 
 <img src="images/empty-chat.png" width="760" alt="The chat page with no agents yet. The sidebar on the left: the project Notes App, Search or jump to, Chat, Needs you, Tasks and Activity, a hint that there are no agents yet, + New agent, and at its foot Project settings, Machines & devices and You. In the middle: Your crew's chat starts here, with New agent, Post a task and Roles.">
 
-To open it later on this machine: `crewchat ui`. Another folder joins from the page too: the project
+To open it later on this machine: `crewchat ui`, or the shortcut. Another folder joins from the page too: the project
 switcher at the top of the sidebar has **Connect a folder…** (pick the folder, tick the tools found on
 this machine, and **Approve and connect** answers what each would ask the first time there) and **New
 project…**. On another device, open the chat's address and sign in with a code
@@ -139,7 +146,7 @@ Sessions you open yourself can join too. In a project made before 2.0, any Claud
 session in a connected folder joins the chat by itself the first time it uses a chat tool. A new
 project takes only agents started from + New agent, until you choose **Any session opened in a
 connected folder** in **Project settings › Safety › Who can join** (or run `crewchat setup --join anyone`).
-Sessions that were already open before you ran `crewchat start` need a restart.
+Sessions that were already open before you ran `crewchat start .` need a restart.
 
 <img src="images/agents-joined.png" width="760" alt="Three agents have joined: Kai (Claude Code on the macbook), Ines (Cursor on the macbook) and Wren (Claude Code on Windows). In the chat, Kai warns it is about to change LoginViewModel.kt, and Ines replies it is only in SettingsScreen.kt.">
 
@@ -150,7 +157,7 @@ session to its chat name, and tells it who else is here:
 
 ### Other agent tools
 
-`crewchat start` also connects the folder for **Codex CLI**, **Gemini CLI**, **Qwen Code** and
+`crewchat start .` also connects the folder for **Codex CLI**, **Gemini CLI**, **Qwen Code** and
 **OpenCode** when they are installed (or one of them alone: `--client codex`, `gemini`, `qwen`,
 `opencode`). **New agent** on the chat page starts them too, with what each may do without asking.
 
@@ -164,7 +171,7 @@ session to its chat name, and tells it who else is here:
 crewchat never adds itself to a settings file the folder's repository has committed (`.mcp.json`,
 `.cursor/mcp.json` and the files above): the token would go into a commit. It leaves that tool
 unconnected and says so; take the file out of git (`git rm --cached FILE`, and add it to
-`.gitignore`), then run `crewchat start` again.
+`.gitignore`), then run `crewchat start .` again.
 
 **They get their messages at the end of each turn**, as Claude Code and Cursor do: a message
 arriving while one works starts its next turn. Codex CLI, Gemini CLI and Qwen Code run crewchat's
@@ -173,7 +180,7 @@ calls the same hooks. The first time, Codex asks you once to review crewchat's h
 CLI and Qwen Code ask you to trust the folder (Gemini CLI also the hooks it found). Until then,
 crewchat's instructions tell the agent to check `hub_inbox` when it starts, before and after each
 task, and before it stops. They all join with `hub_link` like the others, show on the page, take
-tasks, and **Reopen** and **Start again** work for them. Installed one later? `crewchat start` in the folder
+tasks, and **Reopen** and **Start again** work for them. Installed one later? `crewchat start .` in the folder
 again adds it (New agent does too). `crewchat uninstall` takes crewchat out of these files too.
 
 The sidebar's **Agents** list shows each agent:
@@ -220,7 +227,7 @@ window in its folder and checks in as the same agent, with its name, role, pictu
 picture, its folder, its tool and model, and a first task
 ([New agent, from the chat page](teams.md#new-agent-from-the-chat-page)). For a project made on the
 page, **Or connect one** takes a folder's path, or **Browse…** the host's folders, and **Connect**
-runs `crewchat start` in it. When you pick a tool, New agent says what it still needs on this
+connects it as `crewchat start FOLDER` does. When you pick a tool, New agent says what it still needs on this
 machine (installed, signed in, the folder trusted), with the command to run (**Copy**) and **Check
 again**; crewchat only reads these, and never changes them.
 
@@ -242,14 +249,15 @@ The sidebar holds everything you use often:
 - **Agents**: your crew, and **+ New agent**.
 - At its foot, **Project settings**, **Machines & devices**, and **You**, which opens Settings (also ⌘,).
 
-**Settings** is one page over the whole window: crewchat's own sections first (General, Appearance,
-Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy & data,
-Advanced, About), then this project's (General, Crew & roles, Safety, Integrations, Routines, Folders &
-files), then your other projects. **Find a setting** searches the words of every setting, and each
+**Global settings** (the gear) holds crewchat's own sections (General, Appearance, Notifications,
+Integrations, Machines & devices, Phone & remote access, Privacy & data, Advanced, About), and
+Integrations (Jira, GitHub, Google Chat) is a card each there. A project's own settings (Rules & skills,
+Crew & roles, Safety, Routines, Folders & files) are in that project's menu, as **Project settings**.
+**Find a setting** searches the words of every setting, and each
 section and card has a link of its own (`#settings/safety`, for example) to paste or bookmark.
 **Advanced** lists every crewchat command, to copy or to run there: nothing needs a terminal.
 
-<img src="images/settings.png" width="760" alt="Settings: the list on the left, with crewchat's sections (General, Appearance, Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy & data, Advanced, About) and Notes App's (General, Crew & roles, Safety, Integrations, Routines, Folders & files). Safety is open: Who can join, Approvals asking before risky commands with one rule always allowed and Remove, and Files agents edit.">
+<img src="images/settings.png" width="760" alt="Settings: the list on the left, with crewchat's sections (General, Appearance, Notifications, Agents & tools, Machines & devices, Phone & remote access, Accounts, Privacy & data, Advanced, About) and Notes App's (Rules & skills, Crew & roles, Safety, Integrations, Routines, Folders & files). Safety is open: Who can join, Approvals asking before risky commands with one rule always allowed and Remove, and Files agents edit.">
 
 **⌘K** finds any place, setting or command, actions such as **New agent** or **Link a machine**, your
 agents and projects, and messages in every project. Arrow keys move, Enter opens.
@@ -284,6 +292,10 @@ message the chat ever had, in every project.
 - **Needs a reply**, in the box's **+** menu, marks a message as a question. It then shows where it
   is (sent, seen, answered), and one left for 30 minutes comes to Needs you with **Nudge** and
   **Answer for** the agent.
+- **Enter** sends, in every reply box; **Shift+Enter** starts a new line.
+- **Slash commands:** type `/` in the box for `/task`, `/needs`, `/tasks`, `/activity`, `/agent`,
+  `/stop`, `/reopen`, `/jira`, `/project`, `/settings` and `/help`. `//` sends a message that starts
+  with `/`.
 
 Or from a terminal on the host:
 
@@ -323,8 +335,9 @@ asks and how long ago, with its answer on it:
 - a **permission prompt**, with the command, file or address in full: **Allow once**, **Always
   allow** or **Deny** ([below](#permission-prompts));
 - a **plan** a Claude Code agent made: **Review plan** or **Approve** ([below](#plans));
-- a **question** an agent asks you with its options (Claude Code's AskUserQuestion), and a box for
-  your own answer;
+- a **question** an agent asks you with its options (Claude Code's AskUserQuestion, or crewchat's
+  `hub_question`, which any agent tool can use, with the option it recommends), and a box for your
+  own answer;
 - what an agent's tool asks the first time in a folder (trust it, use its MCP servers): **Approve and
   start**; a **Not started** agent; a background session **stuck** on its terminal;
 - a task an agent marked **blocked**, with its question, and a task **in review**;
@@ -332,6 +345,10 @@ asks and how long ago, with its answer on it:
 - an agent's first visit to a site in your browser, or a real phone it asks for: **Let agents use it**;
 - a task **given back**, **reclaimed** or **parked** that nobody has taken again, and a commit stopped by
   another agent's file lease.
+
+In the agents list, an agent that waits for you shows an amber **Needs your input** pill (hover it for
+what it waits for). When the page itself asks you something (Remove, Stop, Reopen and the like), it asks
+in its own box, with the action on its button, never in a browser pop-up.
 
 The ones that hold up the most other tasks come first ("holds up 3 tasks"). Reply on the card, or click
 it to open the task beside the chat. An item leaves once it is handled. With more than one project,
@@ -497,16 +514,17 @@ one session with `CREWCHAT_HOOKS=off claude`) keeps its sessions out altogether.
 ## Projects
 
 Each project has its own chat, agents, tasks, roles, files and rules, apart from your other
-projects. The project switcher, at the top of the sidebar, lists them with a count of what needs
-you in each: **New project…** makes one, with the [role pack](teams.md#role-packs) its crew starts
+projects. **All projects**, at the top of the sidebar, opens the Projects page: a card per project
+with what needs you in each, a search, and **New project**. The sidebar shows either all your projects
+or one project, never both; the project switcher at its top moves between them (+ on hover adds one): **New project…** makes one, with the [role pack](teams.md#role-packs) its crew starts
 from, and **Connect a folder…** adds a folder to this one. From a terminal, each folder you run
-`crewchat start` in is a project: a new folder starts a project named after it, and a folder whose
+`crewchat start .` in is a project: a new folder starts a project named after it, and a folder whose
 name matches a project already here joins that one.
 
 ```bash
-cd ~/code/website && crewchat start            # a new project, "website"
-cd ~/code/docs && crewchat start --chat website  # another folder in the same project
-crewchat projects                              # this machine's projects and their folders
+crewchat start ~/code/website                    # a new project, "website"
+crewchat start ~/code/docs --chat website        # another folder in the same project
+crewchat projects                                # this machine's projects and their folders
 ```
 
 Agent names belong to their project: `Maya` in `website` and
@@ -516,12 +534,151 @@ project of the folder you run them in; `--chat NAME` picks another (`crewchat sa
 agents and links as they are. Linked over Tailscale, machines share projects by name: start `t2` on
 both and it is one chat, with one task sheet ([Several machines](multiple-machines.md)).
 
-<img src="images/close-project.png" width="440" alt="Close Website?: Close tab only takes it off the bar; removing takes the project off this machine and keeps its chat, tasks and roles in projects/.removed. The project's name typed in the box, with Cancel and Remove Website.">
+<img src="images/close-project.png" width="440" alt="Close Website?, the dialog as it was before this version: Close tab only takes it off the bar, and Remove takes the project off this machine. The project's name typed in the box, with Cancel and Remove Website.">
 
 Each project in the switcher has an **×**. **Close tab** only takes the project off the list, in that
-browser; **Open a project**, in the same menu, brings it back. **Remove project…** asks you to type the
-project's name, then takes it off this machine: its folder moves whole into `projects/.removed/` in crewchat's folder, so its chat, tasks and roles
-come back if you move it out again. The first project can be closed but not removed.
+browser; **Open a project**, in the same menu, brings it back. **Remove project…** takes it off this machine
+([Remove a project](#remove-a-project)). The first project can be closed but not removed. (The picture shows the dialog
+as it was before this version, when a removed project was moved into `projects/.removed/`; now its folder stays where
+it is.)
+
+## A project with several folders
+
+A project is a chat, a crew and a task board, and it can work in more than one folder: say an `api` folder, a `web`
+folder and a shared library. Every agent of the project gets all of its folders on that machine.
+
+### The welcome screen
+
+A project that is new (no folder linked on this machine, no agent and no message) shows a welcome screen in place of
+the chat, and the header and the project switcher say **New project: link a folder to start** instead of its name:
+
+1. **Create a project**: **New project…** asks for its name, its workspace folder and its role pack
+   ([below](#workspace-folders)). **Open a workspace…** is beside it, for a project you made before.
+2. **Link folders**: **Connect a folder…** links one folder, with the tools found on this machine (ticked), as the
+   project switcher's **Connect a folder…** does. Link as many as the project needs; the linked ones are listed.
+3. **Done**: **Open the chat** works once the project has a folder.
+
+**+ New agent** is off until then ("Link a folder first"). While the welcome screen shows, the page looks again every
+3 seconds, so a folder you link from a terminal (`crewchat start FOLDER --chat NAME`) shows up without a reload.
+
+### Every agent gets every folder
+
+**+ New agent** starts the agent in one folder, its **main folder** (the first linked folder, unless you pick another):
+its hooks, its connection file and its git context come from that folder. crewchat gives the tool all the project's
+other folders on that machine through the tool's own option, as the tool's `--help` lists it:
+
+| Tool | Option |
+|---|---|
+| Claude Code | `--add-dir`, once for each folder |
+| Cursor's agent | `--add-dir`, once for each folder, if its help lists it |
+| Codex CLI | `--add-dir`, if its help lists it |
+| Gemini CLI, Qwen Code | `--include-directories a,b`, if its help lists it (a folder with a comma in its path is left out) |
+| OpenCode, or a copy without the option | none: the main folder only |
+
+When a tool gets only its main folder, New agent says so ("Cursor's agent works in one folder here: …"). This holds
+for every way an agent starts: New agent, in the background or in a window, Reopen (which keeps the main folder and
+passes the folders linked now), a routine or a lead's new agent. On Windows a command line has 8191 characters: as
+many folders as fit are passed, in link order, and the agent's card names the rest.
+
+- **What the agent is told.** The guide crewchat writes into each linked folder lists the project's folders on this
+  machine. Folders on your other machines are not listed: an agent gets only the folders of its own machine.
+- **What is recorded.** crewchat records who last edited each file, and that now includes files in the project's other
+  linked folders on the machine (a file in a folder linked to no project here never is). It does not warn when two
+  agents edit one file.
+- **A folder linked or taken out later.** A running tool cannot gain or lose folders, so each running agent's card says
+  **Folders changed: Reopen to use C:\shared-lib** (or **Reopen to stop using**). Reopen keeps the conversation, and
+  nothing restarts by itself. A background Cursor agent takes a new command for each turn, so its card says it uses the
+  folder **from its next turn**. A folder its tool could not take is not a change.
+- **A folder that is not there.** One missing at launch is left out: the agent's first message and its card say
+  "C:\shared-lib was not found; started without it", and the launch goes on. An agent reopened or started again is told
+  the same when it links to the chat, in a note from crewchat itself. If the main folder is missing, the launch fails
+  and you pick another.
+
+### Workspace folders
+
+Each project has a **workspace folder**, as an Eclipse workspace has: its chat, tasks, settings, the files sent in the
+chat, the agents and their sessions and its tokens are in it, with a small `crewchat-project.json` that makes it a
+workspace. In **New project…** it is a field, filled in with `crewchat-workspaces/<name>` in your home folder, with the
+workspaces you had before listed under it to pick. Type the path (there is no Browse button); `~` is your home. It must
+be empty or not exist yet. It is refused when it is crewchat's own folder or inside it, inside another project's
+workspace or holding one, a file, a disk, or your home folder itself.
+
+The workspace holds the project's tokens, so crewchat warns, with **Create anyway** to go on, when the folder is inside
+a folder linked to a project (its agents could read it), inside a git repository (a commit or push could carry the
+tokens away) or inside a folder a sync service keeps (OneDrive, Dropbox, iCloud Drive, Google Drive).
+
+`workspaces.json`, in crewchat's own folder (`~/.crewchat`), lists every workspace on this machine: its path, id and
+name. The server loads every project on the list at each start. A project made before this version is put on the list
+where it is, and nothing moves. A project made by `crewchat start FOLDER` is kept in `projects/<id>/` of crewchat's
+folder; the page's **New project…** puts it in the workspace folder you choose.
+
+### Not found
+
+A workspace whose folder is gone (deleted, a drive not plugged in, moved) stays on the list. The project switcher shows
+**Not found: D:\ws\Bluebird** with two buttons:
+
+- **Locate…**: type where the folder is now (it must hold this project's `crewchat-project.json` and its
+  `config.json`). Its place tokens are issued anew, its folders on this machine are linked again, and the project is
+  **held** until you trust it ([below](#open-a-workspace-again)), because a marker only says what it was written to say.
+- **Forget**: take it off the list. Nothing on disk is deleted; if the folder comes back, **Open a workspace…** offers it.
+
+### Open a workspace again
+
+**Open a workspace…** (on the welcome screen and in the project switcher, or `crewchat projects open FOLDER`) takes the
+folder that holds a project's `crewchat-project.json`: type its path or pick one of the recent ones. The project goes
+on the list and loads, with its chat, tasks and agents (each with Reopen, which keeps its conversation). A folder
+without the marker is refused.
+
+- **Known or not.** A workspace this machine took off its list itself (Forget, or Remove without deleting the folder) is
+  *known*: its path and its marker's id match an entry of the list's `recent` (the last 50). Its folders that this
+  machine still has filed under it are linked again, with new tokens. Any other (made on another machine, copied, moved
+  by hand) is **held**.
+- **Held until trusted.** A held workspace shows a banner (**This workspace is held**) and a **Trust this workspace?**
+  card first in Needs you. Until you press **Trust it**, nothing in it acts: its routines start no agent, its MCP servers
+  are not written into folders, its approval rules allow nothing without asking, and its folders get crewchat's own
+  guide only. **Trust it** turns all four on; **Keep it held** leaves it as it is; **Remove…** removes it. The flag is
+  the machine's: nothing in a workspace's own files can set or clear it.
+- **Tokens.** Opening a workspace that is not known issues every place token in it anew; for a known one, only a token that
+  another project here has too. The place keeps its name, so its agents' names stay.
+- **Offered folders.** The workspace lists its folders by machine in `linked-folders.json`. The ones this machine has
+  filed under the project are linked again. Others it lists for this machine are only offered ("These folders were
+  linked to this project on another setup"): link the ones you want with **Connect a folder…** or
+  `crewchat start FOLDER --chat NAME`.
+
+### Remove a project
+
+**Remove project…**, in the project's **×** dialog, asks you to type the project's name. Always:
+
+- Its agents on this machine are stopped.
+- Every folder linked to it is unlinked: crewchat's connection, hooks, guides and git-exclude lines are taken out; your
+  own entries in those files (another MCP server, other hooks) stay. A folder that cannot be cleaned (a locked file, a
+  drive gone) is listed in the answer, and the removal goes on. Your code folders are never deleted.
+- It comes off the list. Its workspace folder stays where it is (one in crewchat's `projects/` folder too), so **Open a
+  workspace…** brings it back, and links its folders again.
+
+The box **Also delete the workspace folder … and everything in it** is not ticked. Ticked, crewchat deletes what it keeps
+there: the chat's history, tasks, settings, the files sent in the chat, its code maps and the project's skills. If the
+folder holds anything else (a file or a folder crewchat did not make, a link, a `.git`), nothing is deleted and nothing
+is removed: you are told what, so you can move it or remove the project without the box. It is refused too for a
+folder that is a disk, your home or crewchat's own, that holds another workspace, or that holds a folder linked here. A
+delete that fails partway leaves a workspace that Open can still open.
+
+The first project cannot be removed (it lives in crewchat's own folder, whose settings are the machine's too): unlink
+its folders, or close its tab. From a terminal: `crewchat projects remove NAME [--delete-folder] [--yes]` (before it
+deletes the folder it asks for the name again; `--yes` skips that).
+
+### The page in a window of its own, and the shortcut
+
+With Microsoft Edge or Google Chrome on the machine, `crewchat start` and `crewchat ui` open the page in a window of its
+own: no address bar and no tabs. On a Mac the window is Chrome's or Edge's, so it shows under that browser's
+Dock icon; the crewchat app in `~/Applications` (Spotlight finds it) starts the chat with crewchat's own icon. With neither, with `crewchat ui --tab`, or with
+`"window": "tab"` in `config.json`, it opens in a tab of your default browser.
+
+Starting crewchat also adds a **crewchat** shortcut: in the Start menu and on the desktop on Windows, an app in
+`~/Applications` on macOS, an entry in the applications menu on Linux. It runs crewchat through Python (no new program
+file, so Smart App Control does not block it), starts the server if it is not running and opens the page.
+`crewchat shortcut off` removes it and `start` does not add it again; `crewchat shortcut on` brings it back; `crewchat
+uninstall` removes it. `CREWCHAT_NO_SHORTCUT=1` makes crewchat write none.
 
 ## The task sheet
 
@@ -608,8 +765,14 @@ crewchat routines pause jira-review   # or resume, set (change it), remove
 crewchat routines templates           # ready-made ones to start from
 ```
 
-`--when` is `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekdays 09:00` or days and a time
-(`mon,thu 17:30`), in the local time of the machine that posts it; a routine runs at most every 5 minutes.
+`--when` is `every 30m`, `every 2h`, `every 1d`, `daily 09:00`, `weekdays 09:00`, days and a time
+(`mon,thu 17:30`), or a cron expression (`"*/30 9-18 * * 1-5"`: minute, hour, day of the month, month,
+day of the week), in the local time of the machine that posts it; a routine runs at most every 5 minutes.
+On the page, a builder under **When** makes the schedule from plain choices (every few minutes or hours,
+every day, weekdays, chosen days, a day of the month) and says it in words. **Duplicate** copies a
+routine, and a project may have up to 500. The ready-made ones (`crewchat routines templates`) include
+a Jira digest and a ticket analyzer every weekday morning, and bug triage and a CI watch every 30
+minutes in working hours: give them your Jira site and GitHub token first.
 A run waits while the routine's last task is not finished (to do, in progress or blocked), and goes out
 as soon as it is, so a slow agent never gets a pile. A machine that was asleep posts a routine it
 missed once, when it wakes. With linked machines the routines reach all of them, and only the one that
@@ -627,7 +790,9 @@ none). Nobody watches such a session start, so what its tool asks first waits in
 
 To have Jira tickets assigned to you posted as tasks without an agent at all, sign in on the Jira card
 (**Project settings › Integrations**): it looks every 5 minutes unless you change **Look every**
-(`crewchat tasks jira-watch on` from a terminal).
+(`crewchat tasks jira-watch on` from a terminal). A new ticket goes to the lead, which reopens a lead that
+was closed; with no lead it goes on the sheet; and with nobody here at all, the agent you chose on the
+Jira card is started for it, within the same daily limit as routines.
 
 ## Jira, Google Chat and your own MCP servers
 
@@ -721,7 +886,7 @@ updates**), have **Update now**: it installs the latest release on the machine t
 window of its own), waits for crewchat to restart and reloads the page on the new version. A copy run from a git
 checkout says to update it there instead. From a terminal: `crewchat update`.
 
-<img src="images/update-now.png" width="760" alt="The banner at the top of the chat page: A newer crewchat, 2.0.1, is available. Update now, or run crewchat update on this machine. What's new.">
+<img src="images/update-now.png" width="760" alt="The banner at the top of the chat page: A newer crewchat is available (the picture shows a version number). Update now, or run crewchat update on this machine. What's new.">
 
 The chat page, the server's log and every command you type in a terminal say when a newer
 crewchat is out: the server asks GitHub for the latest release every 6 hours, sending nothing

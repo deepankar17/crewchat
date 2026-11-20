@@ -1,11 +1,29 @@
 """What a stranger, a wrong token or a misbehaving agent can and cannot do."""
 import json
 import socket
+import subprocess
 import time
 import unittest
 
 import harness as H
 from harness import ToolError, request
+
+
+def this_machines_addresses():
+    """The machine's own IPv4 addresses: its name's, and the one it reaches the network from. A Mac's .local name does
+    not always resolve (e2e, 16 Nov: gaierror), which is no reason to skip the check."""
+    found = set()
+    try:
+        found |= {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 9))  # a documentation address: nothing is sent, only a route is picked
+            found.add(probe.getsockname()[0])
+    except OSError:  # no network at all: only 127.0.0.1, checked above
+        pass
+    return found
 
 
 class Security(unittest.TestCase):
@@ -25,7 +43,7 @@ class Security(unittest.TestCase):
                                 "-sTCP:LISTEN"], capture_output=True, text=True).stdout
         self.assertIn("127.0.0.1:%d" % self.m.port, out)
         self.assertNotIn("*:%d" % self.m.port, out)
-        for addr in {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)} - {"127.0.0.1"}:
+        for addr in this_machines_addresses() - {"127.0.0.1"}:
             with self.assertRaises(OSError):
                 socket.create_connection((addr, self.m.port), timeout=2).close()
 
@@ -100,6 +118,34 @@ class Security(unittest.TestCase):
                 self.agent.call("hub_rename", name=name)
         with self.assertRaises(ToolError):
             self.agent.call("hub_task", action="take", id="1")  # not a task
+
+    def owner_card(self, command_text):
+        def card():
+            status, raw, _ = request(self.m.url + "/api/poll?after=-1&lite=1", opener=self.m.owner.opener)
+            return next((n for n in json.loads(raw)["needs"] if n["kind"] == "permission"
+                         and n.get("tool") == "crewchat as you" and command_text in n["text"]), None)
+        return H.eventually(card, 30, "the owner's card for " + command_text)
+
+    def test_an_owner_command_in_an_agent_session_runs_only_when_the_owner_allows_it(self):
+        """O1: the real command line, run with Claude Code's shell variable set, waits on a card in Needs you."""
+        env = dict(self.m.env, CLAUDECODE="1")
+        for answer in ("deny", "allow"):
+            text = "said from inside an agent session, %s" % answer
+            run = subprocess.Popen(H.crewchat_command() + ["say", "all", text], cwd=str(self.m.folder), env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            item = self.owner_card(text)
+            self.assertEqual(item["choices"], ["allow", "deny"])
+            status, raw, _ = self.m.owner.post("/api/needs", {"key": item["key"], "answer": answer})
+            self.assertEqual(status, 200, raw)
+            out, err = run.communicate(timeout=60)
+            if answer == "deny":
+                self.assertNotEqual(run.returncode, 0)
+                self.assertIn("did not allow it", err)
+                time.sleep(0.5)
+                self.assertIsNone(self.m.owner.find(text))
+            else:
+                self.assertEqual(run.returncode, 0, err)
+                self.assertEqual(self.m.owner.wait_for(text)["from"], "Owner")
 
     def test_tool_arguments_are_checked(self):
         for tool, args in (("hub_send", {"to": "Owner"}), ("hub_send", {"to": "Owner", "text": "x" * 5000}),

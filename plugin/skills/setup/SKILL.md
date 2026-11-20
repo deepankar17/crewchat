@@ -31,7 +31,8 @@ Run `crewchat --version`.
     1. Run `uv --version`. If uv is missing, install it with the system's package manager
        (`brew install uv` on macOS) or another way from
        https://docs.astral.sh/uv/getting-started/installation/.
-    2. `uv tool install --refresh-package crewchat --python 3.12 "crewchat[cloud]"`, then `uv tool update-shell`.
+    2. `uv tool install --refresh-package crewchat --python 3.12 crewchat`, then `uv tool update-shell`.
+       (Cloud sync's libraries are an extra: `crewchat update --cloud` adds them when the user wants cloud sync.)
 
   On macOS or Linux the user can instead run crewchat's own installer, which does both: see Install in
   https://github.com/deepankar17/crewchat#readme. On Windows, if Smart App Control blocks the
@@ -51,14 +52,21 @@ Run `crewchat status` in the project folder.
 
 ## 3. Connect the folder
 
-With the user's go-ahead, run `crewchat start --no-open` in the project folder. It:
+With the user's go-ahead, run `crewchat start . --no-open` in the project folder. The `.` matters:
+a bare `crewchat start` only starts the server and opens the page, and links no folder. It:
 
 - sets up this machine as the chat's host the first time, and starts the server (also at every
   login);
-- makes the folder its own project (named after it), or adds it to one with `--chat NAME`;
+- links the folder to the project named after it, made if there is none yet, or to the one
+  `--chat NAME` names;
 - writes `.mcp.json`, `.claude/settings.local.json`, `.cursor/mcp.json` and `.cursor/hooks.json`
   in the folder. They hold a secret token: tell the user not to commit them;
 - writes a guide for the project's agents (a Claude Code skill and a Cursor rule).
+
+Run from this session, it acts as the user, so crewchat asks them first: a card in Needs you on
+the chat page, with Allow. Only once they allow it does it also add a crewchat shortcut (Start menu
+and desktop, or Applications); `crewchat shortcut off` removes it. If no answer comes, ask the user
+to run `crewchat start .` in the folder in their own terminal instead.
 
 Then:
 

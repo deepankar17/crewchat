@@ -4,7 +4,7 @@ Optional add-on to crewchat.py. Every machine runs its own crewchat server for i
 servers exchange messages through the owner's own Firebase project (Firestore), pushed in real
 time. Everything is encrypted on the machine before it is sent. Design: docs/cloud-sync-design.md.
 
-Needs:  pip install google-cloud-firestore cryptography   (Python 3.10+ recommended)
+Needs:  pip install "crewchat[cloud]" (google-cloud-firestore, cryptography)   (Python 3.10+ recommended)
 
 How the pieces fit:
 - Device: this machine's identity. An RSA key pair (the private key never leaves the machine),
@@ -66,6 +66,7 @@ warnings.filterwarnings("ignore", message=".*Python version.*")
 
 TTL_HOURS = 24  # messages are deleted from Firestore once delivered, and after this at the latest
 STATE_DEBOUNCE = 5  # seconds between publishing roster changes
+REPUBLISH_PAGE = 500  # messages read back at a time for the backlog after a spell offline
 SEEN_EVERY = 300  # "last seen" alone is published at most this often
 HEARTBEAT = 15 * 60  # an otherwise quiet machine with agents says it is alive this often
 HOUSEKEEPING = 10 * 60  # delete delivered messages this often
@@ -118,8 +119,9 @@ QUOTA_NOTE = ("files over %s stay on the machine they were shared on, to keep wi
 # Bytes of a file in one document: in base64 twice and sealed, 58,292 characters, under the 60,000 the security rules
 # (RULES) allow for a document's ciphertext.
 FILE_PART = 32 * 1024
-NOT_INSTALLED = ("which this install does not have. Run the installer again without CREWCHAT_LEAN, "
-                 "or: pip install \"crewchat[cloud]\"")
+def not_installed():
+    """The end of 'cloud sync needs ...': which this copy lacks, and how to add it here."""
+    return "which this install does not have (it is an extra, about 70 MB): " + crewchat.add_cloud_hint()
 
 
 def space_id(root, name):
@@ -132,7 +134,7 @@ def need_crypto():
     try:
         import cryptography  # noqa: F401
     except ImportError:
-        raise CloudError("cloud sync needs the cryptography library, " + NOT_INSTALLED)
+        raise CloudError("cloud sync needs the cryptography library, " + not_installed())
 
 
 # --------------------------------------------------------------------------------------------
@@ -1345,12 +1347,16 @@ class CloudSync(crewchat.ProjectLink):
         self.dirty.set()
 
     def _republish(self):
-        """Messages written here that never reached Firestore (offline, or not yet approved)."""
-        with self.hub.lock:
-            backlog = [dict(m) for m in self.hub.messages
-                       if m.get("origin") == self.device_id and m["seq"] > int(self.marks.get("published", 0))]
-        for msg in backlog:
-            self.outbox.put(msg)
+        """Messages written here that never reached Firestore (offline, or not yet approved): every one, read back
+        from messages.jsonl when there are more than memory holds (R9), a page at a time."""
+        after = int(self.marks.get("published", 0))
+        while True:
+            page, more = self.hub.messages_after(self.device_id, after, REPUBLISH_PAGE)
+            for msg in page:
+                self.outbox.put(msg)
+            if not more or not page:
+                return
+            after = page[-1]["seq"]
 
     def _seal(self, aad, payload):
         kid = self.device.current
@@ -1987,7 +1993,7 @@ def firestore_store(root=None):
 
 def firestore_import_error(e):
     if isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] == "google":
-        return "cloud sync needs Google's Firestore library, " + NOT_INSTALLED
+        return "cloud sync needs Google's Firestore library, " + not_installed()
     if "Application Control" in str(e):
         return ("Windows Smart App Control blocked a file of this Python (%s). It refuses the unsigned Python "
                 "that uv installs: install Python 3.12 from python.org (winget install -e --id Python.Python.3.12), "
@@ -2027,12 +2033,28 @@ def start(hub, root=None, ttl_hours=None):
     return sync
 
 
-RULES = """rules_version = '2';
+UID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+
+
+def rules(uids=()):
+    """The Firestore security rules. Without uids, any Google account that can sign in to the project gets its own
+    folder: what the first machine's sign-in needs, since an account's uid exists only once it has signed in. With
+    uids (from `crewchat cloud login`), only those accounts get in, so a stranger cannot use the project's quota."""
+    uids = [str(u).strip() for u in uids if str(u).strip()]
+    for uid in uids:
+        if len(uid) > 128 or not set(uid) <= UID_CHARS:
+            raise CloudError("%r is not a Firebase account id (the uid `crewchat cloud login` prints)" % uid)
+    who, only = "Each Google account reads and writes only its own crewchat data.", ""
+    if uids:
+        who = ("Only the owner's Google account gets in (`crewchat cloud rules` on a signed-in machine), and only to "
+               "its own data.")
+        only = "\n        && request.auth.uid in [%s]" % ", ".join("'%s'" % u for u in uids)
+    return """rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each Google account reads and writes only its own crewchat data.
+    // %s
     function owner(uid) {
-      return request.auth != null && request.auth.uid == uid;
+      return request.auth != null && request.auth.uid == uid%s;
     }
     // Writes stay small, so one account cannot fill the project.
     function small() {
@@ -2046,7 +2068,13 @@ service cloud.firestore {
     }
   }
 }
-"""
+""" % (who, only)
+
+
+RULES = rules()  # the open rules, for the first sign-in; rules([uid]) locks them to the owner
+LOCK_NOTE = ("Lock your Firebase project to this Google account: run `crewchat cloud rules` and publish what it "
+             "prints in Firestore > Rules (once, from any signed-in machine). Until then any Google account that can "
+             "sign in to the project can use it.")
 
 
 def cmd_cloud(args):
@@ -2105,7 +2133,8 @@ def login(root, device_name=None, again=False, need_browser=False):
     config["cloud"] = True
     crewchat.save_config(config, root)
     return {"email": auth.email, "device": device.name, "tag": device.tag, "fp": device.fp,
-            "state": result if result in ("founded", "ready") else "waiting"}
+            "state": result if result in ("founded", "ready") else "waiting", "uid": auth.uid,
+            **({"rules": rules([auth.uid]), "lock": LOCK_NOTE} if auth.uid else {})}
 
 
 def approve(account, name, fingerprint):
@@ -2352,7 +2381,18 @@ def _cmd_cloud(args):
     root = crewchat.home()
     action = args.action
     if action == "rules":
-        print(RULES, end="")
+        uids = list(getattr(args, "uid", None) or [])
+        if not uids and not getattr(args, "any", False):
+            try:
+                uids = [Auth(root).uid]
+            except CloudError:  # not set up here yet: the open rules, for the first sign-in
+                uids = []
+        text = rules(uids)
+        print(text, end="")
+        if text == RULES:
+            sys.stderr.write("These rules let in any Google account that can sign in to your project. After "
+                             "`crewchat cloud login`, run `crewchat cloud rules` again and publish that: it lets in "
+                             "only your account.\n")
         return
     if action == "setup":
         web = read_json(args.web_config) if args.web_config else {}
@@ -2377,6 +2417,9 @@ def _cmd_cloud(args):
             print("Before it can read or send anything, approve it from a machine that is already set up:")
             print("  crewchat cloud approve %s" % out["device"])
             print("That command shows a fingerprint: it must be %s." % out["fp"])
+        if out.get("lock"):
+            print()
+            print(out["lock"])
         print()
         print("Restart the server so it starts syncing: crewchat service restart (or crewchat serve).")
         return
@@ -2474,6 +2517,9 @@ def add_parser(sub):
     p.add_argument("--device", help="login: this machine's device name (default: its host name)")
     p.add_argument("--again", action="store_true", help="login: sign in again even if signed in")
     p.add_argument("--fingerprint", help="approve: the fingerprint the new machine shows")
+    p.add_argument("--uid", action="append", help="rules: let in this Firebase account id (default: the account "
+                   "this machine is signed in to); repeat for more")
+    p.add_argument("--any", action="store_true", help="rules: the open rules, for the first sign-in")
     p.set_defaults(fn=cmd_cloud)
 
 

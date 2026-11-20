@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_crewchat import TMP, crewchat  # noqa: E402  (the shared module)
+from crewchat_fixture import TMP, crewchat  # noqa: E402  (the shared module)
 
 MIN = 60
 
@@ -93,7 +93,7 @@ class LeadParksTasks(unittest.TestCase):
         out = self.call(self.dev2, action="take", id=self.mid)
         self.assertIn('Owner answered: "prod, the new vault"', out)
         self.assertIn("Which key vault: staging or prod?", out)
-        self.hub.update(self.dev2, self.mid, "done", "Rotated.")
+        self.hub.update(self.dev2, self.mid, "done", "Rotated.\nDecisions: none\nLeft over: none")
         self.assertNotIn("parked", self.hub.sheet[self.mid])  # its work is over: so is the wait
 
     def test_a_parked_task_whose_agent_was_removed_is_still_answered(self):

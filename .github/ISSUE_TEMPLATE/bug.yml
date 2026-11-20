@@ -2,6 +2,10 @@ name: Something is wrong
 description: crewchat did something it should not, or did not do what the docs say
 labels: [bug]
 body:
+  - type: markdown
+    attributes:
+      value: >-
+        crewchat has one maintainer, who reads every issue and replies as time allows.
   - type: textarea
     id: what
     attributes:

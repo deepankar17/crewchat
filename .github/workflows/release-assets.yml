@@ -51,10 +51,12 @@ jobs:
         with:
           name: dist
           path: dist/
+      - name: Checksums (SHA256SUMS, outside dist/ so PyPI is sent the packages only)
+        run: (cd dist && sha256sum *.whl *.tar.gz) > SHA256SUMS && cat SHA256SUMS
       - name: Attach what is missing
         run: |
           have=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
-          for f in dist/*.whl dist/*.tar.gz; do
+          for f in dist/*.whl dist/*.tar.gz SHA256SUMS; do
             if echo "$have" | grep -qx "$(basename "$f")"; then echo "already there: $f"
             else gh release upload "$TAG" "$f" --repo "$GITHUB_REPOSITORY"; fi
           done

@@ -1,0 +1,28 @@
+Usage: claude [options] [command] [prompt]
+
+Options:
+  --bg, --background                    Start the session in the background and
+                                        return immediately. Prints the id that
+                                        `claude attach`, `logs`, `stop` and `rm`
+                                        take; `claude agents` lists them. With
+                                        --resume <session-id>, continues that
+                                        session in the background under the same
+                                        ID, or starts a copy and says so when
+                                        the session is already running
+  --permission-mode <mode>              Permission mode to use for the session
+                                        (choices: "acceptEdits", "auto",
+                                        "bypassPermissions", "manual",
+                                        "dontAsk", "plan")
+
+Commands:
+  agents [options]                      Manage background agents
+  attach <id|name>                      Open a background session in this
+                                        terminal. <id> is the short id that
+                                        `claude --bg` prints and `claude agents`
+                                        lists. Part of the session name works
+                                        too
+  logs <id|name>                        Print a background session's recent
+                                        terminal output
+  stop|kill <id>                        Stop a background session. Its
+                                        conversation is kept: `claude attach
+                                        <id>` opens it again, `claude --resume`

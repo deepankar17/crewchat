@@ -2,6 +2,10 @@ name: An idea
 description: Something crewchat should do, or do differently
 labels: [idea]
 body:
+  - type: markdown
+    attributes:
+      value: >-
+        crewchat has one maintainer, who reads every issue and replies as time allows.
   - type: textarea
     id: problem
     attributes:
